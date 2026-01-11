@@ -1413,6 +1413,212 @@ class StatsManager {
 }
 
 // =============================================================================
+// CLIPBOARD MANAGER - OSC52 + History
+// =============================================================================
+
+class ClipboardManager {
+  constructor() {
+    this.history = [];
+    this.maxHistory = 20;
+    this.maxItemSize = 200 * 1024; // 200KB
+    this.panel = null;
+    this.toast = null;
+    this.pendingCopy = null;
+    this.init();
+  }
+
+  init() {
+    this.createPanel();
+    this.createToast();
+  }
+
+  createPanel() {
+    this.panel = document.createElement("div");
+    this.panel.id = "clipboard-panel";
+    this.panel.className = "clipboard-panel hidden";
+    this.panel.innerHTML = `
+      <div class="clipboard-header">
+        <h3>Clipboard History</h3>
+        <button class="clipboard-close">&times;</button>
+      </div>
+      <div class="clipboard-list"></div>
+    `;
+    document.getElementById("app").appendChild(this.panel);
+
+    this.panel
+      .querySelector(".clipboard-close")
+      .addEventListener("click", () => this.hidePanel());
+  }
+
+  createToast() {
+    this.toast = document.createElement("div");
+    this.toast.className = "clipboard-toast hidden";
+    this.toast.innerHTML = `
+      <span class="toast-message"></span>
+      <button class="toast-copy">Copy</button>
+    `;
+    document.getElementById("app").appendChild(this.toast);
+
+    this.toast.querySelector(".toast-copy").addEventListener("click", () => {
+      if (this.pendingCopy) {
+        this.copyWithGesture(this.pendingCopy);
+      }
+    });
+  }
+
+  // Handle OSC52 from terminal
+  handleOsc52(data) {
+    // Parse: c;<base64>
+    const parts = data.split(";");
+    if (parts.length < 2) return;
+
+    const base64Data = parts.slice(1).join(";");
+
+    try {
+      // UTF-8 safe base64 decode - CRITICAL: Don't use atob() directly!
+      const bytes = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
+      const text = new TextDecoder("utf-8").decode(bytes);
+
+      // Size limit check
+      if (text.length > this.maxItemSize) {
+        this.showToast(
+          "Content too large. Click to download.",
+          "download",
+          text,
+        );
+        return;
+      }
+
+      // Try clipboard API
+      this.copyToClipboard(text);
+    } catch (e) {
+      console.error("OSC52 decode error:", e);
+    }
+  }
+
+  async copyToClipboard(text) {
+    // Add to history first
+    this.addToHistory(text);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      this.showToast("Copied to clipboard!", "success");
+    } catch (err) {
+      // Clipboard API failed (no user gesture)
+      console.warn("Clipboard API failed, showing fallback:", err);
+      this.pendingCopy = text;
+      this.showToast("Click to copy", "pending", text);
+    }
+  }
+
+  copyWithGesture(text) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        this.showToast("Copied!", "success");
+        this.pendingCopy = null;
+      })
+      .catch((err) => {
+        console.error("Copy failed even with gesture:", err);
+        this.showToast("Copy failed", "error");
+      });
+  }
+
+  addToHistory(text) {
+    // Prevent duplicates
+    const existing = this.history.findIndex((h) => h.text === text);
+    if (existing !== -1) {
+      this.history.splice(existing, 1);
+    }
+
+    this.history.unshift({
+      text,
+      timestamp: Date.now(),
+      preview: text.substring(0, 100) + (text.length > 100 ? "..." : ""),
+    });
+
+    // Trim history
+    if (this.history.length > this.maxHistory) {
+      this.history.pop();
+    }
+
+    this.renderHistory();
+  }
+
+  renderHistory() {
+    const list = this.panel.querySelector(".clipboard-list");
+    list.innerHTML = this.history
+      .map(
+        (item, i) => `
+      <div class="clipboard-item" data-index="${i}">
+        <span class="item-preview">${this.escapeHtml(item.preview)}</span>
+        <span class="item-time">${this.formatTime(item.timestamp)}</span>
+        <button class="item-copy" data-index="${i}">Copy</button>
+      </div>
+    `,
+      )
+      .join("");
+
+    list.querySelectorAll(".item-copy").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const idx = parseInt(e.target.dataset.index);
+        this.copyWithGesture(this.history[idx].text);
+      });
+    });
+  }
+
+  showToast(message, type, data = null) {
+    const toast = this.toast;
+    const msgEl = toast.querySelector(".toast-message");
+    const copyBtn = toast.querySelector(".toast-copy");
+
+    msgEl.textContent = message;
+    toast.className = `clipboard-toast ${type}`;
+    copyBtn.style.display = type === "pending" ? "inline-block" : "none";
+
+    toast.classList.remove("hidden");
+
+    if (type === "success" || type === "error") {
+      setTimeout(() => toast.classList.add("hidden"), 2000);
+    }
+  }
+
+  hideToast() {
+    this.toast.classList.add("hidden");
+  }
+
+  showPanel() {
+    this.panel.classList.remove("hidden");
+    this.renderHistory();
+  }
+
+  hidePanel() {
+    this.panel.classList.add("hidden");
+  }
+
+  togglePanel() {
+    this.panel.classList.toggle("hidden");
+    if (!this.panel.classList.contains("hidden")) {
+      this.renderHistory();
+    }
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  formatTime(timestamp) {
+    const now = Date.now();
+    const diff = now - timestamp;
+    if (diff < 60000) return "just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    return new Date(timestamp).toLocaleTimeString();
+  }
+}
+
+// =============================================================================
 // TERMINAL MANAGER - Main orchestrator
 // =============================================================================
 
@@ -1432,6 +1638,7 @@ class TerminalManager {
     this.connectionStatus = document.getElementById("connection-status");
 
     this.tileManager = new TileManager(this.container);
+    this.clipboardManager = new ClipboardManager();
 
     this.init();
   }
@@ -1521,6 +1728,7 @@ class TerminalManager {
       btn.addEventListener("click", () => {
         const action = btn.dataset.action;
         if (action === "file-manager") this.fileManager.open();
+        else if (action === "clipboard") this.clipboardManager.togglePanel();
         else if (action === "copy") this.copySelection();
         else if (action === "paste") this.pasteClipboard();
         else if (action === "font-decrease") this.changeFontSize(-1);
@@ -1796,6 +2004,14 @@ class TerminalManager {
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
     terminal._fitAddon = fitAddon;
+
+    // OSC52 clipboard support (xterm.js 6.0+)
+    if (terminal.parser?.registerOscHandler) {
+      terminal.parser.registerOscHandler(52, (data) => {
+        this.clipboardManager.handleOsc52(data);
+        return true;
+      });
+    }
 
     return terminal;
   }
