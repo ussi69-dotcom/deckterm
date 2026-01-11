@@ -2,6 +2,10 @@ import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import type { ServerWebSocket, Subprocess } from "bun";
+import {
+  cloudflareAccess,
+  type CloudflareAccessPayload,
+} from "@hono/cloudflare-access";
 
 // Bun.Terminal API types (Bun 1.3.5+) - not yet in bun-types
 interface BunTerminalOptions {
@@ -31,9 +35,11 @@ type Terminal = {
   cols: number;
   rows: number;
   createdAt: number;
+  ownerId: string; // User sub from JWT
+  ownerEmail: string; // User email for display
 };
 
-type WsData = { terminalId: string };
+type WsData = { terminalId: string; ownerId: string };
 
 // Configuration
 const DEBUG = process.env.OPENCODE_WEB_DEBUG === "1";
@@ -41,8 +47,19 @@ const MAX_TERMINALS = parseInt(
   process.env.OPENCODE_WEB_MAX_TERMINALS || "10",
   10,
 );
+const MAX_TERMINALS_PER_USER = parseInt(
+  process.env.MAX_TERMINALS_PER_USER || "10",
+  10,
+);
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
 const RATE_LIMIT_MAX_REQUESTS = 20; // max terminals per minute
+
+const CF_ACCESS_REQUIRED = process.env.CF_ACCESS_REQUIRED === "1";
+const CF_ACCESS_TEAM_NAME = process.env.CF_ACCESS_TEAM_NAME || "";
+const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD || "";
+const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "")
+  .split(",")
+  .filter(Boolean);
 
 // Terminal sessions (PTY processes)
 const terminals = new Map<string, Terminal>();
@@ -71,11 +88,38 @@ function debug(...args: unknown[]) {
   if (DEBUG) console.log("[web-terminal]", ...args);
 }
 
+function getCurrentUser(c: {
+  get: (key: string) => CloudflareAccessPayload | undefined;
+}): { ownerId: string; ownerEmail: string } {
+  const accessPayload = c.get("accessPayload");
+  if (CF_ACCESS_REQUIRED && !accessPayload) {
+    throw new Error("Unauthorized");
+  }
+  return {
+    ownerId: accessPayload?.sub || "anonymous",
+    ownerEmail: accessPayload?.email || "anonymous",
+  };
+}
+
 export function createWebApp() {
   const app = new Hono();
 
-  // CORS - allow all origins for development
-  app.use("/*", cors());
+  // Hardened CORS - reject unknown origins
+  app.use(
+    "/*",
+    cors({
+      origin:
+        TRUSTED_ORIGINS.length > 0
+          ? (origin) => (TRUSTED_ORIGINS.includes(origin) ? origin : null)
+          : "*",
+      credentials: true,
+    }),
+  );
+
+  // Cloudflare Access JWT authentication
+  if (CF_ACCESS_REQUIRED && CF_ACCESS_TEAM_NAME) {
+    app.use("/*", cloudflareAccess(CF_ACCESS_TEAM_NAME));
+  }
 
   // No-cache headers - bypass CF cache
   app.use("/*", async (c, next) => {
@@ -131,9 +175,24 @@ export function createWebApp() {
 
   // Create new terminal running shell
   app.post("/api/terminals", async (c) => {
+    const { ownerId, ownerEmail } = getCurrentUser(c);
+
     // Rate limiting check
     if (!rateLimitState.canCreate()) {
       return c.json({ error: "Rate limit exceeded. Try again later." }, 429);
+    }
+
+    // Per-user terminal limit check
+    const userTerminals = Array.from(terminals.values()).filter(
+      (t) => t.ownerId === ownerId,
+    );
+    if (userTerminals.length >= MAX_TERMINALS_PER_USER) {
+      return c.json(
+        {
+          error: `Maximum terminals per user (${MAX_TERMINALS_PER_USER}) reached.`,
+        },
+        429,
+      );
     }
 
     // Max terminals check
@@ -227,6 +286,8 @@ export function createWebApp() {
       cols,
       rows,
       createdAt: Date.now(),
+      ownerId,
+      ownerEmail,
     });
     terminalSockets.set(id, new Set());
 
@@ -237,40 +298,51 @@ export function createWebApp() {
 
   // List terminals
   app.get("/api/terminals", (c) => {
-    const list = Array.from(terminals.values()).map((t) => ({
-      id: t.id,
-      cwd: t.cwd,
-      createdAt: t.createdAt,
-    }));
+    const { ownerId } = getCurrentUser(c);
+    const list = Array.from(terminals.values())
+      .filter((t) => t.ownerId === ownerId)
+      .map((t) => ({
+        id: t.id,
+        cwd: t.cwd,
+        createdAt: t.createdAt,
+      }));
     return c.json(list);
   });
 
   // Delete terminal
   app.delete("/api/terminals/:id", (c) => {
-    const id = c.req.param("id");
-    const term = terminals.get(id);
-    if (term) {
-      term.proc.kill();
-      term.terminal.close();
-      terminals.delete(id);
-      const sockets = terminalSockets.get(id);
-      if (sockets) {
-        for (const ws of sockets) {
-          ws.close();
-        }
-      }
-      terminalSockets.delete(id);
-      return c.json({ ok: true });
-    }
-    return c.json({ error: "Terminal not found" }, 404);
-  });
-
-  // Resize terminal - now with proper PTY resize support via Bun.Terminal
-  app.post("/api/terminals/:id/resize", async (c) => {
+    const { ownerId } = getCurrentUser(c);
     const id = c.req.param("id");
     const term = terminals.get(id);
     if (!term) {
       return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (term.ownerId !== ownerId) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+    term.proc.kill();
+    term.terminal.close();
+    terminals.delete(id);
+    const sockets = terminalSockets.get(id);
+    if (sockets) {
+      for (const ws of sockets) {
+        ws.close();
+      }
+    }
+    terminalSockets.delete(id);
+    return c.json({ ok: true });
+  });
+
+  // Resize terminal - now with proper PTY resize support via Bun.Terminal
+  app.post("/api/terminals/:id/resize", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const id = c.req.param("id");
+    const term = terminals.get(id);
+    if (!term) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (term.ownerId !== ownerId) {
+      return c.json({ error: "Forbidden" }, 403);
     }
 
     const body = await c.req.json();
@@ -489,17 +561,54 @@ export function startWebServer(host: string, port: number) {
     port,
     hostname: host,
 
-    fetch(req, server) {
+    async fetch(req, server) {
       const url = new URL(req.url);
 
       // WebSocket upgrade for terminal connection
       if (url.pathname.startsWith("/ws/terminals/")) {
         const id = url.pathname.split("/").pop();
-        if (id && terminals.has(id)) {
-          const success = server.upgrade(req, { data: { terminalId: id } });
-          if (success) return undefined;
+        const term = terminals.get(id);
+
+        if (!term) {
+          return new Response("Terminal not found", { status: 404 });
         }
-        return new Response("Terminal not found", { status: 404 });
+
+        const jwt = req.headers.get("cf-access-jwt-assertion");
+        if (CF_ACCESS_REQUIRED && !jwt) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+
+        let ownerId = "anonymous";
+        if (jwt && CF_ACCESS_TEAM_NAME) {
+          try {
+            const { cloudflareAccess: verifyJWT } =
+              await import("@hono/cloudflare-access");
+            const mockContext = {
+              req: { header: (name: string) => req.headers.get(name) },
+              set: (key: string, value: CloudflareAccessPayload) => {
+                if (key === "accessPayload") {
+                  ownerId = value.sub;
+                }
+              },
+            };
+            const middleware = verifyJWT(CF_ACCESS_TEAM_NAME);
+            await middleware(mockContext as never, async () => {});
+          } catch (err) {
+            debug("WebSocket JWT verification failed:", err);
+            return new Response("Unauthorized", { status: 401 });
+          }
+        }
+
+        if (term.ownerId !== ownerId) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        const success = server.upgrade(req, {
+          data: { terminalId: id, ownerId },
+        });
+        if (success) return undefined;
+
+        return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
       // Regular HTTP requests go to Hono
