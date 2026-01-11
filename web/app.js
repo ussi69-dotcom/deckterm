@@ -1019,11 +1019,18 @@ class ExtraKeysManager {
     }
 
     extraKeys.querySelectorAll(".ek-btn").forEach((btn) => {
+      btn.tabIndex = -1;
+      const preventFocus = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      };
       const handler = (e) => {
         e.preventDefault();
         e.stopPropagation();
         this.handleKey(btn.dataset.key);
       };
+      btn.addEventListener("mousedown", preventFocus, { passive: false });
+      btn.addEventListener("touchstart", preventFocus, { passive: false });
       btn.addEventListener("click", handler);
       btn.addEventListener("touchend", handler, { passive: false });
     });
