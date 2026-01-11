@@ -1011,32 +1011,64 @@ class ExtraKeysManager {
     const toggle = document.getElementById("extra-keys-toggle");
     const row2 = document.querySelector(".extra-keys-row-2");
 
-    if (toggle && row2) {
-      toggle.addEventListener("click", () => {
+    let touchedKey = null;
+
+    extraKeys.addEventListener(
+      "touchstart",
+      (e) => {
+        const btn = e.target.closest(".ek-btn, .ek-toggle");
+        if (btn) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          touchedKey =
+            btn.dataset.key ||
+            (btn.id === "extra-keys-toggle" ? "TOGGLE" : null);
+        }
+      },
+      { passive: false, capture: true },
+    );
+
+    extraKeys.addEventListener(
+      "touchend",
+      (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        if (touchedKey) {
+          if (touchedKey === "TOGGLE") {
+            row2.classList.toggle("hidden");
+            toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
+          } else {
+            this.handleKey(touchedKey);
+          }
+          touchedKey = null;
+        }
+        setTimeout(() => this.refocusTerminal(), 10);
+      },
+      { passive: false, capture: true },
+    );
+
+    extraKeys.addEventListener("mousedown", (e) => {
+      if (e.target.closest(".ek-btn, .ek-toggle")) {
+        e.preventDefault();
+      }
+    });
+
+    extraKeys.addEventListener("click", (e) => {
+      const btn = e.target.closest(".ek-btn");
+      const tog = e.target.closest(".ek-toggle");
+      if (btn && btn.dataset.key) {
+        e.preventDefault();
+        this.handleKey(btn.dataset.key);
+      } else if (tog && row2 && toggle) {
+        e.preventDefault();
         row2.classList.toggle("hidden");
         toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
-      });
-    }
-
-    extraKeys.querySelectorAll(".ek-btn").forEach((btn) => {
-      btn.tabIndex = -1;
-      const preventFocus = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-      };
-      const handler = (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        this.handleKey(btn.dataset.key);
-      };
-      btn.addEventListener("mousedown", preventFocus, { passive: false });
-      btn.addEventListener("touchstart", preventFocus, { passive: false });
-      btn.addEventListener("click", handler);
-      btn.addEventListener("touchend", handler, { passive: false });
+      }
     });
   }
 
   handleKey(key) {
+    if (!key) return;
     const active = this.tm.terminals.get(this.tm.activeId);
     if (!active?.ws) return;
 
@@ -1080,6 +1112,13 @@ class ExtraKeysManager {
       const mod = btn.dataset.key.toLowerCase();
       btn.classList.toggle("active", this.modifiers[mod] || false);
     });
+  }
+
+  refocusTerminal() {
+    const active = this.tm.terminals.get(this.tm.activeId);
+    if (active?.terminal) {
+      active.terminal.focus();
+    }
   }
 }
 
@@ -1668,8 +1707,8 @@ class TerminalManager {
 
     terminal.onData((data) => {
       let finalData = data;
-      if (this.extraKeys && data.length === 1) {
-        const mods = this.extraKeys.modifiers;
+      const mods = this.extraKeys?.modifiers;
+      if (this.extraKeys && data.length === 1 && mods) {
         if (mods.ctrl) {
           const charCode = data.toUpperCase().charCodeAt(0);
           if (charCode >= 65 && charCode <= 90) {
@@ -1705,6 +1744,14 @@ class TerminalManager {
     setTimeout(() => {
       fitAddon.fit();
       this.sendResize(id);
+
+      const textarea = element.querySelector(".xterm-helper-textarea");
+      if (textarea) {
+        textarea.autocomplete = "off";
+        textarea.autocorrect = "off";
+        textarea.autocapitalize = "off";
+        textarea.spellcheck = false;
+      }
     }, 200);
   }
 

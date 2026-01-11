@@ -77,6 +77,16 @@ export function createWebApp() {
   // CORS - allow all origins for development
   app.use("/*", cors());
 
+  // No-cache headers - bypass CF cache
+  app.use("/*", async (c, next) => {
+    await next();
+    c.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    c.header("Pragma", "no-cache");
+    c.header("Expires", "0");
+    c.header("CDN-Cache-Control", "no-store");
+    c.header("Cloudflare-CDN-Cache-Control", "no-store");
+  });
+
   // Health endpoint
   app.get("/api/health", (c) => {
     return c.json({

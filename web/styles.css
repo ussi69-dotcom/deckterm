@@ -637,6 +637,10 @@ body {
   flex-shrink: 0;
   position: relative;
   overflow: hidden;
+  touch-action: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .extra-keys-row {
@@ -670,9 +674,13 @@ body {
   font-weight: 500;
   cursor: pointer;
   transition: all 0.15s;
-  touch-action: manipulation;
+  touch-action: none;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
   flex-shrink: 0;
+  outline: none;
 }
 
 .ek-btn:hover {

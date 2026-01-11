@@ -17,7 +17,7 @@
       }
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/styles.css?v=20260111a" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -91,40 +91,40 @@
         <!-- Tiles will be created dynamically -->
       </div>
 
-      <!-- Extra Keys Bar (Termux style) -->
+      <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
       <div id="extra-keys" class="extra-keys">
         <div class="extra-keys-row">
-          <button data-key="ESC" class="ek-btn">ESC</button>
-          <button data-key="TAB" class="ek-btn">TAB</button>
-          <button data-key="CTRL" class="ek-btn ek-modifier">CTRL</button>
-          <button data-key="ALT" class="ek-btn ek-modifier">ALT</button>
-          <button data-key="SHIFT" class="ek-btn ek-modifier">SHIFT</button>
-          <button data-key="UP" class="ek-btn ek-icon"><i data-lucide="chevron-up"></i></button>
-          <button data-key="DOWN" class="ek-btn ek-icon"><i data-lucide="chevron-down"></i></button>
-          <button data-key="LEFT" class="ek-btn ek-icon"><i data-lucide="chevron-left"></i></button>
-          <button data-key="RIGHT" class="ek-btn ek-icon"><i data-lucide="chevron-right"></i></button>
-          <button data-key="HOME" class="ek-btn">HOME</button>
-          <button data-key="END" class="ek-btn">END</button>
-          <button data-key="INS" class="ek-btn">INS</button>
-          <button data-key="DEL" class="ek-btn">DEL</button>
+          <span data-key="ESC" class="ek-btn">ESC</span>
+          <span data-key="TAB" class="ek-btn">TAB</span>
+          <span data-key="CTRL" class="ek-btn ek-modifier">CTRL</span>
+          <span data-key="ALT" class="ek-btn ek-modifier">ALT</span>
+          <span data-key="SHIFT" class="ek-btn ek-modifier">SHIFT</span>
+          <span data-key="UP" class="ek-btn ek-icon"><i data-lucide="chevron-up"></i></span>
+          <span data-key="DOWN" class="ek-btn ek-icon"><i data-lucide="chevron-down"></i></span>
+          <span data-key="LEFT" class="ek-btn ek-icon"><i data-lucide="chevron-left"></i></span>
+          <span data-key="RIGHT" class="ek-btn ek-icon"><i data-lucide="chevron-right"></i></span>
+          <span data-key="HOME" class="ek-btn">HOME</span>
+          <span data-key="END" class="ek-btn">END</span>
+          <span data-key="INS" class="ek-btn">INS</span>
+          <span data-key="DEL" class="ek-btn">DEL</span>
         </div>
         <div class="extra-keys-row extra-keys-row-2 hidden">
-          <button data-key="F1" class="ek-btn">F1</button>
-          <button data-key="F2" class="ek-btn">F2</button>
-          <button data-key="F3" class="ek-btn">F3</button>
-          <button data-key="F4" class="ek-btn">F4</button>
-          <button data-key="F5" class="ek-btn">F5</button>
-          <button data-key="F6" class="ek-btn">F6</button>
-          <button data-key="F7" class="ek-btn">F7</button>
-          <button data-key="F8" class="ek-btn">F8</button>
-          <button data-key="F9" class="ek-btn">F9</button>
-          <button data-key="F10" class="ek-btn">F10</button>
-          <button data-key="F11" class="ek-btn">F11</button>
-          <button data-key="F12" class="ek-btn">F12</button>
-          <button data-key="PGUP" class="ek-btn">PgUp</button>
-          <button data-key="PGDN" class="ek-btn">PgDn</button>
+          <span data-key="F1" class="ek-btn">F1</span>
+          <span data-key="F2" class="ek-btn">F2</span>
+          <span data-key="F3" class="ek-btn">F3</span>
+          <span data-key="F4" class="ek-btn">F4</span>
+          <span data-key="F5" class="ek-btn">F5</span>
+          <span data-key="F6" class="ek-btn">F6</span>
+          <span data-key="F7" class="ek-btn">F7</span>
+          <span data-key="F8" class="ek-btn">F8</span>
+          <span data-key="F9" class="ek-btn">F9</span>
+          <span data-key="F10" class="ek-btn">F10</span>
+          <span data-key="F11" class="ek-btn">F11</span>
+          <span data-key="F12" class="ek-btn">F12</span>
+          <span data-key="PGUP" class="ek-btn">PgUp</span>
+          <span data-key="PGDN" class="ek-btn">PgDn</span>
         </div>
-        <button id="extra-keys-toggle" class="ek-toggle" title="More keys">⋯</button>
+        <span id="extra-keys-toggle" class="ek-toggle" title="More keys">⋯</span>
       </div>
 
       <!-- Search Bar -->
@@ -256,6 +256,6 @@
     <script src="/vendor/xterm.min.js"></script>
     <script src="/vendor/xterm-addon-fit.min.js"></script>
     <script src="/vendor/xterm-addon-web-links.min.js"></script>
-    <script src="/app.js"></script>
+    <script src="/app.js?v=20260111f"></script>
   </body>
 </html>
