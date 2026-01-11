@@ -1671,6 +1671,190 @@ class OpenCodeManager {
 }
 
 // =============================================================================
+// GIT MANAGER - Git panel integration
+// =============================================================================
+
+class GitManager {
+  constructor() {
+    this.panel = null;
+    this.currentCwd = null;
+    this.init();
+  }
+
+  init() {
+    this.createPanel();
+    document
+      .querySelector('[data-action="git"]')
+      ?.addEventListener("click", () => this.toggle());
+  }
+
+  createPanel() {
+    this.panel = document.createElement("div");
+    this.panel.id = "git-panel";
+    this.panel.className = "side-panel hidden";
+    this.panel.innerHTML = `
+      <div class="panel-header">
+        <h3>Git</h3>
+        <span id="git-branch" class="git-branch"></span>
+        <button class="panel-refresh" title="Refresh">↻</button>
+        <button class="panel-close">&times;</button>
+      </div>
+      <div id="git-status" class="git-status"></div>
+      <div id="git-diff" class="git-diff"></div>
+      <div class="git-commit">
+        <textarea id="git-message" placeholder="Commit message..."></textarea>
+        <button id="git-commit-btn" class="btn btn-primary">Commit</button>
+      </div>
+    `;
+    document.getElementById("app").appendChild(this.panel);
+
+    this.panel
+      .querySelector(".panel-close")
+      .addEventListener("click", () => this.hide());
+    this.panel
+      .querySelector(".panel-refresh")
+      .addEventListener("click", () => this.refresh());
+    this.panel
+      .querySelector("#git-commit-btn")
+      .addEventListener("click", () => this.commit());
+  }
+
+  async show(cwd) {
+    this.currentCwd =
+      cwd || document.getElementById("directory")?.value || process.env.HOME;
+    this.panel.classList.remove("hidden");
+    await this.refresh();
+  }
+
+  hide() {
+    this.panel.classList.add("hidden");
+  }
+
+  toggle() {
+    this.panel.classList.contains("hidden") ? this.show() : this.hide();
+  }
+
+  async refresh() {
+    if (!this.currentCwd) return;
+
+    try {
+      const res = await fetch(
+        `/api/git/status?cwd=${encodeURIComponent(this.currentCwd)}`,
+      );
+      const data = await res.json();
+
+      if (data.error) {
+        this.panel.querySelector("#git-branch").textContent = "not a repo";
+        this.panel.querySelector("#git-status").innerHTML =
+          `<p class="error">${data.error}</p>`;
+        return;
+      }
+
+      this.panel.querySelector("#git-branch").textContent = data.branch;
+      this.renderStatus(data.files);
+    } catch (err) {
+      console.error("Git status error:", err);
+    }
+  }
+
+  renderStatus(files) {
+    const container = this.panel.querySelector("#git-status");
+    if (files.length === 0) {
+      container.innerHTML = '<p class="muted">No changes</p>';
+      return;
+    }
+
+    container.innerHTML = files
+      .map(
+        (f) => `
+      <div class="git-file" data-path="${f.path}">
+        <span class="git-file-status ${this.statusClass(f.status)}">${f.status}</span>
+        <span class="git-file-path">${f.path}</span>
+        <button class="git-file-diff" title="View diff">diff</button>
+        <button class="git-file-stage" title="Stage/Unstage">+/-</button>
+      </div>
+    `,
+      )
+      .join("");
+
+    container.querySelectorAll(".git-file-diff").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const path = e.target.closest(".git-file").dataset.path;
+        this.showDiff(path);
+      });
+    });
+
+    container.querySelectorAll(".git-file-stage").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const path = e.target.closest(".git-file").dataset.path;
+        const status = e.target
+          .closest(".git-file")
+          .querySelector(".git-file-status").textContent;
+        this.toggleStage(path, status);
+      });
+    });
+  }
+
+  statusClass(status) {
+    if (status.includes("M")) return "modified";
+    if (status.includes("A")) return "added";
+    if (status.includes("D")) return "deleted";
+    if (status.includes("?")) return "untracked";
+    return "";
+  }
+
+  async showDiff(path) {
+    const url = `/api/git/diff?cwd=${encodeURIComponent(this.currentCwd)}&path=${encodeURIComponent(path)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const diffContainer = this.panel.querySelector("#git-diff");
+    diffContainer.innerHTML = `<pre class="diff-content">${this.escapeHtml(data.diff || "No diff")}</pre>`;
+  }
+
+  async toggleStage(path, status) {
+    const isStaged = !status.startsWith(" ") && !status.startsWith("?");
+    const endpoint = isStaged ? "/api/git/unstage" : "/api/git/stage";
+
+    await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: this.currentCwd, paths: [path] }),
+    });
+
+    await this.refresh();
+  }
+
+  async commit() {
+    const message = this.panel.querySelector("#git-message").value.trim();
+    if (!message) {
+      alert("Commit message required");
+      return;
+    }
+
+    const res = await fetch("/api/git/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: this.currentCwd, message }),
+    });
+
+    const data = await res.json();
+    if (data.error) {
+      alert(data.error + ": " + data.message);
+    } else {
+      this.panel.querySelector("#git-message").value = "";
+      await this.refresh();
+    }
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+}
+
+// =============================================================================
 // TERMINAL MANAGER - Main orchestrator
 // =============================================================================
 
@@ -2739,4 +2923,5 @@ document.addEventListener("DOMContentLoaded", () => {
   window.terminalManager = new TerminalManager();
   window.statsManager = new StatsManager();
   window.openCodeManager = new OpenCodeManager();
+  window.gitManager = new GitManager();
 });

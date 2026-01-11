@@ -626,6 +626,210 @@ export function createWebApp() {
     }
   });
 
+  // =============================================================================
+  // GIT API - Secure git operations with realpath validation
+  // =============================================================================
+
+  const ALLOWED_GIT_ROOTS = [process.env.HOME || "/home/deploy"];
+
+  async function validateGitCwd(cwd: string): Promise<boolean> {
+    try {
+      const fs = await import("fs/promises");
+      const realCwd = await fs.realpath(cwd);
+      return ALLOWED_GIT_ROOTS.some((root) => realCwd.startsWith(root));
+    } catch {
+      return false;
+    }
+  }
+
+  // GET /api/git/status?cwd=/path/to/repo
+  app.get("/api/git/status", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "status", "--porcelain", "-b"], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      const lines = output.trim().split("\n");
+      const branch = lines[0]?.replace("## ", "").split("...")[0] || "unknown";
+      const files = lines.slice(1).map((line) => ({
+        status: line.substring(0, 2).trim(),
+        path: line.substring(3),
+      }));
+
+      return c.json({ branch, files, cwd });
+    } catch (err) {
+      return c.json(
+        { error: "Not a git repository", message: String(err) },
+        400,
+      );
+    }
+  });
+
+  // GET /api/git/diff?cwd=...&path=... (optional path for single file)
+  app.get("/api/git/diff", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    const path = c.req.query("path");
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const args = ["git", "diff", "--color=never"];
+      if (path) {
+        args.push("--", path);
+      }
+
+      const proc = Bun.spawn(args, {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      return c.json({ diff: output, cwd, path });
+    } catch (err) {
+      return c.json({ error: "Git diff failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/stage { cwd, paths: string[] }
+  app.post("/api/git/stage", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!paths || !Array.isArray(paths) || paths.length === 0) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "add", "--", ...paths], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      await proc.exited;
+      clearTimeout(timeoutId);
+
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: "Git add failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/unstage { cwd, paths: string[] }
+  app.post("/api/git/unstage", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!paths || !Array.isArray(paths) || paths.length === 0) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "restore", "--staged", "--", ...paths], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      await proc.exited;
+      clearTimeout(timeoutId);
+
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: "Git restore failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/commit { cwd, message }
+  app.post("/api/git/commit", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, message } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!message?.trim()) {
+      return c.json({ error: "Message required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "commit", "-m", message], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      clearTimeout(timeoutId);
+
+      if (code !== 0) {
+        const stderr = await new Response(proc.stderr).text();
+        return c.json({ error: "Commit failed", message: stderr }, 400);
+      }
+
+      return c.json({ ok: true, output });
+    } catch (err) {
+      return c.json({ error: "Git commit failed", message: String(err) }, 400);
+    }
+  });
+
+  // GET /api/git/branches?cwd=...
+  app.get("/api/git/branches", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const proc = Bun.spawn(
+        ["git", "branch", "-a", "--format=%(refname:short)"],
+        {
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      const branches = output.trim().split("\n").filter(Boolean);
+      return c.json({ branches, cwd });
+    } catch (err) {
+      return c.json({ error: "Git branch failed", message: String(err) }, 400);
+    }
+  });
+
   // Serve static files
   app.use(
     "/*",
