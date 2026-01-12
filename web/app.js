@@ -2308,6 +2308,56 @@ class TerminalManager {
     });
   }
 
+  formatCwdLabel(cwd) {
+    if (!cwd) return "Terminal";
+    const cleaned = cwd.replace(/\/+$/, "");
+    if (!cleaned) return "/";
+    const parts = cleaned.split("/");
+    const last = parts[parts.length - 1];
+    return last || "/";
+  }
+
+  updateWorkspaceLabel(workspaceId, cwd) {
+    if (!workspaceId) return;
+    const label = this.formatCwdLabel(cwd);
+    this.tabs.querySelectorAll(".tab").forEach((tab) => {
+      if (tab.dataset.workspaceId === workspaceId) {
+        const labelEl = tab.querySelector(".tab-label");
+        if (labelEl) labelEl.textContent = label;
+        if (cwd) tab.title = cwd;
+      }
+    });
+  }
+
+  parseOsc7Cwd(data) {
+    if (!data) return null;
+    if (data.startsWith("file://")) {
+      const withoutScheme = data.slice("file://".length);
+      const slashIndex = withoutScheme.indexOf("/");
+      if (slashIndex === -1) return null;
+      return decodeURIComponent(withoutScheme.slice(slashIndex));
+    }
+    if (data.startsWith("/")) return decodeURIComponent(data);
+    return null;
+  }
+
+  attachOsc7Handler(id, terminal) {
+    if (!terminal?.parser?.registerOscHandler) return null;
+    return terminal.parser.registerOscHandler(7, (data) => {
+      const cwd = this.parseOsc7Cwd(data);
+      if (!cwd) return false;
+      const t = this.terminals.get(id);
+      if (!t) return true;
+      t.cwd = cwd;
+      if (t.workspaceId && this.activeId === id) {
+        this.updateWorkspaceLabel(t.workspaceId, cwd);
+      }
+      this.updateTabGroups();
+      if (DEBUG) dbg("osc7 cwd", { id, cwd });
+      return true;
+    });
+  }
+
   updateWrapButton() {
     const btn = document.getElementById("wrap-lines-btn");
     if (!btn) return;
@@ -2487,6 +2537,7 @@ class TerminalManager {
 
     const terminal = this.createXtermInstance();
     terminal.open(element);
+    const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
     const fitAddon = terminal._fitAddon;
     fitAddon.fit();
@@ -2540,6 +2591,7 @@ class TerminalManager {
       resizeTimer: null,
       preferredCols: 0,
       onDataDisposable,
+      osc7Disposable,
     });
     this.addTab(id, cwd, tabNum, workspaceId);
     this.switchTo(id);
@@ -2810,6 +2862,7 @@ class TerminalManager {
 
       const terminal = this.createXtermInstance();
       terminal.open(element);
+      const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
       const fitAddon = terminal._fitAddon;
       fitAddon.fit();
@@ -2861,6 +2914,7 @@ class TerminalManager {
         resizeTimer: null,
         preferredCols: 0,
         onDataDisposable,
+        osc7Disposable,
       });
 
       // Only add tab for new workspaces, not splits
@@ -2885,7 +2939,7 @@ class TerminalManager {
     tab.dataset.workspaceId = workspaceId;
     tab.dataset.index = tabNum % 9 || 9;
 
-    const label = cwd ? cwd.split("/").pop() || "/" : "Terminal";
+    const label = this.formatCwdLabel(cwd);
     tab.innerHTML = `
       <span class="tab-dot"></span>
       <span class="tab-index">${tabNum}</span>
@@ -2893,6 +2947,7 @@ class TerminalManager {
       <span class="tab-count"></span>
       <button class="tab-close" title="Close (Ctrl+W)">&times;</button>
     `;
+    if (cwd) tab.title = cwd;
 
     tab
       .querySelector(".tab-label")
@@ -3086,6 +3141,9 @@ class TerminalManager {
       this.tileManager.showWorkspace(t.workspaceId);
     }
     this.tileManager.setActive(id);
+    if (t?.workspaceId && t.cwd) {
+      this.updateWorkspaceLabel(t.workspaceId, t.cwd);
+    }
     if (DEBUG) {
       dbg("switchTo", {
         terminalId: id,
@@ -3136,6 +3194,7 @@ class TerminalManager {
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     t.onDataDisposable?.dispose?.();
+    t.osc7Disposable?.dispose?.();
     try {
       t.terminal?.dispose?.();
     } catch (err) {
