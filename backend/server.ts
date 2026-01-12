@@ -1052,7 +1052,9 @@ export function startWebServer(host: string, port: number) {
         }
 
         sockets.add(ws as unknown as WebSocket);
-        debug(`WebSocket connected for terminal ${terminalId}`);
+        debug(
+          `WebSocket connected for terminal ${terminalId} (${term.cols}x${term.rows})`,
+        );
       },
 
       message(ws: ServerWebSocket<WsData>, message) {
