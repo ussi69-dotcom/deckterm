@@ -2128,6 +2128,7 @@ class TerminalManager {
     this.fontSize = parseInt(localStorage.getItem("opencode-font-size")) || 14;
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
+    this.resizeDebounceMs = 120;
 
     this.container = document.getElementById("terminal-container");
     this.tabs = document.getElementById("terminals-tabs");
@@ -2451,9 +2452,12 @@ class TerminalManager {
       cwd,
       tabNum,
       workspaceId,
+      resizeObserver: null,
+      resizeTimer: null,
     });
     this.addTab(id, cwd, tabNum, workspaceId);
     this.switchTo(id);
+    this.attachResizeObserver(id);
 
     setTimeout(() => {
       fitAddon.fit();
@@ -2624,6 +2628,39 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
+  scheduleResize(id) {
+    const t = this.terminals.get(id);
+    if (!t) return;
+    if (t.resizeTimer) clearTimeout(t.resizeTimer);
+    t.resizeTimer = setTimeout(() => {
+      this.sendResize(id);
+    }, this.resizeDebounceMs);
+  }
+
+  attachResizeObserver(id) {
+    const t = this.terminals.get(id);
+    if (!t?.element || !t.fitAddon) return;
+
+    if (t.resizeObserver) {
+      t.resizeObserver.disconnect();
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (!t.element || t.element.offsetParent === null) return;
+      requestAnimationFrame(() => {
+        try {
+          t.fitAddon.fit();
+          this.scheduleResize(id);
+        } catch (err) {
+          if (DEBUG) dbg("resizeObserver error", { id, err });
+        }
+      });
+    });
+
+    observer.observe(t.element);
+    t.resizeObserver = observer;
+  }
+
   // Create a new terminal in a new workspace (split=false) or current workspace (split=true)
   async createTerminal(split = false) {
     const cwd = this.directoryInput?.value.trim() || undefined;
@@ -2708,6 +2745,8 @@ class TerminalManager {
         cwd,
         tabNum,
         workspaceId,
+        resizeObserver: null,
+        resizeTimer: null,
       });
 
       // Only add tab for new workspaces, not splits
@@ -2718,6 +2757,7 @@ class TerminalManager {
         this.updateTabGroups();
       }
       this.switchTo(id);
+      this.attachResizeObserver(id);
     } catch (err) {
       console.error("Failed to create terminal:", err);
       alert("Failed to create terminal: " + err.message);
