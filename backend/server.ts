@@ -234,7 +234,7 @@ export function createWebApp() {
     let availableMem = freeMem;
     try {
       const meminfo = await fs.readFile("/proc/meminfo", "utf8");
-      const match = meminfo.match(/^MemAvailable:\s+(\\d+)\\s+kB/m);
+      const match = meminfo.match(/^MemAvailable:\s+(\d+)\s+kB/m);
       if (match) {
         availableMem = parseInt(match[1], 10) * 1024;
       }
