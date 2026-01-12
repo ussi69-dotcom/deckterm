@@ -537,7 +537,7 @@ class TileManager {
       this.isMobile = window.innerWidth < 768;
 
       if (wasMobile !== this.isMobile) {
-        this.relayout();
+        this.relayout(this.activeWorkspaceId);
       }
     });
 
@@ -718,7 +718,7 @@ class TileManager {
     if (!activeTile) {
       // No active tile, fill remaining space
       newTile.bounds = { x: 0, y: 0, width: 100, height: 100 };
-      this.relayout();
+      this.relayout(newTile.workspaceId);
       return;
     }
 
@@ -923,6 +923,7 @@ class TileManager {
   removeTile(terminalId) {
     const tile = this.tiles.get(terminalId);
     if (!tile) return;
+    const workspaceId = tile.workspaceId;
 
     this.saveUndo();
 
@@ -935,14 +936,15 @@ class TileManager {
     this.tiles.delete(terminalId);
 
     // Redistribute space to remaining tiles
-    if (this.tiles.size > 0) {
-      this.relayout();
-    }
+    if (workspaceId) this.relayout(workspaceId);
   }
 
-  // Relayout all tiles to fill space
-  relayout() {
-    const tileArray = Array.from(this.tiles.values());
+  // Relayout tiles to fill space, scoped to workspace if provided
+  relayout(workspaceId = null) {
+    const targetWorkspaceId = workspaceId || this.activeWorkspaceId;
+    const tileArray = targetWorkspaceId
+      ? this.getWorkspaceTiles(targetWorkspaceId)
+      : Array.from(this.tiles.values());
     if (tileArray.length === 0) return;
 
     if (this.isMobile) {
@@ -986,7 +988,10 @@ class TileManager {
       tile.updatePosition();
     });
     if (DEBUG) {
-      dbg("relayout", { count: tileArray.length });
+      dbg("relayout", {
+        workspaceId: targetWorkspaceId || "all",
+        count: tileArray.length,
+      });
     }
   }
 
