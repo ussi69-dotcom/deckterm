@@ -1320,9 +1320,12 @@ body.virtual-keyboard-open .extra-keys {
   .toolbar-row-2 {
     display: none;
     width: 100%;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: thin;
     margin-top: 8px;
-    gap: 6px;
+    gap: 8px;
   }
 
   .toolbar-row-2::before {
@@ -1335,8 +1338,8 @@ body.virtual-keyboard-open .extra-keys {
   }
 
   .toolbar.expanded .dir-input {
-    flex: 1 1 100%;
-    min-width: 0;
+    flex: 1 1 auto;
+    min-width: 120px;
     max-width: 100%;
   }
 
@@ -1355,8 +1358,9 @@ body.virtual-keyboard-open .extra-keys {
     margin: 0;
     flex-wrap: nowrap;
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
     gap: 4px;
-    max-width: calc(100vw - 120px);
+    max-width: calc(100vw - 140px);
   }
 
   .toolbar .status-dot {
@@ -1364,8 +1368,8 @@ body.virtual-keyboard-open .extra-keys {
   }
 
   .btn-icon {
-    width: 44px;
-    height: 44px;
+    width: 40px;
+    height: 40px;
   }
 
   .btn {
