@@ -50,3 +50,13 @@ if (typeof window !== "undefined") {
     hexToRgba,
   };
 }
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = { hashCwdToColor, blendWorkspaceColors, hexToRgba };
+}
+
+if (typeof exports !== "undefined") {
+  exports.hashCwdToColor = hashCwdToColor;
+  exports.blendWorkspaceColors = blendWorkspaceColors;
+  exports.hexToRgba = hexToRgba;
+}
