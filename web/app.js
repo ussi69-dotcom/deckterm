@@ -51,6 +51,65 @@ const GROUP_COLORS = [
   "#7ee787",
 ];
 
+const DEBUG = location.search.includes("debug=1");
+const dbg = (...args) => {
+  if (DEBUG) console.log("[deckterm]", ...args);
+};
+const TerminalColors =
+  window.TerminalColors ||
+  (() => {
+    const palette = [
+      "#58a6ff",
+      "#3fb950",
+      "#d29922",
+      "#bc8cff",
+      "#f778ba",
+      "#79c0ff",
+      "#7ee787",
+      "#ffa657",
+      "#ff7b72",
+      "#a371f7",
+    ];
+
+    const hashCwdToColor = (cwd) => {
+      const input = cwd || "terminal";
+      let hash = 2166136261;
+      for (let i = 0; i < input.length; i++) {
+        hash ^= input.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+      }
+      const index = (hash >>> 0) % palette.length;
+      return palette[index];
+    };
+
+    const blendWorkspaceColors = (colors, maxColors = 3) => {
+      const unique = [];
+      const seen = new Set();
+      for (const color of colors) {
+        if (!color || seen.has(color)) continue;
+        seen.add(color);
+        unique.push(color);
+        if (unique.length >= maxColors) break;
+      }
+      return unique.length > 0 ? unique : [palette[0]];
+    };
+
+    const hexToRgba = (hex, alpha = 1) => {
+      const raw = (hex || "#58a6ff").replace("#", "");
+      if (raw.length !== 6) return `rgba(88, 166, 255, ${alpha})`;
+      const r = parseInt(raw.slice(0, 2), 16);
+      const g = parseInt(raw.slice(2, 4), 16);
+      const b = parseInt(raw.slice(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    };
+
+    return { hashCwdToColor, blendWorkspaceColors, hexToRgba };
+  })();
+
+if (!window.TerminalColors) {
+  window.TerminalColors = TerminalColors;
+}
+
 // =============================================================================
 // RECONNECTING WEBSOCKET
 // =============================================================================
@@ -179,16 +238,18 @@ class ReconnectingWebSocket {
 // =============================================================================
 
 class Tile {
-  constructor(id, terminalId, container) {
+  constructor(id, terminalId, container, onCloseRequest) {
     this.id = id;
     this.terminalId = terminalId;
     this.container = container;
+    this.onCloseRequest = onCloseRequest;
     this.groupId = null;
     this.element = null;
     this.terminalWrapper = null;
+    this.closeConfirmVisible = false;
+    this.onDocumentClick = null;
 
-    // Bounds in percentages (0-100)
-    this.bounds = { x: 0, y: 0, width: 50, height: 100 };
+    this.bounds = { x: 0, y: 0, width: 100, height: 100 };
 
     this.isResizing = false;
     this.resizeEdge = null;
@@ -209,7 +270,72 @@ class Tile {
     this.terminalWrapper.id = `terminal-${this.terminalId}`;
     this.element.appendChild(this.terminalWrapper);
 
-    // Resize handles
+    this.createCloseButton();
+    this.createResizeHandles();
+    this.setupResizeHandlers();
+    this.container.appendChild(this.element);
+  }
+
+  createCloseButton() {
+    const closeContainer = document.createElement("div");
+    closeContainer.className = "tile-close-container";
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "tile-close-btn";
+    closeBtn.innerHTML = "&times;";
+    closeBtn.title = "Close terminal";
+
+    const confirmPopup = document.createElement("div");
+    confirmPopup.className = "tile-close-confirm";
+    confirmPopup.innerHTML = `
+      <button class="confirm-close">Close</button>
+      <button class="confirm-cancel">Cancel</button>
+    `;
+
+    closeBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.showCloseConfirm();
+    });
+
+    confirmPopup
+      .querySelector(".confirm-close")
+      .addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.hideCloseConfirm();
+        if (this.onCloseRequest) this.onCloseRequest(this.terminalId);
+      });
+
+    confirmPopup
+      .querySelector(".confirm-cancel")
+      .addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.hideCloseConfirm();
+      });
+
+    this.onDocumentClick = (e) => {
+      if (this.closeConfirmVisible && !closeContainer.contains(e.target)) {
+        this.hideCloseConfirm();
+      }
+    };
+    document.addEventListener("click", this.onDocumentClick);
+
+    closeContainer.appendChild(closeBtn);
+    closeContainer.appendChild(confirmPopup);
+    this.element.appendChild(closeContainer);
+    this.closeConfirm = confirmPopup;
+  }
+
+  showCloseConfirm() {
+    this.closeConfirmVisible = true;
+    this.closeConfirm.classList.add("visible");
+  }
+
+  hideCloseConfirm() {
+    this.closeConfirmVisible = false;
+    this.closeConfirm.classList.remove("visible");
+  }
+
+  createResizeHandles() {
     const edges = [
       "top",
       "right",
@@ -226,9 +352,6 @@ class Tile {
       handle.dataset.edge = edge;
       this.element.appendChild(handle);
     });
-
-    this.setupResizeHandlers();
-    this.container.appendChild(this.element);
   }
 
   setupResizeHandlers() {
@@ -336,10 +459,34 @@ class Tile {
   };
 
   updatePosition() {
-    this.element.style.left = `${this.bounds.x}%`;
-    this.element.style.top = `${this.bounds.y}%`;
-    this.element.style.width = `${this.bounds.width}%`;
-    this.element.style.height = `${this.bounds.height}%`;
+    const isMobile = window.innerWidth < 768;
+
+    if (isMobile) {
+      const containerRect = this.container.getBoundingClientRect();
+      const minWidth = 360;
+      const minHeight = 400;
+
+      const width = Math.max(
+        minWidth,
+        (this.bounds.width / 100) * containerRect.width,
+      );
+      const height = Math.max(
+        minHeight,
+        (this.bounds.height / 100) * containerRect.height,
+      );
+      const left = (this.bounds.x / 100) * containerRect.width;
+      const top = (this.bounds.y / 100) * containerRect.height;
+
+      this.element.style.left = `${left}px`;
+      this.element.style.top = `${top}px`;
+      this.element.style.width = `${width}px`;
+      this.element.style.height = `${height}px`;
+    } else {
+      this.element.style.left = `${this.bounds.x}%`;
+      this.element.style.top = `${this.bounds.y}%`;
+      this.element.style.width = `${this.bounds.width}%`;
+      this.element.style.height = `${this.bounds.height}%`;
+    }
   }
 
   setActive(active) {
@@ -352,6 +499,9 @@ class Tile {
   }
 
   destroy() {
+    if (this.onDocumentClick) {
+      document.removeEventListener("click", this.onDocumentClick);
+    }
     this.element.remove();
   }
 }
@@ -446,7 +596,7 @@ class TileManager {
       this.isMobile = window.innerWidth < 768;
 
       if (wasMobile !== this.isMobile) {
-        this.relayout();
+        this.relayout(this.activeWorkspaceId);
       }
     });
 
@@ -457,13 +607,62 @@ class TileManager {
         this.undo();
       }
     });
+
+    this.setupTouchGestures();
   }
 
-  // Create a new tile for a terminal
-  // split=false means new independent workspace, split=true means split current workspace
-  createTile(terminalId, workspaceId, split = false) {
+  setupTouchGestures() {
+    if (!this.isMobile) return;
+
+    let touchStartX = 0;
+    let touchStartY = 0;
+    let scrollLeft = 0;
+    let scrollTop = 0;
+    let isTwoFingerPan = false;
+
+    this.container.addEventListener(
+      "touchstart",
+      (e) => {
+        if (e.touches.length === 2) {
+          isTwoFingerPan = true;
+          touchStartX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          touchStartY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+          scrollLeft = this.container.scrollLeft;
+          scrollTop = this.container.scrollTop;
+        }
+      },
+      { passive: true },
+    );
+
+    this.container.addEventListener(
+      "touchmove",
+      (e) => {
+        if (isTwoFingerPan && e.touches.length === 2) {
+          const touchX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+          const touchY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+
+          const deltaX = touchStartX - touchX;
+          const deltaY = touchStartY - touchY;
+
+          this.container.scrollLeft = scrollLeft + deltaX;
+          this.container.scrollTop = scrollTop + deltaY;
+        }
+      },
+      { passive: true },
+    );
+
+    this.container.addEventListener(
+      "touchend",
+      () => {
+        isTwoFingerPan = false;
+      },
+      { passive: true },
+    );
+  }
+
+  createTile(terminalId, workspaceId, split = false, onCloseRequest = null) {
     const tileId = `tile-${terminalId}`;
-    const tile = new Tile(tileId, terminalId, this.container);
+    const tile = new Tile(tileId, terminalId, this.container, onCloseRequest);
     tile.workspaceId = workspaceId;
     this.tiles.set(terminalId, tile);
 
@@ -478,6 +677,17 @@ class TileManager {
     tile.updatePosition();
     this.showWorkspace(workspaceId);
 
+    if (DEBUG) {
+      const rect = this.container.getBoundingClientRect();
+      dbg("createTile", {
+        terminalId,
+        workspaceId,
+        split,
+        bounds: { ...tile.bounds },
+        container: { w: rect.width, h: rect.height },
+      });
+    }
+
     return tile.terminalWrapper;
   }
 
@@ -491,6 +701,12 @@ class TileManager {
         tile.element.style.display = "none";
       }
     });
+    if (DEBUG) {
+      dbg("showWorkspace", {
+        workspaceId,
+        tiles: this.getWorkspaceTiles(workspaceId).length,
+      });
+    }
   }
 
   // Get tiles for a workspace
@@ -544,6 +760,9 @@ class TileManager {
       };
       tile.updatePosition();
     });
+    if (DEBUG) {
+      dbg("relayoutWorkspace", { workspaceId, count: tiles.length });
+    }
   }
 
   // Position a new tile next to the active one
@@ -558,7 +777,7 @@ class TileManager {
     if (!activeTile) {
       // No active tile, fill remaining space
       newTile.bounds = { x: 0, y: 0, width: 100, height: 100 };
-      this.relayout();
+      this.relayout(newTile.workspaceId);
       return;
     }
 
@@ -763,6 +982,7 @@ class TileManager {
   removeTile(terminalId) {
     const tile = this.tiles.get(terminalId);
     if (!tile) return;
+    const workspaceId = tile.workspaceId;
 
     this.saveUndo();
 
@@ -775,14 +995,15 @@ class TileManager {
     this.tiles.delete(terminalId);
 
     // Redistribute space to remaining tiles
-    if (this.tiles.size > 0) {
-      this.relayout();
-    }
+    if (workspaceId) this.relayout(workspaceId);
   }
 
-  // Relayout all tiles to fill space
-  relayout() {
-    const tileArray = Array.from(this.tiles.values());
+  // Relayout tiles to fill space, scoped to workspace if provided
+  relayout(workspaceId = null) {
+    const targetWorkspaceId = workspaceId || this.activeWorkspaceId;
+    const tileArray = targetWorkspaceId
+      ? this.getWorkspaceTiles(targetWorkspaceId)
+      : Array.from(this.tiles.values());
     if (tileArray.length === 0) return;
 
     if (this.isMobile) {
@@ -825,6 +1046,12 @@ class TileManager {
       tile.element.style.display = "block";
       tile.updatePosition();
     });
+    if (DEBUG) {
+      dbg("relayout", {
+        workspaceId: targetWorkspaceId || "all",
+        count: tileArray.length,
+      });
+    }
   }
 
   // Set active tile
@@ -1413,6 +1640,541 @@ class StatsManager {
 }
 
 // =============================================================================
+// CLIPBOARD MANAGER - OSC52 + History
+// =============================================================================
+
+class ClipboardManager {
+  constructor() {
+    this.history = [];
+    this.maxHistory = 20;
+    this.maxItemSize = 200 * 1024; // 200KB
+    this.panel = null;
+    this.toast = null;
+    this.pendingCopy = null;
+    this.init();
+  }
+
+  init() {
+    this.createPanel();
+    this.createToast();
+  }
+
+  createPanel() {
+    this.panel = document.createElement("div");
+    this.panel.id = "clipboard-panel";
+    this.panel.className = "clipboard-panel hidden";
+    this.panel.innerHTML = `
+      <div class="clipboard-header">
+        <h3>Clipboard History</h3>
+        <button class="clipboard-close">&times;</button>
+      </div>
+      <div class="clipboard-list"></div>
+    `;
+    document.getElementById("app").appendChild(this.panel);
+
+    this.panel
+      .querySelector(".clipboard-close")
+      .addEventListener("click", () => this.hidePanel());
+  }
+
+  createToast() {
+    this.toast = document.createElement("div");
+    this.toast.className = "clipboard-toast hidden";
+    this.toast.innerHTML = `
+      <span class="toast-message"></span>
+      <button class="toast-copy">Copy</button>
+    `;
+    document.getElementById("app").appendChild(this.toast);
+
+    this.toast.querySelector(".toast-copy").addEventListener("click", () => {
+      if (this.pendingCopy) {
+        this.copyWithGesture(this.pendingCopy);
+      }
+    });
+  }
+
+  // Handle OSC52 from terminal
+  handleOsc52(data) {
+    // Parse: c;<base64>
+    const parts = data.split(";");
+    if (parts.length < 2) return;
+
+    const base64Data = parts.slice(1).join(";");
+
+    try {
+      // UTF-8 safe base64 decode - CRITICAL: Don't use atob() directly!
+      const bytes = Uint8Array.from(atob(base64Data), (c) => c.charCodeAt(0));
+      const text = new TextDecoder("utf-8").decode(bytes);
+
+      // Size limit check
+      if (text.length > this.maxItemSize) {
+        this.showToast(
+          "Content too large. Click to download.",
+          "download",
+          text,
+        );
+        return;
+      }
+
+      // Try clipboard API
+      this.copyToClipboard(text);
+    } catch (e) {
+      console.error("OSC52 decode error:", e);
+    }
+  }
+
+  async copyToClipboard(text) {
+    // Add to history first
+    this.addToHistory(text);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      this.showToast("Copied to clipboard!", "success");
+    } catch (err) {
+      // Clipboard API failed (no user gesture)
+      console.warn("Clipboard API failed, showing fallback:", err);
+      this.pendingCopy = text;
+      this.showToast("Click to copy", "pending", text);
+    }
+  }
+
+  copyWithGesture(text) {
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        this.showToast("Copied!", "success");
+        this.pendingCopy = null;
+      })
+      .catch((err) => {
+        console.error("Copy failed even with gesture:", err);
+        this.showToast("Copy failed", "error");
+      });
+  }
+
+  addToHistory(text) {
+    // Prevent duplicates
+    const existing = this.history.findIndex((h) => h.text === text);
+    if (existing !== -1) {
+      this.history.splice(existing, 1);
+    }
+
+    this.history.unshift({
+      text,
+      timestamp: Date.now(),
+      preview: text.substring(0, 100) + (text.length > 100 ? "..." : ""),
+    });
+
+    // Trim history
+    if (this.history.length > this.maxHistory) {
+      this.history.pop();
+    }
+
+    this.renderHistory();
+  }
+
+  renderHistory() {
+    const list = this.panel.querySelector(".clipboard-list");
+    list.innerHTML = this.history
+      .map(
+        (item, i) => `
+      <div class="clipboard-item" data-index="${i}">
+        <span class="item-preview">${this.escapeHtml(item.preview)}</span>
+        <span class="item-time">${this.formatTime(item.timestamp)}</span>
+        <button class="item-copy" data-index="${i}">Copy</button>
+      </div>
+    `,
+      )
+      .join("");
+
+    list.querySelectorAll(".item-copy").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const idx = parseInt(e.target.dataset.index);
+        this.copyWithGesture(this.history[idx].text);
+      });
+    });
+  }
+
+  showToast(message, type, data = null) {
+    const toast = this.toast;
+    const msgEl = toast.querySelector(".toast-message");
+    const copyBtn = toast.querySelector(".toast-copy");
+
+    msgEl.textContent = message;
+    toast.className = `clipboard-toast ${type}`;
+    copyBtn.style.display = type === "pending" ? "inline-block" : "none";
+
+    toast.classList.remove("hidden");
+
+    if (type === "success" || type === "error") {
+      setTimeout(() => toast.classList.add("hidden"), 2000);
+    }
+  }
+
+  hideToast() {
+    this.toast.classList.add("hidden");
+  }
+
+  showPanel() {
+    this.panel.classList.remove("hidden");
+    this.renderHistory();
+  }
+
+  hidePanel() {
+    this.panel.classList.add("hidden");
+  }
+
+  togglePanel() {
+    this.panel.classList.toggle("hidden");
+    if (!this.panel.classList.contains("hidden")) {
+      this.renderHistory();
+    }
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  formatTime(timestamp) {
+    const now = Date.now();
+    const diff = now - timestamp;
+    if (diff < 60000) return "just now";
+    if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`;
+    return new Date(timestamp).toLocaleTimeString();
+  }
+}
+
+// =============================================================================
+// OPENCODE MANAGER - OpenCode panel integration
+// =============================================================================
+
+class OpenCodeManager {
+  constructor() {
+    this.panel = document.getElementById("opencode-panel");
+    this.iframe = document.getElementById("opencode-iframe");
+    this.status = document.getElementById("opencode-status");
+    this.init();
+  }
+
+  init() {
+    this.opencodeUrl = null;
+    this.serverStatus = "unknown";
+
+    document
+      .querySelector('[data-action="opencode"]')
+      ?.addEventListener("click", () => this.toggle());
+    this.panel
+      ?.querySelector(".app-panel-close")
+      ?.addEventListener("click", () => this.hide());
+    document
+      .getElementById("opencode-popout")
+      ?.addEventListener("click", () => this.openInNewWindow());
+    this.checkHealth();
+    setInterval(() => this.checkHealth(), 30000);
+  }
+
+  async checkHealth() {
+    try {
+      const res = await fetch("/api/apps/opencode/health");
+      const data = await res.json();
+      this.opencodeUrl = data.url || null;
+      this.serverStatus = data.status;
+
+      if (!this.opencodeUrl) {
+        this.status.textContent = "not configured";
+        this.status.className = "app-status offline";
+      } else if (data.status === "running") {
+        this.status.textContent = "running";
+        this.status.className = "app-status online";
+      } else {
+        this.status.textContent = "offline";
+        this.status.className = "app-status offline";
+      }
+    } catch {
+      this.status.textContent = "error";
+      this.status.className = "app-status offline";
+    }
+  }
+
+  show() {
+    if (!this.opencodeUrl) {
+      this.showSetupMessage();
+      return;
+    }
+    if (this.serverStatus !== "running") {
+      this.showOfflineMessage();
+      return;
+    }
+    this.panel?.classList.remove("hidden");
+    if (this.iframe && !this.iframe.src) {
+      this.iframe.src = "/apps/opencode/";
+    }
+  }
+
+  showSetupMessage() {
+    this.panel?.classList.remove("hidden");
+    if (this.iframe) {
+      this.iframe.srcdoc = `
+        <html>
+        <head><style>
+          body { font-family: system-ui; background: #0d1117; color: #c9d1d9; padding: 40px; }
+          h2 { color: #58a6ff; }
+          code { background: #161b22; padding: 2px 6px; border-radius: 4px; }
+          ol { line-height: 2; }
+        </style></head>
+        <body>
+          <h2>OpenCode Not Configured</h2>
+          <p>To enable OpenCode integration:</p>
+          <ol>
+            <li>Run <code>opencode web --port 4096</code> on your server</li>
+            <li>Expose port 4096 via Cloudflare Tunnel (e.g., opencode.yourdomain.com)</li>
+            <li>Set <code>OPENCODE_URL=https://opencode.yourdomain.com</code> in .env</li>
+            <li>Restart DeckTerm</li>
+          </ol>
+        </body>
+        </html>`;
+    }
+  }
+
+  showOfflineMessage() {
+    this.panel?.classList.remove("hidden");
+    if (this.iframe) {
+      this.iframe.srcdoc = `
+        <html>
+        <head><style>
+          body { font-family: system-ui; background: #0d1117; color: #c9d1d9; padding: 40px; }
+          h2 { color: #f85149; }
+          code { background: #161b22; padding: 2px 6px; border-radius: 4px; }
+        </style></head>
+        <body>
+          <h2>OpenCode Server Offline</h2>
+          <p>The OpenCode server is not responding.</p>
+          <p>Start it with: <code>opencode web --port 4096</code></p>
+          <p>Or run in tmux: <code>tmux new -d -s opencode "opencode web --port 4096"</code></p>
+        </body>
+        </html>`;
+    }
+  }
+
+  hide() {
+    this.panel?.classList.add("hidden");
+  }
+
+  openInNewWindow() {
+    if (this.opencodeUrl) {
+      window.open(this.opencodeUrl, "opencode", "width=1200,height=800");
+    } else {
+      alert("OpenCode not configured. Set OPENCODE_URL in .env");
+    }
+  }
+
+  toggle() {
+    if (this.panel?.classList.contains("hidden")) {
+      this.show();
+    } else {
+      this.hide();
+    }
+  }
+
+  notifyResize() {
+    if (
+      this.iframe?.contentWindow &&
+      !this.panel?.classList.contains("hidden")
+    ) {
+      try {
+        this.iframe.contentWindow.postMessage({ type: "resize" }, "*");
+      } catch (e) {
+        console.warn("[OpenCode] Failed to send resize message:", e);
+      }
+    }
+  }
+}
+
+// =============================================================================
+// GIT MANAGER - Git panel integration
+// =============================================================================
+
+class GitManager {
+  constructor() {
+    this.panel = null;
+    this.currentCwd = null;
+    this.init();
+  }
+
+  init() {
+    this.createPanel();
+    document
+      .querySelector('[data-action="git"]')
+      ?.addEventListener("click", () => this.toggle());
+  }
+
+  createPanel() {
+    this.panel = document.createElement("div");
+    this.panel.id = "git-panel";
+    this.panel.className = "side-panel hidden";
+    this.panel.innerHTML = `
+      <div class="panel-header">
+        <h3>Git</h3>
+        <span id="git-branch" class="git-branch"></span>
+        <button class="panel-refresh" title="Refresh">↻</button>
+        <button class="panel-close">&times;</button>
+      </div>
+      <div id="git-status" class="git-status"></div>
+      <div id="git-diff" class="git-diff"></div>
+      <div class="git-commit">
+        <textarea id="git-message" placeholder="Commit message..."></textarea>
+        <button id="git-commit-btn" class="btn btn-primary">Commit</button>
+      </div>
+    `;
+    document.getElementById("app").appendChild(this.panel);
+
+    this.panel
+      .querySelector(".panel-close")
+      .addEventListener("click", () => this.hide());
+    this.panel
+      .querySelector(".panel-refresh")
+      .addEventListener("click", () => this.refresh());
+    this.panel
+      .querySelector("#git-commit-btn")
+      .addEventListener("click", () => this.commit());
+  }
+
+  async show(cwd) {
+    this.currentCwd = cwd || document.getElementById("directory")?.value || "~";
+    this.panel.classList.remove("hidden");
+    await this.refresh();
+  }
+
+  hide() {
+    this.panel.classList.add("hidden");
+  }
+
+  toggle() {
+    this.panel.classList.contains("hidden") ? this.show() : this.hide();
+  }
+
+  async refresh() {
+    if (!this.currentCwd) return;
+
+    try {
+      const res = await fetch(
+        `/api/git/status?cwd=${encodeURIComponent(this.currentCwd)}`,
+      );
+      const data = await res.json();
+
+      if (data.error) {
+        this.panel.querySelector("#git-branch").textContent = "not a repo";
+        this.panel.querySelector("#git-status").innerHTML =
+          `<p class="error">${data.error}</p>`;
+        return;
+      }
+
+      this.panel.querySelector("#git-branch").textContent = data.branch;
+      this.renderStatus(data.files);
+    } catch (err) {
+      console.error("Git status error:", err);
+    }
+  }
+
+  renderStatus(files) {
+    const container = this.panel.querySelector("#git-status");
+    if (files.length === 0) {
+      container.innerHTML = '<p class="muted">No changes</p>';
+      return;
+    }
+
+    container.innerHTML = files
+      .map(
+        (f) => `
+      <div class="git-file" data-path="${f.path}">
+        <span class="git-file-status ${this.statusClass(f.status)}">${f.status}</span>
+        <span class="git-file-path">${f.path}</span>
+        <button class="git-file-diff" title="View diff">diff</button>
+        <button class="git-file-stage" title="Stage/Unstage">+/-</button>
+      </div>
+    `,
+      )
+      .join("");
+
+    container.querySelectorAll(".git-file-diff").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const path = e.target.closest(".git-file").dataset.path;
+        this.showDiff(path);
+      });
+    });
+
+    container.querySelectorAll(".git-file-stage").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const path = e.target.closest(".git-file").dataset.path;
+        const status = e.target
+          .closest(".git-file")
+          .querySelector(".git-file-status").textContent;
+        this.toggleStage(path, status);
+      });
+    });
+  }
+
+  statusClass(status) {
+    if (status.includes("M")) return "modified";
+    if (status.includes("A")) return "added";
+    if (status.includes("D")) return "deleted";
+    if (status.includes("?")) return "untracked";
+    return "";
+  }
+
+  async showDiff(path) {
+    const url = `/api/git/diff?cwd=${encodeURIComponent(this.currentCwd)}&path=${encodeURIComponent(path)}`;
+    const res = await fetch(url);
+    const data = await res.json();
+
+    const diffContainer = this.panel.querySelector("#git-diff");
+    diffContainer.innerHTML = `<pre class="diff-content">${this.escapeHtml(data.diff || "No diff")}</pre>`;
+  }
+
+  async toggleStage(path, status) {
+    const isStaged = !status.startsWith(" ") && !status.startsWith("?");
+    const endpoint = isStaged ? "/api/git/unstage" : "/api/git/stage";
+
+    await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: this.currentCwd, paths: [path] }),
+    });
+
+    await this.refresh();
+  }
+
+  async commit() {
+    const message = this.panel.querySelector("#git-message").value.trim();
+    if (!message) {
+      alert("Commit message required");
+      return;
+    }
+
+    const res = await fetch("/api/git/commit", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd: this.currentCwd, message }),
+    });
+
+    const data = await res.json();
+    if (data.error) {
+      alert(data.error + ": " + data.message);
+    } else {
+      this.panel.querySelector("#git-message").value = "";
+      await this.refresh();
+    }
+  }
+
+  escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+}
+
+// =============================================================================
 // TERMINAL MANAGER - Main orchestrator
 // =============================================================================
 
@@ -1423,8 +2185,11 @@ class TerminalManager {
     this.tabIndex = 0;
     this.workspaceIndex = 0;
     this.fontSize = parseInt(localStorage.getItem("opencode-font-size")) || 14;
+    const storedWrap = localStorage.getItem("opencode-wrap-lines");
+    this.wrapLines = storedWrap ? storedWrap === "1" : false;
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
+    this.resizeDebounceMs = 120;
 
     this.container = document.getElementById("terminal-container");
     this.tabs = document.getElementById("terminals-tabs");
@@ -1432,6 +2197,7 @@ class TerminalManager {
     this.connectionStatus = document.getElementById("connection-status");
 
     this.tileManager = new TileManager(this.container);
+    this.clipboardManager = new ClipboardManager();
 
     this.init();
   }
@@ -1463,6 +2229,7 @@ class TerminalManager {
 
     // Toolbar action buttons
     this.setupToolbarActions();
+    this.updateWrapButton();
 
     // Fullscreen
     document
@@ -1490,10 +2257,19 @@ class TerminalManager {
       clearTimeout(resizeTimeout);
       resizeTimeout = setTimeout(() => {
         const active = this.terminals.get(this.activeId);
+        if (DEBUG) {
+          dbg("window.resize", {
+            activeId: this.activeId,
+            workspaceId: active?.workspaceId || null,
+            cols: active?.terminal?.cols,
+            rows: active?.terminal?.rows,
+          });
+        }
         if (active) {
           active.fitAddon.fit();
-          this.sendResize(this.activeId);
+          this.syncTerminalSize(this.activeId);
         }
+        window.openCodeManager?.notifyResize();
       }, 150);
     });
 
@@ -1521,13 +2297,86 @@ class TerminalManager {
       btn.addEventListener("click", () => {
         const action = btn.dataset.action;
         if (action === "file-manager") this.fileManager.open();
+        else if (action === "clipboard") this.clipboardManager.togglePanel();
         else if (action === "copy") this.copySelection();
         else if (action === "paste") this.pasteClipboard();
         else if (action === "font-decrease") this.changeFontSize(-1);
         else if (action === "font-increase") this.changeFontSize(1);
         else if (action === "fullscreen") this.toggleFullscreen();
+        else if (action === "wrap-lines") this.toggleWrapLines();
       });
     });
+  }
+
+  formatCwdLabel(cwd) {
+    if (!cwd) return "Terminal";
+    const cleaned = cwd.replace(/\/+$/, "");
+    if (!cleaned) return "/";
+    const parts = cleaned.split("/");
+    const last = parts[parts.length - 1];
+    return last || "/";
+  }
+
+  updateWorkspaceLabel(workspaceId, cwd) {
+    if (!workspaceId) return;
+    const label = this.formatCwdLabel(cwd);
+    this.tabs.querySelectorAll(".tab").forEach((tab) => {
+      if (tab.dataset.workspaceId === workspaceId) {
+        const labelEl = tab.querySelector(".tab-label");
+        if (labelEl) labelEl.textContent = label;
+        if (cwd) tab.title = cwd;
+      }
+    });
+  }
+
+  parseOsc7Cwd(data) {
+    if (!data) return null;
+    if (data.startsWith("file://")) {
+      const withoutScheme = data.slice("file://".length);
+      const slashIndex = withoutScheme.indexOf("/");
+      if (slashIndex === -1) return null;
+      return decodeURIComponent(withoutScheme.slice(slashIndex));
+    }
+    if (data.startsWith("/")) return decodeURIComponent(data);
+    return null;
+  }
+
+  attachOsc7Handler(id, terminal) {
+    if (!terminal?.parser?.registerOscHandler) return null;
+    return terminal.parser.registerOscHandler(7, (data) => {
+      const cwd = this.parseOsc7Cwd(data);
+      if (!cwd) return false;
+      const t = this.terminals.get(id);
+      if (!t) return true;
+      t.cwd = cwd;
+      if (t.workspaceId && this.activeId === id) {
+        this.updateWorkspaceLabel(t.workspaceId, cwd);
+      }
+      this.updateTabGroups();
+      if (DEBUG) dbg("osc7 cwd", { id, cwd });
+      return true;
+    });
+  }
+
+  updateWrapButton() {
+    const btn = document.getElementById("wrap-lines-btn");
+    if (!btn) return;
+    btn.classList.toggle("active", this.wrapLines);
+    btn.title = this.wrapLines ? "Line wrap: on" : "Line wrap: off";
+  }
+
+  toggleWrapLines() {
+    this.wrapLines = !this.wrapLines;
+    localStorage.setItem("opencode-wrap-lines", this.wrapLines ? "1" : "0");
+    this.updateWrapButton();
+    for (const [, t] of this.terminals) {
+      t.preferredCols = 0;
+    }
+    if (this.activeId) {
+      const active = this.terminals.get(this.activeId);
+      active?.fitAddon?.fit();
+      this.syncTerminalSize(this.activeId);
+    }
   }
 
   setupHelpModal() {
@@ -1662,15 +2511,13 @@ class TerminalManager {
       const terminals = await res.json();
 
       if (terminals.length > 0) {
-        const reconnect = confirm(
-          `Found ${terminals.length} existing terminal(s). Reconnect?`,
+        console.log(
+          `[DeckTerm] Reconnecting to ${terminals.length} existing terminal(s)...`,
         );
-        if (reconnect) {
-          for (const t of terminals) {
-            await this.reconnectToTerminal(t.id, t.cwd);
-          }
-          return;
+        for (const t of terminals) {
+          await this.reconnectToTerminal(t.id, t.cwd);
         }
+        return;
       }
     } catch (err) {
       console.error("Failed to check existing terminals:", err);
@@ -1683,11 +2530,14 @@ class TerminalManager {
     this.workspaceIndex++;
     const workspaceId = `ws-${this.workspaceIndex}`;
 
-    const element = this.tileManager.createTile(id, workspaceId, false);
+    const element = this.tileManager.createTile(id, workspaceId, false, (tid) =>
+      this.closeTerminal(tid),
+    );
     const overlay = this.createOverlay(element.parentElement);
 
     const terminal = this.createXtermInstance();
     terminal.open(element);
+    const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
     const fitAddon = terminal._fitAddon;
     fitAddon.fit();
@@ -1705,7 +2555,7 @@ class TerminalManager {
       },
     );
 
-    terminal.onData((data) => {
+    const onDataDisposable = terminal.onData((data) => {
       let finalData = data;
       const mods = this.extraKeys?.modifiers;
       if (this.extraKeys && data.length === 1 && mods) {
@@ -1737,13 +2587,19 @@ class TerminalManager {
       cwd,
       tabNum,
       workspaceId,
+      resizeObserver: null,
+      resizeTimer: null,
+      preferredCols: 0,
+      onDataDisposable,
+      osc7Disposable,
     });
     this.addTab(id, cwd, tabNum, workspaceId);
     this.switchTo(id);
+    this.attachResizeObserver(id);
 
     setTimeout(() => {
       fitAddon.fit();
-      this.sendResize(id);
+      this.syncTerminalSize(id);
 
       const textarea = element.querySelector(".xterm-helper-textarea");
       if (textarea) {
@@ -1796,6 +2652,14 @@ class TerminalManager {
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
     terminal._fitAddon = fitAddon;
+
+    // OSC52 clipboard support (xterm.js 6.0+)
+    if (terminal.parser?.registerOscHandler) {
+      terminal.parser.registerOscHandler(52, (data) => {
+        this.clipboardManager.handleOsc52(data);
+        return true;
+      });
+    }
 
     return terminal;
   }
@@ -1871,6 +2735,27 @@ class TerminalManager {
     this.updateOverlay(id, status, extra);
     this.updateConnectionStatus(status);
 
+    if (status === "connected") {
+      const t = this.terminals.get(id);
+      if (t && t.fitAddon && t.terminal && t.ws) {
+        requestAnimationFrame(() => {
+          try {
+            t.fitAddon.fit();
+            this.syncTerminalSize(id);
+            if (DEBUG) {
+              dbg("initial resize sync", {
+                id,
+                cols: t.terminal.cols,
+                rows: t.terminal.rows,
+              });
+            }
+          } catch (e) {
+            console.warn(`[resize] Failed initial sync for ${id}:`, e);
+          }
+        });
+      }
+    }
+
     const tab = this.tabs.querySelector(`[data-id="${id}"]`);
     if (tab) {
       tab.classList.remove("reconnecting", "disconnected");
@@ -1882,6 +2767,62 @@ class TerminalManager {
 
   retryConnection(id) {
     this.terminals.get(id)?.ws?.retry();
+  }
+
+  scheduleResize(id) {
+    const t = this.terminals.get(id);
+    if (!t) return;
+    if (t.resizeTimer) clearTimeout(t.resizeTimer);
+    t.resizeTimer = setTimeout(() => {
+      this.syncTerminalSize(id);
+    }, this.resizeDebounceMs);
+  }
+
+  syncTerminalSize(id) {
+    const t = this.terminals.get(id);
+    if (!t?.terminal) return;
+    const fitCols = t.terminal.cols;
+    const fitRows = t.terminal.rows;
+    if (this.wrapLines) {
+      t.preferredCols = fitCols;
+    } else if (!t.preferredCols || t.preferredCols < fitCols) {
+      t.preferredCols = fitCols;
+    }
+    const targetCols = this.wrapLines
+      ? fitCols
+      : Math.max(fitCols, t.preferredCols);
+    if (targetCols !== fitCols) {
+      try {
+        t.terminal.resize(targetCols, fitRows);
+      } catch (err) {
+        if (DEBUG) dbg("terminal.resize error", { id, err });
+      }
+    }
+    this.sendResize(id, targetCols, fitRows);
+  }
+
+  attachResizeObserver(id) {
+    const t = this.terminals.get(id);
+    if (!t?.element || !t.fitAddon) return;
+
+    if (t.resizeObserver) {
+      t.resizeObserver.disconnect();
+    }
+
+    const observer = new ResizeObserver(() => {
+      if (!t.element || t.element.offsetParent === null) return;
+      requestAnimationFrame(() => {
+        try {
+          t.fitAddon.fit();
+          this.scheduleResize(id);
+        } catch (err) {
+          if (DEBUG) dbg("resizeObserver error", { id, err });
+        }
+      });
+    });
+
+    observer.observe(t.element);
+    t.resizeObserver = observer;
   }
 
   // Create a new terminal in a new workspace (split=false) or current workspace (split=true)
@@ -1911,11 +2852,17 @@ class TerminalManager {
         workspaceId = `ws-${this.workspaceIndex}`;
       }
 
-      const element = this.tileManager.createTile(id, workspaceId, split);
+      const element = this.tileManager.createTile(
+        id,
+        workspaceId,
+        split,
+        (tid) => this.closeTerminal(tid),
+      );
       const overlay = this.createOverlay(element.parentElement);
 
       const terminal = this.createXtermInstance();
       terminal.open(element);
+      const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
       const fitAddon = terminal._fitAddon;
       fitAddon.fit();
@@ -1931,7 +2878,7 @@ class TerminalManager {
         },
       );
 
-      terminal.onData((data) => {
+      const onDataDisposable = terminal.onData((data) => {
         let finalData = data;
         if (this.extraKeys && data.length === 1) {
           const mods = this.extraKeys.modifiers;
@@ -1963,6 +2910,11 @@ class TerminalManager {
         cwd,
         tabNum,
         workspaceId,
+        resizeObserver: null,
+        resizeTimer: null,
+        preferredCols: 0,
+        onDataDisposable,
+        osc7Disposable,
       });
 
       // Only add tab for new workspaces, not splits
@@ -1973,6 +2925,7 @@ class TerminalManager {
         this.updateTabGroups();
       }
       this.switchTo(id);
+      this.attachResizeObserver(id);
     } catch (err) {
       console.error("Failed to create terminal:", err);
       alert("Failed to create terminal: " + err.message);
@@ -1986,7 +2939,7 @@ class TerminalManager {
     tab.dataset.workspaceId = workspaceId;
     tab.dataset.index = tabNum % 9 || 9;
 
-    const label = cwd ? cwd.split("/").pop() || "/" : "Terminal";
+    const label = this.formatCwdLabel(cwd);
     tab.innerHTML = `
       <span class="tab-dot"></span>
       <span class="tab-index">${tabNum}</span>
@@ -1994,6 +2947,7 @@ class TerminalManager {
       <span class="tab-count"></span>
       <button class="tab-close" title="Close (Ctrl+W)">&times;</button>
     `;
+    if (cwd) tab.title = cwd;
 
     tab
       .querySelector(".tab-label")
@@ -2055,10 +3009,15 @@ class TerminalManager {
   updateTabGroups() {
     // Count terminals per workspace
     const workspaceCounts = new Map();
+    const workspaceColors = new Map();
     this.terminals.forEach((t) => {
       if (t.workspaceId) {
         const count = workspaceCounts.get(t.workspaceId) || 0;
         workspaceCounts.set(t.workspaceId, count + 1);
+        const cwdColor = TerminalColors.hashCwdToColor(t.cwd || "terminal");
+        const colors = workspaceColors.get(t.workspaceId) || [];
+        colors.push(cwdColor);
+        workspaceColors.set(t.workspaceId, colors);
       }
     });
 
@@ -2068,26 +3027,39 @@ class TerminalManager {
       const dot = tab.querySelector(".tab-dot");
       const countBadge = tab.querySelector(".tab-count");
       const count = workspaceCounts.get(workspaceId) || 0;
+      const blended = TerminalColors.blendWorkspaceColors(
+        workspaceColors.get(workspaceId) || [],
+      );
 
       if (count > 1) {
         // Multicolor workspace tab (multiple terminals)
         tab.classList.add("multicolor");
         tab.classList.remove("grouped");
-        // Use predefined colors for gradient
-        const colorIndex = parseInt(workspaceId?.replace("ws-", "") || "1") - 1;
-        const color1 = GROUP_COLORS[colorIndex % GROUP_COLORS.length];
-        const color2 = GROUP_COLORS[(colorIndex + 1) % GROUP_COLORS.length];
-        const color3 = GROUP_COLORS[(colorIndex + 2) % GROUP_COLORS.length];
-        tab.style.setProperty("--color-1", color1);
-        tab.style.setProperty("--color-2", color2);
-        tab.style.setProperty("--color-3", color3);
+        const color1 = blended[0] || "#58a6ff";
+        const color2 = blended[1] || color1;
+        const color3 = blended[2] || color2;
+        tab.style.setProperty("--color-1", TerminalColors.hexToRgba(color1, 0.2));
+        tab.style.setProperty("--color-2", TerminalColors.hexToRgba(color2, 0.2));
+        tab.style.setProperty("--color-3", TerminalColors.hexToRgba(color3, 0.2));
+        tab.style.setProperty("--color-1-solid", color1);
+        tab.style.setProperty("--color-2-solid", color2);
+        tab.style.setProperty("--color-3-solid", color3);
+        tab.style.setProperty("--tab-border", TerminalColors.hexToRgba(color1, 0.35));
 
         if (countBadge) countBadge.textContent = count;
-        if (dot) dot.style.backgroundColor = "transparent";
+        if (dot) dot.style.removeProperty("background-color");
       } else {
         // Single terminal workspace
         tab.classList.remove("multicolor", "grouped");
-        if (dot) dot.style.backgroundColor = "#58a6ff";
+        const singleColor = blended[0] || "#58a6ff";
+        if (dot) dot.style.backgroundColor = singleColor;
+        tab.style.setProperty("--color-1-solid", singleColor);
+        tab.style.removeProperty("--color-1");
+        tab.style.removeProperty("--color-2");
+        tab.style.removeProperty("--color-3");
+        tab.style.removeProperty("--color-2-solid");
+        tab.style.removeProperty("--color-3-solid");
+        tab.style.removeProperty("--tab-border");
         tab.style.removeProperty("--group-color");
         if (countBadge) countBadge.textContent = "";
       }
@@ -2169,6 +3141,17 @@ class TerminalManager {
       this.tileManager.showWorkspace(t.workspaceId);
     }
     this.tileManager.setActive(id);
+    if (t?.workspaceId && t.cwd) {
+      this.updateWorkspaceLabel(t.workspaceId, t.cwd);
+    }
+    if (DEBUG) {
+      dbg("switchTo", {
+        terminalId: id,
+        workspaceId: t?.workspaceId || null,
+        cols: t?.terminal?.cols,
+        rows: t?.terminal?.rows,
+      });
+    }
 
     // Highlight tab by workspaceId (works for multi-terminal workspaces)
     const activeWorkspaceId = t?.workspaceId;
@@ -2183,7 +3166,7 @@ class TerminalManager {
     if (active) {
       active.fitAddon.fit();
       active.terminal.focus();
-      this.sendResize(id);
+      this.syncTerminalSize(id);
       this.updateConnectionStatus(
         active.ws?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
       );
@@ -2208,6 +3191,15 @@ class TerminalManager {
     if (!t) return;
 
     t.ws?.close();
+    if (t.resizeObserver) t.resizeObserver.disconnect();
+    if (t.resizeTimer) clearTimeout(t.resizeTimer);
+    t.onDataDisposable?.dispose?.();
+    t.osc7Disposable?.dispose?.();
+    try {
+      t.terminal?.dispose?.();
+    } catch (err) {
+      if (DEBUG) dbg("terminal.dispose error", { id, err });
+    }
     this.tileManager.removeTile(id);
 
     this.tabs.querySelector(`[data-id="${id}"]`)?.remove();
@@ -2229,10 +3221,11 @@ class TerminalManager {
     }
   }
 
-  sendResize(id) {
+  sendResize(id, colsOverride = null, rowsOverride = null) {
     const t = this.terminals.get(id);
     if (!t?.ws) return;
-    const { cols, rows } = t.terminal;
+    const cols = colsOverride ?? t.terminal.cols;
+    const rows = rowsOverride ?? t.terminal.rows;
     t.ws.send(JSON.stringify({ type: "resize", cols, rows }));
   }
 
@@ -2248,9 +3241,10 @@ class TerminalManager {
     localStorage.setItem("opencode-font-size", this.fontSize.toString());
     for (const [, t] of this.terminals) {
       t.terminal.options.fontSize = this.fontSize;
+      t.preferredCols = 0;
       t.fitAddon.fit();
     }
-    if (this.activeId) this.sendResize(this.activeId);
+    if (this.activeId) this.syncTerminalSize(this.activeId);
   }
 
   handleViewportResize() {
@@ -2281,7 +3275,7 @@ class TerminalManager {
     if (active) {
       setTimeout(() => {
         active.fitAddon.fit();
-        this.sendResize(this.activeId);
+        this.syncTerminalSize(this.activeId);
       }, 50);
     }
   }
@@ -2317,7 +3311,7 @@ class TerminalManager {
     if (active)
       setTimeout(() => {
         active.fitAddon.fit();
-        this.sendResize(this.activeId);
+        this.syncTerminalSize(this.activeId);
       }, 100);
   }
 
@@ -2470,4 +3464,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
   window.terminalManager = new TerminalManager();
   window.statsManager = new StatsManager();
+  window.openCodeManager = new OpenCodeManager();
+  window.gitManager = new GitManager();
 });

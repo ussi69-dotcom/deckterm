@@ -2,6 +2,24 @@ import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import type { ServerWebSocket, Subprocess } from "bun";
+import {
+  cloudflareAccess,
+  type CloudflareAccessPayload,
+} from "@hono/cloudflare-access";
+
+// =============================================================================
+// GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
+// =============================================================================
+
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err);
+  // Don't exit - try to keep serving
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("[FATAL] Unhandled rejection at:", promise, "reason:", reason);
+  // Don't exit - try to keep serving
+});
 
 // Bun.Terminal API types (Bun 1.3.5+) - not yet in bun-types
 interface BunTerminalOptions {
@@ -31,9 +49,14 @@ type Terminal = {
   cols: number;
   rows: number;
   createdAt: number;
+  lastActivityAt: number; // Last user input timestamp for idle detection
+  ownerId: string; // User sub from JWT
+  ownerEmail: string; // User email for display
 };
 
-type WsData = { terminalId: string };
+type TerminalWsData = { type: "terminal"; terminalId: string; ownerId: string };
+type OpenCodeWsData = { type: "opencode_proxy"; upstream: WebSocket };
+type WsData = TerminalWsData | OpenCodeWsData;
 
 // Configuration
 const DEBUG = process.env.OPENCODE_WEB_DEBUG === "1";
@@ -41,12 +64,74 @@ const MAX_TERMINALS = parseInt(
   process.env.OPENCODE_WEB_MAX_TERMINALS || "10",
   10,
 );
+const MAX_TERMINALS_PER_USER = parseInt(
+  process.env.MAX_TERMINALS_PER_USER || "10",
+  10,
+);
 const RATE_LIMIT_WINDOW_MS = 60_000; // 1 minute
 const RATE_LIMIT_MAX_REQUESTS = 20; // max terminals per minute
+const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
+  process.env.TERMINAL_IDLE_TIMEOUT_MS || String(2 * 60 * 60 * 1000),
+  10,
+); // 2 hours default
+
+const CF_ACCESS_REQUIRED = process.env.CF_ACCESS_REQUIRED === "1";
+const CF_ACCESS_TEAM_NAME = process.env.CF_ACCESS_TEAM_NAME || "";
+const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD || "";
+const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "")
+  .split(",")
+  .filter(Boolean);
+
+// OpenCode configuration
+const OPENCODE_UPSTREAM =
+  process.env.OPENCODE_UPSTREAM || "http://127.0.0.1:4096";
+const OPENCODE_URL = process.env.OPENCODE_URL || "";
+
+// Hop-by-hop headers to strip from proxied requests/responses
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+];
 
 // Terminal sessions (PTY processes)
 const terminals = new Map<string, Terminal>();
 const terminalSockets = new Map<string, Set<WebSocket>>();
+
+const openCodeCircuit = {
+  failures: 0,
+  lastFailure: 0,
+  isOpen: false,
+  threshold: 5,
+  resetTimeout: 30_000,
+  recordFailure() {
+    this.failures++;
+    this.lastFailure = Date.now();
+    if (this.failures >= this.threshold) {
+      this.isOpen = true;
+      debug("OpenCode circuit OPEN - too many failures");
+    }
+  },
+  recordSuccess() {
+    this.failures = 0;
+    this.isOpen = false;
+  },
+  canRequest(): boolean {
+    if (!this.isOpen) return true;
+    if (Date.now() - this.lastFailure > this.resetTimeout) {
+      this.isOpen = false;
+      this.failures = 0;
+      debug("OpenCode circuit HALF-OPEN - testing");
+      return true;
+    }
+    return false;
+  },
+};
 
 // Rate limiting state (simple in-memory)
 const rateLimitState = {
@@ -71,11 +156,45 @@ function debug(...args: unknown[]) {
   if (DEBUG) console.log("[web-terminal]", ...args);
 }
 
+function getCurrentUser(c: {
+  get: (key: string) => CloudflareAccessPayload | undefined;
+}): { ownerId: string; ownerEmail: string } {
+  const accessPayload = c.get("accessPayload");
+  if (CF_ACCESS_REQUIRED && !accessPayload) {
+    throw new Error("Unauthorized");
+  }
+  return {
+    ownerId: accessPayload?.sub || "anonymous",
+    ownerEmail: accessPayload?.email || "anonymous",
+  };
+}
+
 export function createWebApp() {
   const app = new Hono();
 
-  // CORS - allow all origins for development
-  app.use("/*", cors());
+  app.onError((err, c) => {
+    console.error("[Hono] Route error:", err);
+    return c.json(
+      { error: "Internal server error", message: String(err) },
+      500,
+    );
+  });
+
+  app.use(
+    "/*",
+    cors({
+      origin:
+        TRUSTED_ORIGINS.length > 0
+          ? (origin) => (TRUSTED_ORIGINS.includes(origin) ? origin : null)
+          : "*",
+      credentials: true,
+    }),
+  );
+
+  // Cloudflare Access JWT authentication
+  if (CF_ACCESS_REQUIRED && CF_ACCESS_TEAM_NAME) {
+    app.use("/*", cloudflareAccess(CF_ACCESS_TEAM_NAME));
+  }
 
   // No-cache headers - bypass CF cache
   app.use("/*", async (c, next) => {
@@ -112,7 +231,18 @@ export function createWebApp() {
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
-    const memUsage = ((totalMem - freeMem) / totalMem) * 100;
+    let availableMem = freeMem;
+    try {
+      const meminfo = await fs.readFile("/proc/meminfo", "utf8");
+      const match = meminfo.match(/^MemAvailable:\s+(\d+)\s+kB/m);
+      if (match) {
+        availableMem = parseInt(match[1], 10) * 1024;
+      }
+    } catch {
+      // /proc/meminfo not available, fall back to freeMem
+    }
+
+    const memUsage = ((totalMem - availableMem) / totalMem) * 100;
 
     let diskUsage = 0;
     try {
@@ -124,16 +254,128 @@ export function createWebApp() {
 
     return c.json({
       cpu: { usage: Math.round(cpuUsage) },
-      memory: { percent: Math.round(memUsage) },
+      memory: {
+        percent: Math.round(memUsage),
+        availableBytes: Math.round(availableMem),
+        freeBytes: Math.round(freeMem),
+        totalBytes: Math.round(totalMem),
+      },
       disk: { percent: Math.round(diskUsage) },
     });
   });
 
+  // OpenCode health check
+  app.get("/api/apps/opencode/health", async (c) => {
+    try {
+      const res = await fetch(`${OPENCODE_UPSTREAM}/api/health`, {
+        signal: AbortSignal.timeout(3000),
+      });
+      return c.json({
+        status: res.ok ? "running" : "error",
+        upstream: OPENCODE_UPSTREAM,
+        url: OPENCODE_URL,
+      });
+    } catch {
+      return c.json({
+        status: "not_running",
+        upstream: OPENCODE_UPSTREAM,
+        url: OPENCODE_URL,
+      });
+    }
+  });
+
+  app.all("/apps/opencode/*", async (c) => {
+    if (!openCodeCircuit.canRequest()) {
+      return c.json(
+        {
+          error: "OpenCode temporarily unavailable",
+          message: "Circuit breaker open - too many failures",
+          retryAfter: Math.ceil(openCodeCircuit.resetTimeout / 1000),
+        },
+        503,
+      );
+    }
+
+    const path = c.req.path.replace("/apps/opencode", "") || "/";
+    const url = `${OPENCODE_UPSTREAM}${path}${c.req.url.includes("?") ? "?" + c.req.url.split("?")[1] : ""}`;
+
+    const headers = new Headers();
+    for (const [key, value] of c.req.raw.headers) {
+      if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
+        headers.set(key, value);
+      }
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: c.req.method,
+        headers,
+        body:
+          c.req.method !== "GET" && c.req.method !== "HEAD"
+            ? await c.req.raw.arrayBuffer()
+            : undefined,
+        signal: AbortSignal.timeout(30_000),
+      });
+
+      openCodeCircuit.recordSuccess();
+
+      const contentType = response.headers.get("content-type") || "";
+
+      if (contentType.includes("text/event-stream")) {
+        return new Response(response.body, {
+          status: response.status,
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          },
+        });
+      }
+
+      const responseHeaders = new Headers();
+      for (const [key, value] of response.headers) {
+        if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
+          responseHeaders.set(key, value);
+        }
+      }
+
+      return new Response(response.body, {
+        status: response.status,
+        headers: responseHeaders,
+      });
+    } catch (err) {
+      openCodeCircuit.recordFailure();
+      const isTimeout = err instanceof Error && err.name === "TimeoutError";
+      return c.json(
+        {
+          error: "OpenCode unavailable",
+          message: isTimeout ? "Request timeout" : String(err),
+        },
+        502,
+      );
+    }
+  });
+
   // Create new terminal running shell
   app.post("/api/terminals", async (c) => {
+    const { ownerId, ownerEmail } = getCurrentUser(c);
+
     // Rate limiting check
     if (!rateLimitState.canCreate()) {
       return c.json({ error: "Rate limit exceeded. Try again later." }, 429);
+    }
+
+    // Per-user terminal limit check
+    const userTerminals = Array.from(terminals.values()).filter(
+      (t) => t.ownerId === ownerId,
+    );
+    if (userTerminals.length >= MAX_TERMINALS_PER_USER) {
+      return c.json(
+        {
+          error: `Maximum terminals per user (${MAX_TERMINALS_PER_USER}) reached.`,
+        },
+        429,
+      );
     }
 
     // Max terminals check
@@ -219,6 +461,7 @@ export function createWebApp() {
       },
     });
 
+    const now = Date.now();
     terminals.set(id, {
       id,
       proc,
@@ -226,7 +469,10 @@ export function createWebApp() {
       cwd,
       cols,
       rows,
-      createdAt: Date.now(),
+      createdAt: now,
+      lastActivityAt: now,
+      ownerId,
+      ownerEmail,
     });
     terminalSockets.set(id, new Set());
 
@@ -237,40 +483,51 @@ export function createWebApp() {
 
   // List terminals
   app.get("/api/terminals", (c) => {
-    const list = Array.from(terminals.values()).map((t) => ({
-      id: t.id,
-      cwd: t.cwd,
-      createdAt: t.createdAt,
-    }));
+    const { ownerId } = getCurrentUser(c);
+    const list = Array.from(terminals.values())
+      .filter((t) => t.ownerId === ownerId)
+      .map((t) => ({
+        id: t.id,
+        cwd: t.cwd,
+        createdAt: t.createdAt,
+      }));
     return c.json(list);
   });
 
   // Delete terminal
   app.delete("/api/terminals/:id", (c) => {
-    const id = c.req.param("id");
-    const term = terminals.get(id);
-    if (term) {
-      term.proc.kill();
-      term.terminal.close();
-      terminals.delete(id);
-      const sockets = terminalSockets.get(id);
-      if (sockets) {
-        for (const ws of sockets) {
-          ws.close();
-        }
-      }
-      terminalSockets.delete(id);
-      return c.json({ ok: true });
-    }
-    return c.json({ error: "Terminal not found" }, 404);
-  });
-
-  // Resize terminal - now with proper PTY resize support via Bun.Terminal
-  app.post("/api/terminals/:id/resize", async (c) => {
+    const { ownerId } = getCurrentUser(c);
     const id = c.req.param("id");
     const term = terminals.get(id);
     if (!term) {
       return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (term.ownerId !== ownerId) {
+      return c.json({ error: "Forbidden" }, 403);
+    }
+    term.proc.kill();
+    term.terminal.close();
+    terminals.delete(id);
+    const sockets = terminalSockets.get(id);
+    if (sockets) {
+      for (const ws of sockets) {
+        ws.close();
+      }
+    }
+    terminalSockets.delete(id);
+    return c.json({ ok: true });
+  });
+
+  // Resize terminal - now with proper PTY resize support via Bun.Terminal
+  app.post("/api/terminals/:id/resize", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const id = c.req.param("id");
+    const term = terminals.get(id);
+    if (!term) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (term.ownerId !== ownerId) {
+      return c.json({ error: "Forbidden" }, 403);
     }
 
     const body = await c.req.json();
@@ -470,6 +727,210 @@ export function createWebApp() {
     }
   });
 
+  // =============================================================================
+  // GIT API - Secure git operations with realpath validation
+  // =============================================================================
+
+  const ALLOWED_GIT_ROOTS = [process.env.HOME || "/home/deploy"];
+
+  async function validateGitCwd(cwd: string): Promise<boolean> {
+    try {
+      const fs = await import("fs/promises");
+      const realCwd = await fs.realpath(cwd);
+      return ALLOWED_GIT_ROOTS.some((root) => realCwd.startsWith(root));
+    } catch {
+      return false;
+    }
+  }
+
+  // GET /api/git/status?cwd=/path/to/repo
+  app.get("/api/git/status", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "status", "--porcelain", "-b"], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      const lines = output.trim().split("\n");
+      const branch = lines[0]?.replace("## ", "").split("...")[0] || "unknown";
+      const files = lines.slice(1).map((line) => ({
+        status: line.substring(0, 2).trim(),
+        path: line.substring(3),
+      }));
+
+      return c.json({ branch, files, cwd });
+    } catch (err) {
+      return c.json(
+        { error: "Not a git repository", message: String(err) },
+        400,
+      );
+    }
+  });
+
+  // GET /api/git/diff?cwd=...&path=... (optional path for single file)
+  app.get("/api/git/diff", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    const path = c.req.query("path");
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const args = ["git", "diff", "--color=never"];
+      if (path) {
+        args.push("--", path);
+      }
+
+      const proc = Bun.spawn(args, {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      return c.json({ diff: output, cwd, path });
+    } catch (err) {
+      return c.json({ error: "Git diff failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/stage { cwd, paths: string[] }
+  app.post("/api/git/stage", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!paths || !Array.isArray(paths) || paths.length === 0) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "add", "--", ...paths], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      await proc.exited;
+      clearTimeout(timeoutId);
+
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: "Git add failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/unstage { cwd, paths: string[] }
+  app.post("/api/git/unstage", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!paths || !Array.isArray(paths) || paths.length === 0) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "restore", "--staged", "--", ...paths], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      await proc.exited;
+      clearTimeout(timeoutId);
+
+      return c.json({ ok: true });
+    } catch (err) {
+      return c.json({ error: "Git restore failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/commit { cwd, message }
+  app.post("/api/git/commit", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, message } = body;
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    if (!message?.trim()) {
+      return c.json({ error: "Message required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "commit", "-m", message], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      const code = await proc.exited;
+      clearTimeout(timeoutId);
+
+      if (code !== 0) {
+        const stderr = await new Response(proc.stderr).text();
+        return c.json({ error: "Commit failed", message: stderr }, 400);
+      }
+
+      return c.json({ ok: true, output });
+    } catch (err) {
+      return c.json({ error: "Git commit failed", message: String(err) }, 400);
+    }
+  });
+
+  // GET /api/git/branches?cwd=...
+  app.get("/api/git/branches", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    try {
+      const proc = Bun.spawn(
+        ["git", "branch", "-a", "--format=%(refname:short)"],
+        {
+          cwd,
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      );
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const output = await new Response(proc.stdout).text();
+      clearTimeout(timeoutId);
+
+      const branches = output.trim().split("\n").filter(Boolean);
+      return c.json({ branches, cwd });
+    } catch (err) {
+      return c.json({ error: "Git branch failed", message: String(err) }, 400);
+    }
+  });
+
   // Serve static files
   app.use(
     "/*",
@@ -489,17 +950,80 @@ export function startWebServer(host: string, port: number) {
     port,
     hostname: host,
 
-    fetch(req, server) {
+    async fetch(req, server) {
       const url = new URL(req.url);
 
-      // WebSocket upgrade for terminal connection
+      // OpenCode WebSocket proxy
+      if (url.pathname.startsWith("/apps/opencode/ws")) {
+        const wsUrl =
+          OPENCODE_UPSTREAM.replace("http", "ws") +
+          url.pathname.replace("/apps/opencode", "") +
+          url.search;
+
+        try {
+          const upstream = new WebSocket(wsUrl);
+
+          const success = server.upgrade(req, {
+            data: { type: "opencode_proxy", upstream },
+          });
+
+          if (success) {
+            return undefined;
+          }
+        } catch (err) {
+          debug("OpenCode WebSocket proxy error:", err);
+        }
+
+        return new Response("WebSocket upgrade failed", { status: 500 });
+      }
+
       if (url.pathname.startsWith("/ws/terminals/")) {
         const id = url.pathname.split("/").pop();
-        if (id && terminals.has(id)) {
-          const success = server.upgrade(req, { data: { terminalId: id } });
-          if (success) return undefined;
+        if (!id) {
+          return new Response("Terminal ID required", { status: 400 });
         }
-        return new Response("Terminal not found", { status: 404 });
+        const term = terminals.get(id);
+
+        if (!term) {
+          return new Response("Terminal not found", { status: 404 });
+        }
+
+        const jwt = req.headers.get("cf-access-jwt-assertion");
+        if (CF_ACCESS_REQUIRED && !jwt) {
+          return new Response("Unauthorized", { status: 401 });
+        }
+
+        let ownerId = "anonymous";
+        if (jwt && CF_ACCESS_TEAM_NAME) {
+          try {
+            const { cloudflareAccess: verifyJWT } =
+              await import("@hono/cloudflare-access");
+            const mockContext = {
+              req: { header: (name: string) => req.headers.get(name) },
+              set: (key: string, value: CloudflareAccessPayload) => {
+                if (key === "accessPayload") {
+                  ownerId = value.sub;
+                }
+              },
+            };
+            const middleware = verifyJWT(CF_ACCESS_TEAM_NAME);
+            await middleware(mockContext as never, async () => {});
+          } catch (err) {
+            debug("WebSocket JWT verification failed:", err);
+            return new Response("Unauthorized", { status: 401 });
+          }
+        }
+
+        if (term.ownerId !== ownerId) {
+          return new Response("Forbidden", { status: 403 });
+        }
+
+        const success = server.upgrade(req, {
+          data: { type: "terminal" as const, terminalId: id, ownerId },
+        });
+        if (success) return undefined;
+
+        return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
       // Regular HTTP requests go to Hono
@@ -508,7 +1032,33 @@ export function startWebServer(host: string, port: number) {
 
     websocket: {
       open(ws: ServerWebSocket<WsData>) {
-        const terminalId = ws.data.terminalId;
+        const data = ws.data;
+
+        if (data.type === "opencode_proxy") {
+          const upstream = data.upstream;
+
+          upstream.onmessage = (event) => {
+            try {
+              ws.send(event.data);
+            } catch (err) {
+              debug("OpenCode proxy upstream->client error:", err);
+            }
+          };
+
+          upstream.onerror = (err) => {
+            debug("OpenCode proxy upstream error:", err);
+            ws.close();
+          };
+
+          upstream.onclose = () => {
+            ws.close();
+          };
+
+          debug("OpenCode WebSocket proxy connected");
+          return;
+        }
+
+        const { terminalId } = data;
         const term = terminals.get(terminalId);
         const sockets = terminalSockets.get(terminalId);
 
@@ -518,60 +1068,98 @@ export function startWebServer(host: string, port: number) {
         }
 
         sockets.add(ws as unknown as WebSocket);
-        debug(`WebSocket connected for terminal ${terminalId}`);
+        debug(
+          `WebSocket connected for terminal ${terminalId} (${term.cols}x${term.rows})`,
+        );
       },
 
       message(ws: ServerWebSocket<WsData>, message) {
-        const terminalId = ws.data.terminalId;
-        const term = terminals.get(terminalId);
+        try {
+          const data = ws.data;
 
-        if (!term) {
-          debug(`Terminal ${terminalId} not found for message`);
-          return;
-        }
-
-        // Handle different message types
-        if (typeof message === "string") {
-          debug(`WS message for ${terminalId}`);
-          try {
-            const parsed = JSON.parse(message);
-            if (parsed.type === "ping") {
-              // Respond to heartbeat
-              ws.send(JSON.stringify({ type: "pong" }));
-              return;
+          if (data.type === "opencode_proxy") {
+            try {
+              data.upstream.send(message);
+            } catch (err) {
+              debug("OpenCode proxy client->upstream error:", err);
             }
-            if (parsed.type === "resize") {
-              debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
-              term.cols = parsed.cols;
-              term.rows = parsed.rows;
-              // Use Bun.Terminal resize - sends SIGWINCH
-              try {
-                term.terminal.resize(parsed.cols, parsed.rows);
-              } catch (err) {
-                debug(`Resize error for ${terminalId}:`, err);
-              }
-              return;
-            }
-            if (parsed.type === "input") {
-              debug(`Input ${terminalId}`);
-              term.terminal.write(parsed.data);
-              return;
-            }
-          } catch {
-            // Not JSON, treat as raw input
-            debug(`Raw input ${terminalId}`);
-            term.terminal.write(message);
+            return;
           }
-        } else {
-          // Binary data (Buffer in Bun WebSocket)
-          const buf = message as unknown as Uint8Array;
-          debug(`Binary input ${terminalId}: ${buf.byteLength} bytes`);
-          term.terminal.write(new TextDecoder().decode(buf));
+
+          const { terminalId } = data;
+          const term = terminals.get(terminalId);
+
+          if (!term) {
+            debug(`Terminal ${terminalId} not found for message`);
+            return;
+          }
+
+          if (typeof message === "string") {
+            debug(`WS message for ${terminalId}`);
+            try {
+              const parsed = JSON.parse(message);
+              if (parsed.type === "ping") {
+                ws.send(JSON.stringify({ type: "pong" }));
+                return;
+              }
+              if (parsed.type === "resize") {
+                debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
+                term.cols = parsed.cols;
+                term.rows = parsed.rows;
+                try {
+                  term.terminal.resize(parsed.cols, parsed.rows);
+                } catch (err) {
+                  debug(`Resize error for ${terminalId}:`, err);
+                }
+                return;
+              }
+              if (parsed.type === "input") {
+                debug(`Input ${terminalId}`);
+                term.lastActivityAt = Date.now();
+                try {
+                  term.terminal.write(parsed.data);
+                } catch (err) {
+                  debug(`Write error for ${terminalId}:`, err);
+                }
+                return;
+              }
+            } catch {
+              debug(`Raw input ${terminalId}`);
+              term.lastActivityAt = Date.now();
+              try {
+                term.terminal.write(message);
+              } catch (err) {
+                debug(`Write error for ${terminalId}:`, err);
+              }
+            }
+          } else {
+            const buf = message as unknown as Uint8Array;
+            debug(`Binary input ${terminalId}: ${buf.byteLength} bytes`);
+            term.lastActivityAt = Date.now();
+            try {
+              term.terminal.write(new TextDecoder().decode(buf));
+            } catch (err) {
+              debug(`Binary write error for ${terminalId}:`, err);
+            }
+          }
+        } catch (err) {
+          console.error("[WebSocket] Message handler error:", err);
         }
       },
 
       close(ws: ServerWebSocket<WsData>) {
-        const terminalId = ws.data.terminalId;
+        const data = ws.data;
+
+        if (data.type === "opencode_proxy") {
+          try {
+            data.upstream.close();
+          } catch (err) {
+            debug("OpenCode proxy upstream close error:", err);
+          }
+          return;
+        }
+
+        const { terminalId } = data;
         const sockets = terminalSockets.get(terminalId);
         if (sockets) {
           sockets.delete(ws as unknown as WebSocket);
@@ -582,10 +1170,53 @@ export function startWebServer(host: string, port: number) {
 
   console.log(`🚀 OpenCode Web Terminal running at http://${host}:${port}`);
 
-  // Cleanup on exit
+  const cleanupIdleTerminals = () => {
+    const now = Date.now();
+
+    for (const [id, term] of terminals) {
+      const idleTime = now - term.lastActivityAt;
+
+      if (idleTime > TERMINAL_IDLE_TIMEOUT_MS) {
+        const sockets = terminalSockets.get(id);
+        console.log(
+          `[cleanup] Closing idle terminal ${id} (idle: ${Math.round(idleTime / 1000 / 60)}min, owner: ${term.ownerEmail})`,
+        );
+        if (sockets) {
+          for (const ws of sockets) {
+            try {
+              ws.send(JSON.stringify({ type: "idle_timeout" }));
+              ws.close();
+            } catch {}
+          }
+        }
+        try {
+          term.proc.kill();
+          term.terminal.close();
+        } catch (err) {
+          debug(`Cleanup error for ${id}:`, err);
+        }
+        terminals.delete(id);
+        terminalSockets.delete(id);
+      }
+    }
+  };
+
+  setInterval(cleanupIdleTerminals, 5 * 60 * 1000);
+
   process.on("SIGINT", () => {
     for (const term of terminals.values()) {
-      term.proc.kill();
+      try {
+        term.proc.kill();
+      } catch {}
+    }
+    process.exit(0);
+  });
+
+  process.on("SIGTERM", () => {
+    for (const term of terminals.values()) {
+      try {
+        term.proc.kill();
+      } catch {}
     }
     process.exit(0);
   });

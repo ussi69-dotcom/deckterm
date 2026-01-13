@@ -17,7 +17,7 @@
       }
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260111a" />
+    <link rel="stylesheet" href="/styles.css?v=20260112f" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -54,6 +54,18 @@
             <i data-lucide="folder-open"></i>
           </button>
 
+          <button id="clipboard-btn" class="btn-icon" data-action="clipboard" title="Clipboard History">
+            <i data-lucide="clipboard"></i>
+          </button>
+
+          <button id="opencode-btn" class="btn-icon" data-action="opencode" title="OpenCode">
+            <i data-lucide="code"></i>
+          </button>
+
+          <button id="git-btn" class="btn-icon" data-action="git" title="Git">
+            <i data-lucide="git-branch"></i>
+          </button>
+
           <button id="copy-btn" class="btn-icon" data-action="copy" title="Copy">
             <i data-lucide="copy"></i>
           </button>
@@ -68,6 +80,10 @@
 
           <button id="font-increase-btn" class="btn-icon" data-action="font-increase" title="Font +">
             <i data-lucide="zoom-in"></i>
+          </button>
+
+          <button id="wrap-lines-btn" class="btn-icon" data-action="wrap-lines" title="Line wrap: off">
+            <i data-lucide="wrap-text"></i>
           </button>
 
           <button id="fullscreen-btn" class="btn-icon" data-action="fullscreen" title="Fullscreen">
@@ -146,6 +162,17 @@
       <button id="fullscreen-exit" class="fullscreen-exit hidden" title="Exit fullscreen (Esc)">
         <i data-lucide="minimize-2"></i>
       </button>
+    </div>
+
+    <!-- OpenCode Panel -->
+    <div id="opencode-panel" class="app-panel hidden">
+      <div class="app-panel-header">
+        <span>OpenCode</span>
+        <span id="opencode-status" class="app-status">checking...</span>
+        <button id="opencode-popout" class="btn-icon" title="Open in new window">⧉</button>
+        <button class="app-panel-close">&times;</button>
+      </div>
+      <iframe id="opencode-iframe" src="" frameborder="0"></iframe>
     </div>
 
     <!-- Directory Picker Modal -->
@@ -256,6 +283,14 @@
     <script src="/vendor/xterm.min.js"></script>
     <script src="/vendor/xterm-addon-fit.min.js"></script>
     <script src="/vendor/xterm-addon-web-links.min.js"></script>
-    <script src="/app.js?v=20260111f"></script>
+    <script>
+      if (location.search.includes("debug=1")) {
+        const script = document.createElement("script");
+        script.src = "/dev/diagnostics.js";
+        document.head.appendChild(script);
+      }
+    </script>
+    <script src="/terminal-colors.js?v=20260112g"></script>
+    <script src="/app.js?v=20260112g"></script>
   </body>
 </html>
