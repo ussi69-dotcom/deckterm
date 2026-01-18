@@ -1966,6 +1966,75 @@ class ClipboardManager {
     }
   }
 
+  // Handle Ctrl+V paste with size warning
+  async handlePaste(terminalWs) {
+    try {
+      const text = await navigator.clipboard.readText();
+
+      if (!text) return;
+
+      const sizeBytes = new Blob([text]).size;
+      const sizeKB = sizeBytes / 1024;
+
+      // Warning threshold: 5KB
+      if (sizeKB > 5) {
+        this.showPasteConfirmation(text, sizeBytes, terminalWs);
+      } else {
+        this.executePaste(text, terminalWs);
+      }
+    } catch (err) {
+      console.error("Clipboard read failed:", err);
+      // Permission denied - show paste button fallback
+      this.showToast("Clipboard access denied. Use paste button.", "error");
+    }
+  }
+
+  showPasteConfirmation(text, sizeBytes, terminalWs) {
+    const modal = document.getElementById("paste-modal");
+    const sizeEl = document.getElementById("paste-size");
+    const previewEl = document.getElementById("paste-preview");
+    const confirmBtn = document.getElementById("paste-confirm");
+    const cancelBtn = document.getElementById("paste-cancel");
+    const closeBtn = modal.querySelector(".modal-close");
+
+    // Format size
+    const sizeStr =
+      sizeBytes < 1024
+        ? `${sizeBytes} bytes`
+        : sizeBytes < 1024 * 1024
+          ? `${(sizeBytes / 1024).toFixed(1)} KB`
+          : `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+
+    // SECURITY: Use textContent to prevent XSS from clipboard content
+    sizeEl.textContent = sizeStr;
+    const preview = text.substring(0, 500) + (text.length > 500 ? "\n..." : "");
+    previewEl.textContent = preview;
+
+    modal.classList.remove("hidden");
+
+    // Cleanup previous listeners
+    const cleanup = () => {
+      modal.classList.add("hidden");
+      confirmBtn.onclick = null;
+      cancelBtn.onclick = null;
+      closeBtn.onclick = null;
+    };
+
+    confirmBtn.onclick = () => {
+      cleanup();
+      this.executePaste(text, terminalWs);
+    };
+
+    cancelBtn.onclick = cleanup;
+    closeBtn.onclick = cleanup;
+  }
+
+  executePaste(text, terminalWs) {
+    if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
+      terminalWs.send(JSON.stringify({ type: "input", data: text }));
+    }
+  }
+
   escapeHtml(text) {
     const div = document.createElement("div");
     div.textContent = text;
@@ -2957,6 +3026,24 @@ class TerminalManager {
         return true;
       });
     }
+
+    // Intercept Ctrl+V for clipboard paste with large content warning
+    terminal.attachCustomKeyEventHandler((event) => {
+      // Ctrl+V or Cmd+V
+      if (
+        (event.ctrlKey || event.metaKey) &&
+        event.key === "v" &&
+        event.type === "keydown"
+      ) {
+        event.preventDefault();
+        const termData = this.terminals.get(this.activeId);
+        if (termData?.ws) {
+          this.clipboardManager.handlePaste(termData.ws);
+        }
+        return false; // Prevent default xterm handling
+      }
+      return true; // Allow other keys
+    });
 
     return terminal;
   }

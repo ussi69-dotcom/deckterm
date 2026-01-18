@@ -227,6 +227,26 @@
       </div>
     </div>
 
+    <!-- Paste Confirmation Modal -->
+    <div id="paste-modal" class="modal hidden">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h3>Large Paste Warning</h3>
+          <button class="modal-close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p>
+            You are about to paste <strong id="paste-size"></strong> of content.
+          </p>
+          <pre id="paste-preview" class="paste-preview"></pre>
+        </div>
+        <div class="modal-footer">
+          <button id="paste-cancel" class="btn btn-secondary">Cancel</button>
+          <button id="paste-confirm" class="btn btn-primary">Paste Anyway</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Help Modal -->
     <div id="help-modal" class="modal hidden">
       <div class="modal-content modal-large">

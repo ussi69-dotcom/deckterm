@@ -1011,6 +1011,52 @@ body {
   justify-content: flex-end;
 }
 
+.modal-body {
+  padding: 16px;
+}
+
+.modal-footer {
+  display: flex;
+  gap: 8px;
+  padding: 16px;
+  border-top: 1px solid var(--border-primary);
+  justify-content: flex-end;
+}
+
+.btn-secondary {
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  color: var(--text-primary);
+}
+
+.btn-secondary:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hover);
+}
+
+/* Paste Confirmation Modal */
+#paste-modal .modal-content {
+  max-width: 500px;
+}
+
+.paste-preview {
+  max-height: 200px;
+  overflow: auto;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 12px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin-top: 12px;
+}
+
+#paste-size {
+  color: var(--accent-orange);
+}
+
 /* Directory picker */
 .breadcrumb {
   padding: 12px 16px;
