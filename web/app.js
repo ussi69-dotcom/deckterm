@@ -2039,26 +2039,84 @@ class ClipboardManager {
     }, 300);
   }
 
-  // Handle Ctrl+V paste with size warning
+  // Handle Ctrl+V paste with size warning and image support
   async handlePaste(terminalWs) {
     try {
-      const text = await navigator.clipboard.readText();
+      const clipboardItems = await navigator.clipboard.read();
 
-      if (!text) return;
+      for (const item of clipboardItems) {
+        // Check for image types first
+        const imageType = item.types.find((t) => t.startsWith("image/"));
+        if (imageType) {
+          const blob = await item.getType(imageType);
+          await this.handleImagePaste(blob, terminalWs);
+          return;
+        }
 
-      const sizeBytes = new Blob([text]).size;
-      const sizeKB = sizeBytes / 1024;
+        // Handle text
+        if (item.types.includes("text/plain")) {
+          const blob = await item.getType("text/plain");
+          const text = await blob.text();
 
-      // Warning threshold: 5KB
-      if (sizeKB > 5) {
-        this.showPasteConfirmation(text, sizeBytes, terminalWs);
-      } else {
-        this.executePaste(text, terminalWs);
+          if (!text) continue;
+
+          const sizeBytes = new Blob([text]).size;
+          const sizeKB = sizeBytes / 1024;
+
+          if (sizeKB > 5) {
+            this.showPasteConfirmation(text, sizeBytes, terminalWs);
+          } else {
+            this.executePaste(text, terminalWs);
+          }
+          return;
+        }
       }
     } catch (err) {
-      console.error("Clipboard read failed:", err);
-      // Permission denied - show paste button fallback
-      this.showToast("Clipboard access denied. Use paste button.", "error");
+      // Fallback for browsers that don't support clipboard.read()
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text) {
+          const sizeBytes = new Blob([text]).size;
+          const sizeKB = sizeBytes / 1024;
+
+          if (sizeKB > 5) {
+            this.showPasteConfirmation(text, sizeBytes, terminalWs);
+          } else {
+            this.executePaste(text, terminalWs);
+          }
+        }
+      } catch (readErr) {
+        console.error("Clipboard read failed:", readErr);
+        this.showToast("Clipboard access denied. Use paste button.", "error");
+      }
+    }
+  }
+
+  async handleImagePaste(blob, terminalWs) {
+    this.showToast("Uploading image...", "pending");
+
+    try {
+      const formData = new FormData();
+      formData.append("image", blob, "clipboard-image.png");
+
+      const response = await fetch("/api/clipboard/image", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.error || "Upload failed");
+      }
+
+      const result = await response.json();
+
+      // Send path to terminal
+      this.executePaste(result.path + " ", terminalWs);
+      this.showToast(`Image saved: ${result.filename}`, "success");
+    } catch (err) {
+      console.error("Image upload failed:", err);
+      this.showToast("Image upload failed: " + err.message, "error");
     }
   }
 
