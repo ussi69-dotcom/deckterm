@@ -52,6 +52,7 @@ type Terminal = {
   lastActivityAt: number; // Last user input timestamp for idle detection
   ownerId: string; // User sub from JWT
   ownerEmail: string; // User email for display
+  sessionName?: string; // tmux session name (when TMUX_BACKEND=1)
 };
 
 type TerminalWsData = { type: "terminal"; terminalId: string; ownerId: string };
@@ -78,6 +79,9 @@ const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
 const CF_ACCESS_REQUIRED = process.env.CF_ACCESS_REQUIRED === "1";
 const CF_ACCESS_TEAM_NAME = process.env.CF_ACCESS_TEAM_NAME || "";
 const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD || "";
+
+// tmux backend for session persistence (survives server restart)
+const TMUX_BACKEND = process.env.TMUX_BACKEND === "1";
 const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "")
   .split(",")
   .filter(Boolean);
@@ -150,6 +154,120 @@ const rateLimitState = {
     this.timestamps.push(Date.now());
   },
 };
+
+// Recover existing tmux sessions on startup (for TMUX_BACKEND)
+async function recoverTmuxSessions(): Promise<number> {
+  if (!TMUX_BACKEND) return 0;
+
+  try {
+    const result = Bun.spawn([
+      "tmux",
+      "list-sessions",
+      "-F",
+      "#{session_name}",
+    ]);
+    const output = await new Response(result.stdout).text();
+    await result.exited;
+
+    const sessions = output
+      .trim()
+      .split("\n")
+      .filter((s) => s.startsWith("deckterm_"));
+    let recovered = 0;
+
+    for (const sessionName of sessions) {
+      // Parse: deckterm_{ownerId}_{fullUUID}
+      // Session name format: deckterm_OWNERID_UUID (UUID contains dashes, not underscores)
+      const parts = sessionName.split("_");
+      if (parts.length < 3) continue;
+
+      const ownerId = parts[1];
+      // Extract the full UUID (parts[2] and any remaining parts joined back)
+      // This handles UUIDs correctly since they use dashes, not underscores
+      const id = parts.slice(2).join("_");
+
+      // Get tmux session info
+      const infoResult = Bun.spawn([
+        "tmux",
+        "display-message",
+        "-t",
+        sessionName,
+        "-p",
+        "#{pane_current_path}:#{window_width}:#{window_height}",
+      ]);
+      const infoOutput = await new Response(infoResult.stdout).text();
+      await infoResult.exited;
+
+      const [cwd = "/home/deploy", colsStr = "120", rowsStr = "30"] = infoOutput
+        .trim()
+        .split(":");
+      const cols = parseInt(colsStr, 10) || 120;
+      const rows = parseInt(rowsStr, 10) || 30;
+
+      // Create BunTerminal for I/O
+      const terminal = new BunTerminal({
+        cols,
+        rows,
+        data(term, data) {
+          const sockets = terminalSockets.get(id);
+          if (sockets && sockets.size > 0) {
+            const strData =
+              typeof data === "string" ? data : new TextDecoder().decode(data);
+            for (const ws of sockets) {
+              try {
+                ws.send(strData);
+              } catch {
+                /* ignore */
+              }
+            }
+          }
+        },
+      });
+
+      // Attach to existing session
+      const proc = Bun.spawn(["tmux", "attach-session", "-t", sessionName], {
+        cwd,
+        env: {
+          ...process.env,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+        },
+        // @ts-expect-error - terminal option is Bun 1.3.5+ API
+        terminal,
+        onExit() {
+          terminals.delete(id);
+          terminalSockets.delete(id);
+          terminal.close();
+        },
+      });
+
+      const now = Date.now();
+      terminals.set(id, {
+        id,
+        proc,
+        terminal,
+        cwd,
+        cols,
+        rows,
+        createdAt: now,
+        lastActivityAt: now,
+        ownerId,
+        ownerEmail: "recovered",
+        sessionName,
+      });
+      terminalSockets.set(id, new Set());
+
+      recovered++;
+      console.log(`[tmux] Recovered session: ${sessionName} -> terminal ${id}`);
+    }
+
+    return recovered;
+  } catch (err) {
+    // tmux not running or no sessions - that's fine
+    console.log("[tmux] No existing sessions to recover");
+    return 0;
+  }
+}
 
 // Debug logger
 function debug(...args: unknown[]) {
@@ -430,36 +548,126 @@ export function createWebApp() {
       },
     });
 
-    const proc = Bun.spawn([shell, "-il"], {
-      cwd,
-      env: {
-        ...process.env,
-        TERM: "xterm-256color",
-        COLORTERM: "truecolor",
-        COLUMNS: String(cols),
-        LINES: String(rows),
-        PATH: `${home}/.opencode/bin:${process.env.PATH || "/usr/bin"}`,
-      },
-      // @ts-expect-error - terminal option is Bun 1.3.5+ API, not yet in bun-types
-      terminal,
-      onExit(proc, exitCode, signalCode) {
-        debug(`Terminal ${id} exited: code=${exitCode}, signal=${signalCode}`);
-        const sockets = terminalSockets.get(id);
-        if (sockets) {
-          for (const ws of sockets) {
-            try {
-              ws.send(JSON.stringify({ type: "exit", code: exitCode }));
-              ws.close();
-            } catch {
-              // ignore
+    // tmux session name for persistence (sanitize ownerId for tmux)
+    // Use full UUID in session name for reliable recovery
+    const safeOwnerId = ownerId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 20);
+    const sessionName = TMUX_BACKEND
+      ? `deckterm_${safeOwnerId}_${id}`
+      : undefined;
+
+    let proc: Subprocess;
+
+    if (TMUX_BACKEND && sessionName) {
+      // tmux backend: create detached session, then attach for I/O
+      debug(`Creating tmux session: ${sessionName}`);
+
+      // Create detached tmux session with shell
+      const createProc = Bun.spawn(
+        [
+          "tmux",
+          "new-session",
+          "-d", // detached
+          "-s",
+          sessionName, // session name
+          "-x",
+          String(cols),
+          "-y",
+          String(rows),
+          "-c",
+          cwd, // start directory
+          shell,
+          "-il", // command
+        ],
+        {
+          env: {
+            ...process.env,
+            TERM: "xterm-256color",
+            COLORTERM: "truecolor",
+          },
+        },
+      );
+      await createProc.exited;
+
+      // Hide tmux status bar for cleaner terminal display
+      const hideStatusProc = Bun.spawn([
+        "tmux",
+        "set-option",
+        "-t",
+        sessionName,
+        "status",
+        "off",
+      ]);
+      await hideStatusProc.exited;
+      debug(`Tmux status bar hidden for session: ${sessionName}`);
+
+      // Attach to the session via PTY for I/O streaming
+      proc = Bun.spawn(["tmux", "attach-session", "-t", sessionName], {
+        cwd,
+        env: {
+          ...process.env,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+          COLUMNS: String(cols),
+          LINES: String(rows),
+        },
+        // @ts-expect-error - terminal option is Bun 1.3.5+ API, not yet in bun-types
+        terminal,
+        onExit(proc, exitCode, signalCode) {
+          debug(
+            `Terminal ${id} (tmux: ${sessionName}) exited: code=${exitCode}, signal=${signalCode}`,
+          );
+          const sockets = terminalSockets.get(id);
+          if (sockets) {
+            for (const ws of sockets) {
+              try {
+                ws.send(JSON.stringify({ type: "exit", code: exitCode }));
+                ws.close();
+              } catch {
+                // ignore
+              }
             }
           }
-        }
-        terminals.delete(id);
-        terminalSockets.delete(id);
-        terminal.close();
-      },
-    });
+          terminals.delete(id);
+          terminalSockets.delete(id);
+          terminal.close();
+          // Note: tmux session stays alive for reconnection
+        },
+      });
+    } else {
+      // Raw PTY backend (original behavior)
+      proc = Bun.spawn([shell, "-il"], {
+        cwd,
+        env: {
+          ...process.env,
+          TERM: "xterm-256color",
+          COLORTERM: "truecolor",
+          COLUMNS: String(cols),
+          LINES: String(rows),
+          PATH: `${home}/.opencode/bin:${process.env.PATH || "/usr/bin"}`,
+        },
+        // @ts-expect-error - terminal option is Bun 1.3.5+ API, not yet in bun-types
+        terminal,
+        onExit(proc, exitCode, signalCode) {
+          debug(
+            `Terminal ${id} exited: code=${exitCode}, signal=${signalCode}`,
+          );
+          const sockets = terminalSockets.get(id);
+          if (sockets) {
+            for (const ws of sockets) {
+              try {
+                ws.send(JSON.stringify({ type: "exit", code: exitCode }));
+                ws.close();
+              } catch {
+                // ignore
+              }
+            }
+          }
+          terminals.delete(id);
+          terminalSockets.delete(id);
+          terminal.close();
+        },
+      });
+    }
 
     const now = Date.now();
     terminals.set(id, {
@@ -473,6 +681,7 @@ export function createWebApp() {
       lastActivityAt: now,
       ownerId,
       ownerEmail,
+      sessionName,
     });
     terminalSockets.set(id, new Set());
 
@@ -495,7 +704,7 @@ export function createWebApp() {
   });
 
   // Delete terminal
-  app.delete("/api/terminals/:id", (c) => {
+  app.delete("/api/terminals/:id", async (c) => {
     const { ownerId } = getCurrentUser(c);
     const id = c.req.param("id");
     const term = terminals.get(id);
@@ -505,6 +714,19 @@ export function createWebApp() {
     if (term.ownerId !== ownerId) {
       return c.json({ error: "Forbidden" }, 403);
     }
+
+    // Kill tmux session if using tmux backend
+    if (TMUX_BACKEND && term.sessionName) {
+      debug(`Killing tmux session: ${term.sessionName}`);
+      const killProc = Bun.spawn([
+        "tmux",
+        "kill-session",
+        "-t",
+        term.sessionName,
+      ]);
+      await killProc.exited;
+    }
+
     term.proc.kill();
     term.terminal.close();
     terminals.delete(id);
@@ -539,6 +761,23 @@ export function createWebApp() {
     // Actually resize the PTY - this sends SIGWINCH to the process
     try {
       term.terminal.resize(cols, rows);
+
+      // Also resize tmux pane if using tmux backend
+      if (TMUX_BACKEND && term.sessionName) {
+        const resizeProc = Bun.spawn([
+          "tmux",
+          "resize-pane",
+          "-t",
+          term.sessionName,
+          "-x",
+          String(cols),
+          "-y",
+          String(rows),
+        ]);
+        await resizeProc.exited;
+        debug(`Terminal ${id} tmux pane resized to ${cols}x${rows}`);
+      }
+
       debug(`Terminal ${id} resized to ${cols}x${rows}`);
     } catch (err) {
       debug(`Terminal ${id} resize error:`, err);
@@ -943,7 +1182,18 @@ export function createWebApp() {
   return app;
 }
 
-export function startWebServer(host: string, port: number) {
+export async function startWebServer(host: string, port: number) {
+  // Recover existing tmux sessions before starting server
+  if (TMUX_BACKEND) {
+    console.log(
+      "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
+    );
+    const recovered = await recoverTmuxSessions();
+    if (recovered > 0) {
+      console.log(`[tmux] Recovered ${recovered} session(s)`);
+    }
+  }
+
   const app = createWebApp();
 
   const server = Bun.serve<WsData>({
@@ -1170,7 +1420,7 @@ export function startWebServer(host: string, port: number) {
 
   console.log(`🚀 OpenCode Web Terminal running at http://${host}:${port}`);
 
-  const cleanupIdleTerminals = () => {
+  const cleanupIdleTerminals = async () => {
     const now = Date.now();
 
     for (const [id, term] of terminals) {
@@ -1189,6 +1439,23 @@ export function startWebServer(host: string, port: number) {
             } catch {}
           }
         }
+
+        // Kill tmux session if using tmux backend (prevents orphaned sessions)
+        if (TMUX_BACKEND && term.sessionName) {
+          try {
+            debug(`[cleanup] Killing tmux session: ${term.sessionName}`);
+            const killProc = Bun.spawn([
+              "tmux",
+              "kill-session",
+              "-t",
+              term.sessionName,
+            ]);
+            await killProc.exited;
+          } catch (err) {
+            debug(`[cleanup] tmux kill-session error for ${id}:`, err);
+          }
+        }
+
         try {
           term.proc.kill();
           term.terminal.close();
