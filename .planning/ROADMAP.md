@@ -6,7 +6,7 @@
 | ----- | -------------------- | ---------------------------------------------------- | ------------ |
 | 1     | Terminal Scaling Fix | Fix content not filling window, remove gaps          | **COMPLETE** |
 | 2     | Platform-Adaptive UI | Hide extra keys on desktop, improve mobile detection | **COMPLETE** |
-| 3     | Clipboard Overhaul   | Ctrl+V paste, auto-copy selection, image support     | pending      |
+| 3     | Clipboard Overhaul   | Ctrl+V paste, auto-copy selection, image support     | **COMPLETE** |
 | 4     | Session Lifecycle    | Fast reconnect, auto-cleanup orphaned sessions       | pending      |
 | 5     | Polish & Testing     | Regression tests, performance benchmarks             | pending      |
 
@@ -84,30 +84,30 @@
 
 #### 3a: Ctrl+V Paste
 
-- [ ] Intercept `Ctrl+V` / `Cmd+V` keydown on terminal
-- [ ] Read from `navigator.clipboard.readText()`
-- [ ] Send text to PTY via WebSocket
-- [ ] Handle permission denied gracefully (show paste button)
+- [x] Intercept `Ctrl+V` / `Cmd+V` keydown on terminal
+- [x] Read from `navigator.clipboard.readText()`
+- [x] Send text to PTY via WebSocket
+- [x] Handle permission denied gracefully (show paste button)
 
 #### 3b: Auto-Copy on Selection
 
-- [ ] Listen to xterm.js `onSelectionChange` event
-- [ ] When selection exists, copy to clipboard automatically
-- [ ] Show brief visual feedback (toast: "Copied")
-- [ ] Debounce to avoid spam on mouse drag
+- [x] Listen to xterm.js `onSelectionChange` event
+- [x] When selection exists, copy to clipboard automatically
+- [x] Show brief visual feedback (toast: "Copied")
+- [x] Debounce to avoid spam on mouse drag
 
 #### 3c: Image Clipboard (for Claude Code)
 
-- [ ] Detect `Ctrl+V` with image data in clipboard
-- [ ] Convert image to base64 or upload to server
-- [ ] Send image path/data to active terminal (if Claude Code running)
-- [ ] Fallback: show "Image paste not supported in this context"
+- [x] Detect `Ctrl+V` with image data in clipboard
+- [x] Convert image to base64 or upload to server
+- [x] Send image path/data to active terminal (if Claude Code running)
+- [x] Fallback: show "Image paste not supported in this context"
 
 #### 3d: OSC52 Enhancement
 
-- [ ] Keep existing OSC52 support for TUI tools
-- [ ] Add confirmation dialog for automated clipboard writes (Ghostty-inspired)
-- [ ] Allow "always allow" preference per session
+- [x] Keep existing OSC52 support for TUI tools
+- [x] Add confirmation dialog for automated clipboard writes (Ghostty-inspired)
+- [x] Allow "always allow" preference per session
 
 **Key Files:**
 
