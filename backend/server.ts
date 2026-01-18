@@ -241,6 +241,17 @@ async function recoverTmuxSessions(): Promise<number> {
         },
       });
 
+      // Hide status bar for recovered session
+      const hideStatusProc = Bun.spawn([
+        "tmux",
+        "set-option",
+        "-t",
+        sessionName,
+        "status",
+        "off",
+      ]);
+      await hideStatusProc.exited;
+
       const now = Date.now();
       terminals.set(id, {
         id,
