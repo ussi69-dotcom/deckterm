@@ -1774,6 +1774,8 @@ class ClipboardManager {
     this.panel = null;
     this.toast = null;
     this.pendingCopy = null;
+    this.lastToastTime = 0;
+    this.toastDebounceMs = 2000; // 2 seconds
     this.init();
   }
 
@@ -1918,6 +1920,17 @@ class ClipboardManager {
   }
 
   showToast(message, type, data = null) {
+    const now = Date.now();
+
+    // Debounce success toasts (2 second cooldown)
+    if (type === "success" && now - this.lastToastTime < this.toastDebounceMs) {
+      return; // Skip toast, too soon
+    }
+
+    if (type === "success") {
+      this.lastToastTime = now;
+    }
+
     const toast = this.toast;
     const msgEl = toast.querySelector(".toast-message");
     const copyBtn = toast.querySelector(".toast-copy");
