@@ -1776,6 +1776,8 @@ class ClipboardManager {
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
+    this.autoCopyEnabled = localStorage.getItem("autoCopyEnabled") === "true";
+    this.selectionDebounceTimer = null;
     this.init();
   }
 
@@ -1788,18 +1790,50 @@ class ClipboardManager {
     this.panel = document.createElement("div");
     this.panel.id = "clipboard-panel";
     this.panel.className = "clipboard-panel hidden";
-    this.panel.innerHTML = `
-      <div class="clipboard-header">
-        <h3>Clipboard History</h3>
-        <button class="clipboard-close">&times;</button>
-      </div>
-      <div class="clipboard-list"></div>
-    `;
-    document.getElementById("app").appendChild(this.panel);
 
-    this.panel
-      .querySelector(".clipboard-close")
-      .addEventListener("click", () => this.hidePanel());
+    // Build panel structure using DOM methods for security
+    const header = document.createElement("div");
+    header.className = "clipboard-header";
+
+    const title = document.createElement("h3");
+    title.textContent = "Clipboard";
+    header.appendChild(title);
+
+    const closeBtn = document.createElement("button");
+    closeBtn.className = "clipboard-close";
+    closeBtn.textContent = "\u00D7"; // &times;
+    closeBtn.addEventListener("click", () => this.hidePanel());
+    header.appendChild(closeBtn);
+
+    const settings = document.createElement("div");
+    settings.className = "clipboard-settings";
+
+    const label = document.createElement("label");
+    label.className = "setting-row";
+
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.id = "auto-copy-toggle";
+    checkbox.checked = this.autoCopyEnabled;
+    checkbox.addEventListener("change", (e) => {
+      this.setAutoCopyEnabled(e.target.checked);
+    });
+
+    const labelText = document.createElement("span");
+    labelText.textContent = "Auto-copy on selection";
+
+    label.appendChild(checkbox);
+    label.appendChild(labelText);
+    settings.appendChild(label);
+
+    const list = document.createElement("div");
+    list.className = "clipboard-list";
+
+    this.panel.appendChild(header);
+    this.panel.appendChild(settings);
+    this.panel.appendChild(list);
+
+    document.getElementById("app").appendChild(this.panel);
   }
 
   createToast() {
@@ -1964,6 +1998,29 @@ class ClipboardManager {
     if (!this.panel.classList.contains("hidden")) {
       this.renderHistory();
     }
+  }
+
+  setAutoCopyEnabled(enabled) {
+    this.autoCopyEnabled = enabled;
+    localStorage.setItem("autoCopyEnabled", String(enabled));
+  }
+
+  // Called when terminal selection changes
+  handleSelectionChange(terminal) {
+    if (!this.autoCopyEnabled) return;
+
+    // Clear previous timer
+    if (this.selectionDebounceTimer) {
+      clearTimeout(this.selectionDebounceTimer);
+    }
+
+    // Debounce 300ms
+    this.selectionDebounceTimer = setTimeout(() => {
+      const selection = terminal.getSelection();
+      if (selection && selection.length > 0) {
+        this.copyToClipboard(selection);
+      }
+    }, 300);
   }
 
   // Handle Ctrl+V paste with size warning
@@ -3043,6 +3100,11 @@ class TerminalManager {
         return false; // Prevent default xterm handling
       }
       return true; // Allow other keys
+    });
+
+    // Auto-copy on selection (if enabled)
+    terminal.onSelectionChange(() => {
+      this.clipboardManager?.handleSelectionChange(terminal);
     });
 
     return terminal;

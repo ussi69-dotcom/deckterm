@@ -1706,6 +1706,26 @@ body.virtual-keyboard-open .extra-keys {
   background: var(--btn-green-hover);
 }
 
+/* Clipboard Settings */
+.clipboard-settings {
+  padding: 12px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.setting-row input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+}
+
 /* =============================================================================
    CLIPBOARD TOAST
    ============================================================================= */
