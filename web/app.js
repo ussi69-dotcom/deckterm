@@ -1876,9 +1876,25 @@ class ClipboardManager {
       }
 
       // Try clipboard API
-      this.copyToClipboard(text);
+      this.copyToClipboardOsc52(text);
     } catch (e) {
       console.error("OSC52 decode error:", e);
+    }
+  }
+
+  // Separate method for OSC52 to show different message
+  async copyToClipboardOsc52(text) {
+    // Add to history first
+    this.addToHistory(text);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      // Non-blocking notification for OSC52
+      this.showToast("Clipboard updated by terminal", "success");
+    } catch (err) {
+      console.warn("Clipboard API failed, showing fallback:", err);
+      this.pendingCopy = text;
+      this.showToast("Click to copy", "pending", text);
     }
   }
 
