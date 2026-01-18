@@ -2097,3 +2097,43 @@ body.virtual-keyboard-open .extra-keys {
 .size-warning.visible {
   display: block;
 }
+
+/* Debug overlay for terminal dimensions */
+.debug-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 6px 10px;
+  background: rgba(0, 0, 0, 0.8);
+  border: 1px solid var(--accent-orange);
+  border-radius: 4px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  color: var(--accent-orange);
+  z-index: 100;
+  pointer-events: none;
+  display: none;
+  line-height: 1.4;
+}
+
+.debug-overlay.visible {
+  display: block;
+}
+
+.debug-overlay .debug-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.debug-overlay .debug-label {
+  color: var(--text-muted);
+}
+
+.debug-overlay .debug-value {
+  color: var(--text-primary);
+}
+
+.debug-overlay .debug-value.mismatch {
+  color: var(--accent-red);
+}

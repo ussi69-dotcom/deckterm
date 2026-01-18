@@ -2283,6 +2283,7 @@ class TerminalManager {
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
     this.resizeDebounceMs = 120;
+    this.debugMode = false;
 
     // Session registry for reconnection persistence
     this.sessionRegistry = new SessionRegistry();
@@ -2568,6 +2569,11 @@ class TerminalManager {
         e.preventDefault();
         this.openHelp();
       }
+      // Ctrl+Alt+D - Toggle debug mode
+      if (e.ctrlKey && e.altKey && e.key === "d") {
+        e.preventDefault();
+        this.toggleDebugMode();
+      }
     });
   }
 
@@ -2663,6 +2669,27 @@ class TerminalManager {
     sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
     element.parentElement.appendChild(sizeWarning);
 
+    // Build debug overlay with DOM methods (safe, no innerHTML)
+    const debugOverlay = document.createElement("div");
+    debugOverlay.className = "debug-overlay";
+    const debugFields = ["container", "calculated", "actual", "delta"];
+    const debugLabels = ["Container:", "Calculated:", "Actual:", "Delta:"];
+    debugFields.forEach((field, i) => {
+      const row = document.createElement("div");
+      row.className = "debug-row";
+      const label = document.createElement("span");
+      label.className = "debug-label";
+      label.textContent = debugLabels[i];
+      const value = document.createElement("span");
+      value.className = "debug-value";
+      value.dataset.field = field;
+      value.textContent = "0x0";
+      row.appendChild(label);
+      row.appendChild(value);
+      debugOverlay.appendChild(row);
+    });
+    element.parentElement.appendChild(debugOverlay);
+
     const terminal = this.createXtermInstance();
     terminal.open(element);
     const osc7Disposable = this.attachOsc7Handler(id, terminal);
@@ -2712,6 +2739,7 @@ class TerminalManager {
       overlay,
       dimensionOverlay,
       sizeWarning,
+      debugOverlay,
       dimensionTimer: null,
       cwd,
       tabNum,
@@ -2936,6 +2964,64 @@ class TerminalManager {
     t.dimensionTimer = setTimeout(() => {
       t.dimensionOverlay.classList.remove("visible");
     }, 1000);
+
+    if (this.debugMode) {
+      this.updateDebugOverlay(id);
+    }
+  }
+
+  toggleDebugMode() {
+    this.debugMode = !this.debugMode;
+    for (const [id, t] of this.terminals) {
+      if (t.debugOverlay) {
+        t.debugOverlay.classList.toggle("visible", this.debugMode);
+        if (this.debugMode) {
+          this.updateDebugOverlay(id);
+        }
+      }
+    }
+    console.log(
+      `[debug] Terminal debug mode: ${this.debugMode ? "ON" : "OFF"}`,
+    );
+  }
+
+  updateDebugOverlay(id) {
+    const t = this.terminals.get(id);
+    if (!t?.debugOverlay || !t.terminal || !t.element || !this.debugMode)
+      return;
+
+    const containerWidth = t.element.offsetWidth;
+    const containerHeight = t.element.offsetHeight;
+
+    // Calculate expected dimensions based on cell size
+    const dims = t.terminal._core._renderService?.dimensions;
+    const cellWidth = dims?.css?.cell?.width || 9;
+    const cellHeight = dims?.css?.cell?.height || 18;
+
+    const expectedCols = Math.floor((containerWidth - 16) / cellWidth); // 16px padding
+    const expectedRows = Math.floor((containerHeight - 16) / cellHeight);
+
+    const actualCols = t.terminal.cols;
+    const actualRows = t.terminal.rows;
+
+    const deltaCol = actualCols - expectedCols;
+    const deltaRow = actualRows - expectedRows;
+
+    const fields = t.debugOverlay.querySelectorAll("[data-field]");
+    fields.forEach((field) => {
+      const name = field.dataset.field;
+      if (name === "container")
+        field.textContent = `${containerWidth}x${containerHeight}px`;
+      if (name === "calculated")
+        field.textContent = `${expectedCols}x${expectedRows}`;
+      if (name === "actual") field.textContent = `${actualCols}x${actualRows}`;
+      if (name === "delta") {
+        const sign1 = deltaCol >= 0 ? "+" : "";
+        const sign2 = deltaRow >= 0 ? "+" : "";
+        field.textContent = `${sign1}${deltaCol} / ${sign2}${deltaRow}`;
+        field.classList.toggle("mismatch", deltaCol !== 0 || deltaRow !== 0);
+      }
+    });
   }
 
   syncTerminalSize(id) {
@@ -3043,6 +3129,27 @@ class TerminalManager {
       sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
       element.parentElement.appendChild(sizeWarning);
 
+      // Build debug overlay with DOM methods (safe, no innerHTML)
+      const debugOverlay = document.createElement("div");
+      debugOverlay.className = "debug-overlay";
+      const debugFields = ["container", "calculated", "actual", "delta"];
+      const debugLabels = ["Container:", "Calculated:", "Actual:", "Delta:"];
+      debugFields.forEach((field, i) => {
+        const row = document.createElement("div");
+        row.className = "debug-row";
+        const label = document.createElement("span");
+        label.className = "debug-label";
+        label.textContent = debugLabels[i];
+        const value = document.createElement("span");
+        value.className = "debug-value";
+        value.dataset.field = field;
+        value.textContent = "0x0";
+        row.appendChild(label);
+        row.appendChild(value);
+        debugOverlay.appendChild(row);
+      });
+      element.parentElement.appendChild(debugOverlay);
+
       const terminal = this.createXtermInstance();
       terminal.open(element);
       const osc7Disposable = this.attachOsc7Handler(id, terminal);
@@ -3092,6 +3199,7 @@ class TerminalManager {
         overlay,
         dimensionOverlay,
         sizeWarning,
+        debugOverlay,
         dimensionTimer: null,
         cwd,
         tabNum,
