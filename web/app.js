@@ -1344,10 +1344,10 @@ class ExtraKeysManager {
     // Store reference and apply initial visibility
     this.extraKeysEl = extraKeys;
 
-    // On desktop, apply saved state (default: hidden)
-    if (platformDetector.isDesktop) {
-      this.updateVisibility();
-    }
+    // Apply initial visibility state
+    // On desktop: load from localStorage (default: hidden)
+    // On mobile: always visible
+    this.updateVisibility();
 
     // Setup toggle button handler
     document
@@ -1457,6 +1457,7 @@ class ExtraKeysManager {
   }
 
   // Called by viewport resize handler for mobile keyboard
+  // On mobile, extra keys should ALWAYS stay visible (just repositioned)
   showForKeyboard() {
     if (platformDetector.isMobile) {
       this.visible = true;
@@ -1465,8 +1466,16 @@ class ExtraKeysManager {
   }
 
   hideForKeyboard() {
-    if (platformDetector.isMobile) {
+    // On mobile, DO NOT hide extra keys when keyboard closes
+    // They should remain visible at the bottom of the screen
+    // Only hide on desktop if user explicitly toggled them off
+    if (platformDetector.isDesktop) {
       this.visible = false;
+      this.updateVisibility();
+    }
+    // On mobile, keep extra keys visible
+    if (platformDetector.isMobile) {
+      this.visible = true;
       this.updateVisibility();
     }
   }
@@ -1776,7 +1785,10 @@ class ClipboardManager {
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
-    this.autoCopyEnabled = localStorage.getItem("autoCopyEnabled") === "true";
+    // Auto-copy enabled by default - user can disable in clipboard panel
+    const savedAutoCopy = localStorage.getItem("autoCopyEnabled");
+    this.autoCopyEnabled =
+      savedAutoCopy === null ? true : savedAutoCopy === "true";
     this.selectionDebounceTimer = null;
     this.init();
   }
@@ -3420,19 +3432,26 @@ class TerminalManager {
         try {
           t.fitAddon.fit();
 
-          // Enforce minimum size
+          // Check terminal size - be lenient on mobile
           const cols = t.terminal.cols;
           const rows = t.terminal.rows;
-          const isTooSmall = cols < 80 || rows < 24;
 
+          // On mobile, accept much smaller terminals (40x12 minimum)
+          // On desktop, prefer 80x24 but still allow smaller
+          const minCols = platformDetector.isMobile ? 40 : 60;
+          const minRows = platformDetector.isMobile ? 12 : 16;
+          const isTooSmall = cols < minCols || rows < minRows;
+
+          // Hide size warning on mobile entirely, show on desktop only for very small
           if (t.sizeWarning) {
-            t.sizeWarning.classList.toggle("visible", isTooSmall);
+            t.sizeWarning.classList.toggle(
+              "visible",
+              isTooSmall && !platformDetector.isMobile,
+            );
           }
 
-          // Only send resize if meets minimum
-          if (!isTooSmall) {
-            this.scheduleResize(id);
-          }
+          // Always send resize - terminal will work even if small
+          this.scheduleResize(id);
 
           this.showDimensionOverlay(id);
         } catch (err) {
