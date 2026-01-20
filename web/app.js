@@ -2602,7 +2602,122 @@ class GitManager {
   }
 
   setupKeyboardShortcuts() {
-    // Will be implemented in Task 3.2
+    document.addEventListener("keydown", (e) => {
+      // Only handle when git panel is open and not typing in textarea
+      if (this.panel.classList.contains("hidden")) return;
+      if (e.target.tagName === "TEXTAREA" || e.target.tagName === "INPUT") {
+        if (e.key === "Escape") {
+          e.target.blur();
+          return;
+        }
+        return;
+      }
+
+      switch (e.key) {
+        case "j":
+        case "ArrowDown":
+          e.preventDefault();
+          this.navigateFiles(1);
+          break;
+        case "k":
+        case "ArrowUp":
+          e.preventDefault();
+          this.navigateFiles(-1);
+          break;
+        case " ":
+          e.preventDefault();
+          this.stageSelectedFile();
+          break;
+        case "Enter":
+          e.preventDefault();
+          this.showSelectedDiff();
+          break;
+        case "c":
+          e.preventDefault();
+          this.panel.querySelector("#git-message").focus();
+          break;
+        case "b":
+          e.preventDefault();
+          this.toggleBranches();
+          break;
+        case "r":
+          e.preventDefault();
+          this.refresh();
+          break;
+        case "Tab":
+          e.preventDefault();
+          this.switchPanel();
+          break;
+        case "Escape":
+          e.preventDefault();
+          this.hide();
+          break;
+      }
+    });
+  }
+
+  navigateFiles(delta) {
+    const fileElements = this.panel.querySelectorAll(".git-file");
+    if (fileElements.length === 0) return;
+
+    this.state.selectedIndex = Math.max(
+      0,
+      Math.min(fileElements.length - 1, this.state.selectedIndex + delta),
+    );
+    this.highlightSelectedFile();
+  }
+
+  highlightSelectedFile() {
+    const fileElements = this.panel.querySelectorAll(".git-file");
+    fileElements.forEach((el, i) => {
+      el.classList.toggle("selected", i === this.state.selectedIndex);
+    });
+
+    // Scroll into view
+    const selected = this.panel.querySelector(".git-file.selected");
+    if (selected) {
+      selected.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }
+
+  stageSelectedFile() {
+    const fileElements = this.panel.querySelectorAll(".git-file");
+    const selectedFile = fileElements[this.state.selectedIndex];
+    if (selectedFile) {
+      const path = selectedFile.dataset.path;
+      const status = selectedFile.querySelector(".git-file-status").textContent;
+      this.toggleStage(path, status);
+    }
+  }
+
+  showSelectedDiff() {
+    const fileElements = this.panel.querySelectorAll(".git-file");
+    const selectedFile = fileElements[this.state.selectedIndex];
+    if (selectedFile) {
+      const path = selectedFile.dataset.path;
+      this.showDiff(path);
+    }
+  }
+
+  switchPanel() {
+    const panels = ["files", "history", "branches"];
+    const currentIndex = panels.indexOf(this.state.activePanel);
+    this.state.activePanel = panels[(currentIndex + 1) % panels.length];
+    this.updateActivePanelUI();
+  }
+
+  updateActivePanelUI() {
+    // Visual feedback for active panel
+    this.panel
+      .querySelectorAll(".git-left-panel > div, .git-right-panel > div")
+      .forEach((el) => {
+        el.classList.remove("panel-active");
+      });
+
+    const activeEl = this.panel.querySelector(`#git-${this.state.activePanel}`);
+    if (activeEl) {
+      activeEl.classList.add("panel-active");
+    }
   }
 
   toggleBranches() {
