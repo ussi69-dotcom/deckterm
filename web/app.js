@@ -242,12 +242,43 @@ class ReconnectingWebSocket {
       this.maxDelay,
     );
     this.retryCount++;
+
+    // After 3 failed attempts, check if terminal still exists
+    if (this.retryCount === 3) {
+      this.checkTerminalExists().then((exists) => {
+        if (!exists) {
+          this.intentionallyClosed = true;
+          this.callbacks.onStatusChange("dead");
+          return;
+        }
+        // Terminal exists, continue reconnecting
+        this.callbacks.onStatusChange("reconnecting", {
+          attempt: this.retryCount,
+          maxRetries: this.maxRetries,
+          delay,
+        });
+        this.reconnectTimer = setTimeout(() => this.connect(), delay);
+      });
+      return;
+    }
+
     this.callbacks.onStatusChange("reconnecting", {
       attempt: this.retryCount,
       maxRetries: this.maxRetries,
       delay,
     });
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+
+  async checkTerminalExists() {
+    try {
+      const res = await fetch(`/api/terminals`);
+      if (!res.ok) return false;
+      const terminals = await res.json();
+      return terminals.some((t) => t.id === this.terminalId);
+    } catch {
+      return true; // Assume exists if check fails (network issue)
+    }
   }
 
   send(data) {
@@ -3727,16 +3758,28 @@ class TerminalManager {
     const fitAddon = terminal._fitAddon;
     fitAddon.fit();
 
+    console.log(`[reconnect] Attempting to reconnect terminal ${id}...`);
     terminal.write("\x1b[33m[Reconnecting to existing terminal...]\x1b[0m\r\n");
 
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const wsUrl = `${protocol}//${location.host}/ws/terminals/${id}`;
+    console.log(`[reconnect] WebSocket URL: ${wsUrl}`);
+
     const ws = new ReconnectingWebSocket(
-      `${protocol}//${location.host}/ws/terminals/${id}`,
+      wsUrl,
       id,
       {
-        onMessage: (data) => terminal.write(data),
-        onStatusChange: (status, extra) =>
-          this.handleStatusChange(id, status, extra),
+        onMessage: (data) => {
+          // Log first 100 chars of received data for debugging
+          if (data.length > 0 && data.length < 200) {
+            console.log(`[reconnect] Received data for ${id}: ${data.length} bytes`);
+          }
+          terminal.write(data);
+        },
+        onStatusChange: (status, extra) => {
+          console.log(`[reconnect] Status change for ${id}: ${status}`, extra);
+          this.handleStatusChange(id, status, extra);
+        },
       },
     );
 
@@ -3800,7 +3843,11 @@ class TerminalManager {
       osc7Disposable,
       inputFallbackCleanup,
       inputState,
+      hasConnected: false, // Track if WebSocket has ever successfully connected
+      isReconnection: true, // Mark this as a reconnection scenario
     });
+
+    console.log(`[reconnect] Terminal ${id} stored in Map with isReconnection=true`);
 
     // Register with session registry for future reconnection
     this.sessionRegistry.register(id, { workspaceId, cwd, tabNum });
@@ -4254,20 +4301,46 @@ class TerminalManager {
     this.updateOverlay(id, status, extra);
     this.updateConnectionStatus(status);
 
+    const t = this.terminals.get(id);
+
     if (status === "connected") {
-      const t = this.terminals.get(id);
+      // Mark terminal as successfully connected
+      if (t) {
+        t.hasConnected = true;
+        console.log(`[reconnect] Terminal ${id} marked as hasConnected=true`);
+      }
+
       if (t && t.fitAddon && t.terminal && t.ws) {
+        console.log(`[reconnect] WebSocket connected for ${id}, syncing size and forcing refresh...`);
         requestAnimationFrame(() => {
           try {
             t.fitAddon.fit();
-            this.syncTerminalSize(id);
-            if (DEBUG) {
-              dbg("initial resize sync", {
-                id,
-                cols: t.terminal.cols,
-                rows: t.terminal.rows,
-              });
-            }
+            const cols = t.terminal.cols;
+            const rows = t.terminal.rows;
+            // Send resize to trigger SIGWINCH on server
+            t.ws.send(JSON.stringify({ type: "resize", cols, rows }));
+            console.log(`[reconnect] Sent resize ${cols}x${rows} for ${id}`);
+
+            // Force xterm.js to refresh the viewport after a delay
+            // This ensures any data received is properly rendered
+            setTimeout(() => {
+              try {
+                t.terminal.refresh(0, t.terminal.rows - 1);
+                console.log(`[reconnect] Forced xterm refresh for ${id}`);
+              } catch (e) {
+                console.warn(`[reconnect] xterm refresh failed for ${id}:`, e);
+              }
+            }, 500);
+
+            // Additional refresh after SIGWINCH sequence completes (server sends 3 cycles over ~2.5s)
+            setTimeout(() => {
+              try {
+                t.terminal.refresh(0, t.terminal.rows - 1);
+                console.log(`[reconnect] Second xterm refresh for ${id} (post-SIGWINCH)`);
+              } catch (e) {
+                console.warn(`[reconnect] Second xterm refresh failed for ${id}:`, e);
+              }
+            }, 3000);
           } catch (e) {
             console.warn(`[resize] Failed initial sync for ${id}:`, e);
           }
@@ -4275,12 +4348,28 @@ class TerminalManager {
       }
     }
 
+    // Only show "reconnecting" if we haven't successfully connected yet
+    // This prevents status flickering from rapid connect/disconnect cycles
+    if (status === "reconnecting" && t?.hasConnected) {
+      console.log(`[reconnect] Ignoring reconnecting status for ${id} (already connected once)`);
+      return; // Don't update tab to reconnecting if we've already connected
+    }
+
     const tab = this.tabs.querySelector(`[data-id="${id}"]`);
+    console.log(`[reconnect] Tab update for ${id}: status=${status}, tab found=${!!tab}, hasConnected=${t?.hasConnected}`);
     if (tab) {
       tab.classList.remove("reconnecting", "disconnected");
-      if (status === "reconnecting") tab.classList.add("reconnecting");
-      else if (status === "failed" || status === "dead")
+      if (status === "reconnecting") {
+        tab.classList.add("reconnecting");
+        console.log(`[reconnect] Tab ${id} marked as reconnecting`);
+      } else if (status === "failed" || status === "dead") {
         tab.classList.add("disconnected");
+        console.log(`[reconnect] Tab ${id} marked as disconnected`);
+      } else if (status === "connected") {
+        console.log(`[reconnect] Tab ${id} marked as connected (classes cleared)`);
+      }
+    } else {
+      console.warn(`[reconnect] Tab not found for ${id}!`);
     }
   }
 

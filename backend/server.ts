@@ -1622,9 +1622,103 @@ export async function startWebServer(host: string, port: number) {
         }
 
         sockets.add(ws as unknown as WebSocket);
-        debug(
-          `WebSocket connected for terminal ${terminalId} (${term.cols}x${term.rows})`,
+        const socketsCount = sockets.size;
+
+        // Check if this is a reconnect (terminal created more than 5 seconds ago)
+        const termAge = Date.now() - term.createdAt;
+        const isReconnect = termAge > 5000;
+
+        console.log(
+          `[ws] WebSocket connected for ${terminalId} (${term.cols}x${term.rows}), ` +
+          `sockets: ${socketsCount}, age: ${Math.round(termAge/1000)}s, isReconnect: ${isReconnect}`,
         );
+
+        // Send scrollback buffer to reconnecting client (tmux backend only)
+        if (isReconnect && TMUX_BACKEND && term.sessionName) {
+          (async () => {
+            try {
+              // Capture pane content with escape sequences (colors) - last 2000 lines
+              const captureProc = Bun.spawn(
+                [
+                  "tmux",
+                  "capture-pane",
+                  "-ep",
+                  "-S",
+                  "-2000",
+                  "-t",
+                  term.sessionName!,
+                ],
+                { stdout: "pipe", stderr: "pipe" },
+              );
+              const output = await new Response(captureProc.stdout).text();
+              await captureProc.exited;
+
+              if (output && ws.readyState === 1) {
+                // WebSocket.OPEN = 1
+                // Clear screen first, then write captured content
+                ws.send("\x1b[2J\x1b[H" + output);
+                debug(
+                  `[reconnect] Sent ${output.length} bytes of scrollback to ${terminalId}`,
+                );
+              }
+            } catch (err) {
+              debug(
+                `[reconnect] Failed to capture scrollback for ${terminalId}:`,
+                err,
+              );
+              // Send a simple connected confirmation even if capture fails
+              if (ws.readyState === 1) {
+                ws.send("\x1b[2J\x1b[H\x1b[32m[Reconnected]\x1b[0m\r\n");
+              }
+            }
+          })();
+        } else if (isReconnect && !TMUX_BACKEND) {
+          // Non-tmux backend reconnect: force SIGWINCH to trigger TUI redraw
+          // Use longer delays for Cloudflare tunnel compatibility
+          console.log(`[reconnect] Non-tmux reconnect for ${terminalId}, scheduling SIGWINCH sequence`);
+
+          // Wait for WebSocket to be fully established through tunnel
+          setTimeout(() => {
+            try {
+              const originalCols = term.cols;
+              const originalRows = term.rows;
+
+              // First SIGWINCH: shrink
+              console.log(`[reconnect] SIGWINCH 1/3 shrink for ${terminalId}: ${originalCols}x${originalRows} -> ${originalCols-1}x${originalRows}`);
+              term.terminal.resize(originalCols - 1, originalRows);
+
+              // Second SIGWINCH: restore (after delay for tunnel latency)
+              setTimeout(() => {
+                try {
+                  term.terminal.resize(originalCols, originalRows);
+                  console.log(`[reconnect] SIGWINCH 2/3 restore for ${terminalId}`);
+
+                  // Third: One more resize cycle to ensure TUI gets the signal
+                  setTimeout(() => {
+                    try {
+                      // Small size change to trigger another redraw
+                      term.terminal.resize(originalCols - 1, originalRows - 1);
+                      setTimeout(() => {
+                        try {
+                          term.terminal.resize(originalCols, originalRows);
+                          console.log(`[reconnect] SIGWINCH 3/3 final for ${terminalId}`);
+                        } catch (e) {
+                          console.error(`[reconnect] Final resize error for ${terminalId}:`, e);
+                        }
+                      }, 300);
+                    } catch (e) {
+                      console.error(`[reconnect] Third resize error for ${terminalId}:`, e);
+                    }
+                  }, 500);
+                } catch (e) {
+                  console.error(`[reconnect] Resize restore error for ${terminalId}:`, e);
+                }
+              }, 400);
+            } catch (e) {
+              console.error(`[reconnect] Resize shrink error for ${terminalId}:`, e);
+            }
+          }, 1000); // Longer initial delay for Cloudflare tunnel
+        }
       },
 
       message(ws: ServerWebSocket<WsData>, message) {
