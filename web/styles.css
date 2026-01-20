@@ -2251,3 +2251,350 @@ body.virtual-keyboard-open .extra-keys {
     display: none;
   }
 }
+
+/* =============================================================================
+   LAZYGIT-INSPIRED GIT PANEL LAYOUT
+   ============================================================================= */
+
+#git-panel.side-panel {
+  width: 800px;
+  max-width: 100vw;
+}
+
+@media (max-width: 900px) {
+  #git-panel.side-panel {
+    width: 100vw;
+  }
+}
+
+.git-panel-layout {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  height: calc(100% - 100px);
+  overflow: hidden;
+}
+
+@media (max-width: 600px) {
+  .git-panel-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .git-right-panel {
+    display: none;
+  }
+}
+
+.git-left-panel {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border-primary);
+  overflow: hidden;
+}
+
+.git-right-panel {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.git-files {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+.git-branches {
+  max-height: 200px;
+  overflow-y: auto;
+  padding: 8px;
+  border-top: 1px solid var(--border-primary);
+  background: var(--bg-tertiary);
+}
+
+.git-branches.hidden {
+  display: none;
+}
+
+/* File groups */
+.git-file-group {
+  margin-bottom: 12px;
+}
+
+.git-file-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.git-file-group-icon {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  padding: 2px 4px;
+  border-radius: 3px;
+}
+
+.git-file-group-icon.staged {
+  background: rgba(63, 185, 80, 0.2);
+  color: var(--accent-green);
+}
+.git-file-group-icon.modified {
+  background: rgba(227, 179, 65, 0.2);
+  color: #e3b341;
+}
+.git-file-group-icon.deleted {
+  background: rgba(248, 81, 73, 0.2);
+  color: #f85149;
+}
+.git-file-group-icon.untracked {
+  background: rgba(139, 148, 158, 0.2);
+  color: var(--text-secondary);
+}
+
+.git-file-group-items {
+  padding-left: 4px;
+}
+
+/* File items - lazygit style */
+.git-file.selected {
+  background: rgba(88, 166, 255, 0.15);
+  outline: 1px solid var(--accent-blue);
+}
+
+.git-file-status.staged {
+  color: var(--accent-green);
+}
+.git-file-status.modified {
+  color: #e3b341;
+}
+.git-file-status.deleted {
+  color: #f85149;
+}
+.git-file-status.untracked {
+  color: var(--text-secondary);
+}
+
+.git-file-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.git-file:hover .git-file-actions,
+.git-file.selected .git-file-actions {
+  opacity: 1;
+}
+
+/* Diff viewer */
+.git-diff-header,
+.git-history-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-primary);
+}
+
+/* diff2html overrides for dark theme */
+.d2h-wrapper {
+  background: transparent !important;
+}
+
+.d2h-file-wrapper {
+  border: none !important;
+  margin: 0 !important;
+}
+
+.d2h-file-header {
+  display: none !important;
+}
+
+.d2h-code-linenumber,
+.d2h-code-line {
+  background: transparent !important;
+  border: none !important;
+}
+
+.d2h-del {
+  background: rgba(248, 81, 73, 0.15) !important;
+}
+
+.d2h-ins {
+  background: rgba(63, 185, 80, 0.15) !important;
+}
+
+.d2h-info {
+  background: rgba(88, 166, 255, 0.1) !important;
+  color: var(--accent-blue) !important;
+}
+
+/* Plain diff fallback */
+.diff-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-line.diff-add {
+  background: rgba(63, 185, 80, 0.15);
+  color: var(--accent-green);
+}
+
+.diff-line.diff-del {
+  background: rgba(248, 81, 73, 0.15);
+  color: #f85149;
+}
+
+.diff-line.diff-hunk {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+/* History */
+.git-history {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 8px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+}
+
+.git-commit-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.git-commit-item:hover {
+  background: var(--bg-hover);
+}
+
+.git-commit-graph {
+  color: var(--accent-green);
+  white-space: pre;
+  min-width: 20px;
+}
+
+.git-commit-hash {
+  color: var(--accent-orange);
+  min-width: 60px;
+}
+
+.git-commit-message {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+
+.git-commit-date {
+  color: var(--text-secondary);
+  font-size: 10px;
+  min-width: 50px;
+  text-align: right;
+}
+
+/* Branch list */
+.git-branch-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.git-branch-item:hover {
+  background: var(--bg-hover);
+}
+
+.git-branch-item.current {
+  background: rgba(88, 166, 255, 0.1);
+  cursor: default;
+}
+
+.git-branch-icon {
+  color: var(--accent-blue);
+}
+
+.git-branch-name {
+  font-size: 12px;
+  font-family: "JetBrains Mono", monospace;
+}
+
+.git-branch.clickable {
+  cursor: pointer;
+}
+
+.git-branch.clickable:hover {
+  text-decoration: underline;
+}
+
+/* Bottom bar */
+.git-bottom-bar {
+  border-top: 1px solid var(--border-primary);
+  padding: 8px 12px;
+  background: var(--bg-tertiary);
+}
+
+.git-commit-area {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.git-commit-area textarea {
+  flex: 1;
+  resize: none;
+  padding: 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 12px;
+}
+
+.git-commit-area textarea:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.git-shortcuts {
+  display: flex;
+  gap: 16px;
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.git-shortcuts kbd {
+  padding: 2px 4px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 3px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 9px;
+}
+
+/* Utility classes */
+.centered {
+  text-align: center;
+  padding: 20px;
+}
+
+.panel-active {
+  box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
