@@ -3373,12 +3373,12 @@ class TerminalManager {
           JSON.stringify(finalData),
         );
       }
-      this.extraKeys.resetModifiers();
+      // Don't reset - modifiers stay active until user toggles them off
     } else if (mods.alt) {
       // ALT: prefix entire string with ESC
       finalData = "\x1b" + data;
       if (options.log) console.log("[ExtraKeys] Applied ALT");
-      this.extraKeys.resetModifiers();
+      // Don't reset - modifiers stay active until user toggles them off
     } else if (mods.shift) {
       // SHIFT: uppercase entire string
       finalData = data.toUpperCase();
@@ -3388,7 +3388,7 @@ class TerminalManager {
           JSON.stringify(finalData),
         );
       }
-      this.extraKeys.resetModifiers();
+      // Don't reset - modifiers stay active until user toggles them off
     }
 
     // Update visible debug overlay with input/output
