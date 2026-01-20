@@ -1332,6 +1332,50 @@ export function createWebApp() {
     }
   });
 
+  // GET /api/git/show?cwd=...&commit=...&path=...
+  app.get("/api/git/show", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    const commit = c.req.query("commit");
+    const path = c.req.query("path");
+
+    if (!cwd || !(await validateGitCwd(cwd))) {
+      return c.json({ error: "Forbidden path" }, 403);
+    }
+
+    // Allow hex hashes (4-40 chars), HEAD, HEAD~N, HEAD^N, and branch/tag names
+    if (
+      !commit ||
+      !/^([a-f0-9]{4,40}|HEAD(~\d+|\^\d+)?|[\w\-\/\.]+)$/i.test(commit)
+    ) {
+      return c.json({ error: "Invalid commit reference" }, 400);
+    }
+
+    if (!path) {
+      return c.json({ error: "Path required" }, 400);
+    }
+
+    try {
+      const proc = Bun.spawn(["git", "show", `${commit}:${path}`, "--"], {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+
+      const timeoutId = setTimeout(() => proc.kill(), 10000);
+      const content = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      clearTimeout(timeoutId);
+
+      if (exitCode !== 0) {
+        return c.json({ error: "File not found at commit" }, 404);
+      }
+
+      return c.json({ content, commit, path });
+    } catch (err) {
+      return c.json({ error: "Git show failed", message: String(err) }, 400);
+    }
+  });
+
   // =============================================================================
   // CLIPBOARD IMAGE UPLOAD
   // =============================================================================
