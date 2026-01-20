@@ -2941,12 +2941,29 @@ class GitManager {
   }
 
   async showDiff(path) {
-    const url = `/api/git/diff?cwd=${encodeURIComponent(this.currentCwd)}&path=${encodeURIComponent(path)}`;
-    const res = await fetch(url);
-    const data = await res.json();
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      this.panel.querySelector("#git-diff-title").textContent = path;
+      this.panel.querySelector("#git-diff").innerHTML =
+        '<p class="muted">Loading...</p>';
 
-    const diffContainer = this.panel.querySelector("#git-diff");
-    diffContainer.innerHTML = `<pre class="diff-content">${this.escapeHtml(data.diff || "No diff")}</pre>`;
+      const res = await fetch(
+        `/api/git/diff?cwd=${encodeURIComponent(cwd)}&path=${encodeURIComponent(path)}`,
+      );
+      const data = await res.json();
+
+      if (data.error) {
+        this.panel.querySelector("#git-diff").innerHTML =
+          `<p class="error">${this.escapeHtml(data.error)}</p>`;
+        return;
+      }
+
+      this.showDiffContent(data.diff, path);
+    } catch (err) {
+      console.error("Diff error:", err);
+      this.panel.querySelector("#git-diff").innerHTML =
+        '<p class="error">Failed to load diff</p>';
+    }
   }
 
   async toggleStage(path, status) {
@@ -2988,6 +3005,111 @@ class GitManager {
     const div = document.createElement("div");
     div.textContent = text;
     return div.innerHTML;
+  }
+
+  renderHistory() {
+    const container = this.panel.querySelector("#git-history");
+
+    if (this.state.commits.length === 0) {
+      container.innerHTML = '<p class="muted centered">No commits</p>';
+      return;
+    }
+
+    const html = this.state.commits
+      .map(
+        (commit) => `
+      <div class="git-commit-item" data-hash="${commit.hash}" title="${this.escapeHtml(commit.message)}">
+        <span class="git-commit-graph">${this.escapeHtml(commit.graph)}</span>
+        <span class="git-commit-hash">${commit.hash}</span>
+        <span class="git-commit-message">${this.escapeHtml(this.truncateMessage(commit.message))}</span>
+        <span class="git-commit-date">${this.formatDate(commit.date)}</span>
+      </div>
+    `,
+      )
+      .join("");
+
+    container.innerHTML = html;
+
+    // Click to show commit diff
+    container.querySelectorAll(".git-commit-item").forEach((el) => {
+      el.addEventListener("click", () => {
+        this.showCommitDiff(el.dataset.hash);
+      });
+    });
+  }
+
+  truncateMessage(msg, maxLen = 50) {
+    if (msg.length <= maxLen) return msg;
+    return msg.slice(0, maxLen - 3) + "...";
+  }
+
+  formatDate(isoDate) {
+    const date = new Date(isoDate);
+    const now = new Date();
+    const diffDays = Math.floor((now - date) / (1000 * 60 * 60 * 24));
+
+    if (diffDays === 0) return "today";
+    if (diffDays === 1) return "yesterday";
+    if (diffDays < 7) return `${diffDays}d ago`;
+    if (diffDays < 30) return `${Math.floor(diffDays / 7)}w ago`;
+    return `${Math.floor(diffDays / 30)}mo ago`;
+  }
+
+  async showCommitDiff(hash) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const res = await fetch(
+        `/api/git/diff?cwd=${encodeURIComponent(cwd)}&commit=${hash}`,
+      );
+      const data = await res.json();
+
+      this.panel.querySelector("#git-diff-title").textContent =
+        `Commit: ${hash}`;
+      this.showDiffContent(data.diff || "No changes");
+    } catch (err) {
+      console.error("Commit diff error:", err);
+    }
+  }
+
+  showDiffContent(diffText, filename = "") {
+    const container = this.panel.querySelector("#git-diff");
+
+    if (!diffText || diffText.trim() === "") {
+      container.innerHTML = '<p class="muted centered">No changes</p>';
+      return;
+    }
+
+    // Check if diff2html is available
+    if (typeof Diff2Html !== "undefined") {
+      try {
+        const diffHtml = Diff2Html.html(diffText, {
+          drawFileList: false,
+          matching: "lines",
+          outputFormat: "line-by-line",
+          renderNothingWhenEmpty: false,
+        });
+        container.innerHTML = diffHtml;
+        return;
+      } catch (err) {
+        console.warn("diff2html error, falling back to plain text:", err);
+      }
+    }
+
+    // Fallback to plain text with basic highlighting
+    const lines = diffText
+      .split("\n")
+      .map((line) => {
+        let className = "";
+        if (line.startsWith("+") && !line.startsWith("+++"))
+          className = "diff-add";
+        else if (line.startsWith("-") && !line.startsWith("---"))
+          className = "diff-del";
+        else if (line.startsWith("@")) className = "diff-hunk";
+        return `<div class="diff-line ${className}">${this.escapeHtml(line)}</div>`;
+      })
+      .join("");
+
+    container.innerHTML = `<pre class="diff-plain">${lines}</pre>`;
   }
 }
 
