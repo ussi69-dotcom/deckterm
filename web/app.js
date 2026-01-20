@@ -3499,9 +3499,11 @@ class TerminalManager {
         lastValue = textarea.value || "";
         return;
       }
-      if (!e || e.isComposing) {
+      if (!e) {
         return;
       }
+      // DON'T skip isComposing! Mobile keyboards use composition for ALL input.
+      // We need to process each character immediately, not wait for composition end.
 
       const inputType = e.inputType || "";
       if (inputType === "insertText") {
