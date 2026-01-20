@@ -2859,6 +2859,87 @@ class GitManager {
     return "";
   }
 
+  getAllFiles() {
+    return [
+      ...this.state.files.staged,
+      ...this.state.files.modified,
+      ...this.state.files.deleted,
+      ...this.state.files.untracked,
+    ];
+  }
+
+  renderFiles() {
+    const container = this.panel.querySelector("#git-files");
+    const groups = [
+      { key: "staged", label: "Staged", icon: "\u2713", color: "staged" },
+      { key: "modified", label: "Modified", icon: "M", color: "modified" },
+      { key: "deleted", label: "Deleted", icon: "D", color: "deleted" },
+      { key: "untracked", label: "Untracked", icon: "?", color: "untracked" },
+    ];
+
+    let html = "";
+    let globalIndex = 0;
+
+    groups.forEach((group) => {
+      const files = this.state.files[group.key];
+      if (files.length === 0) return;
+
+      html += `
+        <div class="git-file-group">
+          <div class="git-file-group-header">
+            <span class="git-file-group-icon ${group.color}">${group.icon}</span>
+            <span class="git-file-group-label">${group.label}</span>
+            <span class="git-file-group-count">(${files.length})</span>
+          </div>
+          <div class="git-file-group-items">
+      `;
+
+      files.forEach((f) => {
+        const isSelected = globalIndex === this.state.selectedIndex;
+        html += `
+          <div class="git-file ${isSelected ? "selected" : ""}" data-path="${this.escapeHtml(f.path)}" data-index="${globalIndex}">
+            <span class="git-file-status ${group.color}">${f.displayStatus}</span>
+            <span class="git-file-path" title="${this.escapeHtml(f.path)}">${this.escapeHtml(this.truncatePath(f.path))}</span>
+            <div class="git-file-actions">
+              <button class="git-file-diff" title="View diff">diff</button>
+              <button class="git-file-stage" title="${f.staged ? "Unstage" : "Stage"}">${f.staged ? "-" : "+"}</button>
+            </div>
+          </div>
+        `;
+        globalIndex++;
+      });
+
+      html += "</div></div>";
+    });
+
+    if (html === "") {
+      html = '<p class="muted centered">No changes</p>';
+    }
+
+    container.innerHTML = html;
+
+    // Add event listeners
+    container.querySelectorAll(".git-file").forEach((el) => {
+      el.addEventListener("click", (e) => {
+        if (e.target.classList.contains("git-file-diff")) {
+          this.showDiff(el.dataset.path);
+        } else if (e.target.classList.contains("git-file-stage")) {
+          const files = this.getAllFiles();
+          const file = files[parseInt(el.dataset.index)];
+          this.toggleStage(el.dataset.path, file?.staged);
+        } else {
+          this.state.selectedIndex = parseInt(el.dataset.index);
+          this.highlightSelectedFile();
+        }
+      });
+    });
+  }
+
+  truncatePath(path, maxLen = 30) {
+    if (path.length <= maxLen) return path;
+    return "..." + path.slice(-maxLen + 3);
+  }
+
   async showDiff(path) {
     const url = `/api/git/diff?cwd=${encodeURIComponent(this.currentCwd)}&path=${encodeURIComponent(path)}`;
     const res = await fetch(url);
