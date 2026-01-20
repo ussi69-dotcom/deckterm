@@ -2681,12 +2681,10 @@ class GitManager {
   }
 
   stageSelectedFile() {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    const selectedFile = fileElements[this.state.selectedIndex];
-    if (selectedFile) {
-      const path = selectedFile.dataset.path;
-      const status = selectedFile.querySelector(".git-file-status").textContent;
-      this.toggleStage(path, status);
+    const files = this.getAllFiles();
+    const file = files[this.state.selectedIndex];
+    if (file) {
+      this.toggleStage(file.path, file.staged);
     }
   }
 
@@ -2803,8 +2801,10 @@ class GitManager {
   }
 
   async show(cwd) {
-    this.currentCwd = cwd || document.getElementById("directory")?.value || "~";
+    this.state.cwd = cwd || document.getElementById("directory")?.value || "~";
+    this.currentCwd = this.state.cwd; // Keep backward compatibility
     this.panel.classList.remove("hidden");
+    this.state.selectedIndex = 0;
     await this.refresh();
   }
 
@@ -2919,11 +2919,12 @@ class GitManager {
 
     container.querySelectorAll(".git-file-stage").forEach((btn) => {
       btn.addEventListener("click", (e) => {
-        const path = e.target.closest(".git-file").dataset.path;
-        const status = e.target
-          .closest(".git-file")
-          .querySelector(".git-file-status").textContent;
-        this.toggleStage(path, status);
+        const el = e.target.closest(".git-file");
+        const files = this.getAllFiles();
+        const file = files[parseInt(el.dataset.index)];
+        if (file) {
+          this.toggleStage(file.path, file.staged);
+        }
       });
     });
   }
@@ -3043,17 +3044,30 @@ class GitManager {
     }
   }
 
-  async toggleStage(path, status) {
-    const isStaged = !status.startsWith(" ") && !status.startsWith("?");
-    const endpoint = isStaged ? "/api/git/unstage" : "/api/git/stage";
+  async toggleStage(path, isCurrentlyStaged) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const endpoint = isCurrentlyStaged
+        ? "/api/git/unstage"
+        : "/api/git/stage";
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths: [path] }),
+      });
 
-    await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: this.currentCwd, paths: [path] }),
-    });
+      const data = await res.json();
 
-    await this.refresh();
+      if (data.error) {
+        console.error("Stage/unstage error:", data.error);
+        return;
+      }
+
+      // Refresh file list
+      await this.refresh();
+    } catch (err) {
+      console.error("Toggle stage error:", err);
+    }
   }
 
   async commit() {
