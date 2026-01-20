@@ -1393,8 +1393,10 @@ class ExtraKeysManager {
     const extraKeys = document.getElementById("extra-keys");
     if (!extraKeys) return;
 
-    // Create visible debug overlay for mobile testing
-    this.createDebugOverlay();
+    // Only create debug overlay when ?debug=1 is in URL
+    if (DEBUG) {
+      this.createDebugOverlay();
+    }
 
     // GLOBAL input listener to catch ALL input events
     document.addEventListener(
@@ -3229,12 +3231,30 @@ class TerminalManager {
       },
     );
 
-    const inputState = { lastOnDataAt: 0, lastOnDataValue: "" };
+    const inputState = {
+      lastOnDataAt: 0,
+      lastOnDataValue: "",
+      lastFallbackAt: 0,
+      lastFallbackData: "",
+    };
     const onDataDisposable = terminal.onData((data) => {
       // Debug: direct DOM update
       const dbg = document.getElementById("modifier-debug");
       if (dbg)
         dbg.textContent = `onData1: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
+
+      // Skip if fallback already processed this input (within 50ms, same data)
+      // This prevents double-sending when both handlers fire
+      if (
+        inputState.lastFallbackAt &&
+        performance.now() - inputState.lastFallbackAt < 50
+      ) {
+        if (data === inputState.lastFallbackData) {
+          if (dbg) dbg.textContent = `onData1: SKIP (fallback handled)`;
+          return;
+        }
+      }
+
       inputState.lastOnDataAt = performance.now();
       inputState.lastOnDataValue = data;
       const finalData = this.applyExtraKeyModifiers(data);
@@ -3437,6 +3457,13 @@ class TerminalManager {
       if (!data) {
         lastValue = currentValue;
         return;
+      }
+
+      // Mark that fallback is handling this input BEFORE sending
+      // This prevents onData from double-processing the same input
+      if (inputState) {
+        inputState.lastFallbackAt = performance.now();
+        inputState.lastFallbackData = data;
       }
 
       const finalData = this.applyExtraKeyModifiers(data);
@@ -3987,12 +4014,30 @@ class TerminalManager {
         },
       );
 
-      const inputState = { lastOnDataAt: 0, lastOnDataValue: "" };
+      const inputState = {
+        lastOnDataAt: 0,
+        lastOnDataValue: "",
+        lastFallbackAt: 0,
+        lastFallbackData: "",
+      };
       const onDataDisposable = terminal.onData((data) => {
         // Debug: direct DOM update to see if onData fires at all
         const dbg = document.getElementById("modifier-debug");
         if (dbg)
           dbg.textContent = `onData: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
+
+        // Skip if fallback already processed this input (within 50ms, same data)
+        // This prevents double-sending when both handlers fire
+        if (
+          inputState.lastFallbackAt &&
+          performance.now() - inputState.lastFallbackAt < 50
+        ) {
+          if (data === inputState.lastFallbackData) {
+            if (dbg) dbg.textContent = `onData: SKIP (fallback handled)`;
+            return;
+          }
+        }
+
         const mods = this.extraKeys?.modifiers;
         console.log("[ExtraKeys] onData:", JSON.stringify(data), "mods:", mods);
         inputState.lastOnDataAt = performance.now();
