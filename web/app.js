@@ -544,15 +544,23 @@ class ReconnectingWebSocket {
     );
     this.retryCount++;
 
-    // After 3 failed attempts, check if terminal still exists
+    // After 3 failed attempts, classify whether this is permanent (terminal
+    // gone, or access blocked because the server isn't bootstrapped / denies
+    // us) versus a transient drop. A failed WS upgrade surfaces only as
+    // "Expected 101", so we probe over HTTP instead of looping pointlessly.
     if (this.retryCount === 3) {
-      this.checkTerminalExists().then((exists) => {
-        if (!exists) {
+      this.classifyReconnect().then((outcome) => {
+        if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.callbacks.onStatusChange("dead");
           return;
         }
-        // Terminal exists, continue reconnecting
+        if (outcome === "blocked") {
+          this.intentionallyClosed = true;
+          this.callbacks.onStatusChange("setup_required");
+          return;
+        }
+        // Genuinely transient — continue reconnecting.
         this.callbacks.onStatusChange("reconnecting", {
           attempt: this.retryCount,
           maxRetries: this.maxRetries,
@@ -571,15 +579,42 @@ class ReconnectingWebSocket {
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
-  async checkTerminalExists() {
+  async classifyReconnect() {
+    let catalogOk = false;
+    let catalogStatus = 0;
+    let terminalInCatalog = false;
+    let bootstrapped = null;
     try {
       const res = await fetch(`/api/terminals`);
-      if (!res.ok) return false;
-      const terminals = await res.json();
-      return terminals.some((t) => t.id === this.terminalId);
+      catalogOk = res.ok;
+      catalogStatus = res.status;
+      if (res.ok) {
+        const terminals = await res.json();
+        terminalInCatalog = terminals.some((t) => t.id === this.terminalId);
+      }
     } catch {
-      return true; // Assume exists if check fails (network issue)
+      // Network error — treat as transient, keep retrying.
+      return "retry";
     }
+    // Only the ambiguous "terminal still listed but socket won't open" case
+    // needs the extra probe; resolve it against the bootstrap gate.
+    if (catalogOk && terminalInCatalog) {
+      try {
+        const sres = await fetch(`/api/foundation/status`);
+        if (sres.ok) {
+          const status = await sres.json();
+          bootstrapped = status?.bootstrap?.bootstrapped ?? null;
+        }
+      } catch {
+        /* leave bootstrapped null → classified as retry */
+      }
+    }
+    return window.ReconnectClassify.classifyReconnectFailure({
+      catalogOk,
+      catalogStatus,
+      terminalInCatalog,
+      bootstrapped,
+    });
   }
 
   send(data) {
@@ -8315,6 +8350,16 @@ class TerminalManager {
         <button class="btn" data-overlay-action="close">Close</button>
       `,
       },
+      setup_required: {
+        icon: "🔒",
+        message:
+          "Terminal access is locked — server setup (bootstrap) or permission is required.",
+        actions: `
+        <button class="btn btn-primary" data-overlay-action="setup">Open Setup</button>
+        <button class="btn" data-overlay-action="retry">Retry</button>
+        <button class="btn" data-overlay-action="close">Close</button>
+      `,
+      },
       taken_over: {
         icon: "📱",
         message: "Session resumed on another device",
@@ -8353,6 +8398,10 @@ class TerminalManager {
         if (action === "new-terminal") {
           this.closeTerminal(id);
           this.createTerminal();
+          return;
+        }
+        if (action === "setup") {
+          this.openSetupPanel?.();
           return;
         }
         if (action === "close") {
@@ -8398,7 +8447,8 @@ class TerminalManager {
       } else if (
         status === "failed" ||
         status === "dead" ||
-        status === "taken_over"
+        status === "taken_over" ||
+        status === "setup_required"
       ) {
         tab.classList.add("disconnected");
         dbg(`[reconnect] Tab ${id} marked as disconnected`);
