@@ -176,6 +176,8 @@ Co task dělá: rozjede pracovní workspace s **worker/judge terminály**, spou�
 
 > **Follow-up k izolaci (2026-06-01).** Po splitu jela dev na fresh **nebootstrapnuté** DB → terminál se vytvořil, ale WS attach (`/ws/terminals/:id`) je gatovaný `isBootstrapComplete || isFoundationLegacyBypassEnabled`, takže vracel 403 „bootstrap required" → klient zacyklil na „Reconnecting…" (HTTP create projde, dead-check projde, ale socket se nikdy neotevře — „Expected 101"). Fix: dev unit dostal i `DECKTERM_LEGACY_NO_BOOTSTRAP=1` (ctí se jen s `DECKTERM_RUNTIME_ENV=development`, takže dev-only). **Dev unit teď drží: `DECKTERM_STATE_DIR=/home/deploy/.deckterm-dev` + `DECKTERM_LEGACY_NO_BOOTSTRAP=1` — při resetu dev DB nech obě.**
 
+> **Reconnect klasifikace permanentního selhání (2026-06-01).** Aby se „Reconnecting… 10/10" na trvalém 403 už neopakovalo zbytečně: `ReconnectingWebSocket` na 3. pokus klasifikuje přes `web/reconnect-classify.js` (`classifyReconnectFailure` → `gone`/`blocked`/`retry`, probe `/api/terminals` + `/api/foundation/status`). `blocked` (401/403 katalog nebo terminál v katalogu + nebootstrapnutý server) → nový overlay `setup_required` (🔒 Open Setup / Retry / Close), smyčka se zastaví. Backlog #11, commit `50bc7cc`.
+
 Záměr (z foundation rozhodnutí #18): **hybrid** — terminál pro rychlou práci, task pro strukturovanou agentní práci s auditovatelným outcome. Terminálové session můžou být buď připojené k tasku, nebo standalone.
 
 > Pozn.: v C2 byla parkována změna defaultního providera `codex → claude` — je to _mimo_ bezpečnostní řez a čeká na samostatné rozhodnutí (model-research doporučuje držet codex jako delegátora). Default zatím zůstává `codex`.
