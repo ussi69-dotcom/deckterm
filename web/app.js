@@ -544,15 +544,23 @@ class ReconnectingWebSocket {
     );
     this.retryCount++;
 
-    // After 3 failed attempts, check if terminal still exists
+    // After 3 failed attempts, classify whether this is permanent (terminal
+    // gone, or access blocked because the server isn't bootstrapped / denies
+    // us) versus a transient drop. A failed WS upgrade surfaces only as
+    // "Expected 101", so we probe over HTTP instead of looping pointlessly.
     if (this.retryCount === 3) {
-      this.checkTerminalExists().then((exists) => {
-        if (!exists) {
+      this.classifyReconnect().then((outcome) => {
+        if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.callbacks.onStatusChange("dead");
           return;
         }
-        // Terminal exists, continue reconnecting
+        if (outcome === "blocked") {
+          this.intentionallyClosed = true;
+          this.callbacks.onStatusChange("setup_required");
+          return;
+        }
+        // Genuinely transient — continue reconnecting.
         this.callbacks.onStatusChange("reconnecting", {
           attempt: this.retryCount,
           maxRetries: this.maxRetries,
@@ -571,15 +579,42 @@ class ReconnectingWebSocket {
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
-  async checkTerminalExists() {
+  async classifyReconnect() {
+    let catalogOk = false;
+    let catalogStatus = 0;
+    let terminalInCatalog = false;
+    let bootstrapped = null;
     try {
       const res = await fetch(`/api/terminals`);
-      if (!res.ok) return false;
-      const terminals = await res.json();
-      return terminals.some((t) => t.id === this.terminalId);
+      catalogOk = res.ok;
+      catalogStatus = res.status;
+      if (res.ok) {
+        const terminals = await res.json();
+        terminalInCatalog = terminals.some((t) => t.id === this.terminalId);
+      }
     } catch {
-      return true; // Assume exists if check fails (network issue)
+      // Network error — treat as transient, keep retrying.
+      return "retry";
     }
+    // Only the ambiguous "terminal still listed but socket won't open" case
+    // needs the extra probe; resolve it against the bootstrap gate.
+    if (catalogOk && terminalInCatalog) {
+      try {
+        const sres = await fetch(`/api/foundation/status`);
+        if (sres.ok) {
+          const status = await sres.json();
+          bootstrapped = status?.bootstrap?.bootstrapped ?? null;
+        }
+      } catch {
+        /* leave bootstrapped null → classified as retry */
+      }
+    }
+    return window.ReconnectClassify.classifyReconnectFailure({
+      catalogOk,
+      catalogStatus,
+      terminalInCatalog,
+      bootstrapped,
+    });
   }
 
   send(data) {
@@ -1018,6 +1053,16 @@ const platformDetector = new PlatformDetector();
 
 function syncInteractionModeClasses() {
   document.body.classList.toggle("touch-input-mode", platformDetector.hasTouch);
+}
+
+// True when the event target is a text-entry surface (input/textarea/select or
+// any contenteditable region). Used to stop single-character global shortcuts
+// like `?` from firing while the user is typing into a field.
+function isEditableTarget(target) {
+  if (!target || typeof target.tagName !== "string") return false;
+  const tag = target.tagName.toUpperCase();
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return target.isContentEditable === true;
 }
 
 // =============================================================================
@@ -2676,6 +2721,7 @@ class GitManager {
         <div class="git-commit-area">
           <textarea id="git-message" placeholder="Commit message..." rows="2"></textarea>
           <button id="git-commit-btn" class="btn btn-primary">Commit</button>
+          <span id="git-commit-status" class="git-commit-status"></span>
         </div>
         <div class="git-shortcuts">
           <span><kbd>j</kbd>/<kbd>k</kbd> navigate</span>
@@ -2921,7 +2967,7 @@ class GitManager {
       const data = await res.json();
 
       if (data.error) {
-        alert(`Checkout failed: ${data.error}`);
+        alert(formatGitCheckoutError(data));
         return;
       }
 
@@ -3356,22 +3402,50 @@ class GitManager {
   async commit() {
     const message = this.panel.querySelector("#git-message").value.trim();
     if (!message) {
-      alert("Commit message required");
+      this.showCommitStatus("Commit message required", "error");
       return;
     }
 
-    const res = await fetch("/api/git/commit", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cwd: this.currentCwd, message }),
-    });
+    const cwd = this.state.cwd || this.currentCwd;
+    try {
+      const res = await fetch("/api/git/commit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, message }),
+      });
 
-    const data = await res.json();
-    if (data.error) {
-      alert(data.error + ": " + data.message);
-    } else {
+      const data = await res.json();
+      if (data.error) {
+        // git puts "nothing to commit" on stdout; the backend now folds that
+        // into `message`, so surface the real reason instead of a bare error.
+        const formatGit =
+          typeof formatGitError === "function"
+            ? formatGitError
+            : (p) => (p && p.error) || "Commit failed";
+        this.showCommitStatus(formatGit(data, "Commit failed"), "error");
+        return;
+      }
+
       this.panel.querySelector("#git-message").value = "";
+      this.showCommitStatus("Committed", "success");
       await this.refresh();
+    } catch (err) {
+      console.error("Commit error:", err);
+      this.showCommitStatus("Commit failed: network error", "error");
+    }
+  }
+
+  showCommitStatus(text, kind = "info") {
+    const el = this.panel.querySelector("#git-commit-status");
+    if (!el) return;
+    el.textContent = text;
+    el.className = `git-commit-status ${kind}`;
+    clearTimeout(this._commitStatusTimer);
+    if (kind === "success") {
+      this._commitStatusTimer = setTimeout(() => {
+        el.textContent = "";
+        el.className = "git-commit-status";
+      }, 3000);
     }
   }
 
@@ -4664,14 +4738,56 @@ class TerminalManager {
     panel
       .querySelector("#sessions-refresh-btn")
       ?.addEventListener("click", () => this.refreshSessionsPanel());
-    panel
-      .querySelector("#sessions-list")
-      ?.addEventListener("click", (event) => {
-        const button = event.target.closest("[data-session-id]");
-        if (!button) return;
-        const sessionId = button.dataset.sessionId;
-        if (sessionId) this.switchTo(sessionId);
-      });
+    const list = panel.querySelector("#sessions-list");
+    list?.addEventListener("click", (event) => {
+      const row = event.target.closest("[data-session-id]");
+      if (!row) return;
+      void this.handleSessionRowActivate(row.dataset.sessionId);
+    });
+    // Keyboard affordance: rows are role="button", so Enter/Space activate them.
+    list?.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      const row = event.target.closest("[data-session-id]");
+      if (!row) return;
+      event.preventDefault();
+      void this.handleSessionRowActivate(row.dataset.sessionId);
+    });
+  }
+
+  async handleSessionRowActivate(sessionId) {
+    if (!sessionId) return;
+    const session = (this._sessionCatalog || []).find(
+      (s) => s.id === sessionId,
+    );
+    if (!session) {
+      // Catalog moved on under us — re-fetch rather than act on stale data.
+      await this.refreshSessionsPanel();
+      return;
+    }
+    const action = window.SessionActions.planSessionRowAction(session, {
+      isLocallyOpen: this.terminals.has(sessionId),
+    });
+    switch (action.kind) {
+      case "focus":
+        this.switchTo(sessionId);
+        break;
+      case "attach":
+        await this.reconnectToTerminal(
+          sessionId,
+          session.cwd,
+          this.sessionRegistry.get(sessionId),
+          {
+            backendMode: session.backendMode || null,
+            supportsLinkedView: Boolean(session.supportsLinkedView),
+          },
+        );
+        this.switchTo(sessionId);
+        break;
+      case "open-here":
+        await this.createTerminal(false, { cwd: session.cwd });
+        break;
+    }
+    this.closeSessionsPanel();
   }
 
   openSessionsPanel() {
@@ -4704,23 +4820,31 @@ class TerminalManager {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const sessions = await res.json();
+      // Keep the catalog so the click handler can resolve cwd/flags per row.
+      this._sessionCatalog = sessions;
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
         return;
       }
+      const esc = (v) => (this.escapeHtml ? this.escapeHtml(v) : v);
       list.innerHTML = sessions
         .map((s) => {
-          const isActive = this.terminals.has(s.id);
+          const isLocallyOpen = this.terminals.has(s.id);
+          const action = window.SessionActions.planSessionRowAction(s, {
+            isLocallyOpen,
+          });
           const status = s.sessionStatus || s.status || "unknown";
           const mode = s.mode || "write";
-          const cwd = this.escapeHtml
-            ? this.escapeHtml(s.cwd || "")
-            : s.cwd || "";
-          return `<button class="task-item" type="button" data-session-id="${s.id}" style="width: 100%; text-align: left;">
-          <strong>${isActive ? "●" : "○"} ${s.id.slice(0, 8)}</strong>
-          <div>${cwd}</div>
-          <small>${status} · ${mode}${s.sessionName ? " · tmux" : ""}</small>
-        </button>`;
+          const cwd = esc(s.cwd || "");
+          const dot = action.statusClass === "active" ? "●" : "○";
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${s.id}">
+          <div class="session-row-main">
+            <strong><span class="session-badge ${action.statusClass}">${dot}</span> ${s.id.slice(0, 8)}</strong>
+            <div class="session-row-cwd">${cwd}</div>
+            <small>${esc(status)} · ${esc(mode)}${s.sessionName ? " · tmux" : ""}</small>
+          </div>
+          <button class="session-row-action" type="button" data-session-action="${s.id}">${action.label}</button>
+        </div>`;
         })
         .join("");
     } catch (err) {
@@ -6596,7 +6720,7 @@ class TerminalManager {
       });
       const payload = await res.json().catch(() => ({}));
       if (!res.ok || payload.error) {
-        alert(payload.error || "Checkout failed");
+        alert(formatGitCheckoutError(payload));
         return;
       }
 
@@ -7381,7 +7505,10 @@ class TerminalManager {
         e.preventDefault();
         this.changeFontSize(-1);
       }
-      if (e.key === "F1" || e.key === "?") {
+      // `?` is a literal character in task/commit/search inputs — only treat it
+      // as the help shortcut when focus is not inside an editable field. F1 is a
+      // function key (never typed as text) so it opens help anywhere.
+      if (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target))) {
         e.preventDefault();
         this.openHelp();
       }
@@ -8223,6 +8350,16 @@ class TerminalManager {
         <button class="btn" data-overlay-action="close">Close</button>
       `,
       },
+      setup_required: {
+        icon: "🔒",
+        message:
+          "Terminal access is locked — server setup (bootstrap) or permission is required.",
+        actions: `
+        <button class="btn btn-primary" data-overlay-action="setup">Open Setup</button>
+        <button class="btn" data-overlay-action="retry">Retry</button>
+        <button class="btn" data-overlay-action="close">Close</button>
+      `,
+      },
       taken_over: {
         icon: "📱",
         message: "Session resumed on another device",
@@ -8261,6 +8398,10 @@ class TerminalManager {
         if (action === "new-terminal") {
           this.closeTerminal(id);
           this.createTerminal();
+          return;
+        }
+        if (action === "setup") {
+          this.openSetupPanel?.();
           return;
         }
         if (action === "close") {
@@ -8306,7 +8447,8 @@ class TerminalManager {
       } else if (
         status === "failed" ||
         status === "dead" ||
-        status === "taken_over"
+        status === "taken_over" ||
+        status === "setup_required"
       ) {
         tab.classList.add("disconnected");
         dbg(`[reconnect] Tab ${id} marked as disconnected`);
@@ -8519,13 +8661,13 @@ class TerminalManager {
 
   // Create a new terminal in a new workspace (split=false) or current workspace (split=true)
   async createTerminal(split = false, options = {}) {
-    const { skipBootstrapWait = false } = options;
+    const { skipBootstrapWait = false, cwd: cwdOverride } = options;
     if (!skipBootstrapWait) {
       await this.waitForBootstrap();
     }
     await this.waitForFontMetrics();
 
-    const cwd = this.getCurrentDirectoryValue() || undefined;
+    const cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
     const { cols, rows } = this.estimateInitialTerminalSize(split);
 
     try {
@@ -8535,7 +8677,18 @@ class TerminalManager {
         body: JSON.stringify({ cwd, cols, rows }),
       });
 
-      if (!res.ok) throw new Error("Failed to create terminal");
+      if (!res.ok) {
+        // Surface the backend's real reason (e.g. SQLITE_BUSY-driven 500,
+        // max-terminals limit, bad cwd) instead of a generic, doubled message.
+        let reason = `HTTP ${res.status}`;
+        try {
+          const body = await res.json();
+          reason = body.message || body.error || reason;
+        } catch (_) {
+          /* non-JSON body — keep the status code */
+        }
+        throw new Error(reason);
+      }
 
       const terminalInfo = await res.json();
       const { id } = terminalInfo;

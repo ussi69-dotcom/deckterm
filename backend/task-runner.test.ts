@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -186,6 +186,169 @@ test("createTask can isolate work in a generated git worktree", async () => {
   expect(
     calls.some((call) => call.args[0] === "git" && call.args[1] === "worktree"),
   ).toBe(true);
+});
+
+test("createTask links node_modules into the worktree when the repo has dependencies", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  await mkdir(join(projectRoot, "node_modules"));
+  const calls: { cwd: string; args: string[] }[] = [];
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async ({ cwd, args }) => {
+      calls.push({ cwd, args });
+      if (args.join(" ") === "git rev-parse --show-toplevel") {
+        return { exitCode: 0, stdout: `${projectRoot}\n`, stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  const task = await runner.createTask(
+    {
+      title: "Needs deps",
+      description: "Worktree should reuse node_modules.",
+      projectRoot,
+      workerProvider: "codex",
+      judgeProvider: "codex",
+      useWorktree: true,
+    },
+    { ownerId: "user-1" },
+  );
+
+  expect(
+    calls.some(
+      (call) =>
+        call.args[0] === "ln" &&
+        call.args.includes(join(projectRoot, "node_modules")) &&
+        call.args.includes(join(task.workingDirectory, "node_modules")),
+    ),
+  ).toBe(true);
+});
+
+test("createTask skips node_modules link when the repo has no dependencies", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const calls: { cwd: string; args: string[] }[] = [];
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async ({ cwd, args }) => {
+      calls.push({ cwd, args });
+      if (args.join(" ") === "git rev-parse --show-toplevel") {
+        return { exitCode: 0, stdout: `${projectRoot}\n`, stderr: "" };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  await runner.createTask(
+    {
+      title: "No deps",
+      description: "Nothing to link.",
+      projectRoot,
+      workerProvider: "codex",
+      judgeProvider: "codex",
+      useWorktree: true,
+    },
+    { ownerId: "user-1" },
+  );
+
+  expect(calls.some((call) => call.args[0] === "ln")).toBe(false);
+});
+
+test("handleTerminalExit advances a stuck worker-running task to needs-user", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+
+  const task = await runner.createTask(
+    {
+      title: "Worker exit",
+      description: "Sync status when worker terminal ends.",
+      projectRoot,
+      workerProvider: "codex",
+      judgeProvider: "codex",
+      useWorktree: false,
+    },
+    { ownerId: "user-1" },
+  );
+  await runner.markWorkerStarted(task.id, { ownerId: "user-1" }, "term-worker");
+
+  const updated = await runner.handleTerminalExit("user-1", "term-worker");
+
+  expect(updated?.status).toBe("needs-user");
+  expect(await readFile(task.controlFiles.roundsFile, "utf8")).toContain(
+    "worker-exited",
+  );
+  const reloaded = await runner.getTask(task.id, { ownerId: "user-1" });
+  expect(reloaded.status).toBe("needs-user");
+});
+
+test("handleTerminalExit advances a stuck judge-running task to needs-user", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+
+  const task = await runner.createTask(
+    {
+      title: "Judge exit",
+      description: "Sync status when judge terminal ends.",
+      projectRoot,
+      workerProvider: "codex",
+      judgeProvider: "codex",
+      useWorktree: false,
+    },
+    { ownerId: "user-1" },
+  );
+  await runner.markJudgeStarted(task.id, { ownerId: "user-1" }, "term-judge");
+
+  const updated = await runner.handleTerminalExit("user-1", "term-judge");
+
+  expect(updated?.status).toBe("needs-user");
+});
+
+test("handleTerminalExit ignores terminals not bound to a running task", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+
+  const task = await runner.createTask(
+    {
+      title: "Unrelated exit",
+      description: "Other terminals must not move task status.",
+      projectRoot,
+      workerProvider: "codex",
+      judgeProvider: "codex",
+      useWorktree: false,
+    },
+    { ownerId: "user-1" },
+  );
+  await runner.markWorkerStarted(task.id, { ownerId: "user-1" }, "term-worker");
+
+  const updated = await runner.handleTerminalExit("user-1", "some-other-term");
+
+  expect(updated).toBeNull();
+  const reloaded = await runner.getTask(task.id, { ownerId: "user-1" });
+  expect(reloaded.status).toBe("worker-running");
 });
 
 test("deleteTask removes the git worktree before deleting task metadata", async () => {

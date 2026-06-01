@@ -84,6 +84,8 @@ Capabilities (granty): `terminal.create`, `terminal.attach`, `terminal.write`, `
 
 **Gotcha:** `foundationStatePromise` je **module-level singleton** — jeden foundation state na proces. Proto API testy drží jeden foundation-bearing test na soubor (viz `task-api.test.ts`).
 
+**Gotcha (state dir, 2026-06-01):** `DECKTERM_STATE_DIR` je rovněž module-level const zmražený při importu `server.ts`. Runtime služby v `createWebApp()` (task runner) proto resolvují state dir **za běhu** přes `resolveStateDir()` — jinak by test, který nastaví temp dir až po importu, psal task workspace do živého `~/.deckterm/tasks` (leakly `api-task-*` do reálného UI). Prod beze změny (env je při startu stabilní). `task-api.test.ts` má guard, že task přistál pod temp dir.
+
 ### 3.2 Bootstrap gate (C0)
 
 Čerstvý/produkční start zablokuje host-terminal přístup, dokud neexistuje admin. Dvě cesty k prvnímu adminovi:
@@ -163,6 +165,18 @@ Po reloadu prohlížeče se automaticky obnovují session, které běžely před
 - **Task** = strukturovaný workflow pro práci agenta/člověka s historií a výsledkem.
 
 Co task dělá: rozjede pracovní workspace s **worker/judge terminály**, spouští **checks**, volitelně používá **git worktrees** pro izolaci. Provideři přes `DECKTERM_TASK_PROVIDERS` (`codex,claude`), max kol `DECKTERM_TASK_MAX_ROUNDS` (5). Task má registrovaný `projectRoot`, který od C2 prochází stejným file-access gate jako všechno ostatní.
+
+> **Status sync & worktree deps (2026-05-31).** Když worker/judge terminál skončí, task se sám posune z `worker-running`/`judge-running` na `needs-user` (`taskRunner.handleTerminalExit`, napojeno přes module-level `onTerminalExit` registry v `closeAndRemoveTerminal`) — dřív visel navždy. A `createWorktree` symlinkuje `node_modules` z repo rootu do worktree, takže dep-importující checks (`bun run test:unit`) v izolovaném worktree nepadají na `Cannot find package`.
+
+> **Follow-up úklid (2026-06-01).** Git panel: commit selhání teď surfacuje reálný důvod ("nothing to commit") — git ho píše na stdout, ne stderr, takže backend fallbackuje na stdout a `commit()` ho zobrazí inline (`#git-commit-status`) místo prázdného `alert()`; `git-error.js` zobecněn na `formatGitError`. Help: `?` už neotevírá help při psaní v inputu (`isEditableTarget`), `F1` funguje všude. Detaily a stav: `docs/plans/2026-05-29-followups-backlog.md` (#5/#7/#8).
+
+> **Sessions drawer attach (2026-06-01).** Klik na řádek v Session Manageru uměl jen `switchTo` lokálně otevřené session; živá-ale-neotevřená session (tmux běží, ale tenhle prohlížeč ji nedrží) tiše nic. Nově čistá funkce `planSessionRowAction` (`web/session-actions.js`) rozhodne **focus / attach / open-here** z katalogu + lokální mapy a drawer renderuje status badge + kontextové akční tlačítko; attach jde přes existující `reconnectToTerminal`, open-here přes `createTerminal({cwd})`. Auto-reconnect i backend WS attach byly ověřeny jako funkční — drawer je manuální záchrana, když auto-reconnect vyčerpá pokusy. Design: `docs/plans/2026-06-01-sessions-drawer-attach-design.md`, backlog #9.
+
+> **DB busy_timeout + dev/prod state izolace (2026-06-01).** Vytvoření terminálu občas padalo na 500 „Failed to create terminal" — `SQLITE_BUSY`: **dev (4174) i prod (4173) defaultně sdílely `~/.deckterm/deckterm.db`** a WAL DB neměla `busy_timeout`, takže souběžný zápis hned vyhodil výjimku. Fix: `openFoundationDb` nastavuje `PRAGMA busy_timeout = 5000` (souběžný zapisovatel počká); `createTerminal` surfacuje reálný backend důvod místo generické hlášky; **dev systemd unit dostal `DECKTERM_STATE_DIR=/home/deploy/.deckterm-dev`** → dev už nezapisuje do prod bezpečnostního stavu (prod zůstává `~/.deckterm`). ⚠️ **Pozn. pro budoucí session: dev foundation DB je teď `~/.deckterm-dev/deckterm.db`, ne `~/.deckterm`.** Backlog #10.
+
+> **Follow-up k izolaci (2026-06-01).** Po splitu jela dev na fresh **nebootstrapnuté** DB → terminál se vytvořil, ale WS attach (`/ws/terminals/:id`) je gatovaný `isBootstrapComplete || isFoundationLegacyBypassEnabled`, takže vracel 403 „bootstrap required" → klient zacyklil na „Reconnecting…" (HTTP create projde, dead-check projde, ale socket se nikdy neotevře — „Expected 101"). Fix: dev unit dostal i `DECKTERM_LEGACY_NO_BOOTSTRAP=1` (ctí se jen s `DECKTERM_RUNTIME_ENV=development`, takže dev-only). **Dev unit teď drží: `DECKTERM_STATE_DIR=/home/deploy/.deckterm-dev` + `DECKTERM_LEGACY_NO_BOOTSTRAP=1` — při resetu dev DB nech obě.**
+
+> **Reconnect klasifikace permanentního selhání (2026-06-01).** Aby se „Reconnecting… 10/10" na trvalém 403 už neopakovalo zbytečně: `ReconnectingWebSocket` na 3. pokus klasifikuje přes `web/reconnect-classify.js` (`classifyReconnectFailure` → `gone`/`blocked`/`retry`, probe `/api/terminals` + `/api/foundation/status`). `blocked` (401/403 katalog nebo terminál v katalogu + nebootstrapnutý server) → nový overlay `setup_required` (🔒 Open Setup / Retry / Close), smyčka se zastaví. Backlog #11, commit `50bc7cc`.
 
 Záměr (z foundation rozhodnutí #18): **hybrid** — terminál pro rychlou práci, task pro strukturovanou agentní práci s auditovatelným outcome. Terminálové session můžou být buď připojené k tasku, nebo standalone.
 

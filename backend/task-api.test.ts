@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   bootstrapFirstAdmin,
@@ -82,6 +82,20 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const created = await createRes.json();
   expect(created.status).toBe("ready");
   expect(created.checks[0].command).toBe("bun run test:unit");
+
+  // Isolation guard: the workspace must land under the temp state dir, never
+  // the live ~/.deckterm (regression for leaked api-task-* dirs in the real
+  // UI). createWebApp resolves the task-runner state dir at call time, so the
+  // DECKTERM_STATE_DIR set above is honored even when server.ts was imported
+  // (and its module const frozen) by an earlier test. The owner segment is the
+  // resolved actor id (e.g. "tunnel"), so scan every owner rather than assume.
+  const taskOwners = await readdir(join(stateDir, "tasks"));
+  const persistedTaskDirs = (
+    await Promise.all(
+      taskOwners.map((owner) => readdir(join(stateDir, "tasks", owner))),
+    )
+  ).flat();
+  expect(persistedTaskDirs).toContain(created.slug);
 
   const listRes = await app.fetch(
     new Request("http://deckterm.test/api/tasks"),

@@ -187,9 +187,20 @@ const CLAUDE_AGENT_RESPONDING_IDLE_MS = parseInt(
 const CF_ACCESS_REQUIRED = process.env.CF_ACCESS_REQUIRED === "1";
 const CF_ACCESS_TEAM_NAME = process.env.CF_ACCESS_TEAM_NAME || "";
 const CF_ACCESS_AUD = process.env.CF_ACCESS_AUD || "";
-const DECKTERM_STATE_DIR =
-  process.env.DECKTERM_STATE_DIR ||
-  join(process.env.HOME || "/home/deploy", ".deckterm");
+// Resolves the state directory from the current environment. Prefer this over
+// the frozen DECKTERM_STATE_DIR const for runtime services wired in
+// createWebApp(): the const is captured at module import, so a test that sets
+// DECKTERM_STATE_DIR after server.ts is first imported would otherwise write
+// task workspaces into the live ~/.deckterm (leaking api-task-* dirs into the
+// real UI). In production the env is stable at startup, so this matches the
+// const exactly.
+function resolveStateDir(): string {
+  return (
+    process.env.DECKTERM_STATE_DIR ||
+    join(process.env.HOME || "/home/deploy", ".deckterm")
+  );
+}
+const DECKTERM_STATE_DIR = resolveStateDir();
 // Identifies which build is actually running, so a deploy can verify that prod
 // is serving the release it just promoted (not a rolled-back / stale process).
 // Sourced from env, then a RELEASE_ID marker written next to the app at deploy
@@ -289,6 +300,27 @@ const HOP_BY_HOP_HEADERS = [
 
 // Terminal sessions (PTY processes)
 const terminals = new Map<string, Terminal>();
+
+// Listeners notified when any terminal exits. The task runner uses this to
+// advance tasks stuck on worker-running/judge-running once their agent
+// terminal ends (status otherwise only changes on explicit user actions).
+const terminalExitListeners: Array<
+  (ownerId: string, terminalId: string) => void
+> = [];
+function onTerminalExit(
+  listener: (ownerId: string, terminalId: string) => void,
+) {
+  terminalExitListeners.push(listener);
+}
+function notifyTerminalExit(ownerId: string, terminalId: string) {
+  for (const listener of terminalExitListeners) {
+    try {
+      listener(ownerId, terminalId);
+    } catch (err) {
+      debug("Terminal exit listener failed:", err);
+    }
+  }
+}
 const terminalSockets = new Map<string, Set<ServerWebSocket<WsData>>>();
 type TerminalReconnectState = {
   pendingReady: boolean;
@@ -2006,6 +2038,7 @@ async function createManagedTerminal({
     getFoundationState()
       .then((state) => markTerminalSessionEnded(state.db, id))
       .catch((err) => debug("Failed to mark terminal session ended:", err));
+    notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
     terminal.close();
   };
@@ -2137,11 +2170,21 @@ async function createOwnedTerminal({
 
 export function createWebApp() {
   const app = new Hono();
+  // Resolve at call time (not the frozen const) so task workspaces follow the
+  // current DECKTERM_STATE_DIR — keeps tests that set a temp state dir after
+  // import from leaking api-task-* dirs into the live ~/.deckterm.
   const taskRunner = createTaskRunner({
-    stateDir: DECKTERM_STATE_DIR,
+    stateDir: resolveStateDir(),
     resolveAllowedPath,
     maxRounds: DECKTERM_TASK_MAX_ROUNDS,
     allowedProviders: DECKTERM_TASK_PROVIDERS,
+  });
+
+  // Advance worker/judge tasks when their agent terminal exits.
+  onTerminalExit((ownerId, terminalId) => {
+    taskRunner
+      .handleTerminalExit(ownerId, terminalId)
+      .catch((err) => debug("Task terminal-exit sync failed:", err));
   });
 
   app.onError((err, c) => {
@@ -3414,13 +3457,19 @@ export function createWebApp() {
       });
 
       const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const output = await new Response(proc.stdout).text();
-      const code = await proc.exited;
+      const [output, stderr, code] = await Promise.all([
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+        proc.exited,
+      ]);
       clearTimeout(timeoutId);
 
       if (code !== 0) {
-        const stderr = await new Response(proc.stderr).text();
-        return c.json({ error: "Commit failed", message: stderr }, 400);
+        // git reports the common failure ("nothing to commit") on stdout, not
+        // stderr — fall back to stdout so the panel shows a real reason instead
+        // of an empty "Commit failed:" line.
+        const reason = stderr.trim() || output.trim() || "git commit failed";
+        return c.json({ error: "Commit failed", message: reason }, 400);
       }
 
       return c.json({ ok: true, output });

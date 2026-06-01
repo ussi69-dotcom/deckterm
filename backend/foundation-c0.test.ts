@@ -43,6 +43,13 @@ test("foundation C0 initializes minimal DB, bootstrap token, and imported roots"
     (await stat(join(stateDir, "bootstrap-token"))).mode & 0o777;
   expect(tokenMode).toBe(0o600);
 
+  // Concurrent writers (dev + prod default to the same state dir) must wait on
+  // a contended lock rather than throwing SQLITE_BUSY → 500.
+  const busyTimeout = (
+    state.db.query("PRAGMA busy_timeout").get() as { timeout: number }
+  ).timeout;
+  expect(busyTimeout).toBe(5000);
+
   const tables = state.db
     .query("select name from sqlite_master where type = 'table' order by name")
     .all()

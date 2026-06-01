@@ -416,6 +416,29 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     }
   }
 
+  async function scanOwnerTasks(ownerId: string): Promise<TaskRecord[]> {
+    const ownerDir = join(tasksDir, sanitizePathSegment(ownerId));
+    try {
+      const entries = await readdir(ownerDir, { withFileTypes: true });
+      const tasks = await Promise.all(
+        entries
+          .filter((entry) => entry.isDirectory())
+          .map(async (entry) => {
+            const raw = await readFile(
+              join(ownerDir, entry.name, "task.json"),
+              "utf8",
+            );
+            return hydrateTask(JSON.parse(raw) as TaskRecord);
+          }),
+      );
+      return tasks.sort((left, right) =>
+        right.updatedAt.localeCompare(left.updatedAt),
+      );
+    } catch {
+      return [];
+    }
+  }
+
   async function writeControlFiles(task: TaskRecord): Promise<void> {
     await mkdir(task.taskDir, { recursive: true });
     await writeFile(task.controlFiles.taskFile, renderTaskFile(task));
@@ -466,6 +489,23 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         result.stderr.trim() || "Failed to create task worktree",
         400,
       );
+    }
+
+    // git worktree add does not copy node_modules, so any dependency-importing
+    // check (e.g. `bun run test:unit`) fails with "Cannot find package ...".
+    // Symlink the repo's installed dependencies into the worktree so checks see
+    // them without a slow per-task `bun install`.
+    const repoModules = join(repoRoot, "node_modules");
+    const hasModules = await access(repoModules).then(
+      () => true,
+      () => false,
+    );
+    if (hasModules) {
+      await runCommand({
+        cwd: worktreeDir,
+        args: ["ln", "-s", repoModules, join(worktreeDir, "node_modules")],
+        timeoutMs: 10_000,
+      });
     }
 
     return worktreeDir;
@@ -560,26 +600,36 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     },
 
     async listTasks(ownerId: string): Promise<TaskRecord[]> {
-      const ownerDir = join(tasksDir, sanitizePathSegment(ownerId));
-      try {
-        const entries = await readdir(ownerDir, { withFileTypes: true });
-        const tasks = await Promise.all(
-          entries
-            .filter((entry) => entry.isDirectory())
-            .map(async (entry) => {
-              const raw = await readFile(
-                join(ownerDir, entry.name, "task.json"),
-                "utf8",
-              );
-              return hydrateTask(JSON.parse(raw) as TaskRecord);
-            }),
-        );
-        return tasks.sort((left, right) =>
-          right.updatedAt.localeCompare(left.updatedAt),
-        );
-      } catch {
-        return [];
+      return scanOwnerTasks(ownerId);
+    },
+
+    // A worker/judge terminal that exits never moves the task off its *-running
+    // status on its own (status only changes on explicit actions), so tasks get
+    // stuck on worker-running/judge-running after the agent session ends. The
+    // server calls this when any terminal exits; we advance the owning task so
+    // the user can run checks / re-engage.
+    async handleTerminalExit(
+      ownerId: string,
+      terminalId: string,
+    ): Promise<TaskRecord | null> {
+      if (!terminalId) return null;
+      const tasks = await scanOwnerTasks(ownerId);
+      for (const task of tasks) {
+        const isWorkerExit =
+          task.terminalId === terminalId && task.status === "worker-running";
+        const isJudgeExit =
+          task.judgeTerminalId === terminalId &&
+          task.status === "judge-running";
+        if (!isWorkerExit && !isJudgeExit) continue;
+        task.status = "needs-user";
+        await appendJsonLine(task.controlFiles.roundsFile, {
+          type: isWorkerExit ? "worker-exited" : "judge-exited",
+          at: new Date().toISOString(),
+          terminalId,
+        });
+        return saveTask(task);
       }
+      return null;
     },
 
     async getTask(id: string, actor: ActorContext): Promise<TaskRecord> {

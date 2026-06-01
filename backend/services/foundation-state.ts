@@ -110,6 +110,13 @@ export function openFoundationDb(stateDir: string): Database {
   const db = new Database(dbPath);
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA foreign_keys = ON");
+  // Wait for a contended write lock instead of failing immediately with
+  // SQLITE_BUSY. The foundation DB can have more than one writer process when
+  // dev (4174) and prod (4173) default to the same state dir, or under
+  // concurrent requests in one process; without this, a colliding write throws
+  // and surfaces as a 500 ("Failed to create terminal"). Writes are sub-ms, so
+  // a 5s ceiling is ample headroom and effectively serializes the rare clash.
+  db.exec("PRAGMA busy_timeout = 5000");
   return db;
 }
 
