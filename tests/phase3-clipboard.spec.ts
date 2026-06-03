@@ -279,6 +279,58 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     ).toBe(true);
   });
 
+  test("native paste event sends text exactly once (no double paste)", async ({
+    page,
+  }) => {
+    // Regression: a native `paste` event (right-click / Ctrl+Shift+V) used to
+    // be handled by BOTH our fallback listener AND xterm's own paste listener,
+    // sending the text to the backend twice. The fallback now intercepts in
+    // the capture phase and calls stopImmediatePropagation so xterm never
+    // double-handles it.
+    const sentPayloads = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const textarea = active.element.querySelector(".xterm-helper-textarea");
+
+      const captured: string[] = [];
+      const realSend = active.ws.send.bind(active.ws);
+      active.ws.send = (payload) => {
+        captured.push(String(payload));
+        return realSend(payload);
+      };
+
+      const text = "echo double-paste-canary";
+      const clipboardData = {
+        items: [{ kind: "string", type: "text/plain" }],
+        getData: (type: string) => (type === "text/plain" ? text : ""),
+      };
+      const pasteEvent = new Event("paste", {
+        bubbles: true,
+        cancelable: true,
+      });
+      Object.defineProperty(pasteEvent, "clipboardData", {
+        configurable: true,
+        value: clipboardData,
+      });
+      textarea.dispatchEvent(pasteEvent);
+
+      // Give any async handlers a tick to run.
+      await new Promise((r) => setTimeout(r, 100));
+      return captured;
+    });
+
+    const canaryInputs = sentPayloads.filter((payload) => {
+      if (!payload.includes("double-paste-canary")) return false;
+      try {
+        return JSON.parse(payload).type === "input";
+      } catch {
+        return false;
+      }
+    });
+
+    expect(canaryInputs).toHaveLength(1);
+  });
+
   test("pasteClipboard degrades gracefully when async clipboard is unavailable", async ({
     page,
   }) => {

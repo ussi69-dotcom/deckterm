@@ -8208,6 +8208,13 @@ class TerminalManager {
     const pasteHandler = (event) => {
       if (!event.clipboardData) return;
       event.preventDefault();
+      // stopImmediatePropagation is essential: xterm.js registers its own
+      // `paste` listeners on the inner .xterm element + helper textarea, and
+      // preventDefault alone does NOT stop them from firing. Without this we
+      // paste twice (once here, once via xterm's onData). We attach on the
+      // container in the capture phase (below) so this handler always runs
+      // before xterm's descendant listeners, then halt the event here.
+      event.stopImmediatePropagation();
       this.clipboardManager
         .handlePaste(ws, event.clipboardData)
         .catch((err) => {
@@ -8215,9 +8222,11 @@ class TerminalManager {
         });
     };
 
-    textarea.addEventListener("paste", pasteHandler, true);
+    // Capture phase on the container (an ancestor of the .xterm element and
+    // helper textarea) guarantees we intercept before xterm's own listeners.
+    element.addEventListener("paste", pasteHandler, true);
     return () => {
-      textarea.removeEventListener("paste", pasteHandler, true);
+      element.removeEventListener("paste", pasteHandler, true);
     };
   }
 
@@ -8278,6 +8287,15 @@ class TerminalManager {
         event.key === "v" &&
         event.type === "keydown"
       ) {
+        if (event.shiftKey) {
+          // Ctrl+Shift+V (and similar "paste as plain text"): the browser
+          // fires a native `paste` event that attachClipboardPasteFallback
+          // already handles exactly once. Returning false only stops xterm
+          // from emitting a literal ^V (0x16); we deliberately do NOT
+          // preventDefault here — otherwise the native paste is cancelled
+          // and nothing pastes. Intercepting here too would paste twice.
+          return false;
+        }
         event.preventDefault();
         const termData = this.terminals.get(this.activeId);
         if (termData?.ws) {
