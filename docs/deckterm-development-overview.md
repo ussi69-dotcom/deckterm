@@ -1,6 +1,6 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29
+> **Datum:** 2026-06-08 (aktualizováno z 2026-05-29)
 > **Účel:** Jeden dokument, ze kterého pochopíš, kde DeckTerm je, jak vznikal, jak se nasazuje na nový server, co je autoconfig, jak je navržen multisession a k čemu slouží tasky.
 > **Pro koho:** pro tebe (orientace po delší době) i pro někoho nového, kdo by projekt přebíral.
 
@@ -57,7 +57,15 @@ b1c8324  feat(tmux): opaque session names            ← C1b-01
 38b082c  feat: terminal.write mode + events log      ← C1b-05 & C1b-06
 bb256e0  feat(ui): sessions drawer + mode indicators ← C1b-07
 a908737  feat(cleanup): zombie reconciliation + reapers + OS isolation warnings ← C1b-08
-ac208cd  feat(security): file/git/task gates + doctor hardening ← C2  (HEAD)
+ac208cd  feat(security): file/git/task gates + doctor hardening ← C2
+e92a5db  feat(security): edge-trusted cloudflare-tunnel actor resolution
+e96557d  fix(deploy): stop candidate leak and harden the promote health gate
+3dbf7b8  feat(deploy): verify prod serves the promoted release
+10c6da8  feat(task-runner): sync task status on agent exit and reuse repo deps in worktrees
+9860441  fix(git-panel): surface git stderr on checkout failure
+38fa59a  feat(sessions): attach / open-here from the session drawer
+50bc7cc  feat(reconnect): stop looping on permanent WS attach failures
+c3df89d  fix(clipboard): stop double paste on right-click and Ctrl+Shift+V  ← HEAD
 ```
 
 ---
@@ -166,7 +174,9 @@ Po reloadu prohlížeče se automaticky obnovují session, které běžely před
 
 Co task dělá: rozjede pracovní workspace s **worker/judge terminály**, spouští **checks**, volitelně používá **git worktrees** pro izolaci. Provideři přes `DECKTERM_TASK_PROVIDERS` (`codex,claude`), max kol `DECKTERM_TASK_MAX_ROUNDS` (5). Task má registrovaný `projectRoot`, který od C2 prochází stejným file-access gate jako všechno ostatní.
 
-> **Status sync & worktree deps (2026-05-31).** Když worker/judge terminál skončí, task se sám posune z `worker-running`/`judge-running` na `needs-user` (`taskRunner.handleTerminalExit`, napojeno přes module-level `onTerminalExit` registry v `closeAndRemoveTerminal`) — dřív visel navždy. A `createWorktree` symlinkuje `node_modules` z repo rootu do worktree, takže dep-importující checks (`bun run test:unit`) v izolovaném worktree nepadají na `Cannot find package`.
+> **Status sync & worktree deps (2026-05-31).** Když worker/judge terminál skončí, task se sám posune z `worker-running`/`judge-running` na `needs-user` (`taskRunner.handleTerminalExit`, napojeno přes module-level `onTerminalExit` registry v `closeAndRemoveTerminal`) — dřív visel navždy. A `createWorktree` symlinkuje `node_modules` z repo rootu do worktree, takže dep-importující checks (`bun run test:unit`) v izolovaném worktree nepadají na `Cannot find package`. Commit `10c6da8`.
+
+> **Git panel checkout stderr (2026-05-31).** Selhání `git checkout` (dirty tree, větev otevřená v jiném worktree…) ukazovalo jen „Checkout failed" bez důvodu. Přidán `web/git-error.js` s `formatGitCheckoutError({ error, message })`; obě volání `switchBranch` a `switchGitBranchFromPalette` ho teď používají. Backlog #4. Commit `9860441`.
 
 > **Follow-up úklid (2026-06-01).** Git panel: commit selhání teď surfacuje reálný důvod ("nothing to commit") — git ho píše na stdout, ne stderr, takže backend fallbackuje na stdout a `commit()` ho zobrazí inline (`#git-commit-status`) místo prázdného `alert()`; `git-error.js` zobecněn na `formatGitError`. Help: `?` už neotevírá help při psaní v inputu (`isEditableTarget`), `F1` funguje všude. Detaily a stav: `docs/plans/2026-05-29-followups-backlog.md` (#5/#7/#8).
 
@@ -177,6 +187,8 @@ Co task dělá: rozjede pracovní workspace s **worker/judge terminály**, spou�
 > **Follow-up k izolaci (2026-06-01).** Po splitu jela dev na fresh **nebootstrapnuté** DB → terminál se vytvořil, ale WS attach (`/ws/terminals/:id`) je gatovaný `isBootstrapComplete || isFoundationLegacyBypassEnabled`, takže vracel 403 „bootstrap required" → klient zacyklil na „Reconnecting…" (HTTP create projde, dead-check projde, ale socket se nikdy neotevře — „Expected 101"). Fix: dev unit dostal i `DECKTERM_LEGACY_NO_BOOTSTRAP=1` (ctí se jen s `DECKTERM_RUNTIME_ENV=development`, takže dev-only). **Dev unit teď drží: `DECKTERM_STATE_DIR=/home/deploy/.deckterm-dev` + `DECKTERM_LEGACY_NO_BOOTSTRAP=1` — při resetu dev DB nech obě.**
 
 > **Reconnect klasifikace permanentního selhání (2026-06-01).** Aby se „Reconnecting… 10/10" na trvalém 403 už neopakovalo zbytečně: `ReconnectingWebSocket` na 3. pokus klasifikuje přes `web/reconnect-classify.js` (`classifyReconnectFailure` → `gone`/`blocked`/`retry`, probe `/api/terminals` + `/api/foundation/status`). `blocked` (401/403 katalog nebo terminál v katalogu + nebootstrapnutý server) → nový overlay `setup_required` (🔒 Open Setup / Retry / Close), smyčka se zastaví. Backlog #11, commit `50bc7cc`.
+
+> **Clipboard double-paste fix (2026-06-03).** Nativní paste (right-click, Ctrl+Shift+V) byl zpracován jak naším fallback listenerem, tak vlastním paste handlerem xterm.js — text se odeslal backendu dvakrát. `attachClipboardPasteFallback` nyní listenuje na terminal-containeru v capture fázi a volá `stopImmediatePropagation`, takže xterm nezachytí událost podruhé. `Ctrl+V` customKeyEventHandler přestal interceptovat `Ctrl+Shift+V`. Přidán E2E regresní test. Commit `c3df89d`.
 
 Záměr (z foundation rozhodnutí #18): **hybrid** — terminál pro rychlou práci, task pro strukturovanou agentní práci s auditovatelným outcome. Terminálové session můžou být buď připojené k tasku, nebo standalone.
 
