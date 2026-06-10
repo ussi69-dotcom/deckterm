@@ -26,6 +26,16 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  // Isolate ambient env so the gates run their real allow/deny + audit logic
+  // (same class of leak as 95efecb; leaks come from Bun's .env auto-load and
+  // from running tests inside a DeckTerm dev terminal that inherits the
+  // service environment):
+  // - cloudflare-tunnel mode would resolve the edge-trusted tunnel actor and
+  //   skip the legacy_path_resolution audit row asserted by C2-1,
+  // - DECKTERM_LEGACY_NO_BOOTSTRAP=1 short-circuits requireFileAccess before
+  //   any audit write.
+  delete process.env.DECKTERM_PUBLISH_MODE;
+  delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
 
   // Bring the foundation into a bootstrapped, secure (non-bypass) state so the
   // gates run their real allow/deny logic. The anonymous test actor is made the
