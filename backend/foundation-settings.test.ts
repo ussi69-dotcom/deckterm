@@ -45,3 +45,69 @@ test("user settings round-trip, merge, and delete per actor", async () => {
   // isolation between actors
   expect(getUserSettings(state.db, "user-b")).toEqual({});
 });
+
+test("settings API stores and merges per-actor settings", async () => {
+  const stateDir = await mkdtemp(
+    join(process.env.HOME || "/tmp", ".deckterm-settings-api-"),
+  );
+  tempDirs.push(stateDir);
+  process.env.DECKTERM_STATE_DIR = stateDir;
+  process.env.ALLOWED_FILE_ROOTS = process.env.HOME || "/tmp";
+  process.env.DECKTERM_LEGACY_NO_BOOTSTRAP = "1";
+  delete process.env.DECKTERM_PUBLISH_MODE;
+  // The shell running tests can inherit the dev service's Cloudflare Access
+  // env, which would force 401s for the anonymous test actor.
+  process.env.CF_ACCESS_REQUIRED = "0";
+
+  const { createWebApp } = await import("./server");
+  const app = createWebApp();
+
+  const putRes = await app.fetch(
+    new Request("http://localhost/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        settings: {
+          "windows.layout": { git: { x: 10 } },
+          "dock.enabled": true,
+        },
+      }),
+    }),
+  );
+  expect(putRes.status).toBe(200);
+
+  const getRes = await app.fetch(new Request("http://localhost/api/settings"));
+  expect(getRes.status).toBe(200);
+  const body = (await getRes.json()) as {
+    settings: Record<string, unknown>;
+  };
+  expect(body.settings["dock.enabled"]).toBe(true);
+  expect(
+    (body.settings["windows.layout"] as { git: { x: number } }).git.x,
+  ).toBe(10);
+
+  // merge semantics: null deletes, other keys survive
+  const mergeRes = await app.fetch(
+    new Request("http://localhost/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: { "dock.enabled": null } }),
+    }),
+  );
+  expect(mergeRes.status).toBe(200);
+  const merged = (await mergeRes.json()) as {
+    settings: Record<string, unknown>;
+  };
+  expect(merged.settings["dock.enabled"]).toBeUndefined();
+  expect(merged.settings["windows.layout"]).toBeDefined();
+
+  // validation: non-object body rejected
+  const badRes = await app.fetch(
+    new Request("http://localhost/api/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: [1, 2] }),
+    }),
+  );
+  expect(badRes.status).toBe(400);
+});

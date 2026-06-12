@@ -46,6 +46,7 @@ import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
   getTerminalSession,
+  getUserSettings,
   hasScopedGrant,
   initializeFoundationState,
   isBootstrapComplete,
@@ -53,6 +54,7 @@ import {
   listTerminalSessionsForActor,
   markTerminalSessionEnded,
   recordTerminalSession,
+  setUserSettings,
   writeAuditEvent,
   type FoundationState,
   type RecordedTerminalSession,
@@ -266,6 +268,9 @@ const SCROLLBACK_MAX_BYTES = parseInt(
   process.env.SCROLLBACK_MAX_BYTES || String(1024 * 1024),
   10,
 ); // 1MB default
+const SETTINGS_MAX_KEYS = 200;
+const SETTINGS_MAX_KEY_LENGTH = 128;
+const SETTINGS_MAX_VALUE_BYTES = 16 * 1024;
 const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -3264,6 +3269,44 @@ export function createWebApp() {
     const fileAccess = await requireFileAccess(c, resolved);
     return fileAccess.ok;
   }
+
+  // GET /api/settings — actor-scoped UI settings (windows layout, dock, prefs)
+  app.get("/api/settings", async (c) => {
+    const actor = getCurrentActor(c);
+    const state = await getFoundationState();
+    return c.json({ settings: getUserSettings(state.db, actor.id) });
+  });
+
+  // PUT /api/settings { settings: { key: value | null } } — merge semantics,
+  // null deletes a key. Values are opaque JSON owned by the frontend.
+  app.put("/api/settings", async (c) => {
+    const actor = getCurrentActor(c);
+    const body = await c.req.json().catch(() => null);
+    const entries = (body as { settings?: unknown } | null)?.settings;
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+      return c.json({ error: "settings object required" }, 400);
+    }
+    const record = entries as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length > SETTINGS_MAX_KEYS) {
+      return c.json({ error: "too many settings keys" }, 400);
+    }
+    for (const key of keys) {
+      if (!key || key.length > SETTINGS_MAX_KEY_LENGTH) {
+        return c.json({ error: "invalid settings key" }, 400);
+      }
+      const value = record[key];
+      if (
+        value !== null &&
+        JSON.stringify(value).length > SETTINGS_MAX_VALUE_BYTES
+      ) {
+        return c.json({ error: `settings value too large: ${key}` }, 400);
+      }
+    }
+    const state = await getFoundationState();
+    setUserSettings(state.db, actor.id, record);
+    return c.json({ settings: getUserSettings(state.db, actor.id) });
+  });
 
   // GET /api/git/status?cwd=/path/to/repo
   app.get("/api/git/status", async (c) => {
