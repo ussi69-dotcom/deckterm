@@ -15,6 +15,7 @@ const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
     "clipboard",
     "toggle-extra-keys",
     "wrap-lines",
+    "dock-sessions",
     "fullscreen",
     "font-decrease",
     "font-increase",

@@ -6,6 +6,9 @@ const {
   boundsForSnapZone,
   serializeWindowLayout,
   deserializeWindowLayout,
+  clampDockHeight,
+  dockStateFromSettings,
+  DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
 test("normalizeWindowBounds clamps size and position into the 0-100 area", () => {
@@ -103,4 +106,31 @@ test("window layout serialization round-trips and survives garbage", () => {
   });
   expect(Object.keys(mixed)).toEqual(["good"]);
   expect(mixed.good.snapZone).toBe(null);
+});
+
+test("clampDockHeight keeps the sessions dock between 15% and 75%", () => {
+  expect(clampDockHeight(35)).toBe(35);
+  expect(clampDockHeight(5)).toBe(15);
+  expect(clampDockHeight(90)).toBe(75);
+  expect(clampDockHeight("nonsense")).toBe(DOCK_DEFAULT_HEIGHT_PCT);
+  expect(clampDockHeight(undefined)).toBe(DOCK_DEFAULT_HEIGHT_PCT);
+});
+
+test("dockStateFromSettings tolerates garbage and fills defaults", () => {
+  expect(dockStateFromSettings(null)).toEqual({
+    enabled: false,
+    heightPct: DOCK_DEFAULT_HEIGHT_PCT,
+  });
+  expect(dockStateFromSettings({ enabled: true, heightPct: 40 })).toEqual({
+    enabled: true,
+    heightPct: 40,
+  });
+  expect(dockStateFromSettings({ enabled: 1, heightPct: 200 })).toEqual({
+    enabled: true,
+    heightPct: 75,
+  });
+  expect(dockStateFromSettings("junk")).toEqual({
+    enabled: false,
+    heightPct: DOCK_DEFAULT_HEIGHT_PCT,
+  });
 });

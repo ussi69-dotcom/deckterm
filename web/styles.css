@@ -5283,3 +5283,42 @@ body.virtual-keyboard-open .extra-keys {
   border-radius: 0;
   box-shadow: none;
 }
+
+/* =============================================================================
+   SESSIONS BOTTOM DOCK — VS Code-style panel for the terminal area
+   ============================================================================= */
+
+.dock-sash {
+  display: none;
+}
+
+body.sessions-docked #surface-windows-layer {
+  bottom: var(--dock-height, 35%);
+}
+
+body.sessions-docked #terminal-container {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: calc(var(--dock-height, 35%) - 5px);
+  border-top: 1px solid var(--border-primary);
+}
+
+body.sessions-docked .dock-sash {
+  display: block;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(var(--dock-height, 35%) - 5px);
+  height: 5px;
+  cursor: ns-resize;
+  background: var(--bg-tertiary);
+  z-index: 660;
+  touch-action: none;
+}
+
+body.sessions-docked .dock-sash:hover,
+body.sessions-docked .dock-sash.dragging {
+  background: var(--accent-blue);
+}

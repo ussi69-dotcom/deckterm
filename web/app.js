@@ -390,6 +390,13 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-wrap",
     desktopTone: "secondary",
   }),
+  "dock-sessions": Object.freeze({
+    label: "Dock",
+    icon: "panel-bottom",
+    action: "dock-sessions",
+    toolsId: "tools-sheet-dock-sessions",
+    desktopTone: "secondary",
+  }),
   fullscreen: Object.freeze({
     label: "Fullscreen",
     icon: "maximize-2",
@@ -3765,6 +3772,7 @@ class TerminalManager {
     if (lastDir) this.setDirectoryValue(lastDir);
 
     this.initTaskSignalBadge();
+    this.initSessionsDock();
 
     // Button handlers
     document
@@ -4595,6 +4603,8 @@ class TerminalManager {
         button.classList.toggle("active", moreOpen);
       } else if (actionId === "palette") {
         button.classList.toggle("active", paletteOpen);
+      } else if (actionId === "dock-sessions") {
+        button.classList.toggle("active", Boolean(this.dockState?.enabled));
       }
     });
   }
@@ -4615,6 +4625,7 @@ class TerminalManager {
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
     else if (action === "fullscreen") this.toggleFullscreen();
     else if (action === "wrap-lines") this.toggleWrapLines();
+    else if (action === "dock-sessions") this.toggleSessionsDock();
     else if (action === "help") this.openHelp();
     else if (action === "palette") this.toggleCommandPalette();
 
@@ -6587,6 +6598,13 @@ class TerminalManager {
         run: () => this.toggleWrapLines(),
       },
       {
+        id: "toggle-sessions-dock",
+        title: "Dock Sessions to Bottom",
+        group: "Views",
+        keywords: ["dock", "panel", "bottom", "sessions", "terminal"],
+        run: () => this.toggleSessionsDock(),
+      },
+      {
         id: "toggle-fullscreen",
         title: "Toggle Fullscreen",
         group: "Views",
@@ -7728,6 +7746,78 @@ class TerminalManager {
     }
     manager.open(id);
     return win;
+  }
+
+  // --- Sessions bottom dock (VS Code panel semantics) -----------------------
+
+  initSessionsDock() {
+    this.dockState = { enabled: false, heightPct: 35 };
+    this.dockSash = document.getElementById("dock-sash");
+    this.dockSash?.addEventListener("pointerdown", (e) =>
+      this.startDockSashDrag(e),
+    );
+    this.dockSash?.addEventListener("dblclick", () =>
+      this.setDockHeight(window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35),
+    );
+    void this.settingsReady.then(() => {
+      const stored = window.SurfaceWindows?.dockStateFromSettings?.(
+        this.settingsStore?.get("dock.sessions", null),
+      );
+      if (stored?.enabled) {
+        this.dockState = stored;
+        this.applyDockState({ persist: false });
+      }
+    });
+  }
+
+  applyDockState({ persist = true } = {}) {
+    const enabled = this.dockState.enabled && this.isWindowedSurfaces();
+    document.body.classList.toggle("sessions-docked", enabled);
+    document
+      .getElementById("workspace-area")
+      ?.style.setProperty("--dock-height", `${this.dockState.heightPct}%`);
+    if (persist) {
+      this.settingsStore?.set("dock.sessions", {
+        enabled: this.dockState.enabled,
+        heightPct: this.dockState.heightPct,
+      });
+    }
+    // xterm instances must refit to the resized terminal area.
+    window.dispatchEvent(new Event("resize"));
+    this.syncSurfaceButtonState();
+  }
+
+  toggleSessionsDock() {
+    this.dockState.enabled = !this.dockState.enabled;
+    this.applyDockState();
+  }
+
+  setDockHeight(pct) {
+    this.dockState.heightPct =
+      window.SurfaceWindows?.clampDockHeight?.(pct) ?? this.dockState.heightPct;
+    this.applyDockState();
+  }
+
+  startDockSashDrag(e) {
+    e.preventDefault();
+    const area = document.getElementById("workspace-area");
+    if (!area) return;
+    const rect = area.getBoundingClientRect();
+    this.dockSash?.classList.add("dragging");
+    const onMove = (ev) => {
+      const pct = ((rect.bottom - ev.clientY) / Math.max(rect.height, 1)) * 100;
+      this.dockState.heightPct =
+        window.SurfaceWindows?.clampDockHeight?.(pct) ??
+        this.dockState.heightPct;
+      this.applyDockState({ persist: false });
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      this.dockSash?.classList.remove("dragging");
+      this.applyDockState();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp, { once: true });
   }
 
   async openFileInEditor(path) {
@@ -9250,11 +9340,15 @@ class TerminalManager {
           const minRows = usesCompactLayout ? 12 : 16;
           const isTooSmall = cols < minCols || rows < minRows;
 
-          // Hide the warning for compact layouts where the bottom action bar is expected.
+          // Hide the warning for compact layouts where the bottom action bar
+          // is expected, and for the bottom dock where a short terminal strip
+          // is the whole point.
+          const sessionsDocked =
+            document.body.classList.contains("sessions-docked");
           if (t.sizeWarning) {
             t.sizeWarning.classList.toggle(
               "visible",
-              isTooSmall && !usesCompactLayout,
+              isTooSmall && !usesCompactLayout && !sessionsDocked,
             );
           }
 

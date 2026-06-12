@@ -123,6 +123,28 @@ function deserializeWindowLayout(value) {
   return layout;
 }
 
+// --- Sessions bottom dock (VS Code panel semantics) ------------------------
+
+const DOCK_DEFAULT_HEIGHT_PCT = 35;
+const DOCK_MIN_HEIGHT_PCT = 15;
+const DOCK_MAX_HEIGHT_PCT = 75;
+
+function clampDockHeight(pct) {
+  const value = Number(pct);
+  if (!Number.isFinite(value)) return DOCK_DEFAULT_HEIGHT_PCT;
+  return Math.max(DOCK_MIN_HEIGHT_PCT, Math.min(DOCK_MAX_HEIGHT_PCT, value));
+}
+
+function dockStateFromSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { enabled: false, heightPct: DOCK_DEFAULT_HEIGHT_PCT };
+  }
+  return {
+    enabled: Boolean(value.enabled),
+    heightPct: clampDockHeight(value.heightPct),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // DOM classes (browser only)
 // ---------------------------------------------------------------------------
@@ -547,6 +569,9 @@ const SurfaceWindows = {
   boundsForSnapZone,
   serializeWindowLayout,
   deserializeWindowLayout,
+  clampDockHeight,
+  dockStateFromSettings,
+  DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,
 };
