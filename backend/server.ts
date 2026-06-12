@@ -3748,6 +3748,49 @@ export function createWebApp() {
     }
   });
 
+  // POST /api/git/push { cwd, remote?, branch?, setUpstream? }
+  // POST /api/git/pull { cwd, remote?, branch? }
+  // POST /api/git/fetch { cwd, remote? }
+  // Network ops get a longer timeout; GIT_TERMINAL_PROMPT=0 (runGit) makes
+  // credential prompts fail fast instead of hanging the request. No --force
+  // and no --rebase by design — conflicts belong in the terminal.
+  const GIT_REF_RE = /^[\w\-\/\.]+$/;
+  for (const op of ["push", "pull", "fetch"] as const) {
+    app.post(`/api/git/${op}`, async (c) => {
+      const body = await c.req.json().catch(() => ({}));
+      const { cwd, remote, branch, setUpstream } = body;
+      if (!cwd || !(await validateGitCwd(c, cwd))) {
+        return c.json(
+          { error: "Forbidden path", reason: "no_matching_root" },
+          403,
+        );
+      }
+      if (
+        remote !== undefined &&
+        (typeof remote !== "string" || !GIT_REF_RE.test(remote))
+      ) {
+        return c.json({ error: "Invalid remote" }, 400);
+      }
+      if (
+        branch !== undefined &&
+        (typeof branch !== "string" || !GIT_REF_RE.test(branch))
+      ) {
+        return c.json({ error: "Invalid branch" }, 400);
+      }
+      const args: string[] = [op];
+      if (op === "push" && setUpstream) args.push("-u");
+      if (remote) args.push(remote);
+      if (op !== "fetch" && branch) args.push(branch);
+      const result = await runGit(cwd, args, 30000);
+      if (!result.ok) {
+        const reason =
+          result.stderr.trim() || result.output.trim() || `git ${op} failed`;
+        return c.json({ error: `Git ${op} failed`, message: reason }, 400);
+      }
+      return c.json({ ok: true, output: result.output + result.stderr });
+    });
+  }
+
   // GET /api/git/show?cwd=...&commit=...&path=...
   app.get("/api/git/show", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;

@@ -119,3 +119,26 @@ test("status reports upstream ahead/behind", async () => {
   expect(data.ahead).toBe(1);
   expect(data.behind).toBe(0);
 });
+
+test("push syncs ahead commits to origin; status ahead drops to 0", async () => {
+  const res = await post("/api/git/push", { cwd: repo });
+  expect(res.status).toBe(200);
+  const status = (await (
+    await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+      ),
+    )
+  ).json()) as any;
+  expect(status.ahead).toBe(0);
+});
+
+test("fetch and pull succeed against the local remote", async () => {
+  expect((await post("/api/git/fetch", { cwd: repo })).status).toBe(200);
+  expect((await post("/api/git/pull", { cwd: repo })).status).toBe(200);
+});
+
+test("git mutations outside an allowed root are denied", async () => {
+  const res = await post("/api/git/push", { cwd: "/etc" });
+  expect(res.status).toBe(403);
+});
