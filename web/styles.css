@@ -5006,3 +5006,237 @@ body.virtual-keyboard-open .extra-keys {
 .file-explorer-item .file-actions .edit {
   color: var(--text-secondary);
 }
+
+/* =============================================================================
+   SURFACE WINDOWS — floating, snappable windows for Files/Git/Tasks/Editor
+   ============================================================================= */
+
+#workspace-area {
+  flex: 1;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#surface-windows-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 640;
+}
+
+.surface-window {
+  position: absolute;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  min-width: 280px;
+  min-height: 200px;
+}
+
+.surface-window.hidden {
+  display: none;
+}
+
+.surface-window.active {
+  border-color: var(--border-hover);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+}
+
+.surface-window-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 6px 0 10px;
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-primary);
+  cursor: grab;
+  user-select: none;
+  flex: none;
+  touch-action: none;
+}
+
+.surface-window.dragging .surface-window-titlebar {
+  cursor: grabbing;
+}
+
+.surface-window-icon {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.surface-window-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.surface-window-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.surface-window-btn {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.surface-window-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.surface-window-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  overflow: auto;
+}
+
+.surface-window-resize {
+  position: absolute;
+  z-index: 20;
+  background: transparent;
+  touch-action: none;
+}
+
+.surface-window-resize:hover {
+  background: rgba(88, 166, 255, 0.2);
+}
+
+.surface-window-resize-top {
+  top: 0;
+  left: var(--resize-handle);
+  right: var(--resize-handle);
+  height: var(--resize-handle);
+  cursor: ns-resize;
+}
+
+.surface-window-resize-bottom {
+  bottom: 0;
+  left: var(--resize-handle);
+  right: var(--resize-handle);
+  height: var(--resize-handle);
+  cursor: ns-resize;
+}
+
+.surface-window-resize-left {
+  left: 0;
+  top: var(--resize-handle);
+  bottom: var(--resize-handle);
+  width: var(--resize-handle);
+  cursor: ew-resize;
+}
+
+.surface-window-resize-right {
+  right: 0;
+  top: var(--resize-handle);
+  bottom: var(--resize-handle);
+  width: var(--resize-handle);
+  cursor: ew-resize;
+}
+
+.surface-window-resize-top-left {
+  top: 0;
+  left: 0;
+  width: calc(var(--resize-handle) + 4px);
+  height: calc(var(--resize-handle) + 4px);
+  cursor: nwse-resize;
+}
+
+.surface-window-resize-top-right {
+  top: 0;
+  right: 0;
+  width: calc(var(--resize-handle) + 4px);
+  height: calc(var(--resize-handle) + 4px);
+  cursor: nesw-resize;
+}
+
+.surface-window-resize-bottom-left {
+  bottom: 0;
+  left: 0;
+  width: calc(var(--resize-handle) + 4px);
+  height: calc(var(--resize-handle) + 4px);
+  cursor: nesw-resize;
+}
+
+.surface-window-resize-bottom-right {
+  bottom: 0;
+  right: 0;
+  width: calc(var(--resize-handle) + 4px);
+  height: calc(var(--resize-handle) + 4px);
+  cursor: nwse-resize;
+}
+
+.surface-window-snap-preview {
+  position: absolute;
+  background: rgba(88, 166, 255, 0.15);
+  border: 1px solid var(--accent-blue);
+  border-radius: 8px;
+  pointer-events: none;
+  transition:
+    left 120ms ease,
+    top 120ms ease,
+    width 120ms ease,
+    height 120ms ease;
+  z-index: 1;
+}
+
+.surface-window-snap-preview.hidden {
+  display: none;
+}
+
+/* Panels mounted inside a surface window lose their fixed-overlay layout */
+.surface-window-body > .file-explorer {
+  position: static;
+  inset: auto;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+  z-index: auto;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+}
+
+.surface-window-body > .file-explorer .file-explorer-shell {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.surface-window-body > .side-panel {
+  position: static;
+  width: 100%;
+  height: 100%;
+  border-left: none;
+}
+
+/* The window titlebar replaces the explorer's own header on desktop */
+.surface-window-body > .file-explorer .file-explorer-header {
+  display: none;
+}

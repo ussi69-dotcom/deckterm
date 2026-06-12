@@ -3009,6 +3009,10 @@ class GitManager {
 
   hide() {
     this.panel.classList.add("hidden");
+    // In windowed mode the panel lives inside a SurfaceWindow that must
+    // close with it (the in-panel × and Esc call hide() directly).
+    window.terminalManager?.surfaceWindowManager?.close("git");
+    window.terminalManager?.syncSurfaceButtonState?.();
   }
 
   toggle() {
@@ -3729,6 +3733,13 @@ class TerminalManager {
     this.handleLayoutDragCancel = this.handleLayoutDragCancel.bind(this);
 
     this.tileManager = new TileManager(this.container);
+    // Server-side actor-scoped settings (window layout, dock, prefs). The
+    // load races nothing: window/dock consumers await settingsReady first.
+    this.settingsStore = window.SettingsStore?.createSettingsStore?.() || null;
+    this.settingsReady = this.settingsStore
+      ? this.settingsStore.load().catch(() => ({}))
+      : Promise.resolve({});
+    this.surfaceWindowManager = null;
     this.clipboardManager = new ClipboardManager();
     this.commandPaletteRegistry = null;
     this.commandPalette = null;
@@ -3869,6 +3880,14 @@ class TerminalManager {
     const FileExplorerCtor =
       window.FileExplorerController?.FileExplorerController;
     this.fileExplorer = FileExplorerCtor ? new FileExplorerCtor() : null;
+    // The controller's own close button only hides the explorer content; in
+    // windowed mode the hosting SurfaceWindow has to close with it.
+    document
+      .getElementById("file-explorer-close")
+      ?.addEventListener("click", () => {
+        this.surfaceWindowManager?.close("files");
+        this.syncSurfaceButtonState();
+      });
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       this.fileExplorer.onOpenFile = (path) => void this.fileEditor.open(path);
@@ -4549,12 +4568,25 @@ class TerminalManager {
     );
     const paletteOpen = this.isCommandPaletteOpen();
 
+    // Windowed surfaces can be open simultaneously; the exclusive
+    // right-surface notion only applies to the mobile sheets.
+    const windowed = this.isWindowedSurfaces();
+    const filesOpen = windowed
+      ? Boolean(this.fileExplorer?.isOpen)
+      : surface === "files";
+    const gitOpen = windowed
+      ? Boolean(
+          window.gitManager &&
+          !window.gitManager.panel?.classList.contains("hidden"),
+        )
+      : surface === "git";
+
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
       if (actionId === "files") {
-        button.classList.toggle("active", surface === "files");
+        button.classList.toggle("active", filesOpen);
       } else if (actionId === "git") {
-        button.classList.toggle("active", surface === "git");
+        button.classList.toggle("active", gitOpen);
       } else if (actionId === "tasks") {
         button.classList.toggle("active", tasksOpen);
       } else if (actionId === "setup") {
@@ -7638,17 +7670,89 @@ class TerminalManager {
     return nextSurface;
   }
 
+  // Desktop mounts Files/Git/Tasks/Editor into movable, snappable
+  // SurfaceWindows; mobile keeps the fullscreen sheets. The width check
+  // matches the file explorer's own sheet breakpoint so a narrow desktop
+  // window and the explorer agree on which mode is active.
+  isWindowedSurfaces() {
+    return (
+      !platformDetector.isMobile &&
+      window.innerWidth >= 768 &&
+      Boolean(window.SurfaceWindows?.SurfaceWindowManager)
+    );
+  }
+
+  async ensureSurfaceWindowManager() {
+    if (!this.isWindowedSurfaces()) return null;
+    if (this.surfaceWindowManager) return this.surfaceWindowManager;
+    // Saved geometry must be loaded before the manager reads it.
+    await this.settingsReady;
+    if (!this.surfaceWindowManager) {
+      const layer = document.getElementById("surface-windows-layer");
+      if (!layer) return null;
+      this.surfaceWindowManager =
+        new window.SurfaceWindows.SurfaceWindowManager({
+          container: layer,
+          settingsStore: this.settingsStore,
+        });
+    }
+    return this.surfaceWindowManager;
+  }
+
+  async openSurfaceWindow(id, config) {
+    const manager = await this.ensureSurfaceWindowManager();
+    if (!manager) return null;
+    if (!manager.get(id)) manager.register({ id, ...config });
+    const win = manager.get(id);
+    // The content element may have been reparented back to #app by a
+    // mode switch (viewport crossed the sheet breakpoint) — reclaim it.
+    if (
+      config?.contentEl &&
+      win?.bodyEl &&
+      config.contentEl.parentElement !== win.bodyEl
+    ) {
+      win.bodyEl.appendChild(config.contentEl);
+    }
+    manager.open(id);
+    return win;
+  }
+
+  // Panels originally live in #app; sheets expect them there. Used when a
+  // panel opens in sheet mode after having been mounted in a window.
+  releaseSurfaceWindowContent(id, contentEl) {
+    if (!contentEl) return;
+    this.surfaceWindowManager?.close(id);
+    if (contentEl.parentElement?.classList?.contains("surface-window-body")) {
+      document.getElementById("app")?.appendChild(contentEl);
+    }
+  }
+
   async openFileExplorer() {
     if (!this.fileExplorer) return null;
 
     const { workspaceId, cwd } = this.getActiveWorkspaceContext();
     if (!workspaceId) return null;
 
-    if (
-      window.gitManager &&
-      !window.gitManager.panel?.classList.contains("hidden")
-    ) {
-      window.gitManager.hide();
+    if (this.isWindowedSurfaces()) {
+      // Windows coexist — no mutual exclusion with the git panel.
+      await this.openSurfaceWindow("files", {
+        title: "Files",
+        icon: "▤",
+        contentEl: document.getElementById("file-explorer"),
+        bounds: { x: 64, y: 4, width: 34, height: 92 },
+        onClose: () => this.closeFileExplorer(),
+      });
+    } else {
+      this.releaseSurfaceWindowContent(
+        "files",
+        document.getElementById("file-explorer"),
+      );
+      if (
+        window.gitManager &&
+        !window.gitManager.panel?.classList.contains("hidden")
+      ) {
+        window.gitManager.hide();
+      }
     }
 
     const targetPath = this.fileExplorer.openForWorkspace(workspaceId, cwd);
@@ -7664,6 +7768,7 @@ class TerminalManager {
 
   closeFileExplorer() {
     this.fileExplorer?.close();
+    this.surfaceWindowManager?.close("files");
     this.getRightSurface();
     this.syncSurfaceButtonState();
   }
@@ -7680,8 +7785,23 @@ class TerminalManager {
     const { cwd } = this.getActiveWorkspaceContext();
     if (!cwd) return null;
 
-    if (this.fileExplorer?.isOpen) {
-      this.fileExplorer.close();
+    if (this.isWindowedSurfaces()) {
+      if (window.gitManager?.panel) {
+        await this.openSurfaceWindow("git", {
+          title: "Git",
+          icon: "⎇",
+          contentEl: window.gitManager.panel,
+          bounds: { x: 50, y: 0, width: 50, height: 100 },
+          minWidthPx: 480,
+          minHeightPx: 320,
+          onClose: () => this.closeGitPanel(),
+        });
+      }
+    } else {
+      this.releaseSurfaceWindowContent("git", window.gitManager?.panel);
+      if (this.fileExplorer?.isOpen) {
+        this.fileExplorer.close();
+      }
     }
 
     this.rightSurface = "git";
@@ -7692,6 +7812,7 @@ class TerminalManager {
 
   closeGitPanel() {
     window.gitManager?.hide();
+    this.surfaceWindowManager?.close("git");
     this.getRightSurface();
     this.syncSurfaceButtonState();
   }

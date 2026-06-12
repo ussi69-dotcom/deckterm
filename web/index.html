@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260611d" />
+    <link rel="stylesheet" href="/styles.css?v=20260612a" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -469,9 +469,13 @@
         </section>
       </div>
 
-      <!-- Terminal container - tiles created dynamically by TileManager -->
-      <div id="terminal-container">
-        <!-- Tiles will be created dynamically -->
+      <!-- Workspace area: terminal tiles + floating surface windows layer -->
+      <div id="workspace-area">
+        <!-- Terminal container - tiles created dynamically by TileManager -->
+        <div id="terminal-container">
+          <!-- Tiles will be created dynamically -->
+        </div>
+        <div id="surface-windows-layer"></div>
       </div>
 
       <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
@@ -716,6 +720,6 @@
     <script src="/file-editor.js?v=20260611a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260611h"></script>
+    <script src="/app.js?v=20260612a"></script>
   </body>
 </html>
