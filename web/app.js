@@ -2721,6 +2721,7 @@ class GitManager {
           <div class="panel-header">
             <h3>Git</h3>
             <span id="git-branch" class="git-branch clickable" title="Click to switch branch"></span>
+            <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
             <button class="panel-refresh" title="Refresh (r)">&#x21bb;</button>
             <button class="panel-close" title="Close (Esc)">&times;</button>
           </div>
@@ -3048,33 +3049,18 @@ class GitManager {
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
 
-      this.state.files = {
-        staged: [],
-        changes: [],
+      // groupStatusFiles (git-scm.js) splits into staged/changes/untracked
+      // with VS Code semantics; sync state powers the push/pull header UI.
+      this.state.files = groupStatusFiles(statusData.files);
+      this.state.sync = {
+        upstream: statusData.upstream || null,
+        ahead: statusData.ahead || 0,
+        behind: statusData.behind || 0,
       };
       this.state.branches.current = statusData.branch;
 
-      statusData.files.forEach((f) => {
-        const stagedStatus = f.stagedStatus || "";
-        const unstagedStatus = f.unstagedStatus || "";
-        const isStaged = f.section === "staged" || !!stagedStatus;
-        const sectionKey = isStaged ? "staged" : "changes";
-        const displayStatus = stagedStatus || unstagedStatus || f.status || "?";
-        const file = {
-          path: f.path,
-          oldPath: f.oldPath || null,
-          status: f.status,
-          stagedStatus,
-          unstagedStatus,
-          isRenamed: !!f.isRenamed,
-          section: sectionKey,
-          staged: isStaged,
-          displayStatus,
-        };
-        this.state.files[sectionKey].push(file);
-      });
-
       this.panel.querySelector("#git-branch").textContent = statusData.branch;
+      this.renderSyncState();
       this.renderFiles();
 
       if (prevSelectedPath) {
@@ -3156,7 +3142,13 @@ class GitManager {
   }
 
   getAllFiles() {
-    return [...this.state.files.staged, ...this.state.files.changes];
+    // Order must match renderFiles() section order — row data-index points
+    // into this list.
+    return [
+      ...this.state.files.staged,
+      ...this.state.files.changes,
+      ...(this.state.files.untracked || []),
+    ];
   }
 
   renderFiles() {
@@ -3167,12 +3159,27 @@ class GitManager {
         label: "Staged Changes",
         icon: "\u2713",
         files: this.state.files.staged,
+        groupAction: "unstage-all",
+        groupActionGlyph: "\u2212",
+        groupActionTitle: "Unstage all",
       },
       {
         key: "changes",
         label: "Changes",
         icon: "\u2022",
         files: this.state.files.changes,
+        groupAction: "stage-all",
+        groupActionGlyph: "+",
+        groupActionTitle: "Stage all",
+      },
+      {
+        key: "untracked",
+        label: "Untracked",
+        icon: "\u25cb",
+        files: this.state.files.untracked || [],
+        groupAction: "stage-all",
+        groupActionGlyph: "+",
+        groupActionTitle: "Stage all",
       },
     ];
 
@@ -3194,6 +3201,11 @@ class GitManager {
             <span class="git-file-group-icon ${section.key}">${section.icon}</span>
             <span class="git-file-group-label">${section.label}</span>
             <span class="git-file-group-count">(${files.length})</span>
+            ${
+              files.length > 0
+                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+                : ""
+            }
           </div>
           <div class="git-file-group-items">
             ${treeHtml}
@@ -3233,15 +3245,27 @@ class GitManager {
     // Add event listeners
     container.querySelectorAll(".git-file").forEach((el) => {
       el.addEventListener("click", (e) => {
-        if (e.target.classList.contains("git-file-diff")) {
-          this.showDiff(el.dataset.path);
+        const files = this.getAllFiles();
+        const file = files[parseInt(el.dataset.index, 10)];
+
+        if (e.target.classList.contains("git-file-stage")) {
+          this.toggleStage(el.dataset.path, file?.staged);
           return;
         }
 
-        if (e.target.classList.contains("git-file-stage")) {
-          const files = this.getAllFiles();
-          const file = files[parseInt(el.dataset.index)];
-          this.toggleStage(el.dataset.path, file?.staged);
+        if (e.target.classList.contains("git-file-open")) {
+          const cwd = (this.state.cwd || this.currentCwd || "").replace(
+            /\/$/,
+            "",
+          );
+          window.terminalManager?.openFileInEditor?.(
+            `${cwd}/${el.dataset.path}`,
+          );
+          return;
+        }
+
+        if (e.target.classList.contains("git-file-discard")) {
+          this.discardFile(file || { path: el.dataset.path });
           return;
         }
 
@@ -3251,6 +3275,76 @@ class GitManager {
         this.showDiff(el.dataset.path);
       });
     });
+
+    container.querySelectorAll(".git-group-action").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const group = btn.dataset.group;
+        const action = btn.dataset.groupAction;
+        const files = this.state.files[group] || [];
+        if (files.length === 0) return;
+        this.stagePaths(
+          files.map((f) => f.path),
+          action === "unstage-all",
+        );
+      });
+    });
+  }
+
+  renderSyncState() {
+    const el = this.panel.querySelector("#git-sync-label");
+    if (!el) return;
+    const sync = this.state.sync || { ahead: 0, behind: 0 };
+    el.textContent = syncLabel(sync.ahead, sync.behind);
+  }
+
+  async stagePaths(paths, unstage) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const res = await fetch(unstage ? "/api/git/unstage" : "/api/git/stage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(
+          formatGitError(data, unstage ? "Unstage failed" : "Stage failed"),
+          "error",
+        );
+        return;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Stage paths error:", err);
+    }
+  }
+
+  async discardFile(file) {
+    const untracked = statusLetter(file) === "U";
+    const question = untracked
+      ? `Delete untracked file ${file.path}?`
+      : `Discard changes to ${file.path}? This cannot be undone.`;
+    if (!window.confirm(question)) return;
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const res = await fetch("/api/git/discard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths: [file.path], confirm: true }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Discard failed"), "error");
+        return;
+      }
+      if (this.state.selectedPath === file.path) {
+        this.state.selectedPath = null;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Discard error:", err);
+    }
   }
 
   renderSectionTree(files, section, startIndex) {
@@ -3330,14 +3424,19 @@ class GitManager {
         this.state.selectedPath === file.path ||
         index === this.state.selectedIndex;
       const fileName = file.path.split("/").pop() || file.path;
+      const letter = statusLetter(file);
+      const colorClass = statusClass(letter);
+      const discardTitle =
+        letter === "U" ? "Delete untracked file" : "Discard changes";
       html += `
         <div class="git-file ${isSelected ? "selected" : ""}" data-path="${this.escapeHtml(file.path)}" data-index="${index}" style="--tree-depth:${depth}">
-          <span class="git-file-status ${file.section}">${this.escapeHtml(this.getStatusGlyph(file))}</span>
-          <span class="git-file-path" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
+          <span class="git-file-path ${colorClass}" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
           <div class="git-file-actions">
-            <button class="git-file-diff" title="View diff">diff</button>
-            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "-" : "+"}</button>
+            <button class="git-file-open" title="Open file">⤢</button>
+            <button class="git-file-discard" title="${discardTitle}">⟲</button>
+            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "−" : "+"}</button>
           </div>
+          <span class="git-file-status ${colorClass}">${this.escapeHtml(letter)}</span>
         </div>
       `;
       index++;

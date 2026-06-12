@@ -5322,3 +5322,85 @@ body.sessions-docked .dock-sash:hover,
 body.sessions-docked .dock-sash.dragging {
   background: var(--accent-blue);
 }
+
+/* =============================================================================
+   GIT SOURCE CONTROL (Phase 2) — VS Code-style changes tree + diff editor
+   ============================================================================= */
+
+/* VS Code status letter colors (dark theme palette) */
+.git-status-modified {
+  color: #e2c08d;
+}
+.git-status-added,
+.git-status-untracked {
+  color: #73c991;
+}
+.git-status-deleted {
+  color: #f48771;
+}
+.git-file-path.git-status-deleted {
+  text-decoration: line-through;
+}
+.git-status-renamed {
+  color: #73c991;
+}
+.git-status-conflict {
+  color: #e4676b;
+}
+
+/* Row hover actions (VS Code style: hidden until hover/selected) */
+.git-file .git-file-actions {
+  display: flex;
+  gap: 2px;
+  visibility: hidden;
+}
+.git-file:hover .git-file-actions,
+.git-file.selected .git-file-actions {
+  visibility: visible;
+}
+.git-file-open,
+.git-file-discard {
+  padding: 2px 6px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.git-file-open:hover,
+.git-file-discard:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* Group header action (stage all / unstage all) */
+.git-file-group-header {
+  position: relative;
+}
+.git-group-action {
+  visibility: hidden;
+  margin-left: auto;
+  padding: 0 6px;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+.git-file-group-header:hover .git-group-action {
+  visibility: visible;
+}
+.git-group-action:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* Sync (ahead/behind) label in the panel header */
+.git-sync-label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
