@@ -3631,10 +3631,11 @@ export function createWebApp() {
     }
   });
 
-  // GET /api/git/log?cwd=...&limit=50
+  // GET /api/git/log?cwd=...&limit=50&path= (path = per-file history)
   app.get("/api/git/log", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
     const limit = parseInt(c.req.query("limit") || "50");
+    const path = c.req.query("path");
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
       return c.json(
@@ -3643,22 +3644,25 @@ export function createWebApp() {
       );
     }
 
+    if (path && (path.startsWith("/") || path.includes(".."))) {
+      return c.json({ error: "Invalid path" }, 400);
+    }
+
     try {
-      const proc = Bun.spawn(
-        [
-          "git",
-          "log",
-          `--max-count=${Math.min(limit, 200)}`,
-          "--format=%h|%H|%s|%an|%aI",
-          "--graph",
-          "--",
-        ],
-        {
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
+      const args = [
+        "git",
+        "log",
+        `--max-count=${Math.min(limit, 200)}`,
+        "--format=%h|%H|%s|%an|%aI",
+        "--graph",
+        "--",
+      ];
+      if (path) args.push(path);
+      const proc = Bun.spawn(args, {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
 
       const timeoutId = setTimeout(() => proc.kill(), 10000);
       const output = await new Response(proc.stdout).text();
@@ -3738,6 +3742,37 @@ export function createWebApp() {
         400,
       );
     }
+  });
+
+  // POST /api/git/branch { cwd, action: "create"|"delete", name, checkout?, force? }
+  app.post("/api/git/branch", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, action, name, checkout, force } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (!["create", "delete"].includes(action)) {
+      return c.json({ error: "Invalid branch action" }, 400);
+    }
+    if (!name || typeof name !== "string" || !/^[\w\-\/\.]+$/.test(name)) {
+      return c.json({ error: "Invalid branch name" }, 400);
+    }
+    const args =
+      action === "create"
+        ? checkout
+          ? ["checkout", "-b", name]
+          : ["branch", name]
+        : ["branch", force ? "-D" : "-d", name];
+    const result = await runGit(cwd, args);
+    if (!result.ok) {
+      const reason =
+        result.stderr.trim() || result.output.trim() || "git branch failed";
+      return c.json({ error: "Git branch failed", message: reason }, 400);
+    }
+    return c.json({ ok: true, name, action });
   });
 
   // GET /api/git/stash?cwd= — list stashes
@@ -3934,8 +3969,12 @@ export function createWebApp() {
       return c.json({ error: "Path required" }, 400);
     }
 
+    // "INDEX" maps to git's :0 (staged content) — used by the diff editor for
+    // working-tree/staged comparisons.
+    const ref = commit === "INDEX" ? ":0" : commit;
+
     try {
-      const proc = Bun.spawn(["git", "show", `${commit}:${path}`, "--"], {
+      const proc = Bun.spawn(["git", "show", `${ref}:${path}`, "--"], {
         cwd,
         stdout: "pipe",
         stderr: "pipe",

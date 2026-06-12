@@ -216,3 +216,73 @@ test("stash rejects unknown actions", async () => {
     (await post("/api/git/stash", { cwd: repo, action: "explode" })).status,
   ).toBe(400);
 });
+
+test("branch create + delete round-trip", async () => {
+  expect(
+    (
+      await post("/api/git/branch", {
+        cwd: repo,
+        action: "create",
+        name: "feature/x",
+        checkout: false,
+      })
+    ).status,
+  ).toBe(200);
+  expect(await git(repo, "branch", "--list", "feature/x")).toContain(
+    "feature/x",
+  );
+  expect(
+    (
+      await post("/api/git/branch", {
+        cwd: repo,
+        action: "delete",
+        name: "feature/x",
+      })
+    ).status,
+  ).toBe(200);
+  expect(await git(repo, "branch", "--list", "feature/x")).toBe("");
+});
+
+test("branch rejects invalid names", async () => {
+  expect(
+    (
+      await post("/api/git/branch", {
+        cwd: repo,
+        action: "create",
+        name: "bad name; rm",
+      })
+    ).status,
+  ).toBe(400);
+});
+
+test("log filters by path", async () => {
+  await writeFile(join(repo, "only-once.txt"), "x\n");
+  await git(repo, "add", "only-once.txt");
+  await git(repo, "commit", "-m", "touch only-once");
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/log?cwd=${encodeURIComponent(repo)}&path=only-once.txt`,
+    ),
+  );
+  const data = (await res.json()) as any;
+  expect(data.commits.length).toBe(1);
+  expect(data.commits[0].message).toBe("touch only-once");
+});
+
+test("show resolves INDEX (staged) content", async () => {
+  await writeFile(join(repo, "a.txt"), "staged-content\n");
+  await post("/api/git/stage", { cwd: repo, paths: ["a.txt"] });
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=INDEX&path=a.txt`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  expect(((await res.json()) as any).content).toBe("staged-content\n");
+  await post("/api/git/unstage", { cwd: repo, paths: ["a.txt"] });
+  await post("/api/git/discard", {
+    cwd: repo,
+    paths: ["a.txt"],
+    confirm: true,
+  });
+});
