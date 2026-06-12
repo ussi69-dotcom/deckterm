@@ -98,6 +98,14 @@ const KEY_SEQUENCES = {
 const TERMINAL_FONT_FAMILY =
   '"JetBrains Mono", "Symbols Nerd Font", "Cascadia Code", "Fira Code", Menlo, Monaco, "Courier New", monospace';
 const TERMINAL_LINE_HEIGHT = 1.2;
+// Scrollback-search match highlighting (GitHub-dark yellows; the overview
+// ruler colors are required fields of the SearchAddon decorations API).
+const TERMINAL_SEARCH_DECORATIONS = {
+  matchBackground: "#5a4a00",
+  matchOverviewRuler: "#d29922",
+  activeMatchBackground: "#9e6a03",
+  activeMatchColorOverviewRuler: "#f0c674",
+};
 const TERMINAL_PADDING_X = 16;
 const TERMINAL_PADDING_Y = 16;
 const FONT_METRIC_WAIT_MS = 350;
@@ -8267,9 +8275,12 @@ class TerminalManager {
 
     const fitAddon = new FitAddon.FitAddon();
     const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    const searchAddon = new SearchAddon.SearchAddon();
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
+    terminal.loadAddon(searchAddon);
     terminal._fitAddon = fitAddon;
+    terminal._searchAddon = searchAddon;
 
     // OSC52 clipboard support (xterm.js 6.0+)
     if (terminal.parser?.registerOscHandler) {
@@ -8281,6 +8292,17 @@ class TerminalManager {
 
     // Intercept Ctrl+V for clipboard paste with large content warning
     terminal.attachCustomKeyEventHandler((event) => {
+      // Ctrl+Shift+F: scrollback search overlay
+      if (
+        event.ctrlKey &&
+        event.shiftKey &&
+        event.type === "keydown" &&
+        (event.key === "F" || event.key === "f")
+      ) {
+        event.preventDefault();
+        this.openTerminalSearch();
+        return false;
+      }
       // Ctrl+V or Cmd+V
       if (
         (event.ctrlKey || event.metaKey) &&
@@ -8326,6 +8348,115 @@ class TerminalManager {
     `;
     parentElement.appendChild(overlay);
     return overlay;
+  }
+
+  // --- Scrollback search (Ctrl+Shift+F) -------------------------------------
+  // One shared bar + controller, rebound to the active terminal's SearchAddon
+  // on each open. State logic lives in web/search-overlay.js.
+
+  ensureSearchBar() {
+    if (this.searchBar) return this.searchBar;
+    const bar = document.createElement("div");
+    bar.className = "terminal-search-bar hidden";
+    bar.innerHTML = `
+      <input type="text" class="search-input" placeholder="Search scrollback" spellcheck="false" autocomplete="off" />
+      <span class="search-count" aria-live="polite"></span>
+      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)">↑</button>
+      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)">↓</button>
+      <button type="button" class="search-btn" data-search-act="close" title="Close (Esc)">✕</button>
+    `;
+    const input = bar.querySelector(".search-input");
+    input.addEventListener("input", () => {
+      this.searchController?.setQuery(input.value);
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === "F3") {
+        e.preventDefault();
+        if (e.shiftKey) this.searchController?.prev();
+        else this.searchController?.next();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeTerminalSearch({ refocus: true });
+      }
+    });
+    bar.addEventListener("click", (e) => {
+      const act = e.target?.dataset?.searchAct;
+      if (act === "prev") this.searchController?.prev();
+      else if (act === "next") this.searchController?.next();
+      else if (act === "close") this.closeTerminalSearch({ refocus: true });
+    });
+    this.searchBar = bar;
+    return bar;
+  }
+
+  openTerminalSearch() {
+    const active = this.getActiveTerminal();
+    const addon = active?.terminal?._searchAddon;
+    if (!addon) return;
+
+    const bar = this.ensureSearchBar();
+    const host = active.element?.parentElement || active.element;
+    if (bar.parentElement !== host) host.appendChild(bar);
+
+    this.searchResultsDisposable?.dispose?.();
+    this.searchController = window.SearchOverlay.createSearchController({
+      searchApi: {
+        findNext: (q, opts) =>
+          addon.findNext(q, {
+            ...opts,
+            decorations: TERMINAL_SEARCH_DECORATIONS,
+          }),
+        findPrevious: (q, opts) =>
+          addon.findPrevious(q, {
+            ...opts,
+            decorations: TERMINAL_SEARCH_DECORATIONS,
+          }),
+        clearDecorations: () => addon.clearDecorations(),
+      },
+      onState: (state) => this.renderSearchState(state),
+    });
+    this.searchResultsDisposable = addon.onDidChangeResults?.((r) =>
+      this.searchController?.handleResults(
+        r || { resultIndex: -1, resultCount: 0 },
+      ),
+    );
+
+    // Prefill: short single-line selection wins, then the last search.
+    const selection = active.terminal.getSelection?.()?.trim() || "";
+    const prefill =
+      selection && selection.length <= 200 && !selection.includes("\n")
+        ? selection
+        : this.searchLastQuery || "";
+    const input = bar.querySelector(".search-input");
+    input.value = prefill;
+    this.searchController.open(prefill ? { query: prefill } : undefined);
+    input.focus();
+    input.select();
+  }
+
+  closeTerminalSearch({ refocus = false } = {}) {
+    if (!this.searchController) return;
+    this.searchLastQuery =
+      this.searchController.getState().query || this.searchLastQuery || "";
+    this.searchController.close();
+    this.searchController = null;
+    this.searchResultsDisposable?.dispose?.();
+    this.searchResultsDisposable = null;
+    this.searchBar?.classList.add("hidden");
+    if (refocus) this.getActiveTerminal()?.terminal?.focus();
+  }
+
+  renderSearchState(state) {
+    const bar = this.ensureSearchBar();
+    bar.classList.toggle("hidden", !state.open);
+    const count = bar.querySelector(".search-count");
+    if (!state.query || state.resultCount === null) {
+      count.textContent = "";
+    } else if (state.resultCount === 0) {
+      count.textContent = "0/0";
+    } else {
+      count.textContent = `${state.resultIndex + 1}/${state.resultCount}`;
+    }
   }
 
   createDimensionOverlay(container) {
@@ -9125,6 +9256,9 @@ class TerminalManager {
   switchTo(id) {
     if (!this.terminals.has(id)) return;
 
+    // The search bar/controller are bound to the previous terminal's addon.
+    this.closeTerminalSearch();
+
     this.activeId = id;
     const t = this.terminals.get(id);
     if (t?.workspaceId) {
@@ -9194,6 +9328,8 @@ class TerminalManager {
     const t = this.terminals.get(id);
     if (!t) return;
     const closingWorkspaceId = t.workspaceId;
+
+    if (id === this.activeId) this.closeTerminalSearch();
 
     t.ws?.close();
     t.inputFallbackCleanup?.();
