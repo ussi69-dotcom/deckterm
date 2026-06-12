@@ -4839,3 +4839,50 @@ body.virtual-keyboard-open .extra-keys {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+
+/* =============================================================================
+   TASK SIGNAL BADGE + TRANSITION TOAST
+   ============================================================================= */
+
+.task-signal-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin-right: 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.task-signal-badge:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hover);
+}
+
+.task-signal-badge.hidden {
+  display: none;
+}
+
+.task-toast {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  max-width: 340px;
+  padding: 10px 14px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  z-index: 200;
+}
+
+.task-toast.hidden {
+  display: none;
+}

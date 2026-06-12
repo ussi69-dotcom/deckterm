@@ -3753,6 +3753,8 @@ class TerminalManager {
     const lastDir = localStorage.getItem("opencode-web-dir");
     if (lastDir) this.setDirectoryValue(lastDir);
 
+    this.initTaskSignalBadge();
+
     // Button handlers
     document
       .getElementById("new-terminal")
@@ -5312,6 +5314,7 @@ class TerminalManager {
     this.setTaskStatus("Loading tasks...");
     try {
       const tasks = await this.fetchTaskJson("/api/tasks");
+      this.updateTaskSignals(tasks);
       this.taskState.items = Array.isArray(tasks) ? tasks : [];
       this.taskState.selectedId =
         selectedId &&
@@ -5327,6 +5330,80 @@ class TerminalManager {
     } finally {
       this.taskState.loading = false;
     }
+  }
+
+  // --- Global task-status badge + transition toasts -------------------------
+  // The task panel stays poll-on-open; this badge polls cheaply in the
+  // background so running/needs-user tasks are visible (and notable
+  // transitions toast) while the panel is closed. Logic: web/task-signals.js.
+
+  initTaskSignalBadge() {
+    const status = this.connectionStatus;
+    if (!status?.parentElement || !window.TaskSignals) return;
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.id = "task-signal-badge";
+    badge.className = "task-signal-badge hidden";
+    badge.addEventListener("click", () => void this.openTaskPanel());
+    status.parentElement.insertBefore(badge, status);
+    this.taskSignalBadge = badge;
+    this.taskSignalLast = null;
+
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const res = await fetch("/api/tasks");
+        if (!res.ok) return;
+        this.updateTaskSignals(await res.json());
+      } catch {
+        // Offline/transient — the reconnect overlay owns that messaging.
+      }
+    };
+    this.taskSignalTimer = setInterval(() => void poll(), 15000);
+    void poll();
+  }
+
+  updateTaskSignals(tasks) {
+    if (!this.taskSignalBadge || !window.TaskSignals) return;
+    const signals = window.TaskSignals.computeTaskSignals(tasks);
+    this.taskSignalBadge.classList.toggle("hidden", !signals.badgeText);
+    this.taskSignalBadge.textContent = signals.badgeText || "";
+    this.taskSignalBadge.title = signals.title;
+
+    if (this.taskSignalLast) {
+      const transitions = window.TaskSignals.diffTaskTransitions(
+        this.taskSignalLast,
+        tasks,
+      );
+      for (const transition of transitions) {
+        this.showTaskToast(transition);
+      }
+    }
+    this.taskSignalLast = Array.isArray(tasks) ? tasks : [];
+  }
+
+  showTaskToast(transition) {
+    let toast = document.getElementById("task-toast");
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.id = "task-toast";
+      toast.className = "task-toast hidden";
+      toast.addEventListener("click", () => {
+        toast.classList.add("hidden");
+        void this.openTaskPanel();
+      });
+      document.getElementById("app")?.appendChild(toast);
+    }
+    const verb =
+      transition.to === "complete"
+        ? "completed ✅"
+        : transition.to === "failed"
+          ? "failed ❌"
+          : "needs your input ⏸";
+    toast.textContent = `Task "${transition.title}" ${verb}`;
+    toast.classList.remove("hidden");
+    clearTimeout(this.taskToastTimer);
+    this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
   }
 
   renderTasks() {
