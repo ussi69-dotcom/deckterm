@@ -6586,6 +6586,116 @@ class TerminalManager {
         })
         .filter(Boolean);
     });
+
+    // "@" mode — fuzzy session switch over the server catalog. Each action
+    // carries the raw query as a keyword so it survives registry scoring
+    // (same trick as the go-to-directory provider); ordering comes from the
+    // provider via descending priority.
+    this.commandPaletteRegistry.registerProvider(() => {
+      const query = this.getCommandPaletteQuery();
+      const text = window.PaletteProviders.parsePrefixQuery(query, "@");
+      if (text === null) return [];
+
+      const entries = window.PaletteProviders.filterSessions({
+        sessions: this._sessionCatalog || [],
+        text,
+        isLocallyOpen: (id) => this.terminals.has(id),
+        planAction: (session, options) =>
+          window.SessionActions.planSessionRowAction(session, options),
+      });
+
+      return entries.map((entry, index) => ({
+        id: `palette-session:${entry.session.id}`,
+        title: this.formatCwdLabel(entry.session.cwd) || entry.session.id,
+        group: "Sessions",
+        keywords: [query],
+        meta: [
+          entry.plan.label,
+          entry.plan.statusClass === "active" ? "● live" : "○ ended",
+          entry.session.id,
+        ],
+        priority: 100 - index,
+        run: () => void this.handleSessionRowActivate(entry.session.id),
+      }));
+    });
+
+    // "$" mode — saved commands (localStorage), run in the active terminal.
+    this.savedCommandsStore = window.PaletteProviders.createSavedCommandsStore(
+      window.localStorage,
+    );
+    this.commandPaletteRegistry.registerProvider(() => {
+      const query = this.getCommandPaletteQuery();
+      const text = window.PaletteProviders.parsePrefixQuery(query, "$");
+      if (text === null) return [];
+
+      const commands = window.PaletteProviders.filterSavedCommands(
+        this.savedCommandsStore.list(),
+        text,
+      );
+
+      const actions = commands.map((entry, index) => ({
+        id: `palette-command:${entry.name}`,
+        title: entry.name,
+        group: "Commands",
+        keywords: [query],
+        meta: [entry.command],
+        priority: 100 - index,
+        run: () => this.runSavedCommand(entry.command),
+      }));
+
+      actions.push({
+        id: "palette-command-save",
+        title: "Save command…",
+        group: "Commands",
+        keywords: [query],
+        meta: ["new $ shortcut"],
+        priority: 1,
+        run: () => this.promptSaveCommand(text),
+      });
+      if (commands.length > 0) {
+        actions.push({
+          id: "palette-command-remove",
+          title: "Remove command…",
+          group: "Commands",
+          keywords: [query],
+          meta: ["delete a $ shortcut"],
+          priority: 0,
+          run: () => this.promptRemoveCommand(),
+        });
+      }
+      return actions;
+    });
+  }
+
+  runSavedCommand(command) {
+    const active = this.getActiveTerminal();
+    if (!active?.ws) return;
+    active.ws.send(JSON.stringify({ type: "input", data: `${command}\r` }));
+    active.terminal?.focus();
+  }
+
+  promptSaveCommand(prefillName = "") {
+    const name = window.prompt("Command name (palette: $name)", prefillName);
+    if (!name?.trim()) return;
+    const existing = this.savedCommandsStore
+      .list()
+      .find((entry) => entry.name === name.trim());
+    const command = window.prompt(
+      `Shell command for "${name.trim()}"`,
+      existing?.command || "",
+    );
+    if (!command?.trim()) return;
+    this.savedCommandsStore.save(name, command);
+  }
+
+  promptRemoveCommand() {
+    const names = this.savedCommandsStore
+      .list()
+      .map((entry) => entry.name)
+      .join(", ");
+    const name = window.prompt(`Remove which command? (${names})`);
+    if (!name?.trim()) return;
+    this.savedCommandsStore.remove(name.trim());
   }
 
   getCommandPaletteContext() {
@@ -6676,6 +6786,9 @@ class TerminalManager {
   async openCommandPalette() {
     if (!this.commandPalette) return;
     this.closeToolsSheet();
+    // Fire-and-forget catalog refresh so the "@" sessions mode has fresh
+    // entries by the time the user types; results re-render per keystroke.
+    void this.refreshSessionsPanel();
     this.commandPalette.open(await this.buildCommandPaletteContext());
     this.syncSurfaceButtonState();
   }
