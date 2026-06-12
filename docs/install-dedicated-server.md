@@ -77,6 +77,11 @@ EnvironmentFile=/home/deploy/deckterm/.env
 ExecStart=/home/deploy/.bun/bin/bun run start
 Restart=on-failure
 RestartSec=3
+# Required for tmux-backed session persistence: the tmux server is a child of
+# bun, and the default KillMode=control-group would kill it (and every shell
+# in it) on each service restart. KillMode=process stops only bun; the tmux
+# server survives and the restarted backend re-adopts its sessions.
+KillMode=process
 
 [Install]
 WantedBy=default.target

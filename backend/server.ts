@@ -237,7 +237,10 @@ const TMUX_SESSION_NAMESPACE = resolveTmuxSessionNamespace({
   port: process.env.PORT,
 });
 const TMUX_SESSION_PREFIX = getTmuxSessionPrefix(TMUX_SESSION_NAMESPACE);
-const TMUX_SOCKET_PATH = getTmuxSocketPath(TMUX_SESSION_NAMESPACE);
+const TMUX_SOCKET_PATH = getTmuxSocketPath({
+  namespace: TMUX_SESSION_NAMESPACE,
+  stateDir: DECKTERM_STATE_DIR,
+});
 const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
 const terminalBackend: TerminalBackend = TMUX_BACKEND
   ? new TmuxTerminalBackend({

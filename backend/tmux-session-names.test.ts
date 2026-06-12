@@ -21,11 +21,16 @@ test("resolveTmuxSessionNamespace honors explicit override", () => {
   ).toBe("devalpha");
 });
 
-test("getTmuxSocketPath derives isolated socket path from namespace", () => {
-  expect(getTmuxSocketPath("Dev Alpha")).toBe(
-    "/tmp/deckterm/deckterm_devalpha.sock",
-  );
-  expect(getTmuxSocketPath("!!!")).toBe("/tmp/deckterm/deckterm_default.sock");
+test("getTmuxSocketPath scopes the socket to the instance state dir", () => {
+  // State-dir scoping is what isolates instances: dev (~/.deckterm-dev) and
+  // prod (~/.deckterm) must never resolve the same socket even when both set
+  // the same TMUX_SESSION_NAMESPACE (which deployed .envs do).
+  expect(
+    getTmuxSocketPath({ namespace: "Dev Alpha", stateDir: "/home/u/.dt-dev" }),
+  ).toBe("/home/u/.dt-dev/tmux/deckterm_devalpha.sock");
+  expect(
+    getTmuxSocketPath({ namespace: "!!!", stateDir: "/home/u/.deckterm" }),
+  ).toBe("/home/u/.deckterm/tmux/deckterm_default.sock");
 });
 
 test("buildTmuxSessionName includes namespace and opaque id only", () => {
