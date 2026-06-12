@@ -14,8 +14,9 @@
    - _Velikost:_ malý–střední.
    - _Řešení:_ `createWorktree` symlinkuje `node_modules` z repo rootu do worktree (`ln -s`), pokud repo má nainstalované závislosti — instantní a sdílené, bez per-task `bun install`.
 
-3. **Model / reasoning picker + kanban (à la Hermes).** Možnost vybrat model a reasoning level (ideálně auto) per task; větší kus → vlastní kanban board nad tasky.
+3. 🟡 **ČÁSTEČNĚ (2026-06-12).** **Model / reasoning picker + kanban (à la Hermes).** Možnost vybrat model a reasoning level (ideálně auto) per task; větší kus → vlastní kanban board nad tasky.
    - _Velikost:_ velký (samostatný projekt, chce brainstorming).
+   - _První řez (commit bff50f5):_ kanban board view v task panelu (List/Board toggle, 5 fixních sloupců, read-only karty) + provider picker existoval, default přepnut na claude. Design: `docs/plans/2026-06-12-task-board-design.md`. Zbývá: model/reasoning úroveň (task-runner nemá model parametr), drag-and-drop, WS push.
 
 ## Git panel
 
@@ -27,8 +28,9 @@
    - _Velikost:_ malý.
    - _Řešení:_ backend `/api/git/commit` při selhání fallbackuje na stdout (`reason = stderr || stdout`); `git-error.js` zobecněn na `formatGitError(payload, fallback)` (+ unit testy), `commit()` ho používá místo `alert()` a píše inline `#git-commit-status` (error/success). Paralela k surfacingu checkout stderr (9860441).
 
-6. **VSCode-like file/git panel** — plnohodnotné otevírání/editace souborů (teď file explorer jen browse + download, vytváří jen složky), bohatší git workflow. Větší product směr.
+6. 🟡 **MVP HOTOVO (2026-06-12).** **VSCode-like file/git panel** — plnohodnotné otevírání/editace souborů (teď file explorer jen browse + download, vytváří jen složky), bohatší git workflow. Větší product směr.
    - _Velikost:_ velký.
+   - _MVP (commit 572b261):_ ✎ akce ve file exploreru otevře CodeMirror 6 modal (vendored bundle, syntax highlighting js/ts/json/md/py/html/css, oneDark), Ctrl+S save přes `PUT /api/files/content` — atomický zápis, mtime conflict 409, requireFileAccess gate + audit. Design: `docs/plans/2026-06-12-file-editor-design.md`. Zbývá: taby/více souborů, diff proti gitu, nový soubor z exploreru.
 
 ## Drobnosti
 
