@@ -37,12 +37,23 @@ export function getTmuxSessionPrefix(namespace: unknown) {
   })}`;
 }
 
-export function getTmuxSocketPath(namespace: unknown): string {
+// The socket lives under the instance state dir (multisession design C1b-02:
+// `tmux -S $DECKTERM_STATE_DIR/tmux/<instance>.sock`). A namespace-only path
+// under /tmp let dev and prod — which both set TMUX_SESSION_NAMESPACE=deckterm
+// — share one tmux server, so restarting one instance killed the other's
+// sessions.
+export function getTmuxSocketPath({
+  namespace,
+  stateDir,
+}: {
+  namespace: unknown;
+  stateDir: string;
+}): string {
   const safeNamespace = sanitizeTmuxToken(namespace, {
     fallback: "default",
     maxLength: 24,
   });
-  return `/tmp/deckterm/deckterm_${safeNamespace}.sock`;
+  return `${stateDir.replace(/\/+$/, "")}/tmux/deckterm_${safeNamespace}.sock`;
 }
 
 export function buildTmuxSessionName({

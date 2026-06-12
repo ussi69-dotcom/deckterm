@@ -59,3 +59,16 @@ test("formatGitError uses the provided fallback for an empty payload", () => {
 test("formatGitError defaults the fallback when none is given", () => {
   expect(formatGitError({})).toBe("Git operation failed");
 });
+
+test("access-denial payloads format as the friendly explanation", () => {
+  const text = formatGitError(
+    {
+      error: "Forbidden path",
+      reason: "no_matching_root",
+      path: "/srv/elsewhere",
+    },
+    "Git status failed",
+  );
+  expect(text).toContain("/srv/elsewhere");
+  expect(text.toLowerCase()).toContain("registered");
+});

@@ -567,14 +567,16 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         projectRoot,
         workingDirectory,
         ownerId,
+        // Default provider is claude (2026-06-10 decision: codex has no
+        // credits); explicit workerProvider/judgeProvider still win.
         workerProvider: normalizeProvider(
           input.workerProvider,
-          "codex",
+          "claude",
           allowedProviders,
         ),
         judgeProvider: normalizeProvider(
           input.judgeProvider,
-          "codex",
+          "claude",
           allowedProviders,
         ),
         useWorktree,

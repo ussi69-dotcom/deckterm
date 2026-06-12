@@ -28,6 +28,10 @@ beforeAll(async () => {
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
   process.env.DECKTERM_PUBLISH_MODE = "cloudflare-tunnel";
+  // A shell inside a DeckTerm dev terminal inherits the service's
+  // DECKTERM_LEGACY_NO_BOOTSTRAP=1, which short-circuits requireFileAccess
+  // before the edge_trusted_tunnel audit path this test asserts.
+  delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
 
   // Initialize state but do NOT bootstrap: edge-trust must allow regardless.
   const state = await initializeFoundationState({

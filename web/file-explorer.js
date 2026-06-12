@@ -22,6 +22,24 @@ function normalizeExplorerPath(value) {
   return next || null;
 }
 
+// Prefer the friendly access-denial explanation (web/access-denied.js) over
+// the raw backend error string; fall back to the payload error / caller text.
+function explainApiError(payload, fallback) {
+  let accessDenied = null;
+  if (typeof window !== "undefined" && window.AccessDenied) {
+    accessDenied = window.AccessDenied;
+  } else if (typeof require !== "undefined") {
+    try {
+      accessDenied = require("./access-denied");
+    } catch {
+      accessDenied = null;
+    }
+  }
+  const denial = accessDenied?.describeAccessDenied(payload);
+  if (denial) return denial.text;
+  return (payload && payload.error) || fallback;
+}
+
 function cloneSelection(item) {
   if (!item || typeof item !== "object") return null;
   return { ...item };
@@ -437,6 +455,23 @@ class FileExplorerController {
     const actionsEl = document.createElement("div");
     actionsEl.className = "file-actions";
 
+    if (
+      !item.isDir &&
+      !item.isParent &&
+      typeof this.onOpenFile === "function"
+    ) {
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "edit";
+      editBtn.title = "Edit";
+      editBtn.textContent = "✎";
+      editBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.onOpenFile(item.path);
+      });
+      actionsEl.appendChild(editBtn);
+    }
+
     if (!item.isDir && !item.isParent) {
       const downloadBtn = document.createElement("button");
       downloadBtn.type = "button";
@@ -658,7 +693,7 @@ class FileExplorerController {
       }
 
       if (!res.ok || data.error) {
-        throw new Error(data.error || "Cannot read directory");
+        throw new Error(explainApiError(data, "Cannot read directory"));
       }
 
       const resolvedPath = normalizeExplorerPath(data.path) || nextPath;
@@ -718,7 +753,7 @@ class FileExplorerController {
       );
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        this.alertImpl(payload.error || "Failed to delete");
+        this.alertImpl(explainApiError(payload, "Failed to delete"));
         return false;
       }
 
@@ -764,7 +799,7 @@ class FileExplorerController {
       );
       const payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        this.alertImpl(payload.error || "Failed");
+        this.alertImpl(explainApiError(payload, "Failed"));
         return false;
       }
 
@@ -813,7 +848,7 @@ class FileExplorerController {
         );
         const payload = await res.json().catch(() => ({}));
         if (!res.ok) {
-          this.alertImpl(payload.error || "Upload failed");
+          this.alertImpl(explainApiError(payload, "Upload failed"));
           return false;
         }
       } catch (err) {

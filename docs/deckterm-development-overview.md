@@ -1,6 +1,43 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29
+> **Datum:** 2026-05-29 · **Delta 2026-06-12 viz sekce 0**
+
+## 0. Delta 2026-06-12 — noční QoL/direction session
+
+Směrové rozhodnutí (uloženo i v agent memory): DeckTerm je **agent-aware dev cockpit**
+pro jednoho vývojáře + pár důvěryhodných lidí — ne multi-tenant; kontejnerová izolace
+max. pro task runs, až po UX. Plán noci: `docs/plans/2026-06-10-overnight-qol-and-direction.md`.
+
+**Opravené bugy (zásadní):**
+
+- **Sdílený tmux socket dev+prod** (`/tmp/deckterm/deckterm_deckterm.sock` — oba `.env`
+  mají namespace `deckterm`) + `KillMode=control-group` ⇒ každý restart služby zabil tmux
+  server i sessions druhé instance. Fix `2618203`: socket je `$DECKTERM_STATE_DIR/tmux/…`,
+  dev unit má `KillMode=process` (tmux přežívá restart — ověřeno živě vč. obnovy scrollbacku).
+  **Prod čeká:** KillMode + jednorázová ztráta starých sessions při příštím deployi —
+  runbook `docs/plans/2026-06-12-cloudflare-access-switch-runbook.md`.
+- **test:unit červený lokálně** — testy dědily env z DeckTerm service (legacy bypass,
+  tunnel mode); fix `5fcd118` izoluje env ve foundation testech.
+- **Reconnect klasifikace** běžela jen na 3. pokusu a neuměla ended-in-catalog ⇒ klient
+  mlel 10/10 místo přesného overlay; fix `c24c306` (+ live countdown příštího pokusu).
+- Mrtvý kód pryč: OpenCode proxy (-215 řádků v server.ts) a `gateway.py` (`90a736e`).
+
+**Nové funkce:** scrollback search Ctrl+Shift+F (`6893240`) · palette módy `@` sessions /
+`$` saved commands (`6ed2b4c`) · vysvětlitelné 403 (strukturované deny payloady +
+`access-denied.js`, `ce92c5e`) · task badge v toolbaru + transition toasty (`9d801f8`) ·
+kanban board v task panelu + default provider claude (`bff50f5`) · **in-browser editor
+souborů** — CodeMirror 6, atomický save s mtime conflict guardem, audit (`572b261`).
+
+**Bezpečnost/deploy:** `/api/health` vyjmut z CF Access JWT validace (deploy gate jede
+přes loopback; `2c0011f`) a připraven kompletní runbook na přepnutí prodů
+`cloudflare-tunnel → cloudflare-access` (per-user identity, aktivace gates) — provádí
+Lukáš ručně dle runbooku.
+
+Pozn.: scrollback replay po reconnectu (Hermes tip) **už existoval** (delta replay přes
+`lastEventId` → `capture-pane -S -2000` fallback) — jen nebyl ověřený; teď je.
+
+---
+
 > **Účel:** Jeden dokument, ze kterého pochopíš, kde DeckTerm je, jak vznikal, jak se nasazuje na nový server, co je autoconfig, jak je navržen multisession a k čemu slouží tasky.
 > **Pro koho:** pro tebe (orientace po delší době) i pro někoho nového, kdo by projekt přebíral.
 

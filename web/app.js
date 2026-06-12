@@ -98,6 +98,14 @@ const KEY_SEQUENCES = {
 const TERMINAL_FONT_FAMILY =
   '"JetBrains Mono", "Symbols Nerd Font", "Cascadia Code", "Fira Code", Menlo, Monaco, "Courier New", monospace';
 const TERMINAL_LINE_HEIGHT = 1.2;
+// Scrollback-search match highlighting (GitHub-dark yellows; the overview
+// ruler colors are required fields of the SearchAddon decorations API).
+const TERMINAL_SEARCH_DECORATIONS = {
+  matchBackground: "#5a4a00",
+  matchOverviewRuler: "#d29922",
+  activeMatchBackground: "#9e6a03",
+  activeMatchColorOverviewRuler: "#f0c674",
+};
 const TERMINAL_PADDING_X = 16;
 const TERMINAL_PADDING_Y = 16;
 const FONT_METRIC_WAIT_MS = 350;
@@ -544,11 +552,16 @@ class ReconnectingWebSocket {
     );
     this.retryCount++;
 
-    // After 3 failed attempts, classify whether this is permanent (terminal
-    // gone, or access blocked because the server isn't bootstrapped / denies
-    // us) versus a transient drop. A failed WS upgrade surfaces only as
-    // "Expected 101", so we probe over HTTP instead of looping pointlessly.
-    if (this.retryCount === 3) {
+    // From the 3rd failed attempt on, classify whether this is permanent
+    // (terminal gone, or access blocked because the server isn't
+    // bootstrapped / denies us) versus a transient drop. A failed WS upgrade
+    // surfaces only as "Expected 101", so we probe over HTTP instead of
+    // looping pointlessly. Re-classifying every later attempt matters: when
+    // the outage starts server-side, attempt 3's probe also fails (→ retry),
+    // and the server may come back only to report the terminal as ended —
+    // without re-checking, the client would churn to 10/10 "Connection lost"
+    // instead of switching to the accurate dead/blocked overlay.
+    if (this.retryCount >= 3) {
       this.classifyReconnect().then((outcome) => {
         if (outcome === "gone") {
           this.intentionallyClosed = true;
@@ -583,6 +596,7 @@ class ReconnectingWebSocket {
     let catalogOk = false;
     let catalogStatus = 0;
     let terminalInCatalog = false;
+    let terminalEnded = false;
     let bootstrapped = null;
     try {
       const res = await fetch(`/api/terminals`);
@@ -590,7 +604,11 @@ class ReconnectingWebSocket {
       catalogStatus = res.status;
       if (res.ok) {
         const terminals = await res.json();
-        terminalInCatalog = terminals.some((t) => t.id === this.terminalId);
+        const entry = terminals.find((t) => t.id === this.terminalId);
+        terminalInCatalog = Boolean(entry);
+        terminalEnded = Boolean(
+          entry && !window.SessionActions.isSessionLive(entry),
+        );
       }
     } catch {
       // Network error — treat as transient, keep retrying.
@@ -598,7 +616,7 @@ class ReconnectingWebSocket {
     }
     // Only the ambiguous "terminal still listed but socket won't open" case
     // needs the extra probe; resolve it against the bootstrap gate.
-    if (catalogOk && terminalInCatalog) {
+    if (catalogOk && terminalInCatalog && !terminalEnded) {
       try {
         const sres = await fetch(`/api/foundation/status`);
         if (sres.ok) {
@@ -613,6 +631,7 @@ class ReconnectingWebSocket {
       catalogOk,
       catalogStatus,
       terminalInCatalog,
+      terminalEnded,
       bootstrapped,
     });
   }
@@ -3734,6 +3753,8 @@ class TerminalManager {
     const lastDir = localStorage.getItem("opencode-web-dir");
     if (lastDir) this.setDirectoryValue(lastDir);
 
+    this.initTaskSignalBadge();
+
     // Button handlers
     document
       .getElementById("new-terminal")
@@ -3848,6 +3869,10 @@ class TerminalManager {
     const FileExplorerCtor =
       window.FileExplorerController?.FileExplorerController;
     this.fileExplorer = FileExplorerCtor ? new FileExplorerCtor() : null;
+    if (this.fileExplorer && window.FileEditorModule) {
+      this.fileEditor = new window.FileEditorModule.FileEditor();
+      this.fileExplorer.onOpenFile = (path) => void this.fileEditor.open(path);
+    }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
       this.syncSurfaceButtonState();
@@ -4669,6 +4694,9 @@ class TerminalManager {
       if (!item) return;
       this.selectTask(item.dataset.taskId);
     });
+    panel
+      .querySelector("#task-view-toggle")
+      ?.addEventListener("click", () => this.toggleTaskViewMode());
     panel.querySelector("#task-detail")?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-task-action]");
       if (!button) return;
@@ -5293,6 +5321,7 @@ class TerminalManager {
     this.setTaskStatus("Loading tasks...");
     try {
       const tasks = await this.fetchTaskJson("/api/tasks");
+      this.updateTaskSignals(tasks);
       this.taskState.items = Array.isArray(tasks) ? tasks : [];
       this.taskState.selectedId =
         selectedId &&
@@ -5310,9 +5339,110 @@ class TerminalManager {
     }
   }
 
+  // --- Global task-status badge + transition toasts -------------------------
+  // The task panel stays poll-on-open; this badge polls cheaply in the
+  // background so running/needs-user tasks are visible (and notable
+  // transitions toast) while the panel is closed. Logic: web/task-signals.js.
+
+  initTaskSignalBadge() {
+    const status = this.connectionStatus;
+    if (!status?.parentElement || !window.TaskSignals) return;
+    const badge = document.createElement("button");
+    badge.type = "button";
+    badge.id = "task-signal-badge";
+    badge.className = "task-signal-badge hidden";
+    badge.addEventListener("click", () => void this.openTaskPanel());
+    status.parentElement.insertBefore(badge, status);
+    this.taskSignalBadge = badge;
+    this.taskSignalLast = null;
+
+    const poll = async () => {
+      if (document.visibilityState !== "visible") return;
+      try {
+        const res = await fetch("/api/tasks");
+        if (!res.ok) return;
+        this.updateTaskSignals(await res.json());
+      } catch {
+        // Offline/transient — the reconnect overlay owns that messaging.
+      }
+    };
+    this.taskSignalTimer = setInterval(() => void poll(), 15000);
+    void poll();
+  }
+
+  updateTaskSignals(tasks) {
+    if (!this.taskSignalBadge || !window.TaskSignals) return;
+    const signals = window.TaskSignals.computeTaskSignals(tasks);
+    this.taskSignalBadge.classList.toggle("hidden", !signals.badgeText);
+    this.taskSignalBadge.textContent = signals.badgeText || "";
+    this.taskSignalBadge.title = signals.title;
+
+    if (this.taskSignalLast) {
+      const transitions = window.TaskSignals.diffTaskTransitions(
+        this.taskSignalLast,
+        tasks,
+      );
+      for (const transition of transitions) {
+        this.showTaskToast(transition);
+      }
+    }
+    this.taskSignalLast = Array.isArray(tasks) ? tasks : [];
+  }
+
+  showTaskToast(transition) {
+    let toast = document.getElementById("task-toast");
+    if (!toast) {
+      toast = document.createElement("div");
+      toast.id = "task-toast";
+      toast.className = "task-toast hidden";
+      toast.addEventListener("click", () => {
+        toast.classList.add("hidden");
+        void this.openTaskPanel();
+      });
+      document.getElementById("app")?.appendChild(toast);
+    }
+    const verb =
+      transition.to === "complete"
+        ? "completed ✅"
+        : transition.to === "failed"
+          ? "failed ❌"
+          : "needs your input ⏸";
+    toast.textContent = `Task "${transition.title}" ${verb}`;
+    toast.classList.remove("hidden");
+    clearTimeout(this.taskToastTimer);
+    this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
+  }
+
+  getTaskViewMode() {
+    return localStorage.getItem("deckterm-task-view") === "board"
+      ? "board"
+      : "list";
+  }
+
+  toggleTaskViewMode() {
+    const next = this.getTaskViewMode() === "board" ? "list" : "board";
+    localStorage.setItem("deckterm-task-view", next);
+    this.renderTasks();
+  }
+
+  syncTaskViewToggle() {
+    const toggle = document.getElementById("task-view-toggle");
+    if (!toggle) return;
+    const mode = this.getTaskViewMode();
+    toggle.textContent = mode === "board" ? "☰ List" : "▦ Board";
+    toggle.title =
+      mode === "board" ? "Switch to list view" : "Switch to board view";
+  }
+
   renderTasks() {
+    this.syncTaskViewToggle();
+    if (this.getTaskViewMode() === "board") {
+      this.renderTaskBoard();
+      return;
+    }
     const list = document.getElementById("task-list");
     if (!list) return;
+    list.classList.remove("task-board");
     list.replaceChildren();
 
     if (this.taskState.items.length === 0) {
@@ -5348,6 +5478,53 @@ class TerminalManager {
       button.append(header, meta);
       list.appendChild(button);
     });
+
+    this.renderTaskDetail(
+      this.taskState.items.find(
+        (task) => task.id === this.taskState.selectedId,
+      ) || null,
+    );
+  }
+
+  // Kanban board view inside the task panel (read-only MVP, see
+  // docs/plans/2026-06-12-task-board-design.md). Column logic: task-board.js.
+  renderTaskBoard() {
+    const list = document.getElementById("task-list");
+    if (!list || !window.TaskBoard) return;
+    list.classList.add("task-board");
+    list.replaceChildren();
+
+    const columns = window.TaskBoard.groupTasksForBoard(this.taskState.items);
+    for (const column of columns) {
+      const columnEl = document.createElement("div");
+      columnEl.className = "task-board-column";
+
+      const label = document.createElement("div");
+      label.className = "task-board-column-label";
+      label.textContent = `${column.label} (${column.tasks.length})`;
+      columnEl.appendChild(label);
+
+      for (const task of column.tasks) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "task-item task-board-card";
+        card.dataset.taskId = task.id;
+        card.classList.toggle("active", task.id === this.taskState.selectedId);
+
+        const title = document.createElement("div");
+        title.className = "task-item-title";
+        title.textContent = task.title || "Untitled task";
+
+        const meta = document.createElement("div");
+        meta.className = "task-item-meta";
+        meta.textContent = `${task.status} · ${task.workerProvider || ""}`;
+
+        card.append(title, meta);
+        columnEl.appendChild(card);
+      }
+
+      list.appendChild(columnEl);
+    }
 
     this.renderTaskDetail(
       this.taskState.items.find(
@@ -5498,9 +5675,9 @@ class TerminalManager {
       title: panel.querySelector("#task-title")?.value || "",
       description: panel.querySelector("#task-description")?.value || "",
       workerProvider:
-        panel.querySelector("#task-worker-provider")?.value || "codex",
+        panel.querySelector("#task-worker-provider")?.value || "claude",
       judgeProvider:
-        panel.querySelector("#task-judge-provider")?.value || "codex",
+        panel.querySelector("#task-judge-provider")?.value || "claude",
       useWorktree: Boolean(panel.querySelector("#task-use-worktree")?.checked),
     };
 
@@ -6578,6 +6755,116 @@ class TerminalManager {
         })
         .filter(Boolean);
     });
+
+    // "@" mode — fuzzy session switch over the server catalog. Each action
+    // carries the raw query as a keyword so it survives registry scoring
+    // (same trick as the go-to-directory provider); ordering comes from the
+    // provider via descending priority.
+    this.commandPaletteRegistry.registerProvider(() => {
+      const query = this.getCommandPaletteQuery();
+      const text = window.PaletteProviders.parsePrefixQuery(query, "@");
+      if (text === null) return [];
+
+      const entries = window.PaletteProviders.filterSessions({
+        sessions: this._sessionCatalog || [],
+        text,
+        isLocallyOpen: (id) => this.terminals.has(id),
+        planAction: (session, options) =>
+          window.SessionActions.planSessionRowAction(session, options),
+      });
+
+      return entries.map((entry, index) => ({
+        id: `palette-session:${entry.session.id}`,
+        title: this.formatCwdLabel(entry.session.cwd) || entry.session.id,
+        group: "Sessions",
+        keywords: [query],
+        meta: [
+          entry.plan.label,
+          entry.plan.statusClass === "active" ? "● live" : "○ ended",
+          entry.session.id,
+        ],
+        priority: 100 - index,
+        run: () => void this.handleSessionRowActivate(entry.session.id),
+      }));
+    });
+
+    // "$" mode — saved commands (localStorage), run in the active terminal.
+    this.savedCommandsStore = window.PaletteProviders.createSavedCommandsStore(
+      window.localStorage,
+    );
+    this.commandPaletteRegistry.registerProvider(() => {
+      const query = this.getCommandPaletteQuery();
+      const text = window.PaletteProviders.parsePrefixQuery(query, "$");
+      if (text === null) return [];
+
+      const commands = window.PaletteProviders.filterSavedCommands(
+        this.savedCommandsStore.list(),
+        text,
+      );
+
+      const actions = commands.map((entry, index) => ({
+        id: `palette-command:${entry.name}`,
+        title: entry.name,
+        group: "Commands",
+        keywords: [query],
+        meta: [entry.command],
+        priority: 100 - index,
+        run: () => this.runSavedCommand(entry.command),
+      }));
+
+      actions.push({
+        id: "palette-command-save",
+        title: "Save command…",
+        group: "Commands",
+        keywords: [query],
+        meta: ["new $ shortcut"],
+        priority: 1,
+        run: () => this.promptSaveCommand(text),
+      });
+      if (commands.length > 0) {
+        actions.push({
+          id: "palette-command-remove",
+          title: "Remove command…",
+          group: "Commands",
+          keywords: [query],
+          meta: ["delete a $ shortcut"],
+          priority: 0,
+          run: () => this.promptRemoveCommand(),
+        });
+      }
+      return actions;
+    });
+  }
+
+  runSavedCommand(command) {
+    const active = this.getActiveTerminal();
+    if (!active?.ws) return;
+    active.ws.send(JSON.stringify({ type: "input", data: `${command}\r` }));
+    active.terminal?.focus();
+  }
+
+  promptSaveCommand(prefillName = "") {
+    const name = window.prompt("Command name (palette: $name)", prefillName);
+    if (!name?.trim()) return;
+    const existing = this.savedCommandsStore
+      .list()
+      .find((entry) => entry.name === name.trim());
+    const command = window.prompt(
+      `Shell command for "${name.trim()}"`,
+      existing?.command || "",
+    );
+    if (!command?.trim()) return;
+    this.savedCommandsStore.save(name, command);
+  }
+
+  promptRemoveCommand() {
+    const names = this.savedCommandsStore
+      .list()
+      .map((entry) => entry.name)
+      .join(", ");
+    const name = window.prompt(`Remove which command? (${names})`);
+    if (!name?.trim()) return;
+    this.savedCommandsStore.remove(name.trim());
   }
 
   getCommandPaletteContext() {
@@ -6668,6 +6955,9 @@ class TerminalManager {
   async openCommandPalette() {
     if (!this.commandPalette) return;
     this.closeToolsSheet();
+    // Fire-and-forget catalog refresh so the "@" sessions mode has fresh
+    // entries by the time the user types; results re-render per keystroke.
+    void this.refreshSessionsPanel();
     this.commandPalette.open(await this.buildCommandPaletteContext());
     this.syncSurfaceButtonState();
   }
@@ -8208,6 +8498,13 @@ class TerminalManager {
     const pasteHandler = (event) => {
       if (!event.clipboardData) return;
       event.preventDefault();
+      // stopImmediatePropagation is essential: xterm.js registers its own
+      // `paste` listeners on the inner .xterm element + helper textarea, and
+      // preventDefault alone does NOT stop them from firing. Without this we
+      // paste twice (once here, once via xterm's onData). We attach on the
+      // container in the capture phase (below) so this handler always runs
+      // before xterm's descendant listeners, then halt the event here.
+      event.stopImmediatePropagation();
       this.clipboardManager
         .handlePaste(ws, event.clipboardData)
         .catch((err) => {
@@ -8215,9 +8512,11 @@ class TerminalManager {
         });
     };
 
-    textarea.addEventListener("paste", pasteHandler, true);
+    // Capture phase on the container (an ancestor of the .xterm element and
+    // helper textarea) guarantees we intercept before xterm's own listeners.
+    element.addEventListener("paste", pasteHandler, true);
     return () => {
-      textarea.removeEventListener("paste", pasteHandler, true);
+      element.removeEventListener("paste", pasteHandler, true);
     };
   }
 
@@ -8258,9 +8557,12 @@ class TerminalManager {
 
     const fitAddon = new FitAddon.FitAddon();
     const webLinksAddon = new WebLinksAddon.WebLinksAddon();
+    const searchAddon = new SearchAddon.SearchAddon();
     terminal.loadAddon(fitAddon);
     terminal.loadAddon(webLinksAddon);
+    terminal.loadAddon(searchAddon);
     terminal._fitAddon = fitAddon;
+    terminal._searchAddon = searchAddon;
 
     // OSC52 clipboard support (xterm.js 6.0+)
     if (terminal.parser?.registerOscHandler) {
@@ -8272,12 +8574,32 @@ class TerminalManager {
 
     // Intercept Ctrl+V for clipboard paste with large content warning
     terminal.attachCustomKeyEventHandler((event) => {
+      // Ctrl+Shift+F: scrollback search overlay
+      if (
+        event.ctrlKey &&
+        event.shiftKey &&
+        event.type === "keydown" &&
+        (event.key === "F" || event.key === "f")
+      ) {
+        event.preventDefault();
+        this.openTerminalSearch();
+        return false;
+      }
       // Ctrl+V or Cmd+V
       if (
         (event.ctrlKey || event.metaKey) &&
         event.key === "v" &&
         event.type === "keydown"
       ) {
+        if (event.shiftKey) {
+          // Ctrl+Shift+V (and similar "paste as plain text"): the browser
+          // fires a native `paste` event that attachClipboardPasteFallback
+          // already handles exactly once. Returning false only stops xterm
+          // from emitting a literal ^V (0x16); we deliberately do NOT
+          // preventDefault here — otherwise the native paste is cancelled
+          // and nothing pastes. Intercepting here too would paste twice.
+          return false;
+        }
         event.preventDefault();
         const termData = this.terminals.get(this.activeId);
         if (termData?.ws) {
@@ -8310,6 +8632,115 @@ class TerminalManager {
     return overlay;
   }
 
+  // --- Scrollback search (Ctrl+Shift+F) -------------------------------------
+  // One shared bar + controller, rebound to the active terminal's SearchAddon
+  // on each open. State logic lives in web/search-overlay.js.
+
+  ensureSearchBar() {
+    if (this.searchBar) return this.searchBar;
+    const bar = document.createElement("div");
+    bar.className = "terminal-search-bar hidden";
+    bar.innerHTML = `
+      <input type="text" class="search-input" placeholder="Search scrollback" spellcheck="false" autocomplete="off" />
+      <span class="search-count" aria-live="polite"></span>
+      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)">↑</button>
+      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)">↓</button>
+      <button type="button" class="search-btn" data-search-act="close" title="Close (Esc)">✕</button>
+    `;
+    const input = bar.querySelector(".search-input");
+    input.addEventListener("input", () => {
+      this.searchController?.setQuery(input.value);
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === "F3") {
+        e.preventDefault();
+        if (e.shiftKey) this.searchController?.prev();
+        else this.searchController?.next();
+      } else if (e.key === "Escape") {
+        e.preventDefault();
+        this.closeTerminalSearch({ refocus: true });
+      }
+    });
+    bar.addEventListener("click", (e) => {
+      const act = e.target?.dataset?.searchAct;
+      if (act === "prev") this.searchController?.prev();
+      else if (act === "next") this.searchController?.next();
+      else if (act === "close") this.closeTerminalSearch({ refocus: true });
+    });
+    this.searchBar = bar;
+    return bar;
+  }
+
+  openTerminalSearch() {
+    const active = this.getActiveTerminal();
+    const addon = active?.terminal?._searchAddon;
+    if (!addon) return;
+
+    const bar = this.ensureSearchBar();
+    const host = active.element?.parentElement || active.element;
+    if (bar.parentElement !== host) host.appendChild(bar);
+
+    this.searchResultsDisposable?.dispose?.();
+    this.searchController = window.SearchOverlay.createSearchController({
+      searchApi: {
+        findNext: (q, opts) =>
+          addon.findNext(q, {
+            ...opts,
+            decorations: TERMINAL_SEARCH_DECORATIONS,
+          }),
+        findPrevious: (q, opts) =>
+          addon.findPrevious(q, {
+            ...opts,
+            decorations: TERMINAL_SEARCH_DECORATIONS,
+          }),
+        clearDecorations: () => addon.clearDecorations(),
+      },
+      onState: (state) => this.renderSearchState(state),
+    });
+    this.searchResultsDisposable = addon.onDidChangeResults?.((r) =>
+      this.searchController?.handleResults(
+        r || { resultIndex: -1, resultCount: 0 },
+      ),
+    );
+
+    // Prefill: short single-line selection wins, then the last search.
+    const selection = active.terminal.getSelection?.()?.trim() || "";
+    const prefill =
+      selection && selection.length <= 200 && !selection.includes("\n")
+        ? selection
+        : this.searchLastQuery || "";
+    const input = bar.querySelector(".search-input");
+    input.value = prefill;
+    this.searchController.open(prefill ? { query: prefill } : undefined);
+    input.focus();
+    input.select();
+  }
+
+  closeTerminalSearch({ refocus = false } = {}) {
+    if (!this.searchController) return;
+    this.searchLastQuery =
+      this.searchController.getState().query || this.searchLastQuery || "";
+    this.searchController.close();
+    this.searchController = null;
+    this.searchResultsDisposable?.dispose?.();
+    this.searchResultsDisposable = null;
+    this.searchBar?.classList.add("hidden");
+    if (refocus) this.getActiveTerminal()?.terminal?.focus();
+  }
+
+  renderSearchState(state) {
+    const bar = this.ensureSearchBar();
+    bar.classList.toggle("hidden", !state.open);
+    const count = bar.querySelector(".search-count");
+    if (!state.query || state.resultCount === null) {
+      count.textContent = "";
+    } else if (state.resultCount === 0) {
+      count.textContent = "0/0";
+    } else {
+      count.textContent = `${state.resultIndex + 1}/${state.resultCount}`;
+    }
+  }
+
   createDimensionOverlay(container) {
     const overlay = document.createElement("div");
     overlay.className = "dimension-overlay";
@@ -8327,11 +8758,20 @@ class TerminalManager {
     const message = overlay.querySelector(".overlay-message");
     const actions = overlay.querySelector(".overlay-actions");
 
+    // Any status change invalidates a running next-attempt countdown.
+    clearInterval(t.reconnectCountdownTimer);
+    t.reconnectCountdownTimer = null;
+
+    const formatAttempt = window.ReconnectClassify.formatReconnectAttempt;
     const overlayConfigs = {
       connected: { hidden: true },
       reconnecting: {
         icon: "🔄",
-        message: `Reconnecting... (attempt ${extra.attempt}/${extra.maxRetries})`,
+        message: formatAttempt({
+          attempt: extra.attempt,
+          maxRetries: extra.maxRetries,
+          secondsLeft: Math.round((extra.delay || 0) / 1000),
+        }),
         actions: "",
       },
       failed: {
@@ -8408,6 +8848,22 @@ class TerminalManager {
           this.closeTerminal(id);
         }
       };
+
+      if (status === "reconnecting" && extra.delay > 1000) {
+        const deadline = Date.now() + extra.delay;
+        t.reconnectCountdownTimer = setInterval(() => {
+          const secondsLeft = Math.round((deadline - Date.now()) / 1000);
+          message.textContent = formatAttempt({
+            attempt: extra.attempt,
+            maxRetries: extra.maxRetries,
+            secondsLeft,
+          });
+          if (secondsLeft <= 0) {
+            clearInterval(t.reconnectCountdownTimer);
+            t.reconnectCountdownTimer = null;
+          }
+        }, 1000);
+      }
     }
   }
 
@@ -9107,6 +9563,9 @@ class TerminalManager {
   switchTo(id) {
     if (!this.terminals.has(id)) return;
 
+    // The search bar/controller are bound to the previous terminal's addon.
+    this.closeTerminalSearch();
+
     this.activeId = id;
     const t = this.terminals.get(id);
     if (t?.workspaceId) {
@@ -9177,12 +9636,15 @@ class TerminalManager {
     if (!t) return;
     const closingWorkspaceId = t.workspaceId;
 
+    if (id === this.activeId) this.closeTerminalSearch();
+
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
+    if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();

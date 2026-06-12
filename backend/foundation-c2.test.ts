@@ -26,6 +26,16 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  // Isolate ambient env so the gates run their real allow/deny + audit logic
+  // (same class of leak as 95efecb; leaks come from Bun's .env auto-load and
+  // from running tests inside a DeckTerm dev terminal that inherits the
+  // service environment):
+  // - cloudflare-tunnel mode would resolve the edge-trusted tunnel actor and
+  //   skip the legacy_path_resolution audit row asserted by C2-1,
+  // - DECKTERM_LEGACY_NO_BOOTSTRAP=1 short-circuits requireFileAccess before
+  //   any audit write.
+  delete process.env.DECKTERM_PUBLISH_MODE;
+  delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
 
   // Bring the foundation into a bootstrapped, secure (non-bypass) state so the
   // gates run their real allow/deny logic. The anonymous test actor is made the
@@ -95,6 +105,25 @@ test("C2-1: allowed file access emits a legacy_path_resolution audit row, not lo
   expect(rows[0].action).toBe("file.access");
 });
 
+test("C2-1b: denied file access returns a structured, explainable payload", async () => {
+  // /api/browse intentionally falls back to the default root for unknown
+  // paths, so use a strict endpoint. The deny here comes from the legacy
+  // allowed-roots resolution, which now carries the same machine-readable
+  // reason as the foundation gate so the frontend can explain the 403 and
+  // offer a Setup CTA (web/access-denied.js) instead of a blind "Forbidden".
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/download?path=${encodeURIComponent(
+        join(outsideRoot, "nope.txt"),
+      )}`,
+    ),
+  );
+  expect(res.status).toBe(403);
+  const body = await res.json();
+  expect(body.reason).toBe("no_matching_root");
+  expect(typeof body.error).toBe("string");
+});
+
 test("C2-2: task create with a forbidden root is denied and writes a foundation audit deny row", async () => {
   const res = await app.fetch(
     new Request("http://deckterm.test/api/tasks", {
@@ -127,4 +156,60 @@ test("C2-3: onboarding remediate route returns success:false for an unknown reme
   expect(res.status).toBe(200);
   const data = await res.json();
   expect(data.success).toBe(false);
+});
+
+test("C2-2b: file content roundtrip — GET reads, PUT saves atomically with conflict guard", async () => {
+  const target = join(allowedRoot, "hello.txt");
+
+  const getRes = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/content?path=${encodeURIComponent(target)}`,
+    ),
+  );
+  expect(getRes.status).toBe(200);
+  const getBody = await getRes.json();
+  expect(getBody.content).toBe("hi");
+  expect(typeof getBody.mtimeMs).toBe("number");
+
+  const putRes = await app.fetch(
+    new Request("http://deckterm.test/api/files/content", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        path: target,
+        content: "hello editor",
+        expectedMtimeMs: getBody.mtimeMs,
+      }),
+    }),
+  );
+  expect(putRes.status).toBe(200);
+  expect(await readFile(target, "utf8")).toBe("hello editor");
+
+  // Stale expectedMtimeMs (pre-save) must 409 instead of clobbering.
+  const conflictRes = await app.fetch(
+    new Request("http://deckterm.test/api/files/content", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        path: target,
+        content: "lost update",
+        expectedMtimeMs: getBody.mtimeMs,
+      }),
+    }),
+  );
+  expect(conflictRes.status).toBe(409);
+  expect(await readFile(target, "utf8")).toBe("hello editor");
+});
+
+test("C2-2c: file content endpoints deny outside registered roots", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/content?path=${encodeURIComponent(
+        join(outsideRoot, "hello.txt"),
+      )}`,
+    ),
+  );
+  expect(res.status).toBe(403);
+  const body = await res.json();
+  expect(body.reason).toBe("no_matching_root");
 });

@@ -19,6 +19,7 @@ function classifyReconnectFailure({
   catalogOk,
   catalogStatus,
   terminalInCatalog,
+  terminalEnded,
   bootstrapped,
 }) {
   if (!catalogOk) {
@@ -26,11 +27,25 @@ function classifyReconnectFailure({
     return "retry";
   }
   if (!terminalInCatalog) return "gone";
+  // Ended sessions stay listed in the catalog; a WS attach to one can never
+  // succeed, so it is "gone" regardless of the bootstrap state.
+  if (terminalEnded) return "gone";
   if (bootstrapped === false) return "blocked";
   return "retry";
 }
 
-const ReconnectClassify = { classifyReconnectFailure };
+// Overlay copy for the reconnecting state. Backoff is exponential (1s→30s
+// cap), so without the countdown a user can stare at "attempt 6/10" for half
+// a minute with no sign anything is happening.
+function formatReconnectAttempt({ attempt, maxRetries, secondsLeft }) {
+  const base = `Reconnecting... (attempt ${attempt}/${maxRetries}`;
+  if (Number.isFinite(secondsLeft) && secondsLeft > 0) {
+    return `${base}, next try in ${secondsLeft}s)`;
+  }
+  return `${base})`;
+}
+
+const ReconnectClassify = { classifyReconnectFailure, formatReconnectAttempt };
 
 if (typeof window !== "undefined") {
   window.ReconnectClassify = ReconnectClassify;

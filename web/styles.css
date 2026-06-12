@@ -4777,3 +4777,232 @@ body.virtual-keyboard-open .extra-keys {
 .panel-active {
   box-shadow: inset 0 0 0 1px var(--accent-blue);
 }
+
+/* =============================================================================
+   TERMINAL SCROLLBACK SEARCH BAR (Ctrl+Shift+F)
+   ============================================================================= */
+
+.terminal-search-bar {
+  position: absolute;
+  top: 8px;
+  right: 16px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  z-index: 60;
+}
+
+.terminal-search-bar.hidden {
+  display: none;
+}
+
+.terminal-search-bar .search-input {
+  width: 200px;
+  padding: 4px 8px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+
+.terminal-search-bar .search-input:focus {
+  border-color: var(--accent-blue);
+}
+
+.terminal-search-bar .search-count {
+  min-width: 38px;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.terminal-search-bar .search-btn {
+  padding: 4px 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+  line-height: 1;
+}
+
+.terminal-search-bar .search-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* =============================================================================
+   TASK SIGNAL BADGE + TRANSITION TOAST
+   ============================================================================= */
+
+.task-signal-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  margin-right: 6px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.task-signal-badge:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-hover);
+}
+
+.task-signal-badge.hidden {
+  display: none;
+}
+
+.task-toast {
+  position: fixed;
+  bottom: 18px;
+  right: 18px;
+  max-width: 340px;
+  padding: 10px 14px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  z-index: 200;
+}
+
+.task-toast.hidden {
+  display: none;
+}
+
+/* =============================================================================
+   TASK BOARD (kanban view in the task panel)
+   ============================================================================= */
+
+.task-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#task-list.task-board {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  align-items: flex-start;
+}
+
+.task-board-column {
+  flex: 1 0 150px;
+  min-width: 150px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-board-column-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 2px 4px;
+}
+
+.task-board-card {
+  width: 100%;
+  text-align: left;
+}
+
+/* =============================================================================
+   FILE EDITOR MODAL (CodeMirror 6)
+   ============================================================================= */
+
+.file-editor-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(13, 17, 23, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+
+.file-editor-modal.hidden {
+  display: none;
+}
+
+.file-editor-shell {
+  width: min(960px, 94vw);
+  height: min(80vh, 760px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.file-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.file-editor-title {
+  flex: 1;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: "JetBrains Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.file-editor-dirty {
+  color: var(--accent-red);
+  visibility: hidden;
+}
+
+.file-editor-dirty.visible {
+  visibility: visible;
+}
+
+.file-editor-status {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.file-editor-mount {
+  flex: 1;
+  overflow: hidden;
+}
+
+.file-editor-mount .cm-editor {
+  height: 100%;
+}
+
+.file-explorer-item .file-actions .edit {
+  color: var(--text-secondary);
+}

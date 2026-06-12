@@ -13,6 +13,7 @@ const ISOLATED_ENV_KEYS = [
   "CF_ACCESS_REQUIRED",
   "DECKTERM_RUNTIME_ENV",
   "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
   "SHELL",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -90,6 +91,10 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   // design (see foundation-tunnel.test.ts), and a local .env enabling tunnel
   // mode would otherwise leak in and make this test pass in CI but fail locally.
   delete process.env.DECKTERM_PUBLISH_MODE;
+  // Likewise: a shell running inside a DeckTerm dev terminal inherits the
+  // service's DECKTERM_LEGACY_NO_BOOTSTRAP=1, which bypasses the very
+  // bootstrap gate this test asserts.
+  delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
   process.env.SHELL = "/bin/bash";
 
   const { createWebApp, startWebServer } = await import("./server");

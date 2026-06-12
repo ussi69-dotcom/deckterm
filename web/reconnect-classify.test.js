@@ -1,5 +1,8 @@
 import { test, expect } from "bun:test";
-import { classifyReconnectFailure } from "./reconnect-classify";
+import {
+  classifyReconnectFailure,
+  formatReconnectAttempt,
+} from "./reconnect-classify";
 
 test("terminal absent from the catalog is gone (dead)", () => {
   expect(
@@ -82,4 +85,37 @@ test("non-auth catalog error (e.g. 500/0) is treated as transient", () => {
       bootstrapped: null,
     }),
   ).toBe("retry");
+});
+
+test("formatReconnectAttempt shows the attempt and a live countdown when known", () => {
+  expect(
+    formatReconnectAttempt({ attempt: 2, maxRetries: 10, secondsLeft: 4 }),
+  ).toBe("Reconnecting... (attempt 2/10, next try in 4s)");
+  expect(
+    formatReconnectAttempt({ attempt: 2, maxRetries: 10, secondsLeft: 0 }),
+  ).toBe("Reconnecting... (attempt 2/10)");
+  expect(formatReconnectAttempt({ attempt: 5, maxRetries: 10 })).toBe(
+    "Reconnecting... (attempt 5/10)",
+  );
+});
+
+test("terminal listed in the catalog but ended is gone, not blocked", () => {
+  expect(
+    classifyReconnectFailure({
+      catalogOk: true,
+      catalogStatus: 200,
+      terminalInCatalog: true,
+      terminalEnded: true,
+      bootstrapped: false,
+    }),
+  ).toBe("gone");
+  expect(
+    classifyReconnectFailure({
+      catalogOk: true,
+      catalogStatus: 200,
+      terminalInCatalog: true,
+      terminalEnded: true,
+      bootstrapped: true,
+    }),
+  ).toBe("gone");
 });
