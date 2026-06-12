@@ -105,6 +105,25 @@ test("C2-1: allowed file access emits a legacy_path_resolution audit row, not lo
   expect(rows[0].action).toBe("file.access");
 });
 
+test("C2-1b: denied file access returns a structured, explainable payload", async () => {
+  // /api/browse intentionally falls back to the default root for unknown
+  // paths, so use a strict endpoint. The deny here comes from the legacy
+  // allowed-roots resolution, which now carries the same machine-readable
+  // reason as the foundation gate so the frontend can explain the 403 and
+  // offer a Setup CTA (web/access-denied.js) instead of a blind "Forbidden".
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/download?path=${encodeURIComponent(
+        join(outsideRoot, "nope.txt"),
+      )}`,
+    ),
+  );
+  expect(res.status).toBe(403);
+  const body = await res.json();
+  expect(body.reason).toBe("no_matching_root");
+  expect(typeof body.error).toBe("string");
+});
+
 test("C2-2: task create with a forbidden root is denied and writes a foundation audit deny row", async () => {
   const res = await app.fetch(
     new Request("http://deckterm.test/api/tasks", {

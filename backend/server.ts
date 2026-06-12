@@ -848,6 +848,9 @@ async function requireFoundationCapability({
       status: 403,
       message: "DeckTerm bootstrap required",
       reason: "bootstrap_required",
+      capability,
+      resourceType,
+      resourceId: resourceId || "*",
     };
   }
 
@@ -874,24 +877,41 @@ async function requireFoundationCapability({
       status: 403,
       message: "DeckTerm capability denied",
       reason: "missing_capability",
+      capability,
+      resourceType,
+      resourceId: resourceId || "*",
     };
   }
 
   return { ok: true };
 }
 
-function foundationGateJson(error: { message: string; reason: string }) {
+function foundationGateJson(error: {
+  message: string;
+  reason: string;
+  capability?: string;
+  resourceType?: string;
+  resourceId?: string;
+}) {
+  const structured = {
+    reason: error.reason,
+    capability: error.capability,
+    resourceType: error.resourceType,
+    resourceId: error.resourceId,
+  };
   if (error.reason === "bootstrap_required") {
     return {
       error: error.message,
       message:
         "DeckTerm foundation state exists, but no admin has completed bootstrap yet.",
+      ...structured,
     };
   }
   return {
     error: error.message,
     message:
       "The current user is missing the required DeckTerm capability grant.",
+    ...structured,
   };
 }
 
@@ -1063,7 +1083,11 @@ async function requireFileAccess(
     return {
       ok: false,
       status: 403,
-      body: { error: "Forbidden path (no matching registered root)" },
+      body: {
+        error: "Forbidden path (no matching registered root)",
+        reason: "no_matching_root",
+        path: resolvedPath,
+      },
     };
   }
 
@@ -2897,7 +2921,10 @@ export function createWebApp() {
     }
     const filePath = await resolveAllowedPath(requestedPath);
     if (!filePath) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
     const fileAccess = await requireFileAccess(c, filePath);
     if (!fileAccess.ok) {
@@ -2935,7 +2962,10 @@ export function createWebApp() {
     }
     const targetPath = await resolveAllowedPath(requestedPath);
     if (!targetPath) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
     const fileAccess = await requireFileAccess(c, targetPath);
     if (!fileAccess.ok) {
@@ -2964,7 +2994,10 @@ export function createWebApp() {
         allowMissing: true,
       });
       if (!destPath) {
-        return c.json({ error: "Forbidden path" }, 403);
+        return c.json(
+          { error: "Forbidden path", reason: "no_matching_root" },
+          403,
+        );
       }
       const buffer = await file.arrayBuffer();
       await fs.writeFile(destPath, Buffer.from(buffer));
@@ -2988,7 +3021,10 @@ export function createWebApp() {
       allowMissing: true,
     });
     if (!dirPath) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
     const fileAccess = await requireFileAccess(c, dirPath);
     if (!fileAccess.ok) {
@@ -3017,7 +3053,10 @@ export function createWebApp() {
     }
     const filePath = await resolveAllowedPath(requestedPath);
     if (!filePath) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
     const fileAccess = await requireFileAccess(c, filePath);
     if (!fileAccess.ok) {
@@ -3056,7 +3095,10 @@ export function createWebApp() {
     const from = await resolveAllowedPath(fromInput);
     const to = await resolveAllowedPath(toInput, { allowMissing: true });
     if (!from || !to) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
     const fromAccess = await requireFileAccess(c, from);
     if (!fromAccess.ok) {
@@ -3092,7 +3134,10 @@ export function createWebApp() {
   app.get("/api/git/status", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     try {
@@ -3171,7 +3216,10 @@ export function createWebApp() {
     const staged = c.req.query("staged");
     const commit = c.req.query("commit");
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     if (
@@ -3245,7 +3293,10 @@ export function createWebApp() {
     const { cwd, paths } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     if (!paths || !Array.isArray(paths) || paths.length === 0) {
@@ -3275,7 +3326,10 @@ export function createWebApp() {
     const { cwd, paths } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     if (!paths || !Array.isArray(paths) || paths.length === 0) {
@@ -3305,7 +3359,10 @@ export function createWebApp() {
     const { cwd, message } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     if (!message?.trim()) {
@@ -3345,7 +3402,10 @@ export function createWebApp() {
   app.get("/api/git/branches", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     try {
@@ -3375,7 +3435,10 @@ export function createWebApp() {
     const limit = parseInt(c.req.query("limit") || "50");
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     try {
@@ -3436,7 +3499,10 @@ export function createWebApp() {
     const { cwd, branch } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     if (
@@ -3479,7 +3545,10 @@ export function createWebApp() {
     const path = c.req.query("path");
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json({ error: "Forbidden path" }, 403);
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
     }
 
     // Allow hex hashes (4-40 chars), HEAD, HEAD~N, HEAD^N, and branch/tag names
