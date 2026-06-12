@@ -99,13 +99,14 @@ test.describe("File explorer surface on desktop", () => {
       "beta",
     );
 
+    // Desktop surfaces are SurfaceWindows since phase 1 of the VS Code-grade
+    // workspace — Files and Git coexist instead of swapping a shared slot.
     await page.click("#desktop-git-btn");
     await expect(page.locator("#git-panel")).toBeVisible();
-    await expect(page.locator("#file-explorer")).not.toBeVisible();
+    await expect(page.locator("#file-explorer")).toBeVisible();
 
     await page.click("#desktop-files-btn");
     await expect(page.locator("#file-explorer")).toBeVisible();
-    await expect(page.locator("#git-panel")).not.toBeVisible();
 
     await page
       .locator(`#terminals-tabs .tab[data-workspace-id="${workspaceAId}"]`)

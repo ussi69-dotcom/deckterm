@@ -2,6 +2,37 @@
 
 > **Datum:** 2026-05-29 · **Delta 2026-06-12 viz sekce 0**
 
+## 0a. Delta 2026-06-12 (večer) — VS Code-grade workspace, fáze 1
+
+Směr schválen uživatelem: UI dotáhnout na úroveň VS Code **uvnitř DeckTermu**
+(žádný embedovaný code-server — obcházel by foundation gates). Deštníkový design:
+`docs/plans/2026-06-12-vscode-grade-workspace-design.md` (4 fáze), impl plán fáze 1:
+`docs/plans/2026-06-12-workspace-windows.md`.
+
+**Fáze 1 hotová (vše na `dev`, ověřeno Playwrightem na 4174):**
+
+- **Surface windows** (`web/surface-windows.js`): Files/Git/Tasks/Editor jsou na
+  desktopu (≥768px) přesouvatelná, resizovatelná okna se snapem (poloviny/kvadranty/
+  maximalizace, Windows/VS Code styl) a z-orderem; mobil nechává fullscreen sheets.
+  Files+Git mohou být otevřené současně (padla vzájemná exkluzivita right-surface).
+- **Bottom dock**: akce „Dock" (overflow + palette) přepne terminálovou plochu do
+  spodního VS Code-style panelu se sashem (15–75 %, dblclick reset); size-warning
+  je v dock módu potlačen.
+- **Settings KV**: `user_settings` tabulka (migrace 4) + `GET/PUT /api/settings`
+  (actor-scoped, merge sémantika, null maže klíč) + `web/settings-store.js`
+  (debounced batch PUT, localStorage fallback). Geometrie oken a dock stav se
+  obnovují napříč zařízeními/prohlížeči.
+- Testy: `foundation-settings.test.ts` (samostatný chain link v `test:unit`),
+  `settings-store.test.js`, `surface-windows.test.js`, e2e `workspace-windows.spec.ts`;
+  upraven `file-explorer-surface.spec.ts` (koexistence oken je teď záměr).
+
+**Fáze 2–4 (plánované):** VS Code-grade git panel (strom změn, `@codemirror/merge`
+diffy, push/pull/fetch/discard/stash za capability gatem) → explorer⇄git dekorace +
+per-file timeline + editor gutter → settings UI (kategorie + search, migrace
+localStorage klíčů).
+
+---
+
 ## 0. Delta 2026-06-12 — noční QoL/direction session
 
 Směrové rozhodnutí (uloženo i v agent memory): DeckTerm je **agent-aware dev cockpit**
