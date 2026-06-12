@@ -552,11 +552,16 @@ class ReconnectingWebSocket {
     );
     this.retryCount++;
 
-    // After 3 failed attempts, classify whether this is permanent (terminal
-    // gone, or access blocked because the server isn't bootstrapped / denies
-    // us) versus a transient drop. A failed WS upgrade surfaces only as
-    // "Expected 101", so we probe over HTTP instead of looping pointlessly.
-    if (this.retryCount === 3) {
+    // From the 3rd failed attempt on, classify whether this is permanent
+    // (terminal gone, or access blocked because the server isn't
+    // bootstrapped / denies us) versus a transient drop. A failed WS upgrade
+    // surfaces only as "Expected 101", so we probe over HTTP instead of
+    // looping pointlessly. Re-classifying every later attempt matters: when
+    // the outage starts server-side, attempt 3's probe also fails (→ retry),
+    // and the server may come back only to report the terminal as ended —
+    // without re-checking, the client would churn to 10/10 "Connection lost"
+    // instead of switching to the accurate dead/blocked overlay.
+    if (this.retryCount >= 3) {
       this.classifyReconnect().then((outcome) => {
         if (outcome === "gone") {
           this.intentionallyClosed = true;
@@ -591,6 +596,7 @@ class ReconnectingWebSocket {
     let catalogOk = false;
     let catalogStatus = 0;
     let terminalInCatalog = false;
+    let terminalEnded = false;
     let bootstrapped = null;
     try {
       const res = await fetch(`/api/terminals`);
@@ -598,7 +604,11 @@ class ReconnectingWebSocket {
       catalogStatus = res.status;
       if (res.ok) {
         const terminals = await res.json();
-        terminalInCatalog = terminals.some((t) => t.id === this.terminalId);
+        const entry = terminals.find((t) => t.id === this.terminalId);
+        terminalInCatalog = Boolean(entry);
+        terminalEnded = Boolean(
+          entry && !window.SessionActions.isSessionLive(entry),
+        );
       }
     } catch {
       // Network error — treat as transient, keep retrying.
@@ -606,7 +616,7 @@ class ReconnectingWebSocket {
     }
     // Only the ambiguous "terminal still listed but socket won't open" case
     // needs the extra probe; resolve it against the bootstrap gate.
-    if (catalogOk && terminalInCatalog) {
+    if (catalogOk && terminalInCatalog && !terminalEnded) {
       try {
         const sres = await fetch(`/api/foundation/status`);
         if (sres.ok) {
@@ -621,6 +631,7 @@ class ReconnectingWebSocket {
       catalogOk,
       catalogStatus,
       terminalInCatalog,
+      terminalEnded,
       bootstrapped,
     });
   }
@@ -8589,11 +8600,20 @@ class TerminalManager {
     const message = overlay.querySelector(".overlay-message");
     const actions = overlay.querySelector(".overlay-actions");
 
+    // Any status change invalidates a running next-attempt countdown.
+    clearInterval(t.reconnectCountdownTimer);
+    t.reconnectCountdownTimer = null;
+
+    const formatAttempt = window.ReconnectClassify.formatReconnectAttempt;
     const overlayConfigs = {
       connected: { hidden: true },
       reconnecting: {
         icon: "🔄",
-        message: `Reconnecting... (attempt ${extra.attempt}/${extra.maxRetries})`,
+        message: formatAttempt({
+          attempt: extra.attempt,
+          maxRetries: extra.maxRetries,
+          secondsLeft: Math.round((extra.delay || 0) / 1000),
+        }),
         actions: "",
       },
       failed: {
@@ -8670,6 +8690,22 @@ class TerminalManager {
           this.closeTerminal(id);
         }
       };
+
+      if (status === "reconnecting" && extra.delay > 1000) {
+        const deadline = Date.now() + extra.delay;
+        t.reconnectCountdownTimer = setInterval(() => {
+          const secondsLeft = Math.round((deadline - Date.now()) / 1000);
+          message.textContent = formatAttempt({
+            attempt: extra.attempt,
+            maxRetries: extra.maxRetries,
+            secondsLeft,
+          });
+          if (secondsLeft <= 0) {
+            clearInterval(t.reconnectCountdownTimer);
+            t.reconnectCountdownTimer = null;
+          }
+        }, 1000);
+      }
     }
   }
 
@@ -9450,6 +9486,7 @@ class TerminalManager {
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
+    if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
