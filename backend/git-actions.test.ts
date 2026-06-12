@@ -142,3 +142,36 @@ test("git mutations outside an allowed root are denied", async () => {
   const res = await post("/api/git/push", { cwd: "/etc" });
   expect(res.status).toBe(403);
 });
+
+test("discard requires confirm:true", async () => {
+  await writeFile(join(repo, "a.txt"), "dirty\n");
+  const res = await post("/api/git/discard", { cwd: repo, paths: ["a.txt"] });
+  expect(res.status).toBe(400);
+});
+
+test("discard restores tracked files and deletes untracked ones", async () => {
+  await writeFile(join(repo, "untracked.txt"), "tmp\n");
+  const res = await post("/api/git/discard", {
+    cwd: repo,
+    paths: ["a.txt", "untracked.txt"],
+    confirm: true,
+  });
+  expect(res.status).toBe(200);
+  expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("two\n");
+  expect(await Bun.file(join(repo, "untracked.txt")).exists()).toBe(false);
+});
+
+test("commit --amend rewrites the last message", async () => {
+  await writeFile(join(repo, "a.txt"), "three\n");
+  await post("/api/git/stage", { cwd: repo, paths: ["a.txt"] });
+  await post("/api/git/commit", { cwd: repo, message: "wip" });
+  const res = await post("/api/git/commit", {
+    cwd: repo,
+    message: "third",
+    amend: true,
+  });
+  expect(res.status).toBe(200);
+  expect(await git(repo, "log", "-1", "--format=%s")).toContain("third");
+  expect(await git(repo, "log", "--format=%s")).not.toContain("wip");
+  await post("/api/git/push", { cwd: repo }); // keep remote in sync for later tasks
+});

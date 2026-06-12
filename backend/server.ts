@@ -3566,7 +3566,7 @@ export function createWebApp() {
   // POST /api/git/commit { cwd, message }
   app.post("/api/git/commit", async (c) => {
     const body = await c.req.json().catch(() => ({}));
-    const { cwd, message } = body;
+    const { cwd, message, amend } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
       return c.json(
@@ -3580,29 +3580,21 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "commit", "-m", message], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      const args = amend
+        ? ["commit", "--amend", "-m", message]
+        : ["commit", "-m", message];
+      const result = await runGit(cwd, args);
 
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const [output, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      clearTimeout(timeoutId);
-
-      if (code !== 0) {
+      if (!result.ok) {
         // git reports the common failure ("nothing to commit") on stdout, not
         // stderr — fall back to stdout so the panel shows a real reason instead
         // of an empty "Commit failed:" line.
-        const reason = stderr.trim() || output.trim() || "git commit failed";
+        const reason =
+          result.stderr.trim() || result.output.trim() || "git commit failed";
         return c.json({ error: "Commit failed", message: reason }, 400);
       }
 
-      return c.json({ ok: true, output });
+      return c.json({ ok: true, output: result.output });
     } catch (err) {
       return c.json({ error: "Git commit failed", message: String(err) }, 400);
     }
@@ -3746,6 +3738,71 @@ export function createWebApp() {
         400,
       );
     }
+  });
+
+  // POST /api/git/discard { cwd, paths: string[], confirm: true }
+  // Destructive: confirm is required by contract; untracked files are removed
+  // via `git clean` (restore can't touch them), tracked via `git restore`.
+  app.post("/api/git/discard", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths, confirm } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.some((p) => typeof p !== "string")
+    ) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+    if (confirm !== true) {
+      return c.json(
+        { error: "Confirmation required", reason: "confirm_required" },
+        400,
+      );
+    }
+    const status = await runGit(cwd, ["status", "--porcelain", "--", ...paths]);
+    if (!status.ok) {
+      return c.json(
+        { error: "Git status failed", message: status.stderr.trim() },
+        400,
+      );
+    }
+    const untracked: string[] = [];
+    const tracked: string[] = [];
+    for (const line of status.output.split("\n")) {
+      if (line.length < 3) continue;
+      const path = line.substring(3).trim();
+      (line.startsWith("??") ? untracked : tracked).push(path);
+    }
+    if (tracked.length > 0) {
+      const res = await runGit(cwd, [
+        "restore",
+        "--worktree",
+        "--",
+        ...tracked,
+      ]);
+      if (!res.ok) {
+        return c.json(
+          { error: "Git restore failed", message: res.stderr.trim() },
+          400,
+        );
+      }
+    }
+    if (untracked.length > 0) {
+      const res = await runGit(cwd, ["clean", "-f", "--", ...untracked]);
+      if (!res.ok) {
+        return c.json(
+          { error: "Git clean failed", message: res.stderr.trim() },
+          400,
+        );
+      }
+    }
+    return c.json({ ok: true, discarded: { tracked, untracked } });
   });
 
   // POST /api/git/push { cwd, remote?, branch?, setUpstream? }
