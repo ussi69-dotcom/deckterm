@@ -3740,6 +3740,67 @@ export function createWebApp() {
     }
   });
 
+  // GET /api/git/stash?cwd= — list stashes
+  app.get("/api/git/stash", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    const result = await runGit(cwd, ["stash", "list", "--format=%gd%x09%s"]);
+    if (!result.ok) {
+      return c.json(
+        { error: "Git stash failed", message: result.stderr.trim() },
+        400,
+      );
+    }
+    const stashes = result.output
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line, i) => {
+        const [ref, ...rest] = line.split("\t");
+        return { index: i, ref, message: rest.join("\t") };
+      });
+    return c.json({ stashes, cwd });
+  });
+
+  // POST /api/git/stash { cwd, action: "push"|"pop"|"apply"|"drop", message?, index? }
+  app.post("/api/git/stash", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, action, message, index } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (!["push", "pop", "apply", "drop"].includes(action)) {
+      return c.json({ error: "Invalid stash action" }, 400);
+    }
+    if (index !== undefined && (!Number.isInteger(index) || index < 0)) {
+      return c.json({ error: "Invalid stash index" }, 400);
+    }
+    const args = ["stash", action as string];
+    if (action === "push") {
+      args.push("--include-untracked");
+      if (typeof message === "string" && message.trim()) {
+        args.push("-m", message.trim());
+      }
+    } else if (index !== undefined) {
+      args.push(`stash@{${index}}`);
+    }
+    const result = await runGit(cwd, args);
+    if (!result.ok) {
+      const reason =
+        result.stderr.trim() || result.output.trim() || "git stash failed";
+      return c.json({ error: "Git stash failed", message: reason }, 400);
+    }
+    return c.json({ ok: true, output: result.output });
+  });
+
   // POST /api/git/discard { cwd, paths: string[], confirm: true }
   // Destructive: confirm is required by contract; untracked files are removed
   // via `git clean` (restore can't touch them), tracked via `git restore`.

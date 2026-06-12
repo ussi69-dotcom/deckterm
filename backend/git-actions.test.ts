@@ -175,3 +175,44 @@ test("commit --amend rewrites the last message", async () => {
   expect(await git(repo, "log", "--format=%s")).not.toContain("wip");
   await post("/api/git/push", { cwd: repo }); // keep remote in sync for later tasks
 });
+
+test("stash push/list/pop round-trip", async () => {
+  await writeFile(join(repo, "a.txt"), "stash-me\n");
+  expect(
+    (
+      await post("/api/git/stash", {
+        cwd: repo,
+        action: "push",
+        message: "wip stash",
+      })
+    ).status,
+  ).toBe(200);
+  expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("three\n");
+
+  const list = (await (
+    await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/stash?cwd=${encodeURIComponent(repo)}`,
+      ),
+    )
+  ).json()) as any;
+  expect(list.stashes.length).toBe(1);
+  expect(list.stashes[0].message).toContain("wip stash");
+
+  expect(
+    (await post("/api/git/stash", { cwd: repo, action: "pop", index: 0 }))
+      .status,
+  ).toBe(200);
+  expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("stash-me\n");
+  await post("/api/git/discard", {
+    cwd: repo,
+    paths: ["a.txt"],
+    confirm: true,
+  });
+});
+
+test("stash rejects unknown actions", async () => {
+  expect(
+    (await post("/api/git/stash", { cwd: repo, action: "explode" })).status,
+  ).toBe(400);
+});
