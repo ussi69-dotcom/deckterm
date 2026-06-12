@@ -3757,7 +3757,7 @@ export function createWebApp() {
     if (!["create", "delete"].includes(action)) {
       return c.json({ error: "Invalid branch action" }, 400);
     }
-    if (!name || typeof name !== "string" || !/^[\w\-\/\.]+$/.test(name)) {
+    if (!name || typeof name !== "string" || !/^(?!-)[\w\-\/\.]+$/.test(name)) {
       return c.json({ error: "Invalid branch name" }, 400);
     }
     const args =
@@ -3907,7 +3907,9 @@ export function createWebApp() {
   // Network ops get a longer timeout; GIT_TERMINAL_PROMPT=0 (runGit) makes
   // credential prompts fail fast instead of hanging the request. No --force
   // and no --rebase by design — conflicts belong in the terminal.
-  const GIT_REF_RE = /^[\w\-\/\.]+$/;
+  // Leading dash is rejected so a ref can never be parsed as a git flag
+  // (argv smuggling, e.g. remote="--force").
+  const GIT_REF_RE = /^(?!-)[\w\-\/\.]+$/;
   for (const op of ["push", "pull", "fetch"] as const) {
     app.post(`/api/git/${op}`, async (c) => {
       const body = await c.req.json().catch(() => ({}));

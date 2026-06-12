@@ -243,6 +243,30 @@ test("branch create + delete round-trip", async () => {
   expect(await git(repo, "branch", "--list", "feature/x")).toBe("");
 });
 
+test("refs starting with a dash are rejected (argv flag smuggling)", async () => {
+  expect(
+    (await post("/api/git/push", { cwd: repo, remote: "--force" })).status,
+  ).toBe(400);
+  expect(
+    (
+      await post("/api/git/push", {
+        cwd: repo,
+        remote: "origin",
+        branch: "--mirror",
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await post("/api/git/branch", {
+        cwd: repo,
+        action: "create",
+        name: "-D",
+      })
+    ).status,
+  ).toBe(400);
+});
+
 test("branch rejects invalid names", async () => {
   expect(
     (
