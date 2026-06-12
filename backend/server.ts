@@ -143,8 +143,7 @@ type TerminalWsData = {
   clientId: string | null;
   lastEventId: number | null;
 };
-type OpenCodeWsData = { type: "opencode_proxy"; upstream: WebSocket };
-type WsData = TerminalWsData | OpenCodeWsData;
+type WsData = TerminalWsData;
 
 // Configuration
 const DEBUG = process.env.OPENCODE_WEB_DEBUG === "1";
@@ -276,27 +275,10 @@ const ALLOWED_FILESYSTEM_ROOTS = (
   .map((root) => root.trim())
   .filter(Boolean);
 
-// OpenCode configuration
-const OPENCODE_UPSTREAM =
-  process.env.OPENCODE_UPSTREAM || "http://127.0.0.1:4096";
-const OPENCODE_URL = process.env.OPENCODE_URL || "";
-
 // Clipboard image configuration
 const CLIPBOARD_IMAGES_DIR = "/tmp/deckterm-clipboard";
 const CLIPBOARD_IMAGE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const CLIPBOARD_IMAGE_TTL_MS = 60 * 60 * 1000; // 1 hour
-
-// Hop-by-hop headers to strip from proxied requests/responses
-const HOP_BY_HOP_HEADERS = [
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailers",
-  "transfer-encoding",
-  "upgrade",
-];
 
 // Terminal sessions (PTY processes)
 const terminals = new Map<string, Terminal>();
@@ -535,36 +517,6 @@ async function finalizeReconnectReady(
     sendReconnectLifecycle(ws, "ready");
   }
 }
-
-const openCodeCircuit = {
-  failures: 0,
-  lastFailure: 0,
-  isOpen: false,
-  threshold: 5,
-  resetTimeout: 30_000,
-  recordFailure() {
-    this.failures++;
-    this.lastFailure = Date.now();
-    if (this.failures >= this.threshold) {
-      this.isOpen = true;
-      debug("OpenCode circuit OPEN - too many failures");
-    }
-  },
-  recordSuccess() {
-    this.failures = 0;
-    this.isOpen = false;
-  },
-  canRequest(): boolean {
-    if (!this.isOpen) return true;
-    if (Date.now() - this.lastFailure > this.resetTimeout) {
-      this.isOpen = false;
-      this.failures = 0;
-      debug("OpenCode circuit HALF-OPEN - testing");
-      return true;
-    }
-    return false;
-  },
-};
 
 // Rate limiting state (simple in-memory)
 const rateLimitState = {
@@ -2385,98 +2337,6 @@ export function createWebApp() {
     return c.json(result);
   });
 
-  // OpenCode health check
-  app.get("/api/apps/opencode/health", async (c) => {
-    try {
-      const res = await fetch(`${OPENCODE_UPSTREAM}/api/health`, {
-        signal: AbortSignal.timeout(3000),
-      });
-      return c.json({
-        status: res.ok ? "running" : "error",
-        upstream: OPENCODE_UPSTREAM,
-        url: OPENCODE_URL,
-      });
-    } catch {
-      return c.json({
-        status: "not_running",
-        upstream: OPENCODE_UPSTREAM,
-        url: OPENCODE_URL,
-      });
-    }
-  });
-
-  app.all("/apps/opencode/*", async (c) => {
-    if (!openCodeCircuit.canRequest()) {
-      return c.json(
-        {
-          error: "OpenCode temporarily unavailable",
-          message: "Circuit breaker open - too many failures",
-          retryAfter: Math.ceil(openCodeCircuit.resetTimeout / 1000),
-        },
-        503,
-      );
-    }
-
-    const path = c.req.path.replace("/apps/opencode", "") || "/";
-    const url = `${OPENCODE_UPSTREAM}${path}${c.req.url.includes("?") ? "?" + c.req.url.split("?")[1] : ""}`;
-
-    const headers = new Headers();
-    for (const [key, value] of c.req.raw.headers) {
-      if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
-        headers.set(key, value);
-      }
-    }
-
-    try {
-      const response = await fetch(url, {
-        method: c.req.method,
-        headers,
-        body:
-          c.req.method !== "GET" && c.req.method !== "HEAD"
-            ? await c.req.raw.arrayBuffer()
-            : undefined,
-        signal: AbortSignal.timeout(30_000),
-      });
-
-      openCodeCircuit.recordSuccess();
-
-      const contentType = response.headers.get("content-type") || "";
-
-      if (contentType.includes("text/event-stream")) {
-        return new Response(response.body, {
-          status: response.status,
-          headers: {
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            Connection: "keep-alive",
-          },
-        });
-      }
-
-      const responseHeaders = new Headers();
-      for (const [key, value] of response.headers) {
-        if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
-          responseHeaders.set(key, value);
-        }
-      }
-
-      return new Response(response.body, {
-        status: response.status,
-        headers: responseHeaders,
-      });
-    } catch (err) {
-      openCodeCircuit.recordFailure();
-      const isTimeout = err instanceof Error && err.name === "TimeoutError";
-      return c.json(
-        {
-          error: "OpenCode unavailable",
-          message: isTimeout ? "Request timeout" : String(err),
-        },
-        502,
-      );
-    }
-  });
-
   function taskErrorResponse(c: any, err: unknown) {
     if (err instanceof TaskRunnerError) {
       return c.json({ error: err.message }, err.status as never);
@@ -3802,37 +3662,6 @@ export async function startWebServer(host: string, port: number) {
     async fetch(req, server) {
       const url = new URL(req.url);
 
-      // OpenCode WebSocket proxy
-      if (url.pathname.startsWith("/apps/opencode/ws")) {
-        const auth = await authenticateWebSocketRequest(req);
-        if (!auth.ok) {
-          return new Response(auth.message || "Unauthorized", {
-            status: auth.status || 401,
-          });
-        }
-
-        const wsUrl =
-          OPENCODE_UPSTREAM.replace("http", "ws") +
-          url.pathname.replace("/apps/opencode", "") +
-          url.search;
-
-        try {
-          const upstream = new WebSocket(wsUrl);
-
-          const success = server.upgrade(req, {
-            data: { type: "opencode_proxy", upstream },
-          });
-
-          if (success) {
-            return undefined;
-          }
-        } catch (err) {
-          debug("OpenCode WebSocket proxy error:", err);
-        }
-
-        return new Response("WebSocket upgrade failed", { status: 500 });
-      }
-
       if (url.pathname.startsWith("/ws/terminals/")) {
         const id = url.pathname.split("/").pop();
         if (!id) {
@@ -3965,30 +3794,6 @@ export async function startWebServer(host: string, port: number) {
       open(ws: ServerWebSocket<WsData>) {
         const data = ws.data;
 
-        if (data.type === "opencode_proxy") {
-          const upstream = data.upstream;
-
-          upstream.onmessage = (event) => {
-            try {
-              ws.send(event.data);
-            } catch (err) {
-              debug("OpenCode proxy upstream->client error:", err);
-            }
-          };
-
-          upstream.onerror = (err) => {
-            debug("OpenCode proxy upstream error:", err);
-            ws.close();
-          };
-
-          upstream.onclose = () => {
-            ws.close();
-          };
-
-          debug("OpenCode WebSocket proxy connected");
-          return;
-        }
-
         const { terminalId } = data;
         const term = terminals.get(terminalId);
         const sockets = terminalSockets.get(terminalId);
@@ -4034,15 +3839,6 @@ export async function startWebServer(host: string, port: number) {
       message(ws: ServerWebSocket<WsData>, message) {
         try {
           const data = ws.data;
-
-          if (data.type === "opencode_proxy") {
-            try {
-              data.upstream.send(message);
-            } catch (err) {
-              debug("OpenCode proxy client->upstream error:", err);
-            }
-            return;
-          }
 
           const { terminalId } = data;
 
@@ -4167,15 +3963,6 @@ export async function startWebServer(host: string, port: number) {
       close(ws: ServerWebSocket<WsData>) {
         const data = ws.data;
         socketReconnectState.delete(ws);
-
-        if (data.type === "opencode_proxy") {
-          try {
-            data.upstream.close();
-          } catch (err) {
-            debug("OpenCode proxy upstream close error:", err);
-          }
-          return;
-        }
 
         const { terminalId } = data;
         const sockets = terminalSockets.get(terminalId);

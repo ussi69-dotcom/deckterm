@@ -145,7 +145,7 @@ Common runtime variables:
 
 Legacy compatibility note:
 
-- The backend still contains OpenCode proxy routes, but OpenCode is no longer part of the active DeckTerm UI and is not documented as a primary workflow.
+- The OpenCode proxy routes were removed in June 2026 (OpenCode is not part of the DeckTerm workflow). The `OPENCODE_WEB_*` env var names remain for deployment compatibility: they configure DeckTerm itself (debug logging, terminal caps, rate limits), not OpenCode.
 
 ## Development Workflow
 
