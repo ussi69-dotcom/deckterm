@@ -4690,6 +4690,9 @@ class TerminalManager {
       if (!item) return;
       this.selectTask(item.dataset.taskId);
     });
+    panel
+      .querySelector("#task-view-toggle")
+      ?.addEventListener("click", () => this.toggleTaskViewMode());
     panel.querySelector("#task-detail")?.addEventListener("click", (event) => {
       const button = event.target.closest("[data-task-action]");
       if (!button) return;
@@ -5406,9 +5409,36 @@ class TerminalManager {
     this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
   }
 
+  getTaskViewMode() {
+    return localStorage.getItem("deckterm-task-view") === "board"
+      ? "board"
+      : "list";
+  }
+
+  toggleTaskViewMode() {
+    const next = this.getTaskViewMode() === "board" ? "list" : "board";
+    localStorage.setItem("deckterm-task-view", next);
+    this.renderTasks();
+  }
+
+  syncTaskViewToggle() {
+    const toggle = document.getElementById("task-view-toggle");
+    if (!toggle) return;
+    const mode = this.getTaskViewMode();
+    toggle.textContent = mode === "board" ? "☰ List" : "▦ Board";
+    toggle.title =
+      mode === "board" ? "Switch to list view" : "Switch to board view";
+  }
+
   renderTasks() {
+    this.syncTaskViewToggle();
+    if (this.getTaskViewMode() === "board") {
+      this.renderTaskBoard();
+      return;
+    }
     const list = document.getElementById("task-list");
     if (!list) return;
+    list.classList.remove("task-board");
     list.replaceChildren();
 
     if (this.taskState.items.length === 0) {
@@ -5444,6 +5474,53 @@ class TerminalManager {
       button.append(header, meta);
       list.appendChild(button);
     });
+
+    this.renderTaskDetail(
+      this.taskState.items.find(
+        (task) => task.id === this.taskState.selectedId,
+      ) || null,
+    );
+  }
+
+  // Kanban board view inside the task panel (read-only MVP, see
+  // docs/plans/2026-06-12-task-board-design.md). Column logic: task-board.js.
+  renderTaskBoard() {
+    const list = document.getElementById("task-list");
+    if (!list || !window.TaskBoard) return;
+    list.classList.add("task-board");
+    list.replaceChildren();
+
+    const columns = window.TaskBoard.groupTasksForBoard(this.taskState.items);
+    for (const column of columns) {
+      const columnEl = document.createElement("div");
+      columnEl.className = "task-board-column";
+
+      const label = document.createElement("div");
+      label.className = "task-board-column-label";
+      label.textContent = `${column.label} (${column.tasks.length})`;
+      columnEl.appendChild(label);
+
+      for (const task of column.tasks) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = "task-item task-board-card";
+        card.dataset.taskId = task.id;
+        card.classList.toggle("active", task.id === this.taskState.selectedId);
+
+        const title = document.createElement("div");
+        title.className = "task-item-title";
+        title.textContent = task.title || "Untitled task";
+
+        const meta = document.createElement("div");
+        meta.className = "task-item-meta";
+        meta.textContent = `${task.status} · ${task.workerProvider || ""}`;
+
+        card.append(title, meta);
+        columnEl.appendChild(card);
+      }
+
+      list.appendChild(columnEl);
+    }
 
     this.renderTaskDetail(
       this.taskState.items.find(
@@ -5594,9 +5671,9 @@ class TerminalManager {
       title: panel.querySelector("#task-title")?.value || "",
       description: panel.querySelector("#task-description")?.value || "",
       workerProvider:
-        panel.querySelector("#task-worker-provider")?.value || "codex",
+        panel.querySelector("#task-worker-provider")?.value || "claude",
       judgeProvider:
-        panel.querySelector("#task-judge-provider")?.value || "codex",
+        panel.querySelector("#task-judge-provider")?.value || "claude",
       useWorktree: Boolean(panel.querySelector("#task-use-worktree")?.checked),
     };
 

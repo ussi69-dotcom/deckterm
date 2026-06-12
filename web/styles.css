@@ -4886,3 +4886,46 @@ body.virtual-keyboard-open .extra-keys {
 .task-toast.hidden {
   display: none;
 }
+
+/* =============================================================================
+   TASK BOARD (kanban view in the task panel)
+   ============================================================================= */
+
+.task-panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+#task-list.task-board {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  align-items: flex-start;
+}
+
+.task-board-column {
+  flex: 1 0 150px;
+  min-width: 150px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.task-board-column-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 2px 4px;
+}
+
+.task-board-card {
+  width: 100%;
+  text-align: left;
+}

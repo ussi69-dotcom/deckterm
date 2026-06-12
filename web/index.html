@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260611b" />
+    <link rel="stylesheet" href="/styles.css?v=20260611c" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -217,14 +217,24 @@
               <div class="task-panel-kicker">Agent Runner</div>
               <h3 id="task-panel-title">Tasks</h3>
             </div>
-            <button
-              id="task-panel-close"
-              class="btn-icon"
-              title="Close tasks"
-              aria-label="Close tasks"
-            >
-              <i data-lucide="x"></i>
-            </button>
+            <div class="task-panel-header-actions">
+              <button
+                id="task-view-toggle"
+                class="btn btn-secondary"
+                type="button"
+                title="Switch to board view"
+              >
+                ▦ Board
+              </button>
+              <button
+                id="task-panel-close"
+                class="btn-icon"
+                title="Close tasks"
+                aria-label="Close tasks"
+              >
+                <i data-lucide="x"></i>
+              </button>
+            </div>
           </div>
 
           <form id="task-form" class="task-form">
@@ -244,15 +254,15 @@
               <label>
                 <span>Worker</span>
                 <select id="task-worker-provider" name="workerProvider">
+                  <option value="claude" selected>Claude</option>
                   <option value="codex">Codex</option>
-                  <option value="claude">Claude</option>
                 </select>
               </label>
               <label>
                 <span>Judge</span>
                 <select id="task-judge-provider" name="judgeProvider">
+                  <option value="claude" selected>Claude</option>
                   <option value="codex">Codex</option>
-                  <option value="claude">Claude</option>
                 </select>
               </label>
             </div>
@@ -692,6 +702,7 @@
     <script src="/reconnect-classify.js?v=20260601a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
+    <script src="/task-board.js?v=20260611a"></script>
     <script src="/terminal-colors.js?v=20260112g"></script>
     <script src="/bootstrap-routing.js?v=20260401b"></script>
     <script src="/terminal-sizing.js?v=20260401a"></script>
@@ -702,6 +713,6 @@
     <script src="/file-explorer.js?v=20260611a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260611f"></script>
+    <script src="/app.js?v=20260611g"></script>
   </body>
 </html>

@@ -472,3 +472,29 @@ test("getTask includes persisted round history after checks run", async () => {
   ]);
   expect(loaded.rounds?.[1]?.success).toBe(true);
 });
+
+test("createTask defaults both providers to claude when unspecified", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+
+  const task = await runner.createTask(
+    {
+      title: "Default provider check",
+      description: "No provider specified.",
+      projectRoot,
+      useWorktree: false,
+    },
+    { ownerId: "user-1" },
+  );
+
+  // Decision 2026-06-10: default provider is claude (codex has no credits);
+  // still overridable per task via workerProvider/judgeProvider.
+  expect(task.workerProvider).toBe("claude");
+  expect(task.judgeProvider).toBe("claude");
+});
