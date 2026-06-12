@@ -5240,3 +5240,46 @@ body.virtual-keyboard-open .extra-keys {
 .surface-window-body > .file-explorer .file-explorer-header {
   display: none;
 }
+
+.surface-window-body > .task-panel {
+  position: static;
+  inset: auto;
+  width: 100%;
+  height: 100%;
+  pointer-events: auto;
+  z-index: auto;
+}
+
+.surface-window-body > .task-panel .task-panel-backdrop {
+  display: none;
+}
+
+.surface-window-body > .task-panel .task-panel-shell {
+  position: static;
+  width: 100%;
+  max-height: none;
+  height: 100%;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.surface-window-body > .file-editor-modal {
+  position: static;
+  inset: auto;
+  background: none;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  z-index: auto;
+}
+
+.surface-window-body > .file-editor-modal .file-editor-shell {
+  width: 100%;
+  height: 100%;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+}

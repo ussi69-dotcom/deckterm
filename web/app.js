@@ -3890,7 +3890,7 @@ class TerminalManager {
       });
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
-      this.fileExplorer.onOpenFile = (path) => void this.fileEditor.open(path);
+      this.fileExplorer.onOpenFile = (path) => void this.openFileInEditor(path);
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -4923,6 +4923,18 @@ class TerminalManager {
 
     this.closeToolsSheet();
     this.closeSetupPanel();
+    if (this.isWindowedSurfaces()) {
+      await this.openSurfaceWindow("tasks", {
+        title: "Tasks",
+        icon: "▦",
+        contentEl: panel,
+        bounds: { x: 20, y: 8, width: 60, height: 80 },
+        minWidthPx: 420,
+        onClose: () => this.closeTaskPanel(),
+      });
+    } else {
+      this.releaseSurfaceWindowContent("tasks", panel);
+    }
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     const rootInput = panel.querySelector("#task-project-root");
@@ -4941,6 +4953,7 @@ class TerminalManager {
     if (!panel) return;
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    this.surfaceWindowManager?.close("tasks");
     this.syncSurfaceButtonState();
   }
 
@@ -7715,6 +7728,29 @@ class TerminalManager {
     }
     manager.open(id);
     return win;
+  }
+
+  async openFileInEditor(path) {
+    if (!this.fileEditor) return;
+    await this.fileEditor.open(path);
+    // open() bails on binary files and fetch errors — only window a visible
+    // editor.
+    const modal = document.getElementById("file-editor-modal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    if (this.isWindowedSurfaces()) {
+      const win = await this.openSurfaceWindow("editor", {
+        title: path,
+        icon: "✎",
+        contentEl: modal,
+        bounds: { x: 12, y: 6, width: 76, height: 86 },
+        minWidthPx: 480,
+        minHeightPx: 320,
+        onClose: () => this.fileEditor.close(),
+      });
+      win?.setTitle(path);
+    } else {
+      this.releaseSurfaceWindowContent("editor", modal);
+    }
   }
 
   // Panels originally live in #app; sheets expect them there. Used when a

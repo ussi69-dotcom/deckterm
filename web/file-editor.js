@@ -252,6 +252,11 @@ class FileEditor {
     this.view = null;
     this.current = null;
     this.setDirty(false);
+    // In windowed mode the editor lives inside a SurfaceWindow that must
+    // close with it (Esc and the in-editor ✕ call close() directly).
+    if (typeof window !== "undefined") {
+      window.terminalManager?.surfaceWindowManager?.close("editor");
+    }
   }
 }
 
