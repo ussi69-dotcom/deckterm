@@ -64,3 +64,4 @@ cd tests && PW_BASE_URL=http://localhost:4174 npx playwright test some.spec.ts
 - Use native `Bun.Terminal` (not Node PTY). Don't drop CORS, `/api/terminals` rate limits, or WS disconnect cleanup. Don't hardcode paths — use env vars / allowed roots.
 - Legacy OpenCode proxy routes still exist in `server.ts` but OpenCode is **not** an active workflow. `gateway.py` is a separate FastAPI prototype, not part of the Bun server.
 - Branch flow: `feature/*` → `dev` (validate on 4174) → `main` (production; `Deploy Main` CI packages + atomically rolls out).
+- **Notion docs:** project state & docs live on the DeckTerm Notion page (landing `33377ff522ce81af89c5c9bfbe3554bb`) per the workspace template convention — Readme / Operations Guide / Development Plan / append-only Development Log / Backlog / agent memory pages. Session-end sync via `/notion-project-sync`; repo stays authoritative for technical spec — link, don't copy.
