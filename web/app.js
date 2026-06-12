@@ -3869,6 +3869,10 @@ class TerminalManager {
     const FileExplorerCtor =
       window.FileExplorerController?.FileExplorerController;
     this.fileExplorer = FileExplorerCtor ? new FileExplorerCtor() : null;
+    if (this.fileExplorer && window.FileEditorModule) {
+      this.fileEditor = new window.FileEditorModule.FileEditor();
+      this.fileExplorer.onOpenFile = (path) => void this.fileEditor.open(path);
+    }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
       this.syncSurfaceButtonState();

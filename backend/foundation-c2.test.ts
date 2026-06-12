@@ -157,3 +157,59 @@ test("C2-3: onboarding remediate route returns success:false for an unknown reme
   const data = await res.json();
   expect(data.success).toBe(false);
 });
+
+test("C2-2b: file content roundtrip — GET reads, PUT saves atomically with conflict guard", async () => {
+  const target = join(allowedRoot, "hello.txt");
+
+  const getRes = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/content?path=${encodeURIComponent(target)}`,
+    ),
+  );
+  expect(getRes.status).toBe(200);
+  const getBody = await getRes.json();
+  expect(getBody.content).toBe("hi");
+  expect(typeof getBody.mtimeMs).toBe("number");
+
+  const putRes = await app.fetch(
+    new Request("http://deckterm.test/api/files/content", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        path: target,
+        content: "hello editor",
+        expectedMtimeMs: getBody.mtimeMs,
+      }),
+    }),
+  );
+  expect(putRes.status).toBe(200);
+  expect(await readFile(target, "utf8")).toBe("hello editor");
+
+  // Stale expectedMtimeMs (pre-save) must 409 instead of clobbering.
+  const conflictRes = await app.fetch(
+    new Request("http://deckterm.test/api/files/content", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        path: target,
+        content: "lost update",
+        expectedMtimeMs: getBody.mtimeMs,
+      }),
+    }),
+  );
+  expect(conflictRes.status).toBe(409);
+  expect(await readFile(target, "utf8")).toBe("hello editor");
+});
+
+test("C2-2c: file content endpoints deny outside registered roots", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/content?path=${encodeURIComponent(
+        join(outsideRoot, "hello.txt"),
+      )}`,
+    ),
+  );
+  expect(res.status).toBe(403);
+  const body = await res.json();
+  expect(body.reason).toBe("no_matching_root");
+});

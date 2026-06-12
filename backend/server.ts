@@ -2969,6 +2969,126 @@ export function createWebApp() {
     }
   });
 
+  // File content for the in-browser editor: GET returns text + mtime, PUT
+  // saves atomically (tmp + rename) with an optimistic-concurrency check on
+  // expectedMtimeMs so two editors can't silently clobber each other.
+  const EDITOR_MAX_FILE_BYTES = 2 * 1024 * 1024;
+
+  app.get("/api/files/content", async (c) => {
+    const requestedPath = c.req.query("path");
+    if (!requestedPath) {
+      return c.json({ error: "Path required" }, 400);
+    }
+    const filePath = await resolveAllowedPath(requestedPath);
+    if (!filePath) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    const fileAccess = await requireFileAccess(c, filePath);
+    if (!fileAccess.ok) {
+      return c.json(fileAccess.body, { status: fileAccess.status as any });
+    }
+
+    const fs = await import("fs/promises");
+    try {
+      const fileStat = await fs.stat(filePath);
+      if (!fileStat.isFile()) {
+        return c.json({ error: "Not a file" }, 400);
+      }
+      if (fileStat.size > EDITOR_MAX_FILE_BYTES) {
+        return c.json(
+          { error: "File too large to edit", maxBytes: EDITOR_MAX_FILE_BYTES },
+          413,
+        );
+      }
+      const data = await fs.readFile(filePath);
+      if (data.includes(0)) {
+        return c.json({ error: "Binary file cannot be edited" }, 415);
+      }
+      return c.json({
+        path: filePath,
+        content: data.toString("utf8"),
+        mtimeMs: fileStat.mtimeMs,
+        size: fileStat.size,
+      });
+    } catch {
+      return c.json({ error: "Cannot read file" }, 400);
+    }
+  });
+
+  app.put("/api/files/content", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const requestedPath = typeof body.path === "string" ? body.path : "";
+    const content = typeof body.content === "string" ? body.content : null;
+    if (!requestedPath || content === null) {
+      return c.json({ error: "path and content required" }, 400);
+    }
+    if (Buffer.byteLength(content, "utf8") > EDITOR_MAX_FILE_BYTES) {
+      return c.json(
+        { error: "Content too large", maxBytes: EDITOR_MAX_FILE_BYTES },
+        413,
+      );
+    }
+    const filePath = await resolveAllowedPath(requestedPath);
+    if (!filePath) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    const fileAccess = await requireFileAccess(c, filePath);
+    if (!fileAccess.ok) {
+      return c.json(fileAccess.body, { status: fileAccess.status as any });
+    }
+
+    const fs = await import("fs/promises");
+    try {
+      const expectedMtimeMs = Number(body.expectedMtimeMs);
+      if (Number.isFinite(expectedMtimeMs)) {
+        try {
+          const current = await fs.stat(filePath);
+          if (current.mtimeMs !== expectedMtimeMs) {
+            return c.json(
+              {
+                error: "File changed on disk since it was opened",
+                reason: "mtime_conflict",
+                mtimeMs: current.mtimeMs,
+              },
+              409,
+            );
+          }
+        } catch {
+          // File vanished — treat as conflict so the user re-decides.
+          return c.json(
+            { error: "File no longer exists", reason: "mtime_conflict" },
+            409,
+          );
+        }
+      }
+
+      const tmpPath = `${filePath}.deckterm-save-${process.pid}-${Date.now()}`;
+      await fs.writeFile(tmpPath, content, "utf8");
+      await fs.rename(tmpPath, filePath);
+      const saved = await fs.stat(filePath);
+
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: getCurrentUser(c).ownerId,
+        action: "file.write",
+        resourceType: "root",
+        decision: "allow",
+        reason: "editor_save",
+        data: { path: filePath, bytes: saved.size },
+      });
+
+      return c.json({ ok: true, path: filePath, mtimeMs: saved.mtimeMs });
+    } catch (err) {
+      return c.json({ error: "Cannot write file", message: String(err) }, 500);
+    }
+  });
+
   // File upload
   app.post("/api/files/upload", async (c) => {
     const requestedPath = c.req.query("path");

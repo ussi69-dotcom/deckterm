@@ -4929,3 +4929,80 @@ body.virtual-keyboard-open .extra-keys {
   width: 100%;
   text-align: left;
 }
+
+/* =============================================================================
+   FILE EDITOR MODAL (CodeMirror 6)
+   ============================================================================= */
+
+.file-editor-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(13, 17, 23, 0.7);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 300;
+}
+
+.file-editor-modal.hidden {
+  display: none;
+}
+
+.file-editor-shell {
+  width: min(960px, 94vw);
+  height: min(80vh, 760px);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+.file-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.file-editor-title {
+  flex: 1;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-family: "JetBrains Mono", monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.file-editor-dirty {
+  color: var(--accent-red);
+  visibility: hidden;
+}
+
+.file-editor-dirty.visible {
+  visibility: visible;
+}
+
+.file-editor-status {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.file-editor-mount {
+  flex: 1;
+  overflow: hidden;
+}
+
+.file-editor-mount .cm-editor {
+  height: 100%;
+}
+
+.file-explorer-item .file-actions .edit {
+  color: var(--text-secondary);
+}

@@ -455,6 +455,23 @@ class FileExplorerController {
     const actionsEl = document.createElement("div");
     actionsEl.className = "file-actions";
 
+    if (
+      !item.isDir &&
+      !item.isParent &&
+      typeof this.onOpenFile === "function"
+    ) {
+      const editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.className = "edit";
+      editBtn.title = "Edit";
+      editBtn.textContent = "✎";
+      editBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        this.onOpenFile(item.path);
+      });
+      actionsEl.appendChild(editBtn);
+    }
+
     if (!item.isDir && !item.isParent) {
       const downloadBtn = document.createElement("button");
       downloadBtn.type = "button";
