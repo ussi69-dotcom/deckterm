@@ -2735,6 +2735,7 @@ class GitManager {
               <button class="git-diff-mode active" data-mode="working">Working Tree</button>
               <button class="git-diff-mode" data-mode="staged">Staged</button>
               <button class="git-diff-mode" data-mode="commit">Commit</button>
+              <button id="git-diff-layout" class="git-diff-mode git-diff-layout" title="Toggle split / inline diff">⫿⫿</button>
             </div>
           </div>
           <div id="git-diff" class="git-diff"></div>
@@ -2774,9 +2775,20 @@ class GitManager {
     this.panel
       .querySelector("#git-branch")
       .addEventListener("click", () => this.toggleBranches());
-    this.panel.querySelectorAll(".git-diff-mode").forEach((btn) => {
-      btn.addEventListener("click", () => this.setDiffMode(btn.dataset.mode));
-    });
+    this.panel
+      .querySelectorAll(".git-diff-mode:not(.git-diff-layout)")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => this.setDiffMode(btn.dataset.mode));
+      });
+    this.panel
+      .querySelector("#git-diff-layout")
+      .addEventListener("click", () => {
+        const next = this.getDiffLayout() === "split" ? "inline" : "split";
+        window.terminalManager?.settingsStore?.set("git.diffLayout", next);
+        if (this.state.selectedPath) {
+          this.showDiff(this.state.selectedPath);
+        }
+      });
   }
 
   setupKeyboardShortcuts() {
@@ -3458,26 +3470,57 @@ class GitManager {
   }
 
   async showDiff(path) {
+    const mode = this.state.diffMode || "working";
+    this.state.selectedPath = path || this.state.selectedPath;
+    const resolvedPath = path || this.state.selectedPath;
+    const titlePath = resolvedPath || "Diff";
+    const modeLabel =
+      mode === "staged"
+        ? "Staged"
+        : mode === "commit"
+          ? "Commit"
+          : "Working Tree";
+    this.panel.querySelector("#git-diff-title").textContent =
+      `${titlePath} (${modeLabel})`;
+    this.panel.querySelector("#git-diff").innerHTML =
+      '<p class="muted">Loading...</p>';
+
+    // Whole-commit view (no file selected) stays a raw patch — the merge
+    // editor compares exactly one file.
+    if (!resolvedPath || (mode === "commit" && !this.state.selectedCommit)) {
+      await this.showPatchDiff(resolvedPath);
+      return;
+    }
+
+    try {
+      const file = this.getAllFiles().find((f) => f.path === resolvedPath) || {
+        path: resolvedPath,
+      };
+      const sources = diffSources(mode, file, this.state.selectedCommit);
+      const [original, modified] = await Promise.all([
+        this.fetchDiffSource(sources.original, resolvedPath),
+        this.fetchDiffSource(sources.modified, resolvedPath),
+      ]);
+      if (original === null || modified === null) {
+        // Binary/unreadable on either side — the unified patch still renders.
+        await this.showPatchDiff(resolvedPath);
+        return;
+      }
+      await this.renderMergeDiff(original, modified, resolvedPath);
+    } catch (err) {
+      console.warn("Merge diff failed, falling back to patch:", err);
+      await this.showPatchDiff(resolvedPath);
+    }
+  }
+
+  // Legacy unified-patch rendering (diff2html / plain text) — fallback path.
+  async showPatchDiff(path) {
     try {
       const cwd = this.state.cwd || this.currentCwd;
       const mode = this.state.diffMode || "working";
-      this.state.selectedPath = path || this.state.selectedPath;
-      const titlePath = path || this.state.selectedPath || "Diff";
-      const modeLabel =
-        mode === "staged"
-          ? "Staged"
-          : mode === "commit"
-            ? "Commit"
-            : "Working Tree";
-      this.panel.querySelector("#git-diff-title").textContent =
-        `${titlePath} (${modeLabel})`;
-      this.panel.querySelector("#git-diff").innerHTML =
-        '<p class="muted">Loading...</p>';
-
       const params = new URLSearchParams({ cwd });
-      const resolvedPath = path || this.state.selectedPath;
-      if (resolvedPath) {
-        params.set("path", resolvedPath);
+      if (path) {
+        params.set("path", path);
       }
       if (mode === "staged") {
         params.set("staged", "1");
@@ -3494,12 +3537,92 @@ class GitManager {
         return;
       }
 
-      this.showDiffContent(data.diff, resolvedPath || "");
+      this.showDiffContent(data.diff, path || "");
     } catch (err) {
       console.error("Diff error:", err);
       this.panel.querySelector("#git-diff").innerHTML =
         '<p class="error">Failed to load diff</p>';
     }
+  }
+
+  // Resolves a diffSources() descriptor to document text. null = unreadable
+  // (binary, too large) → caller falls back to the patch view. A git-show 404
+  // means "file absent at that ref" (new file) and maps to "".
+  async fetchDiffSource(source, relPath) {
+    const cwd = this.state.cwd || this.currentCwd;
+    if (source.kind === "empty") return "";
+    if (source.kind === "worktree") {
+      const abs = `${cwd.replace(/\/$/, "")}/${relPath}`;
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      return typeof data.content === "string" ? data.content : null;
+    }
+    const params = new URLSearchParams({
+      cwd,
+      commit: source.ref,
+      path: relPath,
+    });
+    const res = await fetch(`/api/git/show?${params.toString()}`);
+    if (res.status === 404) return "";
+    if (!res.ok) return null;
+    const data = await res.json();
+    return typeof data.content === "string" ? data.content : "";
+  }
+
+  getDiffLayout() {
+    // Narrow screens always get the inline diff; otherwise the persisted
+    // preference (settings KV, phase 1) decides.
+    if (window.innerWidth < 768) return "inline";
+    return (
+      window.terminalManager?.settingsStore?.get("git.diffLayout", "split") ||
+      "split"
+    );
+  }
+
+  async renderMergeDiff(original, modified, relPath) {
+    this.cm ||= await import("/vendor/codemirror.js");
+    const container = this.panel.querySelector("#git-diff");
+    container.innerHTML = "";
+    this._mergeView?.destroy?.();
+    this._mergeView = null;
+
+    const langName = window.FileEditorModule?.detectEditorLanguage?.(relPath);
+    const langExt =
+      langName && typeof this.cm[langName] === "function"
+        ? [this.cm[langName]()]
+        : [];
+    const shared = [
+      this.cm.EditorView.editable.of(false),
+      this.cm.EditorState.readOnly.of(true),
+      this.cm.oneDark,
+      ...langExt,
+    ];
+
+    if (this.getDiffLayout() === "inline") {
+      this._mergeView = new this.cm.EditorView({
+        doc: modified,
+        extensions: [
+          ...shared,
+          this.cm.unifiedMergeView({
+            original,
+            mergeControls: false,
+            collapseUnchanged: { margin: 3, minSize: 4 },
+          }),
+        ],
+        parent: container,
+      });
+      return;
+    }
+
+    this._mergeView = new this.cm.MergeView({
+      a: { doc: original, extensions: shared },
+      b: { doc: modified, extensions: shared },
+      parent: container,
+      collapseUnchanged: { margin: 3, minSize: 4 },
+    });
   }
 
   async toggleStage(path, isCurrentlyStaged) {

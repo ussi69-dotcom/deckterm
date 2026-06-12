@@ -5404,3 +5404,18 @@ body.sessions-docked .dock-sash.dragging {
   color: var(--text-secondary);
   white-space: nowrap;
 }
+
+/* CodeMirror merge diff editor inside the git panel */
+.git-diff .cm-mergeView {
+  height: 100%;
+  min-height: 200px;
+  font-size: 12px;
+}
+.git-diff .cm-editor {
+  min-height: 200px;
+  max-height: 100%;
+  font-size: 12px;
+}
+.git-diff-layout {
+  margin-left: 6px;
+}
