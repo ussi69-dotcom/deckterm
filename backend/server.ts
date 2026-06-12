@@ -2192,10 +2192,25 @@ export function createWebApp() {
     }),
   );
 
-  // Cloudflare Access JWT authentication
+  // Cloudflare Access JWT authentication. /api/health is exempt: the deploy
+  // pipeline health-gates the candidate and verifies the promoted release
+  // over 127.0.0.1 where no JWT exists, and the origin binds loopback, so the
+  // exemption exposes nothing publicly (edge traffic still passes the CF
+  // Access policy). See backend/health-allowlist.test.ts.
   if (CF_ACCESS_REQUIRED && CF_ACCESS_TEAM_NAME) {
-    app.use("/*", cloudflareAccess(CF_ACCESS_TEAM_NAME));
+    const cfAccessMiddleware = cloudflareAccess(CF_ACCESS_TEAM_NAME);
     app.use("/*", async (c, next) => {
+      if (c.req.path === "/api/health") {
+        await next();
+        return;
+      }
+      return cfAccessMiddleware(c, next);
+    });
+    app.use("/*", async (c, next) => {
+      if (c.req.path === "/api/health") {
+        await next();
+        return;
+      }
       const accessPayload = c.get("accessPayload");
       if (!isCloudflareAudienceAllowed(accessPayload?.aud, CF_ACCESS_AUD)) {
         return c.text("Unauthorized", 401);
