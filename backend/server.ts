@@ -3270,6 +3270,30 @@ export function createWebApp() {
     return fileAccess.ok;
   }
 
+  // Shared runner for git child processes. GIT_TERMINAL_PROMPT=0 makes
+  // credential prompts (e.g. push to an auth-requiring remote) fail fast
+  // instead of hanging the request until the timeout.
+  async function runGit(
+    cwd: string,
+    args: string[],
+    timeoutMs = 10000,
+  ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
+    const [output, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timeoutId);
+    return { ok: code === 0, output, stderr, code };
+  }
+
   // GET /api/settings — actor-scoped UI settings (windows layout, dock, prefs)
   app.get("/api/settings", async (c) => {
     const actor = getCurrentActor(c);
@@ -3344,7 +3368,15 @@ export function createWebApp() {
       }
 
       const lines = output.trim().split("\n");
-      const branch = lines[0]?.replace("## ", "").split("...")[0] || "unknown";
+      const headerLine = lines[0]?.replace("## ", "") || "";
+      // "main...origin/main [ahead 1, behind 2]" | "main" | "No commits yet on main"
+      const trackMatch = headerLine.match(
+        /^(.+?)(?:\.\.\.(\S+))?(?:\s+\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\])?$/,
+      );
+      const branch = trackMatch?.[1] || "unknown";
+      const upstream = trackMatch?.[2] || null;
+      const ahead = Number(trackMatch?.[3] || 0);
+      const behind = Number(trackMatch?.[4] || 0);
       const files = lines
         .slice(1)
         .filter((line) => line.length >= 3)
@@ -3378,7 +3410,7 @@ export function createWebApp() {
           };
         });
 
-      return c.json({ branch, files, cwd });
+      return c.json({ branch, upstream, ahead, behind, files, cwd });
     } catch (err) {
       return c.json(
         { error: "Not a git repository", message: String(err) },
