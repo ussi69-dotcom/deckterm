@@ -339,9 +339,27 @@ async function ensureBootstrapToken({
   stateDir: string;
   env: FoundationEnv;
 }): Promise<FoundationBootstrapStatus> {
-  const adminCount = (
-    db.query("SELECT COUNT(*) AS count FROM users").get() as { count: number }
+  // The legacy/tunnel era created an implicit `anonymous` admin row without a
+  // real bootstrap; it must not make a fresh access-mode deployment look
+  // bootstrapped, or no real identity ever receives grants. An `anonymous`
+  // row still counts when a real bootstrap recorded it (legacy_dev token
+  // path) — bootstrapFirstAdmin always writes a bootstrap.admin.create audit
+  // row, the legacy-era row has none.
+  const realUserCount = (
+    db
+      .query("SELECT COUNT(*) AS count FROM users WHERE id != 'anonymous'")
+      .get() as { count: number }
   ).count;
+  const anonymousBootstrapMarker = db
+    .query(
+      `SELECT 1 FROM audit_events
+       WHERE action = 'bootstrap.admin.create'
+         AND decision = 'allow'
+         AND actor_user_id = 'anonymous'
+       LIMIT 1`,
+    )
+    .get();
+  const adminCount = realUserCount + (anonymousBootstrapMarker ? 1 : 0);
   const tokenPath = join(stateDir, "bootstrap-token");
 
   if (adminCount > 0) {

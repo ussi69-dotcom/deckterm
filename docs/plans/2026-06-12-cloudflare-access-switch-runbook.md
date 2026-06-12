@@ -1,6 +1,13 @@
 # Runbook: prod přepnutí `cloudflare-tunnel` → `cloudflare-access` (+ tmux ops změny)
 
-> Stav: připraveno 2026-06-12 (noční session). **Prod není přepnutý** — kroky níže provádí Lukáš ručně.
+> Stav: **provedeno 2026-06-12 večer** (team `waginy`, AUD pinned, admin `ussi69@gmail.com`).
+> Postmortem: premisa „prod DB nemá admina" (krok 0) byla mylná — DB obsahovala legacy `anonymous`
+> admin řádek z C0 éry (2026-05-12), takže `ensureBootstrapToken` hlásil bootstrap jako hotový,
+> Setup se nenabídl a CF identita neměla žádné granty (`terminal.create` → deny `missing_capability`).
+> Oprava: jednorázová datová remediace v prod DB (user + auth identita + default granty, audit
+> `env_admin_manual_remediation`) + fix v `foundation-state.ts` — legacy `anonymous` řádek se
+> nepočítá jako dokončený bootstrap, pokud k němu neexistuje `bootstrap.admin.create` audit řádek
+> (test ve `foundation-c1.test.ts`).
 > Proč: v `cloudflare-tunnel` módu server plně věří edge — bootstrap i granty se obcházejí a všichni
 > příchozí jsou jeden aktér `tunnel`. V `cloudflare-access` módu si DeckTerm **sám validuje**
 > `Cf-Access-Jwt-Assertion` (team + AUD), každý uživatel je reálná identita a foundation gates
