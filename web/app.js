@@ -3114,6 +3114,14 @@ class GitManager {
         }
       }
 
+      // Keep explorer git decorations in sync with the panel: invalidate the
+      // shared status cache for this cwd, then re-derive decorations.
+      const tm = window.terminalManager;
+      if (tm?.gitStatusStore) {
+        tm.gitStatusStore.invalidate(cwd);
+        void tm.refreshExplorerDecorations();
+      }
+
       // Fetch commit history
       const logRes = await fetch(
         `/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=30`,
@@ -4278,6 +4286,15 @@ class TerminalManager {
     const FileExplorerCtor =
       window.FileExplorerController?.FileExplorerController;
     this.fileExplorer = FileExplorerCtor ? new FileExplorerCtor() : null;
+    // Shared git-status cache feeding the explorer's VS Code-style decorations
+    // (and reusable by the git panel). A git mutation can invalidate it later.
+    const GitStatusStoreCtor = window.GitStatusStore?.GitStatusStore;
+    this.gitStatusStore = GitStatusStoreCtor ? new GitStatusStoreCtor() : null;
+    if (this.fileExplorer) {
+      // Re-derive git decorations whenever the explorer navigates.
+      this.fileExplorer.onDirLoaded = () =>
+        void this.refreshExplorerDecorations();
+    }
     // The controller's own close button only hides the explorer content; in
     // windowed mode the hosting SurfaceWindow has to close with it.
     document
@@ -8078,6 +8095,40 @@ class TerminalManager {
       workspaceId: active?.workspaceId || null,
       cwd: active?.cwd || this.getCurrentDirectoryValue() || "/",
     };
+  }
+
+  // Fetch git status for the explorer's current directory (via the shared
+  // store), build the decoration map (git-decorations.js), and set it on the
+  // explorer snapshot so rows render status badges/colors. Silently skips when
+  // the dir is not a git repo (status error) or the store/explorer is absent.
+  async refreshExplorerDecorations(options = {}) {
+    if (!this.fileExplorer || !this.gitStatusStore) return;
+    if (!window.GitDecorations?.buildDecorationMap) return;
+
+    const workspaceId = this.fileExplorer.currentWorkspaceId;
+    const cwd = this.fileExplorer.currentPath;
+    if (!workspaceId || !cwd) return;
+
+    let status;
+    try {
+      status = options.force
+        ? await this.gitStatusStore.refreshStatus(cwd)
+        : await this.gitStatusStore.getStatus(cwd);
+    } catch {
+      return;
+    }
+
+    // Not a git repo (or status failed) → clear decorations silently.
+    if (!status || status.error || !status.root) {
+      this.fileExplorer.setDecorations(workspaceId, {});
+      return;
+    }
+
+    const decorations = window.GitDecorations.buildDecorationMap(
+      status.files,
+      status.root,
+    );
+    this.fileExplorer.setDecorations(workspaceId, decorations);
   }
 
   getRightSurface() {

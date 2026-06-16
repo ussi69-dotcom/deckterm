@@ -5437,6 +5437,23 @@ body.sessions-docked .dock-sash.dragging {
   color: #e4676b;
 }
 
+/* File explorer git decorations (Phase 3): VS Code-style status letter badge
+   on changed rows. Reuses the .git-status-* color classes above for the name
+   tint + the badge color. */
+.file-item.git-decorated .file-name {
+  font-style: normal;
+}
+.file-item .file-git-status {
+  margin-left: 6px;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  flex: 0 0 auto;
+  min-width: 12px;
+  text-align: center;
+}
+
 /* Row hover actions (VS Code style: hidden until hover/selected) */
 .git-file .git-file-actions {
   display: flex;

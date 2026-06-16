@@ -179,6 +179,7 @@ class FileExplorerController {
     this.error = null;
     this.dragActive = false;
     this.loadSequence = 0;
+    this.decorationsByWorkspace = new Map();
 
     this.shellEl = null;
     this.backdropEl = null;
@@ -291,6 +292,9 @@ class FileExplorerController {
       path,
       selectedItem: workspaceId ? this.getSelectedItem(workspaceId) : null,
       items: workspaceId ? this.getWorkspaceItems(workspaceId) : [],
+      decorations: workspaceId
+        ? this.decorationsByWorkspace.get(workspaceId) || {}
+        : {},
       loading: this.loading,
       error: this.error,
       dragActive: this.dragActive,
@@ -448,6 +452,22 @@ class FileExplorerController {
     nameEl.className = "file-name";
     nameEl.textContent = item.name;
 
+    // Git status decoration (VS Code style): a single-letter badge + color
+    // class threaded in via snapshot.decorations (keyed by absolute path).
+    const decoration = snapshot.decorations?.[item.path];
+    let badgeEl = null;
+    if (decoration && decoration.letter) {
+      el.classList.add("git-decorated");
+      if (decoration.colorClass) {
+        el.classList.add(decoration.colorClass);
+        nameEl.classList.add(decoration.colorClass);
+      }
+      badgeEl = document.createElement("span");
+      badgeEl.className = "file-git-status";
+      if (decoration.colorClass) badgeEl.classList.add(decoration.colorClass);
+      badgeEl.textContent = decoration.letter;
+    }
+
     const sizeEl = document.createElement("span");
     sizeEl.className = "file-size";
     sizeEl.textContent = item.isDir ? "" : formatFileSize(item.size);
@@ -500,6 +520,7 @@ class FileExplorerController {
 
     el.appendChild(iconEl);
     el.appendChild(nameEl);
+    if (badgeEl) el.appendChild(badgeEl);
     el.appendChild(sizeEl);
     el.appendChild(actionsEl);
 
@@ -601,6 +622,22 @@ class FileExplorerController {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return [];
     return cloneItems(this.itemsByWorkspace.get(normalizedWorkspaceId));
+  }
+
+  // Git status decorations keyed by absolute item path. Re-renders the list
+  // when set for the active workspace so badges/colors appear immediately.
+  setDecorations(workspaceId, decorations) {
+    const normalizedWorkspaceId = String(workspaceId || "").trim();
+    if (!normalizedWorkspaceId) return null;
+
+    const next =
+      decorations && typeof decorations === "object" ? { ...decorations } : {};
+    this.decorationsByWorkspace.set(normalizedWorkspaceId, next);
+
+    if (normalizedWorkspaceId === this.currentWorkspaceId) {
+      this.renderList();
+    }
+    return next;
   }
 
   setLoading(loading) {
@@ -706,6 +743,15 @@ class FileExplorerController {
 
       if (normalizedWorkspaceId === this.currentWorkspaceId) {
         this.render();
+      }
+
+      // Lets the host (app.js) refresh git decorations for the new directory.
+      if (typeof this.onDirLoaded === "function") {
+        try {
+          this.onDirLoaded(resolvedPath, normalizedWorkspaceId);
+        } catch {
+          // Decoration refresh must not break directory loading.
+        }
       }
 
       return data;
