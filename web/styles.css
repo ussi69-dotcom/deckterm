@@ -5574,6 +5574,10 @@ body.ide-mode #workspace-area {
 }
 
 .ide-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   padding: 8px 12px;
   font-size: 11px;
   text-transform: uppercase;
@@ -5582,11 +5586,56 @@ body.ide-mode #workspace-area {
   flex: 0 0 auto;
 }
 
+.ide-sidebar-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-sidebar-action {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #858585);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+.ide-sidebar-action:hover {
+  color: var(--text-primary, #fff);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.ide-sidebar-action.active {
+  color: var(--accent-blue);
+}
+
 .ide-sidebar-body {
   flex: 1;
   min-height: 0;
   position: relative;
   overflow: auto;
+}
+
+/* Hint shown in the (otherwise empty) sidebar when the Explorer is popped out
+   into a floating window. Hidden by default; revealed via the detached class. */
+.ide-sidebar-detached-hint {
+  display: none;
+  padding: 16px 12px;
+  font-size: 12px;
+  color: var(--text-secondary, #858585);
+}
+
+.ide-sidebar.explorer-detached .ide-sidebar-body {
+  display: none;
+}
+
+.ide-sidebar.explorer-detached .ide-sidebar-detached-hint {
+  display: block;
 }
 
 .ide-editor-area {

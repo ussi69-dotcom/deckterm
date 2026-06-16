@@ -3,12 +3,21 @@ import {
   LAYOUT_SCHEMA_VERSION,
   LAYOUT_MODE_KEY,
   LAYOUT_SCHEMA_VERSION_KEY,
+  LAYOUT_DETACHED_KEY,
+  VIEW_EXPLORER,
+  EXPLORER_HOST_SIDEBAR,
+  EXPLORER_HOST_DETACHED,
   normalizeLayoutMode,
   toggleLayoutMode,
   resolveRenderedMode,
   isIdeRendered,
   loadLayoutState,
   migrateLayoutState,
+  normalizeDetachedState,
+  loadDetachedState,
+  isViewDetached,
+  setViewDetached,
+  resolveExplorerHost,
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
@@ -93,20 +102,23 @@ function makeFakeStore(initial = {}) {
   };
 }
 
-test("loadLayoutState reads stored mode + version, defaulting cleanly", () => {
+test("loadLayoutState reads stored mode + version + detached, defaulting cleanly", () => {
   const empty = makeFakeStore();
   expect(loadLayoutState(empty)).toEqual({
     mode: "terminal",
     schemaVersion: LAYOUT_SCHEMA_VERSION,
+    detached: {},
   });
 
   const stored = makeFakeStore({
     "layout.mode": "ide",
     "layout.schemaVersion": LAYOUT_SCHEMA_VERSION,
+    "layout.detached": { explorer: true },
   });
   expect(loadLayoutState(stored)).toEqual({
     mode: "ide",
     schemaVersion: LAYOUT_SCHEMA_VERSION,
+    detached: { explorer: true },
   });
 
   // A bad stored mode is normalized.
@@ -212,4 +224,87 @@ test("captureExplorerState defaults missing/blank fields to a closed-home state"
   expect(
     captureExplorerState({ parentId: "", isOpen: 0, surfaceWindow: "" }),
   ).toEqual({ parentId: null, isOpen: false, surfaceWindow: null });
+});
+
+// ── Slice 3: schema v2 + detached-state helpers ──────────────────────────────
+
+test("schema version is v2 (slice 3 bumped it for layout.detached)", () => {
+  expect(LAYOUT_SCHEMA_VERSION).toBe(2);
+  expect(LAYOUT_DETACHED_KEY).toBe("layout.detached");
+  expect(VIEW_EXPLORER).toBe("explorer");
+});
+
+test("migrateLayoutState v1 store → v2 stamps version, never clobbers keys", () => {
+  // A store left at v1 with an existing mode + (hypothetical) detached map must
+  // be bumped to v2 WITHOUT touching either existing value.
+  const store = makeFakeStore({
+    "layout.mode": "ide",
+    "layout.schemaVersion": 1,
+    "layout.detached": { explorer: true },
+  });
+  const result = migrateLayoutState(store);
+  expect(result.migrated).toBe(true);
+  expect(store.get("layout.schemaVersion")).toBe(2);
+  expect(store.get("layout.mode")).toBe("ide");
+  expect(store.get("layout.detached")).toEqual({ explorer: true });
+});
+
+test("normalizeDetachedState keeps only true entries, tolerates junk + JSON", () => {
+  expect(normalizeDetachedState({ explorer: true })).toEqual({
+    explorer: true,
+  });
+  // Falsy/non-true entries are dropped (docked views are simply absent).
+  expect(normalizeDetachedState({ explorer: false, git: 1, x: "y" })).toEqual(
+    {},
+  );
+  expect(normalizeDetachedState('{"explorer":true}')).toEqual({
+    explorer: true,
+  });
+  expect(normalizeDetachedState("not json")).toEqual({});
+  expect(normalizeDetachedState(null)).toEqual({});
+  expect(normalizeDetachedState([1, 2])).toEqual({});
+  expect(normalizeDetachedState(42)).toEqual({});
+});
+
+test("loadDetachedState reads the persisted map, defaulting to empty", () => {
+  expect(loadDetachedState(makeFakeStore())).toEqual({});
+  expect(
+    loadDetachedState(makeFakeStore({ "layout.detached": { explorer: true } })),
+  ).toEqual({ explorer: true });
+  expect(loadDetachedState(null)).toEqual({});
+});
+
+test("isViewDetached reports per-view detached flag over a (raw or normalized) map", () => {
+  expect(isViewDetached({ explorer: true }, "explorer")).toBe(true);
+  expect(isViewDetached({ explorer: true }, "git")).toBe(false);
+  expect(isViewDetached({}, "explorer")).toBe(false);
+  expect(isViewDetached({ explorer: false }, "explorer")).toBe(false);
+  // Tolerates JSON strings too.
+  expect(isViewDetached('{"explorer":true}', "explorer")).toBe(true);
+});
+
+test("setViewDetached is a pure reducer that never mutates its input", () => {
+  const before = { git: true };
+  const after = setViewDetached(before, "explorer", true);
+  expect(after).toEqual({ git: true, explorer: true });
+  // Input untouched.
+  expect(before).toEqual({ git: true });
+  // Docking drops the key entirely (minimal persisted shape).
+  expect(
+    setViewDetached({ explorer: true, git: true }, "explorer", false),
+  ).toEqual({ git: true });
+  // Docking an absent view is a no-op.
+  expect(setViewDetached({}, "explorer", false)).toEqual({});
+});
+
+test("resolveExplorerHost routes the single element to home/sidebar/detached", () => {
+  // Not IDE → terminal-mode home, regardless of the detached flag.
+  expect(resolveExplorerHost("terminal", false)).toBe("home");
+  expect(resolveExplorerHost("terminal", true)).toBe("home");
+  // IDE + docked → sidebar.
+  expect(resolveExplorerHost("ide", false)).toBe(EXPLORER_HOST_SIDEBAR);
+  // IDE + detached → floating window.
+  expect(resolveExplorerHost("ide", true)).toBe(EXPLORER_HOST_DETACHED);
+  // Junk mode normalizes to terminal → home.
+  expect(resolveExplorerHost("garbage", true)).toBe("home");
 });

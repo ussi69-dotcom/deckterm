@@ -36,12 +36,25 @@
 
 // ── Schema + canonical keys ──────────────────────────────────────────────────
 
-const LAYOUT_SCHEMA_VERSION = 1;
+// Schema v2 (slice 3) adds `layout.detached` — a per-view map of "is this IDE
+// sidebar view popped out into a floating SurfaceWindow?". The key was reserved
+// in slice 2; v2 just stamps the version (the map defaults to {} and never
+// clobbers existing keys).
+const LAYOUT_SCHEMA_VERSION = 2;
 const LAYOUT_MODE_KEY = "layout.mode";
 const LAYOUT_SCHEMA_VERSION_KEY = "layout.schemaVersion";
+const LAYOUT_DETACHED_KEY = "layout.detached";
 
 const LAYOUT_MODE_IDE = "ide";
 const LAYOUT_MODE_TERMINAL = "terminal";
+
+// The only view that gets pop-out/dock this slice (YAGNI: no multi-view
+// registry — Source Control / Search / Tasks arrive in slices 5-7).
+const VIEW_EXPLORER = "explorer";
+
+// Where the single #file-explorer element is hosted in IDE mode.
+const EXPLORER_HOST_SIDEBAR = "sidebar";
+const EXPLORER_HOST_DETACHED = "detached";
 
 // ── Pure logic (DOM-free, unit-tested) ───────────────────────────────────────
 
@@ -83,7 +96,8 @@ function loadLayoutState(store) {
       ? Number(store.get(LAYOUT_SCHEMA_VERSION_KEY, LAYOUT_SCHEMA_VERSION)) ||
         LAYOUT_SCHEMA_VERSION
       : LAYOUT_SCHEMA_VERSION;
-  return { mode, schemaVersion };
+  const detached = loadDetachedState(store);
+  return { mode, schemaVersion, detached };
 }
 
 // Stamp the current schema version onto a versionless store. Never clobbers an
@@ -98,8 +112,64 @@ function migrateLayoutState(store) {
   }
   const current = Number(store.get(LAYOUT_SCHEMA_VERSION_KEY, 0)) || 0;
   if (current >= LAYOUT_SCHEMA_VERSION) return { migrated: false };
+  // v2 only stamps the version. `layout.detached` defaults to {} lazily on read,
+  // so we never need to seed it — and never clobber an existing value if a future
+  // newer-schema client already wrote one. Existing layout.mode is untouched.
   store.set(LAYOUT_SCHEMA_VERSION_KEY, LAYOUT_SCHEMA_VERSION);
   return { migrated: true };
+}
+
+// ── Pure detached-state helpers (DOM-free, unit-tested) ──────────────────────
+
+// Normalize any stored value into a clean { [viewId]: true } map. Only `true`
+// entries are kept (a docked view is simply absent), so the persisted shape stays
+// minimal and idempotent. Tolerates strings (JSON), junk, and arrays.
+function normalizeDetachedState(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return {};
+    }
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const out = {};
+  for (const [viewId, flag] of Object.entries(parsed)) {
+    if (flag === true) out[viewId] = true;
+  }
+  return out;
+}
+
+// Read the persisted detached map from a settings store (get(key, fallback)).
+function loadDetachedState(store) {
+  if (!store || typeof store.get !== "function") return {};
+  return normalizeDetachedState(store.get(LAYOUT_DETACHED_KEY, {}));
+}
+
+// Is a given view popped out, per a (normalized or raw) detached map?
+function isViewDetached(detached, viewId) {
+  return normalizeDetachedState(detached)[viewId] === true;
+}
+
+// Pure reducer: return the next detached map with `viewId` set to `detached`.
+// Never mutates the input; drops the key entirely when docking so the persisted
+// shape stays minimal.
+function setViewDetached(detached, viewId, isDetached) {
+  const next = normalizeDetachedState(detached);
+  if (isDetached) next[viewId] = true;
+  else delete next[viewId];
+  return next;
+}
+
+// Where should the Explorer be hosted right now? Pure resolver over the resolved
+// (viewport-gated) mode + the detached flag:
+//   - not IDE        → "home" (terminal-mode #app/sheet/Files-window path)
+//   - IDE + detached → "detached" (floating SurfaceWindow)
+//   - IDE + docked   → "sidebar"
+function resolveExplorerHost(renderedMode, isDetached) {
+  if (normalizeLayoutMode(renderedMode) !== LAYOUT_MODE_IDE) return "home";
+  return isDetached ? EXPLORER_HOST_DETACHED : EXPLORER_HOST_SIDEBAR;
 }
 
 // ── Pure focus-target resolution (DOM-free, unit-tested) ─────────────────────
@@ -235,6 +305,21 @@ class IdeShellController {
       typeof options.restoreExplorerState === "function"
         ? options.restoreExplorerState
         : null;
+    // Slice-3 pop-out/dock hooks. The app owns the SurfaceWindow plumbing; the
+    // shell only decides WHEN to detach/dock + reparents the single element.
+    //   detachExplorerWindow(el) => container — open the floating Explorer window
+    //     and return the SurfaceWindow body the #file-explorer element now lives
+    //     in (so the controller can run the ViewHost rebind against it).
+    //   dockExplorerWindow()    => void — close the floating Explorer window
+    //     (the controller reparents the element back into the sidebar itself).
+    this.detachExplorerWindowFn =
+      typeof options.detachExplorerWindow === "function"
+        ? options.detachExplorerWindow
+        : null;
+    this.dockExplorerWindowFn =
+      typeof options.dockExplorerWindow === "function"
+        ? options.dockExplorerWindow
+        : null;
 
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
@@ -245,6 +330,7 @@ class IdeShellController {
     this.sidebarEl = null;
     this.sidebarBodyEl = null;
     this.editorAreaEl = null;
+    this.popOutBtnEl = null;
 
     // True while the shell is actually rendered (IDE presentation active).
     this.rendered = false;
@@ -267,6 +353,33 @@ class IdeShellController {
   // Which mode actually renders right now (viewport-gated).
   renderedMode() {
     return resolveRenderedMode(this.getStoredMode(), this.isDesktop());
+  }
+
+  // ── Detached (pop-out) state ────────────────────────────────────────────────
+
+  // Is the Explorer popped out into a floating SurfaceWindow? (persisted flag).
+  isExplorerDetached() {
+    if (!this.settingsStore) return false;
+    return isViewDetached(
+      this.settingsStore.get(LAYOUT_DETACHED_KEY, {}),
+      VIEW_EXPLORER,
+    );
+  }
+
+  // Persist a new detached flag for the Explorer (pure reducer + store write).
+  setExplorerDetached(isDetached) {
+    if (!this.settingsStore) return;
+    const next = setViewDetached(
+      this.settingsStore.get(LAYOUT_DETACHED_KEY, {}),
+      VIEW_EXPLORER,
+      Boolean(isDetached),
+    );
+    this.settingsStore.set(LAYOUT_DETACHED_KEY, next);
+  }
+
+  // Where the Explorer element should be hosted right now (pure resolver).
+  explorerHost() {
+    return resolveExplorerHost(this.renderedMode(), this.isExplorerDetached());
   }
 
   // Persist a new desktop preference (device-local) + apply live. Does NOT write
@@ -316,11 +429,11 @@ class IdeShellController {
     // doesn't race stale surface-window state / no-op against a moved node.
     if (this.beforeEnterIde) this.beforeEnterIde();
 
-    // Host the Explorer in the sidebar: move the single #file-explorer element
-    // into the sidebar body, then rebind the controller to it via the ViewHost
-    // contract (unmount old host → mount new host). The controller instance is
-    // REUSED — never recreated — so its model/store persist.
-    this.mountExplorer();
+    // Host the Explorer in its resolved IDE home: the sidebar by default, or a
+    // floating SurfaceWindow when the persisted detached flag is set. Either way
+    // the single #file-explorer element is MOVED (not cloned) and the controller
+    // is REUSED via the ViewHost contract — never recreated.
+    this.mountExplorerForHost();
 
     // App hook: dock terminals to the bottom panel (CSS only — no PTY touch).
     if (this.onEnterIde) this.onEnterIde();
@@ -342,6 +455,20 @@ class IdeShellController {
 
     // Snapshot focus before the reparent so it can be restored after.
     const focusTarget = this.captureFocusFn ? this.captureFocusFn() : null;
+
+    // If the Explorer is currently popped out into the floating IDE window, close
+    // that window so its body releases the #file-explorer element before we
+    // restore terminal-mode presentation. The DETACHED FLAG IS PRESERVED in
+    // settings — it's an IDE-only artifact: leaving IDE mode closes the window,
+    // but the next IDE entry re-detaches the Explorer (mirrors slice 2's
+    // "explorer prior-state restored on exit, remembered for next entry").
+    if (this.isExplorerDetached() && this.dockExplorerWindowFn) {
+      try {
+        this.dockExplorerWindowFn();
+      } catch {
+        // Window may already be gone; restore still reparents the element.
+      }
+    }
 
     // Return the explorer element home + rebind so the surface-window / sheet
     // path keeps working in terminal mode. Lossless: restore the EXACT prior
@@ -387,6 +514,9 @@ class IdeShellController {
     explorerBtn.title = "Explorer";
     explorerBtn.setAttribute("aria-label", "Explorer");
     explorerBtn.innerHTML = '<i data-lucide="files"></i>';
+    // Clicking the (active) Explorer icon while it's popped out docks it back —
+    // VS Code "click the active view re-homes it in the sidebar".
+    explorerBtn.addEventListener("click", () => this.dockExplorer());
     activityBar.appendChild(explorerBtn);
 
     // Sidebar — hosts the Explorer skeleton (#file-explorer) this slice.
@@ -394,11 +524,30 @@ class IdeShellController {
     sidebar.className = "ide-sidebar";
     const sidebarHeader = this.doc.createElement("div");
     sidebarHeader.className = "ide-sidebar-header";
-    sidebarHeader.textContent = "Explorer";
+    const sidebarTitle = this.doc.createElement("span");
+    sidebarTitle.className = "ide-sidebar-title";
+    sidebarTitle.textContent = "Explorer";
+    // Pop-out control — detaches the Explorer into a floating SurfaceWindow.
+    const popOutBtn = this.doc.createElement("button");
+    popOutBtn.type = "button";
+    popOutBtn.className = "ide-sidebar-action ide-popout-btn";
+    popOutBtn.title = "Move the Explorer into a floating window";
+    popOutBtn.setAttribute("aria-label", "Pop out the Explorer");
+    popOutBtn.setAttribute("aria-pressed", "false");
+    popOutBtn.textContent = "⤢";
+    popOutBtn.addEventListener("click", () => this.toggleExplorerDetached());
+    sidebarHeader.appendChild(sidebarTitle);
+    sidebarHeader.appendChild(popOutBtn);
     const sidebarBody = this.doc.createElement("div");
     sidebarBody.className = "ide-sidebar-body";
+    // Hint shown when the Explorer is popped out (sidebar body is then empty).
+    const detachedHint = this.doc.createElement("div");
+    detachedHint.className = "ide-sidebar-detached-hint";
+    detachedHint.textContent = "Explorer is in a floating window.";
     sidebar.appendChild(sidebarHeader);
     sidebar.appendChild(sidebarBody);
+    sidebar.appendChild(detachedHint);
+    this.popOutBtnEl = popOutBtn;
 
     // Editor area — empty placeholder this slice (tabs come in slice 4).
     const editorArea = this.doc.createElement("div");
@@ -436,9 +585,19 @@ class IdeShellController {
     }
   }
 
+  // Mount the Explorer into its resolved IDE host (sidebar OR floating window),
+  // per the persisted detached flag. Single dispatch point used on enter + on a
+  // pop-out/dock toggle so the reparent path stays identical.
+  mountExplorerForHost() {
+    if (this.explorerHost() === EXPLORER_HOST_DETACHED)
+      this.mountExplorerDetached();
+    else this.mountExplorerSidebar();
+    this.syncPopOutAffordance();
+  }
+
   // Move the #file-explorer element into the sidebar body and rebind the
   // controller. Reuses the live FileExplorerController — no recreation.
-  mountExplorer() {
+  mountExplorerSidebar() {
     if (!this.doc) return;
     const explorerEl = this.doc.getElementById("file-explorer");
     if (!explorerEl || !this.sidebarBodyEl) return;
@@ -449,11 +608,105 @@ class IdeShellController {
     // always visible and docked — strip the modal chrome via a host class.
     explorerEl.classList.add("ide-hosted");
     explorerEl.classList.remove("hidden");
+    this.rebindExplorerView(explorerEl);
+  }
+
+  // Pop the Explorer OUT into a floating SurfaceWindow. The app hook owns the
+  // window plumbing and returns the window body the element now lives in; the
+  // controller runs the ViewHost rebind against it. Reuses the same element +
+  // controller (no recreation). Falls back to the sidebar if no hook is wired.
+  mountExplorerDetached() {
+    if (!this.doc) return;
+    const explorerEl = this.doc.getElementById("file-explorer");
+    if (!explorerEl) return;
+    if (!this.detachExplorerWindowFn) {
+      this.mountExplorerSidebar();
+      return;
+    }
+    // Floating window content flows like the sheet/window path (NOT the static
+    // sidebar layout), so drop the ide-hosted host class but keep it visible.
+    explorerEl.classList.remove("ide-hosted");
+    explorerEl.classList.remove("hidden");
+    let container = null;
+    try {
+      container = this.detachExplorerWindowFn(explorerEl);
+    } catch {
+      // If the window failed to open, degrade gracefully to the sidebar.
+    }
+    if (!container) {
+      this.mountExplorerSidebar();
+      return;
+    }
+    if (explorerEl.parentElement !== container)
+      container.appendChild(explorerEl);
+    this.rebindExplorerView(explorerEl);
+  }
+
+  // ViewHost rebind helper: unmount the old host + mount the (reparented)
+  // skeleton, then run a resize pass. The controller instance is REUSED.
+  rebindExplorerView(explorerEl) {
     const view = this.explorerView;
-    if (view) {
-      // ViewHost contract: rebind to the (now reparented) skeleton.
-      if (typeof view.unmount === "function") view.unmount();
-      if (typeof view.mount === "function") view.mount(explorerEl);
+    if (!view) return;
+    if (typeof view.unmount === "function") view.unmount();
+    if (typeof view.mount === "function") view.mount(explorerEl);
+    if (typeof view.resize === "function") {
+      try {
+        view.resize();
+      } catch {
+        // Resize is best-effort; never break the reparent.
+      }
+    }
+  }
+
+  // ── Pop-out / dock toggle (slice 3) ─────────────────────────────────────────
+
+  // Flip the Explorer between the sidebar and a floating window. Persists the
+  // flag, then re-mounts into the new host (moving the single element, reusing
+  // the controller). No-op outside rendered IDE mode.
+  toggleExplorerDetached() {
+    if (!this.rendered) return;
+    const next = !this.isExplorerDetached();
+    this.setExplorerDetached(next);
+    if (!next) {
+      // Docking back: close the floating window FIRST so its body releases the
+      // element, then the sidebar mount reclaims it.
+      if (this.dockExplorerWindowFn) {
+        try {
+          this.dockExplorerWindowFn();
+        } catch {
+          // Window may already be gone; the re-mount still reparents the element.
+        }
+      }
+    }
+    this.mountExplorerForHost();
+    this.runAfterRender();
+  }
+
+  // Dock the Explorer back to the sidebar if it is currently detached (used by
+  // the activity-bar Explorer icon — VS Code "click the active view re-focuses
+  // it in the sidebar"). No-op when already docked.
+  dockExplorer() {
+    if (!this.rendered || !this.isExplorerDetached()) return;
+    this.toggleExplorerDetached();
+  }
+
+  // Keep the sidebar pop-out button + activity-bar state in sync with whether the
+  // Explorer is currently detached.
+  syncPopOutAffordance() {
+    const detached = this.isExplorerDetached();
+    if (this.popOutBtnEl) {
+      this.popOutBtnEl.classList.toggle("active", detached);
+      this.popOutBtnEl.setAttribute(
+        "aria-pressed",
+        detached ? "true" : "false",
+      );
+      this.popOutBtnEl.title = detached
+        ? "Dock the Explorer back to the sidebar"
+        : "Move the Explorer into a floating window";
+    }
+    // When detached, the sidebar body is empty — show a hint + dim the header.
+    if (this.sidebarEl) {
+      this.sidebarEl.classList.toggle("explorer-detached", detached);
     }
   }
 
@@ -540,14 +793,23 @@ const IdeShell = {
   LAYOUT_SCHEMA_VERSION,
   LAYOUT_MODE_KEY,
   LAYOUT_SCHEMA_VERSION_KEY,
+  LAYOUT_DETACHED_KEY,
   LAYOUT_MODE_IDE,
   LAYOUT_MODE_TERMINAL,
+  VIEW_EXPLORER,
+  EXPLORER_HOST_SIDEBAR,
+  EXPLORER_HOST_DETACHED,
   normalizeLayoutMode,
   toggleLayoutMode,
   resolveRenderedMode,
   isIdeRendered,
   loadLayoutState,
   migrateLayoutState,
+  normalizeDetachedState,
+  loadDetachedState,
+  isViewDetached,
+  setViewDetached,
+  resolveExplorerHost,
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
@@ -566,14 +828,23 @@ if (typeof exports !== "undefined") {
   exports.LAYOUT_SCHEMA_VERSION = LAYOUT_SCHEMA_VERSION;
   exports.LAYOUT_MODE_KEY = LAYOUT_MODE_KEY;
   exports.LAYOUT_SCHEMA_VERSION_KEY = LAYOUT_SCHEMA_VERSION_KEY;
+  exports.LAYOUT_DETACHED_KEY = LAYOUT_DETACHED_KEY;
   exports.LAYOUT_MODE_IDE = LAYOUT_MODE_IDE;
   exports.LAYOUT_MODE_TERMINAL = LAYOUT_MODE_TERMINAL;
+  exports.VIEW_EXPLORER = VIEW_EXPLORER;
+  exports.EXPLORER_HOST_SIDEBAR = EXPLORER_HOST_SIDEBAR;
+  exports.EXPLORER_HOST_DETACHED = EXPLORER_HOST_DETACHED;
   exports.normalizeLayoutMode = normalizeLayoutMode;
   exports.toggleLayoutMode = toggleLayoutMode;
   exports.resolveRenderedMode = resolveRenderedMode;
   exports.isIdeRendered = isIdeRendered;
   exports.loadLayoutState = loadLayoutState;
   exports.migrateLayoutState = migrateLayoutState;
+  exports.normalizeDetachedState = normalizeDetachedState;
+  exports.loadDetachedState = loadDetachedState;
+  exports.isViewDetached = isViewDetached;
+  exports.setViewDetached = setViewDetached;
+  exports.resolveExplorerHost = resolveExplorerHost;
   exports.captureFocusTarget = captureFocusTarget;
   exports.resolveFocusTarget = resolveFocusTarget;
   exports.captureExplorerState = captureExplorerState;

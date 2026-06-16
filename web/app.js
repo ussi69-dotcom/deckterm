@@ -112,6 +112,9 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// SurfaceWindow id for the IDE Explorer pop-out (slice 3). Distinct from the
+// terminal-mode "files" window so their persisted geometries don't collide.
+const IDE_EXPLORER_WINDOW_ID = "ide-explorer";
 const APP_DEFAULT_TERMINAL_COLS =
   window.TerminalSizing?.DEFAULT_TERMINAL_COLS || 120;
 const APP_DEFAULT_TERMINAL_ROWS =
@@ -8953,13 +8956,22 @@ class TerminalManager {
       // restore the EXACT same state on exit.
       readExplorerState: () => this.readExplorerPresentation(),
       restoreExplorerState: (state) => this.restoreExplorerPresentation(state),
+      // Slice-3 pop-out/dock: open/close a dedicated floating SurfaceWindow that
+      // hosts the SAME #file-explorer element while detached (the controller does
+      // the reparent + ViewHost rebind — these hooks only own window plumbing).
+      detachExplorerWindow: (el) => this.detachIdeExplorerWindow(el),
+      dockExplorerWindow: () => this.dockIdeExplorerWindow(),
     });
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
     platformDetector.onChange(() => this.syncIdeAffordance());
-    void this.settingsReady.then(() => {
+    void this.settingsReady.then(async () => {
       window.IdeShell.migrateLayoutState(this.settingsStore);
+      // The Explorer can restore directly into a detached floating window on
+      // reload, so the surface-window manager must exist BEFORE applyMode() runs
+      // enterIde(). ensureSurfaceWindowManager no-ops off-desktop / when absent.
+      await this.ensureSurfaceWindowManager();
       this.syncIdeAffordance();
       this.ideShell?.applyMode();
     });
@@ -9091,6 +9103,43 @@ class TerminalManager {
       view.mount?.(explorerEl);
     }
     void this.openFileExplorer();
+  }
+
+  // --- IDE Explorer pop-out window (slice 3) --------------------------------
+
+  // Open (or reuse) the floating Explorer SurfaceWindow and host the given
+  // #file-explorer element in it. Returns the window body element so the IDE
+  // shell controller can run its ViewHost rebind against it (the SAME element +
+  // controller are reused — no recreation). Synchronous: by the time IDE mode is
+  // active the surface-window manager + settings are already resolved.
+  detachIdeExplorerWindow(explorerEl) {
+    const manager = this.surfaceWindowManager;
+    if (!manager || !explorerEl) return null;
+    if (!manager.get(IDE_EXPLORER_WINDOW_ID)) {
+      manager.register({
+        id: IDE_EXPLORER_WINDOW_ID,
+        title: "Explorer",
+        icon: "▤",
+        // Default bounds when no saved geometry exists; the manager prefers the
+        // persisted windows.layout entry for this id when present.
+        bounds: { x: 6, y: 6, width: 30, height: 80 },
+        // Closing via the window's × docks the Explorer back to the sidebar.
+        onClose: () => this.ideShell?.dockExplorer(),
+      });
+    }
+    const win = manager.get(IDE_EXPLORER_WINDOW_ID);
+    if (!win?.bodyEl) return null;
+    if (explorerEl.parentElement !== win.bodyEl) {
+      win.bodyEl.appendChild(explorerEl);
+    }
+    manager.open(IDE_EXPLORER_WINDOW_ID);
+    return win.bodyEl;
+  }
+
+  // Close the floating Explorer window (used when docking back to the sidebar or
+  // when leaving IDE mode). The controller reparents the element out separately.
+  dockIdeExplorerWindow() {
+    this.surfaceWindowManager?.close(IDE_EXPLORER_WINDOW_ID);
   }
 
   setDockHeight(pct) {
