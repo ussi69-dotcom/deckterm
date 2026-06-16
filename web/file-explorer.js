@@ -40,16 +40,21 @@ function explainApiError(payload, fallback) {
   return (payload && payload.error) || fallback;
 }
 
-function cloneSelection(item) {
-  if (!item || typeof item !== "object") return null;
-  return { ...item };
-}
-
-function cloneItems(items) {
-  if (!Array.isArray(items)) return [];
-  return items.map((item) =>
-    item && typeof item === "object" ? { ...item } : item,
-  );
+// Resolve the FileTreeStore constructor across browser (<script>) and bun:test
+// (require), then return a fresh store. Falls back to null-safe behavior only
+// if the module is somehow unavailable (it is always loaded alongside this one).
+function resolveFileTreeStore() {
+  let ctor = null;
+  if (typeof window !== "undefined" && window.FileTreeStore) {
+    ctor = window.FileTreeStore.FileTreeStore;
+  } else if (typeof require !== "undefined") {
+    try {
+      ctor = require("./file-tree-store").FileTreeStore;
+    } catch {
+      ctor = null;
+    }
+  }
+  return ctor ? new ctor() : null;
 }
 
 function getViewportWidth(viewport) {
@@ -142,12 +147,8 @@ class FileExplorerController {
     confirmImpl = null,
     promptImpl = null,
     openWindowImpl = null,
+    store = null,
   } = {}) {
-    this.root =
-      root ||
-      (typeof document !== "undefined"
-        ? document.getElementById("file-explorer")
-        : null);
     this.viewport =
       viewport ||
       (typeof window !== "undefined" ? window : { innerWidth: 1024 });
@@ -168,19 +169,18 @@ class FileExplorerController {
       status: typeof renderers.status === "function" ? renderers.status : null,
     };
 
-    this.isOpen = false;
-    this.mode = resolveFileExplorerMode(this.viewport, this.breakpoint);
-    this.currentWorkspaceId = null;
-    this.currentPathByWorkspace = new Map();
-    this.selectedItemByWorkspace = new Map();
-    this.itemsByWorkspace = new Map();
-    this.pendingLoadByWorkspace = new Map();
-    this.loading = false;
-    this.error = null;
-    this.dragActive = false;
-    this.loadSequence = 0;
-    this.decorationsByWorkspace = new Map();
+    // The model lives in a DOM-free store so an unmount()/mount() restores the
+    // UI from state. The controller's flag/path/selection getters delegate to
+    // it; callers keep using the same controller method surface as before.
+    this.store = store || resolveFileTreeStore();
+    this.store.setMode(resolveFileExplorerMode(this.viewport, this.breakpoint));
 
+    // Per-load bookkeeping is transient (not part of the persisted model).
+    this.pendingLoadByWorkspace = new Map();
+    this.loadSequence = 0;
+
+    // DOM handles — null until mount(container) binds a host element.
+    this.root = null;
     this.shellEl = null;
     this.backdropEl = null;
     this.breadcrumbEl = null;
@@ -191,6 +191,10 @@ class FileExplorerController {
     this.mkdirBtnEl = null;
     this.refreshBtnEl = null;
     this.closeButtons = [];
+    this.dropTargetEl = null;
+    this._boundUploadClick = null;
+    this._boundMkdirClick = null;
+    this._boundRefreshClick = null;
 
     this.handleClose = this.close.bind(this);
     this.handleBackdropClick = this.handleBackdropClick.bind(this);
@@ -199,13 +203,100 @@ class FileExplorerController {
     this.handleDragLeave = this.handleDragLeave.bind(this);
     this.handleDropEvent = this.handleDropEvent.bind(this);
 
-    this.bindDom();
-    this.syncDom();
+    // Auto-mount the legacy host (#file-explorer) when present so existing
+    // call sites that relied on the constructor binding keep working.
+    const initialRoot =
+      root ||
+      (typeof document !== "undefined"
+        ? document.getElementById("file-explorer")
+        : null);
+    if (initialRoot) {
+      this.mount(initialRoot);
+    } else {
+      this.syncDom();
+    }
+  }
+
+  // --- Store-backed flag accessors (preserve the prior instance surface) ---
+
+  get isOpen() {
+    return this.store.isOpen;
+  }
+  set isOpen(value) {
+    this.store.setOpen(value);
+  }
+
+  get mode() {
+    return this.store.mode;
+  }
+  set mode(value) {
+    this.store.setMode(value);
+  }
+
+  get currentWorkspaceId() {
+    return this.store.currentWorkspaceId;
+  }
+  set currentWorkspaceId(value) {
+    this.store.setCurrentWorkspaceId(value);
+  }
+
+  get loading() {
+    return this.store.loading;
+  }
+  set loading(value) {
+    this.store.setLoading(value);
+  }
+
+  get error() {
+    return this.store.error;
+  }
+  set error(value) {
+    this.store.setError(value);
+  }
+
+  get dragActive() {
+    return this.store.dragActive;
+  }
+  set dragActive(value) {
+    this.store.setDragActive(value);
   }
 
   get currentPath() {
     if (!this.currentWorkspaceId) return null;
     return this.getWorkspacePath(this.currentWorkspaceId);
+  }
+
+  // --- ViewHost lifecycle ---------------------------------------------------
+
+  // Render into the provided DOM container and attach listeners. Safe to call
+  // after an unmount() to re-host the same view into a different container; the
+  // model persists in the store so the UI restores itself.
+  mount(container) {
+    if (this.root === container) return;
+    if (this.root) this.unmount();
+    this.root = container || null;
+    this.bindDom();
+    this.render();
+  }
+
+  // Remove DOM bindings + detach listeners but KEEP model state. After this the
+  // view can be mount()ed into another container.
+  unmount() {
+    this.unbindDom();
+    this.root = null;
+  }
+
+  // Full teardown: unmount and drop the store binding.
+  dispose() {
+    this.unmount();
+    this.store = null;
+  }
+
+  // Re-measure / relayout after the container size changed. The explorer has no
+  // measured widgets, so a re-render suffices to keep it consistent.
+  resize() {
+    if (!this.root) return;
+    this.render();
   }
 
   bindDom() {
@@ -234,20 +325,69 @@ class FileExplorerController {
     });
 
     this.backdropEl?.addEventListener("click", this.handleBackdropClick);
-    this.uploadBtnEl?.addEventListener("click", () =>
-      this.uploadInputEl?.click(),
-    );
-    this.uploadInputEl?.addEventListener("change", this.handleUpload);
-    this.mkdirBtnEl?.addEventListener("click", () => void this.createFolder());
-    this.refreshBtnEl?.addEventListener("click", () => {
+
+    // Hold references to the per-mount closures so unmount() can detach them.
+    this._boundUploadClick = () => this.uploadInputEl?.click();
+    this._boundMkdirClick = () => void this.createFolder();
+    this._boundRefreshClick = () => {
       if (!this.currentPath) return;
       void this.loadDir(this.currentPath);
-    });
+    };
 
-    const dropTarget = this.shellEl || this.root;
-    dropTarget?.addEventListener("dragover", this.handleDragOver);
-    dropTarget?.addEventListener("dragleave", this.handleDragLeave);
-    dropTarget?.addEventListener("drop", this.handleDropEvent);
+    this.uploadBtnEl?.addEventListener("click", this._boundUploadClick);
+    this.uploadInputEl?.addEventListener("change", this.handleUpload);
+    this.mkdirBtnEl?.addEventListener("click", this._boundMkdirClick);
+    this.refreshBtnEl?.addEventListener("click", this._boundRefreshClick);
+
+    this.dropTargetEl = this.shellEl || this.root;
+    this.dropTargetEl?.addEventListener("dragover", this.handleDragOver);
+    this.dropTargetEl?.addEventListener("dragleave", this.handleDragLeave);
+    this.dropTargetEl?.addEventListener("drop", this.handleDropEvent);
+  }
+
+  // Detach every listener bindDom() attached and drop cached DOM handles, so an
+  // unmounted view leaks nothing and a later mount() can rebind cleanly.
+  unbindDom() {
+    this.closeButtons.forEach((button) => {
+      button.removeEventListener?.("click", this.handleClose);
+    });
+    this.backdropEl?.removeEventListener?.("click", this.handleBackdropClick);
+    if (this._boundUploadClick) {
+      this.uploadBtnEl?.removeEventListener?.("click", this._boundUploadClick);
+    }
+    this.uploadInputEl?.removeEventListener?.("change", this.handleUpload);
+    if (this._boundMkdirClick) {
+      this.mkdirBtnEl?.removeEventListener?.("click", this._boundMkdirClick);
+    }
+    if (this._boundRefreshClick) {
+      this.refreshBtnEl?.removeEventListener?.(
+        "click",
+        this._boundRefreshClick,
+      );
+    }
+    if (this.dropTargetEl) {
+      this.dropTargetEl.removeEventListener?.("dragover", this.handleDragOver);
+      this.dropTargetEl.removeEventListener?.(
+        "dragleave",
+        this.handleDragLeave,
+      );
+      this.dropTargetEl.removeEventListener?.("drop", this.handleDropEvent);
+    }
+
+    this.shellEl = null;
+    this.backdropEl = null;
+    this.breadcrumbEl = null;
+    this.listEl = null;
+    this.dropZoneEl = null;
+    this.uploadInputEl = null;
+    this.uploadBtnEl = null;
+    this.mkdirBtnEl = null;
+    this.refreshBtnEl = null;
+    this.closeButtons = [];
+    this.dropTargetEl = null;
+    this._boundUploadClick = null;
+    this._boundMkdirClick = null;
+    this._boundRefreshClick = null;
   }
 
   handleBackdropClick(event) {
@@ -292,9 +432,7 @@ class FileExplorerController {
       path,
       selectedItem: workspaceId ? this.getSelectedItem(workspaceId) : null,
       items: workspaceId ? this.getWorkspaceItems(workspaceId) : [],
-      decorations: workspaceId
-        ? this.decorationsByWorkspace.get(workspaceId) || {}
-        : {},
+      decorations: workspaceId ? this.store.getDecorations(workspaceId) : {},
       loading: this.loading,
       error: this.error,
       dragActive: this.dragActive,
@@ -551,7 +689,7 @@ class FileExplorerController {
       normalizeExplorerPath(cwd) ||
       "/";
 
-    this.currentPathByWorkspace.set(normalizedWorkspaceId, rememberedPath);
+    this.store.setWorkspacePath(normalizedWorkspaceId, rememberedPath);
     this.render();
     return rememberedPath;
   }
@@ -567,7 +705,7 @@ class FileExplorerController {
     const normalizedPath = normalizeExplorerPath(path);
     if (!normalizedWorkspaceId || !normalizedPath) return null;
 
-    this.currentPathByWorkspace.set(normalizedWorkspaceId, normalizedPath);
+    this.store.setWorkspacePath(normalizedWorkspaceId, normalizedPath);
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
       this.render();
     }
@@ -575,21 +713,17 @@ class FileExplorerController {
   }
 
   getWorkspacePath(workspaceId) {
-    const normalizedWorkspaceId = String(workspaceId || "").trim();
-    if (!normalizedWorkspaceId) return null;
-    return this.currentPathByWorkspace.get(normalizedWorkspaceId) || null;
+    return this.store.getWorkspacePath(workspaceId);
   }
 
   setSelectedItem(workspaceId, item) {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return null;
 
-    const nextSelection = cloneSelection(item);
-    if (nextSelection) {
-      this.selectedItemByWorkspace.set(normalizedWorkspaceId, nextSelection);
-    } else {
-      this.selectedItemByWorkspace.delete(normalizedWorkspaceId);
-    }
+    const nextSelection = this.store.setSelectedItem(
+      normalizedWorkspaceId,
+      item,
+    );
 
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
       this.renderList();
@@ -598,19 +732,17 @@ class FileExplorerController {
   }
 
   getSelectedItem(workspaceId) {
-    const normalizedWorkspaceId = String(workspaceId || "").trim();
-    if (!normalizedWorkspaceId) return null;
-    return cloneSelection(
-      this.selectedItemByWorkspace.get(normalizedWorkspaceId),
-    );
+    return this.store.getSelectedItem(workspaceId);
   }
 
   setWorkspaceItems(workspaceId, items) {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return [];
 
-    const nextItems = cloneItems(items);
-    this.itemsByWorkspace.set(normalizedWorkspaceId, nextItems);
+    const nextItems = this.store.setWorkspaceItems(
+      normalizedWorkspaceId,
+      items,
+    );
 
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
       this.renderList();
@@ -619,9 +751,7 @@ class FileExplorerController {
   }
 
   getWorkspaceItems(workspaceId) {
-    const normalizedWorkspaceId = String(workspaceId || "").trim();
-    if (!normalizedWorkspaceId) return [];
-    return cloneItems(this.itemsByWorkspace.get(normalizedWorkspaceId));
+    return this.store.getWorkspaceItems(workspaceId);
   }
 
   // Git status decorations keyed by absolute item path. Re-renders the list
@@ -630,9 +760,7 @@ class FileExplorerController {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return null;
 
-    const next =
-      decorations && typeof decorations === "object" ? { ...decorations } : {};
-    this.decorationsByWorkspace.set(normalizedWorkspaceId, next);
+    const next = this.store.setDecorations(normalizedWorkspaceId, decorations);
 
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
       this.renderList();
@@ -710,12 +838,12 @@ class FileExplorerController {
     this.pendingLoadByWorkspace.set(normalizedWorkspaceId, requestId);
 
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
-      this.currentPathByWorkspace.set(normalizedWorkspaceId, nextPath);
+      this.store.setWorkspacePath(normalizedWorkspaceId, nextPath);
       this.setLoading(true);
       this.setError(null);
       this.render();
     } else {
-      this.currentPathByWorkspace.set(normalizedWorkspaceId, nextPath);
+      this.store.setWorkspacePath(normalizedWorkspaceId, nextPath);
     }
 
     try {
@@ -736,8 +864,8 @@ class FileExplorerController {
       const resolvedPath = normalizeExplorerPath(data.path) || nextPath;
       const items = this.buildItemsFromBrowse(data);
 
-      this.currentPathByWorkspace.set(normalizedWorkspaceId, resolvedPath);
-      this.itemsByWorkspace.set(normalizedWorkspaceId, items);
+      this.store.setWorkspacePath(normalizedWorkspaceId, resolvedPath);
+      this.store.setWorkspaceItems(normalizedWorkspaceId, items);
       this.loading = false;
       this.error = null;
 
