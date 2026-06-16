@@ -5622,14 +5622,19 @@ body.ide-mode #terminal-container {
   border-top: 1px solid var(--border-primary);
 }
 
+/* Floating surface windows float ABOVE the whole shell in IDE mode (matching
+   the "float above the shell" decision — pop-out/dock is slice 3). Span the
+   FULL workspace grid so windows aren't clipped/shifted into the editor column. */
 body.ide-mode #surface-windows-layer {
-  grid-column: 3;
+  grid-column: 1 / -1;
   grid-row: 1;
 }
 
 /* Explorer hosted inside the sidebar (not a modal sheet): drop the fixed
-   overlay chrome so it flows in the sidebar body. */
-#file-explorer.ide-hosted {
+   overlay chrome so it flows in the sidebar body. Gated strictly under
+   body.ide-mode so a leftover `ide-hosted` class from an interrupted
+   transition can't leak IDE positioning into terminal mode. */
+body.ide-mode #file-explorer.ide-hosted {
   position: static;
   inset: auto;
   width: 100%;
@@ -5640,11 +5645,11 @@ body.ide-mode #surface-windows-layer {
   pointer-events: auto;
 }
 
-#file-explorer.ide-hosted .file-explorer-backdrop {
+body.ide-mode #file-explorer.ide-hosted .file-explorer-backdrop {
   display: none;
 }
 
-#file-explorer.ide-hosted .file-explorer-shell {
+body.ide-mode #file-explorer.ide-hosted .file-explorer-shell {
   position: static;
   width: 100%;
   min-width: 0;

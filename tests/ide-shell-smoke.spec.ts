@@ -27,7 +27,9 @@ test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
   // Desktop viewport BEFORE navigation so the app boots in desktop mode (IDE
   // is desktop-only — gating it after load would suppress the toggle).
   await page.setViewportSize({ width: 1400, height: 900 });
-  await page.goto("http://localhost:4174/");
+  // Use the Playwright baseURL (config / PW_BASE_URL) like the other specs
+  // instead of a hardcoded host.
+  await page.goto("/");
   await page.setViewportSize({ width: 1400, height: 900 });
 
   // Wait for the app + IDE shell controller to be ready.
@@ -56,11 +58,43 @@ test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
     { timeout: 5000 },
   );
 
+  // Ensure at least one REAL terminal exists before the no-recreation check —
+  // otherwise `[] === []` passes vacuously without proving anything. Try to
+  // create one (staying well under MAX_TERMINALS_PER_USER=10) if none exist.
+  await page.evaluate(async () => {
+    const tm = (window as any).terminalManager;
+    if (!tm) return;
+    if (
+      (tm.terminals?.size || 0) === 0 &&
+      typeof tm.createTerminal === "function"
+    ) {
+      try {
+        await tm.createTerminal();
+      } catch {
+        // Headless box may forbid terminal creation (foundation auth) — guarded
+        // below by skipping the no-recreation assertion when none exist.
+      }
+    }
+  });
+  await page
+    .waitForFunction(
+      () => Boolean((window as any).terminalManager?.terminals?.size),
+      { timeout: 8000 },
+    )
+    .catch(() => {});
+
   // Snapshot terminal ids BEFORE toggling.
   const idsBefore = await page.evaluate(() => {
     const tm = (window as any).terminalManager;
     return Array.from(tm?.terminals?.keys?.() || []);
   });
+  // Guard: the "same ids across toggle" assertion only proves no-recreation when
+  // a real terminal is present. In the pre-existing-broken headless box terminal
+  // creation is forbidden, so skip the suite rather than pass vacuously.
+  test.skip(
+    idsBefore.length === 0,
+    "no terminal could be created in this environment — no-recreation assertion would be vacuous",
+  );
 
   // Toggle ON via the toolbar button (real user path).
   await page.click("#ide-toggle-btn");

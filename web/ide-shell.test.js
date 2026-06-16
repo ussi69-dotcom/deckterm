@@ -9,6 +9,9 @@ import {
   isIdeRendered,
   loadLayoutState,
   migrateLayoutState,
+  captureFocusTarget,
+  resolveFocusTarget,
+  captureExplorerState,
 } from "./ide-shell";
 
 // ── normalizeLayoutMode ──────────────────────────────────────────────────────
@@ -132,4 +135,81 @@ test("migrateLayoutState is idempotent once the version is current", () => {
 
 test("migrateLayoutState no-ops without a store", () => {
   expect(migrateLayoutState(null)).toEqual({ migrated: false });
+});
+
+// ── captureFocusTarget (pure focus snapshot) ─────────────────────────────────
+
+test("captureFocusTarget prefers a live active terminal", () => {
+  expect(captureFocusTarget({ activeTerminalId: "t-1" })).toEqual({
+    kind: "terminal",
+    terminalId: "t-1",
+  });
+  // A terminal wins even if a control tag is also passed.
+  expect(
+    captureFocusTarget({ activeTerminalId: "t-2", activeControl: "explorer" }),
+  ).toEqual({ kind: "terminal", terminalId: "t-2" });
+});
+
+test("captureFocusTarget falls back to a focused control, else none", () => {
+  expect(captureFocusTarget({ activeControl: "explorer" })).toEqual({
+    kind: "control",
+    control: "explorer",
+  });
+  expect(captureFocusTarget({})).toEqual({ kind: "none" });
+  expect(captureFocusTarget()).toEqual({ kind: "none" });
+  expect(
+    captureFocusTarget({ activeTerminalId: null, activeControl: null }),
+  ).toEqual({
+    kind: "none",
+  });
+});
+
+// ── resolveFocusTarget (pure post-switch resolution) ─────────────────────────
+
+test("resolveFocusTarget keeps a terminal target only if it still exists", () => {
+  const target = { kind: "terminal", terminalId: "t-1" };
+  expect(resolveFocusTarget(target, (id) => id === "t-1")).toEqual(target);
+  // Terminal gone → no focus restore.
+  expect(resolveFocusTarget(target, () => false)).toEqual({ kind: "none" });
+  // Missing predicate → conservatively "none".
+  expect(resolveFocusTarget(target)).toEqual({ kind: "none" });
+});
+
+test("resolveFocusTarget passes control targets through and guards junk", () => {
+  const control = { kind: "control", control: "explorer" };
+  expect(resolveFocusTarget(control, () => true)).toEqual(control);
+  expect(resolveFocusTarget({ kind: "none" }, () => true)).toEqual({
+    kind: "none",
+  });
+  expect(resolveFocusTarget(null, () => true)).toEqual({ kind: "none" });
+  expect(resolveFocusTarget(undefined)).toEqual({ kind: "none" });
+});
+
+// ── captureExplorerState (pure prior-state capture) ──────────────────────────
+
+test("captureExplorerState normalizes a flat DOM read", () => {
+  expect(
+    captureExplorerState({
+      parentId: "app",
+      isOpen: true,
+      surfaceWindow: "files",
+    }),
+  ).toEqual({ parentId: "app", isOpen: true, surfaceWindow: "files" });
+});
+
+test("captureExplorerState defaults missing/blank fields to a closed-home state", () => {
+  expect(captureExplorerState({})).toEqual({
+    parentId: null,
+    isOpen: false,
+    surfaceWindow: null,
+  });
+  expect(captureExplorerState()).toEqual({
+    parentId: null,
+    isOpen: false,
+    surfaceWindow: null,
+  });
+  // Blank strings + falsy open coerce cleanly.
+  expect(
+    captureExplorerState({ parentId: "", isOpen: 0, surfaceWindow: "" }),
+  ).toEqual({ parentId: null, isOpen: false, surfaceWindow: null });
 });

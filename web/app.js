@@ -8934,6 +8934,9 @@ class TerminalManager {
       settingsStore: this.settingsStore,
       isDesktop: () => this.isWindowedSurfaces(),
       getExplorerView: () => this.fileExplorer,
+      // Release-before-reparent: free the Files surface-window BEFORE the shell
+      // moves #file-explorer into the sidebar (avoids racing stale window state).
+      beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
       // Refit terminals + re-render the explorer after the container resizes.
@@ -8942,6 +8945,14 @@ class TerminalManager {
         this.fileExplorer?.resize?.();
         this.syncSurfaceButtonState();
       },
+      // Focus preservation across the switch (contract: active focus is kept).
+      captureFocus: () => this.captureIdeFocusTarget(),
+      restoreFocus: (target) => this.restoreIdeFocusTarget(target),
+      terminalExists: (id) => this.terminals.has(id),
+      // Lossless explorer state: capture its prior presentation on enter and
+      // restore the EXACT same state on exit.
+      readExplorerState: () => this.readExplorerPresentation(),
+      restoreExplorerState: (state) => this.restoreExplorerPresentation(state),
     });
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
@@ -8975,23 +8986,112 @@ class TerminalManager {
     this.syncIdeAffordance();
   }
 
-  // Entering IDE mode: the `body.ide-mode` class (set by the controller) docks
-  // the terminal container to the bottom panel via CSS only — no PTY touch. If
-  // the Files surface-window currently holds the #file-explorer element, release
-  // it first so the controller can reparent that element into the sidebar.
-  // Other floating windows are left as-is (they float above the shell —
-  // pop-out/dock is slice 3).
-  onEnterIdeMode() {
+  // Run BEFORE the shell reparents #file-explorer into the sidebar. If the Files
+  // surface-window currently HOSTS the explorer element, release it FIRST so the
+  // reparent doesn't race stale surface-window state / no-op against a moved node.
+  // Other floating windows are left as-is (they float above the shell — pop-out/
+  // dock is slice 3).
+  beforeEnterIdeMode() {
     this.releaseSurfaceWindowContent(
       "files",
       document.getElementById("file-explorer"),
     );
   }
 
+  // Entering IDE mode (after reparent): the `body.ide-mode` class (set by the
+  // controller) docks the terminal container to the bottom panel via CSS only —
+  // no PTY touch. No further bookkeeping needed here.
+  onEnterIdeMode() {}
+
   // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
   // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
-  // element). No undock bookkeeping is needed here.
+  // element). The explorer's prior state is restored via restoreExplorerPresentation.
   onExitIdeMode() {}
+
+  // Snapshot the focus target before a mode switch. An active terminal wins (its
+  // xterm is the natural focus); else, if the explorer holds focus, remember it.
+  captureIdeFocusTarget() {
+    const activeId = this.activeId || null;
+    const active = this.terminals.get(activeId);
+    if (active?.terminal) {
+      return window.IdeShell.captureFocusTarget({ activeTerminalId: activeId });
+    }
+    const explorerEl = document.getElementById("file-explorer");
+    const ae = document.activeElement;
+    const focusInExplorer = Boolean(
+      explorerEl && ae && explorerEl.contains(ae),
+    );
+    return window.IdeShell.captureFocusTarget({
+      activeControl: focusInExplorer ? "explorer" : null,
+    });
+  }
+
+  // Refocus the resolved target on the live DOM (the controller already checked
+  // the terminal still exists). Best-effort — never throws into the switch.
+  restoreIdeFocusTarget(target) {
+    if (!target) return;
+    if (target.kind === "terminal" && target.terminalId) {
+      this.focusTerminal(target.terminalId, { ensureVisible: true });
+      return;
+    }
+    if (target.kind === "control" && target.control === "explorer") {
+      const explorerEl = document.getElementById("file-explorer");
+      if (!explorerEl) return;
+      // Focus the first focusable explorer control, else the container itself.
+      const focusable = explorerEl.querySelector(
+        'button, [href], input, [tabindex]:not([tabindex="-1"])',
+      );
+      (focusable || explorerEl).focus?.({ preventScroll: true });
+    }
+  }
+
+  // Flat DOM read of the explorer's prior presentation (parent, open, surface
+  // window host) for a lossless restore on IDE exit.
+  readExplorerPresentation() {
+    const explorerEl = document.getElementById("file-explorer");
+    const parent = explorerEl?.parentElement || null;
+    const inSurfaceWindow = Boolean(
+      parent?.classList?.contains("surface-window-body"),
+    );
+    return {
+      parentId: parent?.id || null,
+      isOpen: Boolean(explorerEl && !explorerEl.classList.contains("hidden")),
+      surfaceWindow: inSurfaceWindow ? "files" : null,
+    };
+  }
+
+  // Restore the explorer to its captured prior presentation on IDE exit. If it
+  // was OPEN before, re-present it (in a surface window when that's where it was);
+  // if it was CLOSED, keep it closed in #app. Never force-hides an open explorer.
+  restoreExplorerPresentation(state) {
+    const explorerEl = document.getElementById("file-explorer");
+    if (!explorerEl) return;
+    const home = document.getElementById("app");
+    if (home && explorerEl.parentElement !== home) home.appendChild(explorerEl);
+
+    const wasOpen = Boolean(state?.isOpen);
+    if (!wasOpen) {
+      // Closed before IDE → keep closed. Rebind the view to the home skeleton.
+      explorerEl.classList.add("hidden");
+      const view = this.fileExplorer;
+      if (view) {
+        view.unmount?.();
+        view.mount?.(explorerEl);
+        view.isOpen = false;
+      }
+      return;
+    }
+
+    // Open before IDE → re-open via the normal path (this rebinds + re-presents,
+    // re-hosting in the Files surface-window on desktop just like the user left it).
+    explorerEl.classList.remove("hidden");
+    const view = this.fileExplorer;
+    if (view) {
+      view.unmount?.();
+      view.mount?.(explorerEl);
+    }
+    void this.openFileExplorer();
+  }
 
   setDockHeight(pct) {
     this.dockState.heightPct =

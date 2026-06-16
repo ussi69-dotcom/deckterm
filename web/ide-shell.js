@@ -15,7 +15,13 @@
 //     TileManager presentation exactly (we only added/removed CSS + moved one
 //     element; tile geometry/z-order/focus are untouched).
 //   - Focus & resize. The host runs a resize pass AFTER reparenting (xterm
-//     needs a fit once its container changes size; the explorer re-renders).
+//     needs a fit once its container changes size; the explorer re-renders),
+//     then RESTORES focus to the element that held it before the switch (the
+//     active terminal, or the focused control if it survived the reparent).
+//   - Lossless explorer state. The Explorer's prior presentation (parent +
+//     open/visibility + surface-window host) is captured BEFORE entering IDE
+//     and restored EXACTLY on exit — an explorer that was closed stays closed,
+//     one open in #app reopens in #app. IDE never force-closes it.
 //
 // LAYOUT PERSISTENCE (Codex xhigh):
 //   - layout.mode ("ide" | "terminal") is DEVICE-LOCAL / viewport-gated: stored
@@ -96,6 +102,62 @@ function migrateLayoutState(store) {
   return { migrated: true };
 }
 
+// ── Pure focus-target resolution (DOM-free, unit-tested) ─────────────────────
+
+// Snapshot the focus target before a mode switch into a serializable descriptor,
+// so it can be restored after reparenting. Pure: given the active-terminal id and
+// (optionally) a tag describing the active control, it returns a descriptor. Pref
+// order: a live active terminal wins (its xterm/textarea is the natural focus);
+// else, if a relevant control is focused, remember it as a "control"; else none.
+//   activeTerminalId  string|null — the TerminalManager active terminal id
+//   activeControl     string|null — a stable id/tag for a focused control (e.g.
+//                     "explorer"), or null when focus isn't on a relevant control
+function captureFocusTarget({ activeTerminalId, activeControl } = {}) {
+  if (activeTerminalId) {
+    return { kind: "terminal", terminalId: activeTerminalId };
+  }
+  if (activeControl) {
+    return { kind: "control", control: activeControl };
+  }
+  return { kind: "none" };
+}
+
+// Given a captured descriptor + a predicate that says whether a terminal id still
+// exists/connected, decide what to refocus AFTER the switch. Pure resolver: returns
+// the same descriptor when the target survived, else a "none" descriptor. Callers
+// do the actual .focus() on the live node — this only decides the target.
+//   target          the descriptor from captureFocusTarget
+//   terminalExists  (id) => boolean — is that terminal still live?
+function resolveFocusTarget(target, terminalExists) {
+  if (!target || typeof target !== "object") return { kind: "none" };
+  if (target.kind === "terminal") {
+    const exists =
+      typeof terminalExists === "function"
+        ? Boolean(terminalExists(target.terminalId))
+        : false;
+    return exists ? target : { kind: "none" };
+  }
+  if (target.kind === "control") return target;
+  return { kind: "none" };
+}
+
+// ── Pure explorer prior-state capture (DOM-free, unit-tested) ─────────────────
+
+// Distill the Explorer's prior presentation into a serializable descriptor so the
+// EXACT state can be restored on IDE exit. Pure: given a flat read of the live DOM
+// (parent id, open flag, surface-window host), returns a normalized descriptor.
+//   parentId       id of the explorer's parent element (or null)
+//   isOpen         was the explorer visible/open?
+//   surfaceWindow  was it hosted in a floating surface window? (string id|null)
+function captureExplorerState({ parentId, isOpen, surfaceWindow } = {}) {
+  return {
+    parentId: typeof parentId === "string" && parentId ? parentId : null,
+    isOpen: Boolean(isOpen),
+    surfaceWindow:
+      typeof surfaceWindow === "string" && surfaceWindow ? surfaceWindow : null,
+  };
+}
+
 // ── DOM controller (browser-only) ────────────────────────────────────────────
 
 // Drives the IDE shell scaffold + the terminal/explorer reparenting. Injected
@@ -110,9 +172,21 @@ function migrateLayoutState(store) {
 //   explorerView    the FileExplorerController (mount/unmount ViewHost contract)
 //   getExplorerView () => the controller, resolved lazily (the app creates the
 //                   explorer AFTER the shell is wired, so prefer this getter)
-//   onEnterIde      () => void — app hook: dock terminals to bottom, refit xterm
+//   beforeEnterIde  () => void — app hook run BEFORE reparenting the explorer:
+//                   release the Files surface-window so the (still-hosted) node
+//                   can be moved into the sidebar without racing stale state.
+//   onEnterIde      () => void — app hook (after reparent): dock terminals to
+//                   bottom, refit xterm. (alias kept for back-compat)
 //   onExitIde       () => void — app hook: restore full-bleed terminals
 //   afterRender     () => void — app hook: run a resize/measure pass post-switch
+//   captureFocus    () => descriptor — snapshot the focus target pre-switch
+//                   (e.g. { kind:"terminal", terminalId } or { kind:"control" }).
+//   restoreFocus    (descriptor) => void — refocus the resolved target post-switch
+//   terminalExists  (id) => boolean — is a terminal id still live/connected?
+//   readExplorerState  () => { parentId, isOpen, surfaceWindow } — flat DOM read
+//                   of the explorer's prior presentation (for lossless restore).
+//   restoreExplorerState (descriptor) => void — app hook: re-present the explorer
+//                   in its captured prior parent/open/surface-window state.
 class IdeShellController {
   constructor(options = {}) {
     this.doc =
@@ -135,12 +209,35 @@ class IdeShellController {
       typeof options.getExplorerView === "function"
         ? options.getExplorerView
         : () => options.explorerView || null;
+    this.beforeEnterIde =
+      typeof options.beforeEnterIde === "function"
+        ? options.beforeEnterIde
+        : null;
     this.onEnterIde =
       typeof options.onEnterIde === "function" ? options.onEnterIde : null;
     this.onExitIde =
       typeof options.onExitIde === "function" ? options.onExitIde : null;
     this.afterRender =
       typeof options.afterRender === "function" ? options.afterRender : null;
+    this.captureFocusFn =
+      typeof options.captureFocus === "function" ? options.captureFocus : null;
+    this.restoreFocusFn =
+      typeof options.restoreFocus === "function" ? options.restoreFocus : null;
+    this.terminalExistsFn =
+      typeof options.terminalExists === "function"
+        ? options.terminalExists
+        : null;
+    this.readExplorerStateFn =
+      typeof options.readExplorerState === "function"
+        ? options.readExplorerState
+        : null;
+    this.restoreExplorerStateFn =
+      typeof options.restoreExplorerState === "function"
+        ? options.restoreExplorerState
+        : null;
+
+    // Captured across an enter→exit round-trip (null when not in IDE mode).
+    this.priorExplorerState = null;
 
     // DOM handles, created lazily on first IDE render.
     this.shellEl = null;
@@ -203,10 +300,21 @@ class IdeShellController {
   // and ask the app to dock terminals to the bottom panel.
   enterIde() {
     if (!this.doc || this.rendered) return;
+
+    // Snapshot focus + the explorer's prior presentation BEFORE any reparenting,
+    // so exit can restore them losslessly.
+    const focusTarget = this.captureFocusFn ? this.captureFocusFn() : null;
+    this.priorExplorerState = this.captureExplorerStateNow();
+
     this.ensureShell();
     const body = this.doc.body;
     if (body) body.classList.add("ide-mode");
     if (this.shellEl) this.shellEl.hidden = false;
+
+    // Release-before-reparent: if the Files surface-window currently HOSTS the
+    // #file-explorer element, release it FIRST so reparenting into the sidebar
+    // doesn't race stale surface-window state / no-op against a moved node.
+    if (this.beforeEnterIde) this.beforeEnterIde();
 
     // Host the Explorer in the sidebar: move the single #file-explorer element
     // into the sidebar body, then rebind the controller to it via the ViewHost
@@ -221,6 +329,9 @@ class IdeShellController {
 
     // Resize/measure pass AFTER reparenting (xterm fit, explorer re-render).
     this.runAfterRender();
+
+    // Restore focus to the prior target if it survived the reparent.
+    this.restoreFocusTo(focusTarget);
   }
 
   // Restore terminal mode: undock terminals, return the explorer element to its
@@ -229,8 +340,12 @@ class IdeShellController {
   exitIde() {
     if (!this.doc || !this.rendered) return;
 
-    // Return the explorer element to its home parent (#app) and rebind so the
-    // surface-window / sheet path keeps working in terminal mode.
+    // Snapshot focus before the reparent so it can be restored after.
+    const focusTarget = this.captureFocusFn ? this.captureFocusFn() : null;
+
+    // Return the explorer element home + rebind so the surface-window / sheet
+    // path keeps working in terminal mode. Lossless: restore the EXACT prior
+    // parent/open/surface-window state captured on enter (not a forced hide).
     this.unmountExplorer();
 
     // App hook: restore full-bleed terminals (undock).
@@ -243,6 +358,9 @@ class IdeShellController {
     this.rendered = false;
 
     this.runAfterRender();
+
+    // Restore focus to the prior target if it survived the reparent.
+    this.restoreFocusTo(focusTarget);
   }
 
   // Create the activity-bar + sidebar + editor-area scaffold once, inserted at
@@ -339,22 +457,69 @@ class IdeShellController {
     }
   }
 
-  // Return the #file-explorer element to its home parent and rebind so the
-  // terminal-mode surface-window / sheet path keeps working.
+  // Return the #file-explorer element to terminal mode and rebind. Lossless:
+  // when the app supplies restoreExplorerState + a captured prior state, restore
+  // the EXACT prior parent/open/surface-window presentation. Otherwise fall back
+  // to the safe default (home in #app, hidden). Always strips `ide-hosted` so an
+  // interrupted transition can't leave IDE positioning leaking into terminal mode.
   unmountExplorer() {
     if (!this.doc) return;
     const explorerEl = this.doc.getElementById("file-explorer");
+    if (!explorerEl) return;
+
+    // Always remove the IDE host class first (defensive: never let it linger).
+    explorerEl.classList.remove("ide-hosted");
+
+    const prior = this.priorExplorerState;
+    this.priorExplorerState = null;
+
+    if (this.restoreExplorerStateFn && prior) {
+      // App owns the lossless restore (parent, open/hidden, surface-window host)
+      // + the ViewHost rebind. The explorer node is already free of ide-hosted.
+      this.restoreExplorerStateFn(prior);
+      return;
+    }
+
+    // Fallback when no app hook is wired: home in #app, closed.
     const home = this.doc.getElementById("app");
-    if (explorerEl) {
-      explorerEl.classList.remove("ide-hosted");
-      explorerEl.classList.add("hidden");
-      if (home && explorerEl.parentElement !== home)
-        home.appendChild(explorerEl);
-      const view = this.explorerView;
-      if (view) {
-        if (typeof view.unmount === "function") view.unmount();
-        if (typeof view.mount === "function") view.mount(explorerEl);
-      }
+    explorerEl.classList.add("hidden");
+    if (home && explorerEl.parentElement !== home) home.appendChild(explorerEl);
+    const view = this.explorerView;
+    if (view) {
+      if (typeof view.unmount === "function") view.unmount();
+      if (typeof view.mount === "function") view.mount(explorerEl);
+    }
+  }
+
+  // Read the explorer's live prior presentation into a pure descriptor (delegates
+  // to the app's flat DOM read when wired, else reads the element directly).
+  captureExplorerStateNow() {
+    if (this.readExplorerStateFn) {
+      return captureExplorerState(this.readExplorerStateFn() || {});
+    }
+    const explorerEl = this.doc?.getElementById("file-explorer");
+    if (!explorerEl) return captureExplorerState({});
+    return captureExplorerState({
+      parentId: explorerEl.parentElement?.id || null,
+      isOpen: !explorerEl.classList.contains("hidden"),
+      surfaceWindow: null,
+    });
+  }
+
+  // Resolve + apply focus restoration for a captured descriptor. Pure resolution
+  // (does the target still exist?) lives in resolveFocusTarget; the actual focus
+  // is delegated to the app's restoreFocus hook on the live node.
+  restoreFocusTo(focusTarget) {
+    if (!focusTarget || !this.restoreFocusFn) return;
+    const resolved = resolveFocusTarget(
+      focusTarget,
+      this.terminalExistsFn || (() => false),
+    );
+    if (resolved.kind === "none") return;
+    try {
+      this.restoreFocusFn(resolved);
+    } catch {
+      // Focus restoration is best-effort; never break the mode switch.
     }
   }
 
@@ -383,6 +548,9 @@ const IdeShell = {
   isIdeRendered,
   loadLayoutState,
   migrateLayoutState,
+  captureFocusTarget,
+  resolveFocusTarget,
+  captureExplorerState,
   IdeShellController,
 };
 
@@ -406,5 +574,8 @@ if (typeof exports !== "undefined") {
   exports.isIdeRendered = isIdeRendered;
   exports.loadLayoutState = loadLayoutState;
   exports.migrateLayoutState = migrateLayoutState;
+  exports.captureFocusTarget = captureFocusTarget;
+  exports.resolveFocusTarget = resolveFocusTarget;
+  exports.captureExplorerState = captureExplorerState;
   exports.IdeShellController = IdeShellController;
 }
