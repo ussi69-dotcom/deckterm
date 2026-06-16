@@ -2691,6 +2691,7 @@ class GitManager {
       files: { staged: [], changes: [] },
       branches: { current: "", list: [] },
       commits: [],
+      stashes: [],
       selectedIndex: 0,
       selectedPath: null,
       activePanel: "files", // 'files' | 'history' | 'branches'
@@ -2722,10 +2723,15 @@ class GitManager {
             <h3>Git</h3>
             <span id="git-branch" class="git-branch clickable" title="Click to switch branch"></span>
             <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
+            <button id="git-pull-btn" class="panel-refresh git-sync-btn" title="Pull">↓</button>
+            <button id="git-push-btn" class="panel-refresh git-sync-btn" title="Push">↑</button>
+            <button id="git-fetch-btn" class="panel-refresh git-sync-btn" title="Fetch">⇣</button>
+            <button id="git-stash-btn" class="panel-refresh git-sync-btn" title="Stash changes">≡</button>
             <button class="panel-refresh" title="Refresh (r)">&#x21bb;</button>
             <button class="panel-close" title="Close (Esc)">&times;</button>
           </div>
           <div id="git-files" class="git-files"></div>
+          <div id="git-stashes" class="git-stashes"></div>
           <div id="git-branches" class="git-branches hidden"></div>
         </div>
         <div class="git-right-panel">
@@ -2748,6 +2754,7 @@ class GitManager {
       <div class="git-bottom-bar">
         <div class="git-commit-area">
           <textarea id="git-message" placeholder="Commit message..." rows="2"></textarea>
+          <label class="git-amend" title="Amend the last commit"><input type="checkbox" id="git-amend" /> Amend</label>
           <button id="git-commit-btn" class="btn btn-primary">Commit</button>
           <span id="git-commit-status" class="git-commit-status"></span>
         </div>
@@ -2775,6 +2782,24 @@ class GitManager {
     this.panel
       .querySelector("#git-branch")
       .addEventListener("click", () => this.toggleBranches());
+    this.panel
+      .querySelector("#git-pull-btn")
+      .addEventListener("click", () => this.syncAction("pull"));
+    this.panel
+      .querySelector("#git-push-btn")
+      .addEventListener("click", () => this.syncAction("push"));
+    this.panel
+      .querySelector("#git-fetch-btn")
+      .addEventListener("click", () => this.syncAction("fetch"));
+    this.panel
+      .querySelector("#git-stash-btn")
+      .addEventListener("click", () => this.stashPush());
+    this.panel.querySelector("#git-amend").addEventListener("change", (e) => {
+      const messageEl = this.panel.querySelector("#git-message");
+      if (e.target.checked && !messageEl.value.trim()) {
+        messageEl.value = this.state.commits[0]?.message || "";
+      }
+    });
     this.panel
       .querySelectorAll(".git-diff-mode:not(.git-diff-layout)")
       .forEach((btn) => {
@@ -3099,6 +3124,16 @@ class GitManager {
         this.state.commits = logData.commits || [];
         this.renderHistory();
       }
+
+      // Fetch stash list (pop/apply/drop UI lives in #git-stashes)
+      const stashRes = await fetch(
+        `/api/git/stash?cwd=${encodeURIComponent(cwd)}`,
+      );
+      const stashData = await stashRes.json();
+      if (!stashData.error) {
+        this.state.stashes = stashData.stashes || [];
+        this.renderStashes();
+      }
     } catch (err) {
       console.error("Git refresh error:", err);
     } finally {
@@ -3306,8 +3341,138 @@ class GitManager {
   renderSyncState() {
     const el = this.panel.querySelector("#git-sync-label");
     if (!el) return;
-    const sync = this.state.sync || { ahead: 0, behind: 0 };
+    const sync = this.state.sync || { ahead: 0, behind: 0, upstream: null };
     el.textContent = syncLabel(sync.ahead, sync.behind);
+    // Pull only makes sense with an upstream; Push without one publishes the
+    // branch (-u origin <branch>), VS Code-style.
+    this.panel.querySelector("#git-pull-btn").disabled = !sync.upstream;
+    this.panel
+      .querySelector("#git-push-btn")
+      .setAttribute(
+        "title",
+        sync.upstream ? "Push" : "Publish branch (push -u origin)",
+      );
+  }
+
+  async syncAction(op) {
+    const btn = this.panel.querySelector(`#git-${op}-btn`);
+    if (btn?.disabled) return;
+    const cwd = this.state.cwd || this.currentCwd;
+    const body = { cwd };
+    if (op === "push" && !this.state.sync?.upstream) {
+      body.setUpstream = true;
+      body.remote = "origin";
+      body.branch = this.state.branches.current;
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(`/api/git/${op}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(
+          formatGitError(data, `${op[0].toUpperCase()}${op.slice(1)} failed`),
+          "error",
+        );
+        return;
+      }
+      this.showCommitStatus(
+        `${op[0].toUpperCase()}${op.slice(1)} done`,
+        "success",
+      );
+      await this.refresh();
+    } catch (err) {
+      console.error(`Git ${op} error:`, err);
+      this.showCommitStatus(`${op} failed: network error`, "error");
+    } finally {
+      if (btn) btn.disabled = false;
+      this.renderSyncState();
+    }
+  }
+
+  async stashPush() {
+    const message = window.prompt("Stash message (optional):");
+    if (message === null) return; // cancelled
+    const cwd = this.state.cwd || this.currentCwd;
+    try {
+      const res = await fetch("/api/git/stash", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cwd,
+          action: "push",
+          message: message.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Stash failed"), "error");
+        return;
+      }
+      this.showCommitStatus("Stashed", "success");
+      await this.refresh();
+    } catch (err) {
+      console.error("Stash error:", err);
+    }
+  }
+
+  async stashAction(action, index) {
+    if (
+      action === "drop" &&
+      !window.confirm("Drop this stash? This cannot be undone.")
+    ) {
+      return;
+    }
+    const cwd = this.state.cwd || this.currentCwd;
+    try {
+      const res = await fetch("/api/git/stash", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, action, index }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Stash failed"), "error");
+        return;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Stash action error:", err);
+    }
+  }
+
+  renderStashes() {
+    const container = this.panel.querySelector("#git-stashes");
+    if (!container) return;
+    const stashes = this.state.stashes || [];
+    if (stashes.length === 0) {
+      container.innerHTML = "";
+      return;
+    }
+    const rows = stashes
+      .map(
+        (s) => `
+      <div class="git-stash-item" data-index="${s.index}">
+        <span class="git-stash-icon" title="Stash">${"≡"}</span>
+        <span class="git-stash-msg" title="${this.escapeHtml(s.message)}">${this.escapeHtml(s.message)}</span>
+        <button class="git-stash-action" data-action="apply" title="Apply (keep stash)">apply</button>
+        <button class="git-stash-action" data-action="pop" title="Pop (apply + drop)">pop</button>
+        <button class="git-stash-action git-stash-drop" data-action="drop" title="Drop">${"×"}</button>
+      </div>`,
+      )
+      .join("");
+    container.innerHTML = `<div class="git-stash-header">Stashes (${stashes.length})</div>${rows}`;
+
+    container.querySelectorAll(".git-stash-action").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const item = e.target.closest(".git-stash-item");
+        const index = parseInt(item.dataset.index, 10);
+        this.stashAction(e.target.dataset.action, index);
+      });
+    });
   }
 
   async stagePaths(paths, unstage) {
@@ -3659,11 +3824,13 @@ class GitManager {
     }
 
     const cwd = this.state.cwd || this.currentCwd;
+    const amendEl = this.panel.querySelector("#git-amend");
+    const amend = !!amendEl?.checked;
     try {
       const res = await fetch("/api/git/commit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, message }),
+        body: JSON.stringify({ cwd, message, amend }),
       });
 
       const data = await res.json();
@@ -3679,7 +3846,8 @@ class GitManager {
       }
 
       this.panel.querySelector("#git-message").value = "";
-      this.showCommitStatus("Committed", "success");
+      if (amendEl) amendEl.checked = false;
+      this.showCommitStatus(amend ? "Amended" : "Committed", "success");
       await this.refresh();
     } catch (err) {
       console.error("Commit error:", err);

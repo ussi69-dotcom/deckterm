@@ -4702,6 +4702,95 @@ body.virtual-keyboard-open .extra-keys {
   cursor: pointer;
 }
 
+/* Sync actions (pull/push/fetch/stash) in the git panel header */
+.git-sync-btn {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.git-sync-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+/* Amend toggle in the commit area */
+.git-amend {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+}
+
+.git-amend input {
+  margin: 0;
+}
+
+/* Stash list */
+.git-stashes {
+  margin-top: 4px;
+}
+
+.git-stash-header {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  padding: 4px 8px 2px;
+}
+
+.git-stash-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+
+.git-stash-item:hover {
+  background: var(--bg-hover);
+}
+
+.git-stash-icon {
+  color: var(--accent-blue);
+}
+
+.git-stash-msg {
+  flex: 1;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.git-stash-action {
+  font-size: 10px;
+  padding: 1px 6px;
+  background: transparent;
+  border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+  border-radius: 3px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.git-stash-item:hover .git-stash-action {
+  opacity: 1;
+}
+
+.git-stash-action:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.git-stash-drop:hover {
+  color: var(--accent-red, #f85149);
+}
+
 .git-branch.clickable:hover {
   text-decoration: underline;
 }
