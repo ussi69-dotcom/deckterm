@@ -82,6 +82,8 @@ show (`backend/server.ts` ~3268–3700). The frontend rendering is the gap.
 
 ## Phase 4 — Settings UI
 
+**Status: shipped on `dev` 2026-06-16** (impl plan `docs/plans/2026-06-16-vscode-phase4-settings-ui.md`; commits `0f780c8`, `3ecc556`, `1ec1dd4`, `f1b7fb6`). Schema registry + VS Code-style settings window (sidebar + search) + central settings runtime + migration of the 6 legacy localStorage keys onto `/api/settings` + read-only env-info (allowlist, paths coarsened/capability-gated, no secrets). **This completes the VS Code-grade workspace umbrella (phases 1–4).** Note: `terminal.autoCopy` default is now `false` (schema is source of truth; previously implicitly `true` when unset — explicitly-set values migrate).
+
 - VS Code-style settings window: category sidebar (Appearance, Terminal,
   Windows & Layout, Git, Files, Tasks, Advanced) + full-text search; controls
   generated from a frontend schema registry.

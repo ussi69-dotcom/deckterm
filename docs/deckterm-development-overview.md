@@ -2,7 +2,7 @@
 
 > **Datum:** 2026-05-29 · **Delta 2026-06-16 viz sekce 0z**
 
-## 0z. Delta 2026-06-16 — VS Code-grade workspace, fáze 2 + 3 hotové
+## 0z. Delta 2026-06-16 — VS Code-grade workspace HOTOVÝ (fáze 2 + 3 + 4)
 
 **Fáze 2 — VS Code-grade git panel (na `dev`):** git-scm pure helpery, strom změn
 (staged/changes/untracked, status písmena+barvy, hover akce), `@codemirror/merge`
@@ -34,7 +34,32 @@ impl plán `docs/plans/2026-06-16-vscode-phase3-explorer-git-timeline.md`):**
   návrh prošel Codex (gpt-5.5) druhým názorem (chytil root/add diff + rename scope).
   Pozn.: agent worktree izolace zde dala zastaralou bázi → tasky běžely v hlavním checkoutu.
 
-**Fáze 4 (plánovaná):** settings UI (kategorie + search, migrace localStorage klíčů).
+**Fáze 4 — settings UI (na `dev`, impl plán
+`docs/plans/2026-06-16-vscode-phase4-settings-ui.md`):**
+
+- **Schema registry** (`web/settings-schema.js`, `0f780c8`): deklarativní
+  `SETTINGS_SCHEMA` (13 nastavení, 7 kategorií) + pure helpery `searchSchema`/
+  `categoriesOf`/`defaultsOf`/`coerceValue` — single source of truth pro UI i klíče.
+- **env-info endpoint** (`3ecc556`): `GET /api/settings/env-info` — hardcoded
+  allowlist, secrets vyloučené, path-valued config (`ALLOWED_FILE_ROOTS`,
+  `DECKTERM_STATE_DIR`) coarsené (label+count) a přesné cesty jen za filesystem
+  capability (`actorHoldsFilesystemCapability`, read-only bez audit-deny).
+- **Settings okno + runtime** (`1ec1dd4`): VS Code two-pane SurfaceWindow (sidebar
+  - search + controls ze schématu, read-only Server Config sekce), centrální
+    `web/settings-runtime.js` aplikuje side-effecty i bez otevření okna; entry pointy
+    v command palette + toolbaru.
+- **Migrace** (`f1b7fb6`): 6 legacy localStorage klíčů → kanonické klíče přes
+  `web/settings-migration.js` (presence-test, flush-před-flagem `settings.migratedV1`,
+  žádný legacy fallback u konzumentů). Při tom opraven latentní bug: kolize
+  `const Schema` napříč `<script>` tagy tiše abortovala settings-runtime.
+  Pozn.: `terminal.autoCopy` default je teď `false` (schema = source of truth).
+- Testy: `settings-schema/-ui/-runtime/-migration.test.js`, `foundation-env-info.test.ts`
+  (vše v `test:unit`), e2e `settings-ui.spec.ts`, `settings-migration.spec.ts`.
+  Full unit (exit 0) + 13 e2e zelené na 4174.
+
+**→ Tím je celý VS Code-grade workspace (fáze 1–4) HOTOVÝ.** Orchestrace fází
+3 i 4 přes paralelní/serializované subagenty s Codex (gpt-5.5) druhým názorem na
+každý plán.
 
 ---
 
