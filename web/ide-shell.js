@@ -620,6 +620,10 @@ class IdeShellController {
     const explorerEl = this.doc.getElementById("file-explorer");
     if (!explorerEl) return;
     if (!this.detachExplorerWindowFn) {
+      // No window plumbing wired: keep persisted state consistent with where the
+      // element actually lands (sidebar ⇔ flag false), or the pop-out affordance
+      // would falsely show "detached".
+      this.setExplorerDetached(false);
       this.mountExplorerSidebar();
       return;
     }
@@ -634,6 +638,9 @@ class IdeShellController {
       // If the window failed to open, degrade gracefully to the sidebar.
     }
     if (!container) {
+      // Window failed to open: fall back to the sidebar AND roll back the
+      // persisted flag so state stays consistent (Codex slice-3 review #2).
+      this.setExplorerDetached(false);
       this.mountExplorerSidebar();
       return;
     }

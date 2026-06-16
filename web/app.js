@@ -8971,9 +8971,14 @@ class TerminalManager {
       // The Explorer can restore directly into a detached floating window on
       // reload, so the surface-window manager must exist BEFORE applyMode() runs
       // enterIde(). ensureSurfaceWindowManager no-ops off-desktop / when absent.
-      await this.ensureSurfaceWindowManager();
-      this.syncIdeAffordance();
-      this.ideShell?.applyMode();
+      // try/finally so a manager failure still applies IDE mode — a detached
+      // restore just degrades to the docked sidebar (Codex slice-3 review #4).
+      try {
+        await this.ensureSurfaceWindowManager();
+      } finally {
+        this.syncIdeAffordance();
+        this.ideShell?.applyMode();
+      }
     });
   }
 
