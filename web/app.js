@@ -2093,20 +2093,37 @@ class ExtraKeysManager {
     // On mobile, always start visible (managed by keyboard)
     if (platformDetector.isMobile) return true;
 
-    // On desktop, load from localStorage (default: hidden)
-    const saved = localStorage.getItem("extraKeysVisible");
-    return saved === "true";
+    // On desktop, read the canonical terminal.extraKeysVisible from the store
+    // (schema default: hidden). No legacy localStorage read — migration owns it.
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    const fallback = Boolean(defaults["terminal.extraKeysVisible"]);
+    return Boolean(
+      this.tm?.settingsStore?.get("terminal.extraKeysVisible", fallback) ??
+      fallback,
+    );
   }
 
-  saveVisibilityState() {
-    localStorage.setItem("extraKeysVisible", String(this.visible));
+  // Apply visibility WITHOUT persisting (the runtime side effect entry point).
+  applyVisibility(visible) {
+    this.visible = Boolean(visible);
+    this.updateVisibility();
   }
 
   setVisible(visible) {
-    this.visible = visible;
-    this.updateVisibility();
+    // Persist through the settings runtime/store; the side effect applies it.
+    if (platformDetector.isDesktop && this.tm?.settingsRuntime) {
+      this.tm.settingsRuntime.apply(
+        "terminal.extraKeysVisible",
+        Boolean(visible),
+      );
+      return;
+    }
+    this.applyVisibility(visible);
     if (platformDetector.isDesktop) {
-      this.saveVisibilityState();
+      this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
     }
   }
 
@@ -2209,7 +2226,8 @@ class StatsManager {
 // =============================================================================
 
 class ClipboardManager {
-  constructor() {
+  constructor(manager = null) {
+    this.manager = manager;
     this.history = [];
     this.maxHistory = 20;
     this.maxItemSize = 200 * 1024; // 200KB
@@ -2218,10 +2236,14 @@ class ClipboardManager {
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
-    // Auto-copy enabled by default - user can disable in clipboard panel
-    const savedAutoCopy = localStorage.getItem("autoCopyEnabled");
-    this.autoCopyEnabled =
-      savedAutoCopy === null ? true : savedAutoCopy === "true";
+    // Seed with the schema default for terminal.autoCopy; the settings runtime
+    // applies the canonical (and migrated) value once the store resolves. No
+    // legacy localStorage read here — the migration owns that.
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    this.autoCopyEnabled = Boolean(defaults["terminal.autoCopy"]);
     this.selectionDebounceTimer = null;
     this.init();
   }
@@ -2462,8 +2484,25 @@ class ClipboardManager {
   }
 
   setAutoCopyEnabled(enabled) {
-    this.autoCopyEnabled = enabled;
-    localStorage.setItem("autoCopyEnabled", String(enabled));
+    // Persist through the settings runtime/store; the terminal.autoCopy side
+    // effect (applyAutoCopy) updates local state + the checkbox.
+    const runtime = this.manager?.settingsRuntime;
+    if (runtime) {
+      runtime.apply("terminal.autoCopy", Boolean(enabled));
+    } else {
+      this.applyAutoCopy(Boolean(enabled));
+      this.manager?.settingsStore?.set(
+        "terminal.autoCopy",
+        this.autoCopyEnabled,
+      );
+    }
+  }
+
+  // Side effect for terminal.autoCopy. `enabled` is already coerced to bool.
+  applyAutoCopy(enabled) {
+    this.autoCopyEnabled = Boolean(enabled);
+    const checkbox = document.getElementById("auto-copy-toggle");
+    if (checkbox) checkbox.checked = this.autoCopyEnabled;
   }
 
   // Called when terminal selection changes
@@ -4544,9 +4583,19 @@ class TerminalManager {
     this.activeId = null;
     this.tabIndex = 0;
     this.workspaceIndex = 0;
-    this.fontSize = parseInt(localStorage.getItem("opencode-font-size")) || 14;
-    const storedWrap = localStorage.getItem("opencode-wrap-lines");
-    this.wrapLines = storedWrap ? storedWrap === "1" : false;
+    // Canonical settings (terminal.fontSize / terminal.wrapLines) are applied
+    // by the settings runtime once the store + legacy migration resolve; seed
+    // with the schema defaults here so terminals constructed before that have a
+    // sane value. No legacy localStorage read — the migration owns that.
+    const settingsDefaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    this.fontSize =
+      typeof settingsDefaults["terminal.fontSize"] === "number"
+        ? settingsDefaults["terminal.fontSize"]
+        : 14;
+    this.wrapLines = Boolean(settingsDefaults["terminal.wrapLines"]);
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
     this.workspaceLastActive = new Map(); // workspaceId -> terminalId
@@ -4602,13 +4651,21 @@ class TerminalManager {
     // Server-side actor-scoped settings (window layout, dock, prefs). The
     // load races nothing: window/dock consumers await settingsReady first.
     this.settingsStore = window.SettingsStore?.createSettingsStore?.() || null;
+    // Load server-side settings, then run the one-time legacy-localStorage
+    // migration BEFORE any consumer reads, so canonical keys are populated and
+    // consumers never need a legacy fallback. The migrated flag is only set
+    // after the flush resolves (so the debounced PUT can't be lost).
     this.settingsReady = this.settingsStore
-      ? this.settingsStore.load().catch(() => ({}))
+      ? this.settingsStore
+          .load()
+          .catch(() => ({}))
+          .then(() => this.runSettingsMigration())
+          .catch(() => {})
       : Promise.resolve({});
     this.surfaceWindowManager = null;
     this.settingsRuntime = null;
     this.settingsManager = null;
-    this.clipboardManager = new ClipboardManager();
+    this.clipboardManager = new ClipboardManager(this);
     this.commandPaletteRegistry = null;
     this.commandPalette = null;
 
@@ -4629,8 +4686,9 @@ class TerminalManager {
   }
 
   init() {
-    const lastDir = localStorage.getItem("opencode-web-dir");
-    if (lastDir) this.setDirectoryValue(lastDir);
+    // The last directory is restored from the canonical files.defaultCwd via the
+    // settings runtime (applyDefaultCwd) once the store + migration resolve — no
+    // synchronous legacy localStorage read here.
 
     this.initTaskSignalBadge();
     this.initSessionsDock();
@@ -5579,7 +5637,12 @@ class TerminalManager {
     ) {
       this.toolsSheetDirectoryInput.value = next;
     }
-    localStorage.setItem("opencode-web-dir", next);
+    // Persist the last directory as the canonical files.defaultCwd. Write
+    // directly to the store (NOT via runtime.apply) to avoid re-dispatching the
+    // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
+    // recurse). The value is only a navigation default; the backend file gates
+    // remain the authorization boundary (Codex #4 — do not trust it).
+    this.settingsStore?.set("files.defaultCwd", next);
   }
 
   setupToolsSheet() {
@@ -5851,6 +5914,38 @@ class TerminalManager {
   // startup, so side effects (CSS vars, etc.) take hold even if the settings
   // window is never opened. Real consumers are registered in Task 3; here we
   // wire appearance.accent as a demo CSS-var side effect.
+  // One-time migration of the six legacy localStorage keys onto the canonical
+  // settings store. Flush-before-flag: only after the debounced PUT resolves do
+  // we record `settings.migratedV1`, so the migrated values can't be lost if the
+  // tab closes mid-flight. Idempotent (the migration helper no-ops when flagged).
+  async runSettingsMigration() {
+    if (
+      !this.settingsStore ||
+      !window.SettingsMigration?.migrateLegacySettings
+    ) {
+      return;
+    }
+    const storage = typeof localStorage !== "undefined" ? localStorage : null;
+    if (!storage) return;
+    const schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    const flagKey =
+      window.SettingsMigration.MIGRATED_FLAG_KEY || "settings.migratedV1";
+    const result = window.SettingsMigration.migrateLegacySettings(
+      storage,
+      this.settingsStore,
+      schema,
+    );
+    if (result.alreadyMigrated) return;
+    try {
+      // Flush whatever the migration enqueued, THEN mark the flag and flush it.
+      await this.settingsStore.flush();
+      this.settingsStore.set(flagKey, true);
+      await this.settingsStore.flush();
+    } catch {
+      // A failed flush leaves the flag unset; the next load+migration retries.
+    }
+  }
+
   initSettingsRuntime() {
     if (!window.SettingsRuntime?.createSettingsRuntime || !this.settingsStore) {
       return;
@@ -5860,9 +5955,21 @@ class TerminalManager {
       schema: window.SettingsSchema?.SETTINGS_SCHEMA || [],
       sideEffects: {
         "appearance.accent": (value) => this.applyAccentColor(value),
+        // The six migrated legacy settings — applied live when changed in the
+        // settings window AND once on startup via applyAll(). Each receives the
+        // already-coerced value (numbers clamped to the schema range).
+        "terminal.fontSize": (value) => this.applyFontSize(value),
+        "terminal.wrapLines": (value) => this.applyWrapLines(value),
+        "terminal.autoCopy": (value) =>
+          this.clipboardManager?.applyAutoCopy(value),
+        "terminal.extraKeysVisible": (value) =>
+          this.applyExtraKeysVisible(value),
+        "tasks.view": (value) => this.applyTaskView(value),
+        "files.defaultCwd": (value) => this.applyDefaultCwd(value),
       },
     });
-    // Settings load is async; apply once it resolves so the store is populated.
+    // Settings load + migration are async; apply once they resolve so the store
+    // is populated with the canonical (and migrated) values.
     void this.settingsReady.then(() => this.settingsRuntime?.applyAll());
   }
 
@@ -5876,6 +5983,23 @@ class TerminalManager {
     };
     const color = map[name] || map.blue;
     document.documentElement.style.setProperty("--color-accent", color);
+  }
+
+  // Side effect for terminal.extraKeysVisible (value coerced to bool). Delegates
+  // to ExtraKeysManager without re-persisting. Mobile keeps its own always-on
+  // behavior, so this only re-applies desktop visibility.
+  applyExtraKeysVisible(visible) {
+    if (!this.extraKeys) return;
+    if (platformDetector.isMobile) return;
+    this.extraKeys.applyVisibility(Boolean(visible));
+  }
+
+  // Side effect for files.defaultCwd. A path value used purely as a navigation
+  // default — NOT trusted as authorized (Codex #4); the backend file gates still
+  // apply on the resulting loadDir. Only restores a non-empty stored value.
+  applyDefaultCwd(value) {
+    const dir = typeof value === "string" ? value : "";
+    if (dir) this.setDirectoryValue(dir, { force: true });
   }
 
   async openSettings() {
@@ -6404,14 +6528,30 @@ class TerminalManager {
   }
 
   getTaskViewMode() {
-    return localStorage.getItem("deckterm-task-view") === "board"
+    // Canonical tasks.view from the store (schema default "list").
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    const fallback = defaults["tasks.view"] || "list";
+    return this.settingsStore?.get("tasks.view", fallback) === "board"
       ? "board"
       : "list";
   }
 
   toggleTaskViewMode() {
     const next = this.getTaskViewMode() === "board" ? "list" : "board";
-    localStorage.setItem("deckterm-task-view", next);
+    // Persist + apply through the runtime; applyTaskView re-renders.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("tasks.view", next);
+    } else {
+      this.settingsStore?.set("tasks.view", next);
+      this.renderTasks();
+    }
+  }
+
+  // Side effect for tasks.view (value already coerced to a valid option).
+  applyTaskView() {
     this.renderTasks();
   }
 
@@ -8575,8 +8715,19 @@ class TerminalManager {
   }
 
   toggleWrapLines() {
-    this.wrapLines = !this.wrapLines;
-    localStorage.setItem("opencode-wrap-lines", this.wrapLines ? "1" : "0");
+    const next = !this.wrapLines;
+    // Persist + apply through the runtime so the change is live everywhere.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("terminal.wrapLines", next);
+    } else {
+      this.applyWrapLines(next);
+      this.settingsStore?.set("terminal.wrapLines", this.wrapLines);
+    }
+  }
+
+  // Side effect for terminal.wrapLines. `enabled` is already coerced to bool.
+  applyWrapLines(enabled) {
+    this.wrapLines = Boolean(enabled);
     this.updateWrapButton();
     for (const [, t] of this.terminals) {
       t.preferredCols = 0;
@@ -10936,8 +11087,23 @@ class TerminalManager {
   }
 
   changeFontSize(delta) {
-    this.fontSize = Math.max(8, Math.min(24, this.fontSize + delta));
-    localStorage.setItem("opencode-font-size", this.fontSize.toString());
+    const next = this.fontSize + delta;
+    // Persist + clamp through the runtime (coerceValue clamps to the schema
+    // min/max); the terminal.fontSize side effect (applyFontSize) does the work.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("terminal.fontSize", next);
+    } else {
+      this.applyFontSize(next);
+      this.settingsStore?.set("terminal.fontSize", this.fontSize);
+    }
+  }
+
+  // Side effect for terminal.fontSize. `value` is already coerced/clamped by the
+  // runtime; clamp defensively too (Codex #4 — clamp host-affecting numbers at
+  // the application site) before applying it to every terminal.
+  applyFontSize(value) {
+    const n = Number(value);
+    this.fontSize = Number.isFinite(n) ? Math.max(8, Math.min(32, n)) : 14;
     for (const [, t] of this.terminals) {
       t.terminal.options.fontSize = this.fontSize;
       t.preferredCols = 0;

@@ -10,7 +10,10 @@
 // with coerced values. (Task 3 registers the real consumers; this module just
 // provides the mechanism.)
 
-const Schema =
+// Unique const name: classic <script> tags share global scope and several
+// settings-* files resolve the schema module, so a shared `const Schema`
+// identifier would collide (redeclaration error) and silently abort this file.
+const RuntimeSchema =
   typeof require === "function"
     ? require("./settings-schema.js")
     : typeof window !== "undefined"
@@ -18,7 +21,7 @@ const Schema =
       : null;
 
 function createSettingsRuntime({ store, schema, sideEffects = {} } = {}) {
-  const list = schema || Schema?.SETTINGS_SCHEMA || [];
+  const list = schema || RuntimeSchema?.SETTINGS_SCHEMA || [];
   const byKey = new Map();
   for (const def of list) {
     if (def && typeof def.key === "string") byKey.set(def.key, def);
@@ -30,7 +33,7 @@ function createSettingsRuntime({ store, schema, sideEffects = {} } = {}) {
   }
 
   const subscribers = new Set();
-  const coerce = Schema?.coerceValue || ((_def, raw) => raw);
+  const coerce = RuntimeSchema?.coerceValue || ((_def, raw) => raw);
 
   function register(key, fn) {
     if (typeof key === "string" && typeof fn === "function") {

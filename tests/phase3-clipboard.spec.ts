@@ -75,6 +75,10 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     await checkbox.check();
     await expect(checkbox).toBeChecked();
 
+    // Auto-copy now persists through the server-backed settings store (debounced
+    // PUT, 250ms); let it flush before reloading.
+    await page.waitForTimeout(600);
+
     // Reload and verify
     await page.reload();
     await waitForTerminal(page);
