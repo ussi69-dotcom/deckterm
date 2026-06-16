@@ -70,6 +70,8 @@ show (`backend/server.ts` ~3268–3700). The frontend rendering is the gap.
 
 ## Phase 3 — Explorer ⇄ Git integration + Timeline
 
+**Status: shipped on `dev` 2026-06-16** (impl plan `docs/plans/2026-06-16-vscode-phase3-explorer-git-timeline.md`; commits `2ba8ead`, `a7ebfce`, `ca5fea4`, `8da0284`). Explorer decorations + per-file timeline + editor gutter all live, unit + e2e green. Scope note: timeline is current-path history only (renames/deletes fall back to empty diff sides).
+
 - **Explorer decorations:** git status badge + color on files/folders in the
   file explorer tree (VS Code Explorer style); "Open Changes" jumps to diff.
 - **Timeline:** per-file commit history view; clicking a commit shows the

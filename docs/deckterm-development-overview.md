@@ -1,6 +1,42 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-06-12 viz sekce 0**
+> **Datum:** 2026-05-29 · **Delta 2026-06-16 viz sekce 0z**
+
+## 0z. Delta 2026-06-16 — VS Code-grade workspace, fáze 2 + 3 hotové
+
+**Fáze 2 — VS Code-grade git panel (na `dev`):** git-scm pure helpery, strom změn
+(staged/changes/untracked, status písmena+barvy, hover akce), `@codemirror/merge`
+split+inline diff editor, header sync akce (pull/push/fetch/stash) za capability
+gatem, stash list (apply/pop/drop), amend toggle. Side fix: přidán `.prettierignore`
+— quality-gate prettier hook expandoval minifikovaný `web/vendor/codemirror.js`
+(33 → ~30k řádků) při každém editu.
+
+**Fáze 3 — explorer⇄git dekorace + timeline + editor gutter (na `dev`,
+impl plán `docs/plans/2026-06-16-vscode-phase3-explorer-git-timeline.md`):**
+
+- **Backend `root` field** (`2ba8ead`): `GET /api/git/status` vrací absolutní git
+  toplevel, aby šly mapovat porcelain (repo-relativní) cesty na absolutní.
+- **Editor gutter** (`a7ebfce`): `@codemirror/merge` `unifiedMergeView`
+  (`mergeControls:false`, jen change-bary) vs HEAD; edit/save/undo/selection
+  ověřeny bez regrese; bez gutteru pro untracked/not-a-repo.
+- **Explorer dekorace** (`ca5fea4`): sdílený `web/git-status-store.js` (cache +
+  `refreshStatus` + listener) → `web/git-decorations.js` → status badge+barva na
+  řádcích exploreru; reuse `statusLetter`/`statusClass` z `git-scm.js`.
+- **Per-file timeline** (`8da0284`): „Timeline" tab v pravém panelu nad
+  `GET /api/git/log?path=`; klik na commit → diff revize přes existující
+  `renderMergeDiff`. Scope: current-path only; root/add diff fallbackuje na
+  prázdnou stranu (backend `show` regex odmítá `<sha>~1`/`^`, proto se jako prevRef
+  bere full hash předchozího log entry, root → empty-tree sha).
+- Testy: `git-status-store.test.js`, `git-decorations.test.js`, `git-timeline.test.js`,
+  `editor-git-gutter.test.js` (vše v `test:unit`), e2e `explorer-git-decorations.spec.ts`,
+  `git-timeline.spec.ts`, `editor-git-gutter.spec.ts`. Full unit + 19 e2e zelené na 4174.
+- **Orchestrace:** fáze 3 dělaná přes paralelní subagenty (Task 0‖C, pak A→B);
+  návrh prošel Codex (gpt-5.5) druhým názorem (chytil root/add diff + rename scope).
+  Pozn.: agent worktree izolace zde dala zastaralou bázi → tasky běžely v hlavním checkoutu.
+
+**Fáze 4 (plánovaná):** settings UI (kategorie + search, migrace localStorage klíčů).
+
+---
 
 ## 0a. Delta 2026-06-12 (večer) — VS Code-grade workspace, fáze 1
 
