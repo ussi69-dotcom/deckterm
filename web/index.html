@@ -78,6 +78,19 @@
             <i data-lucide="copy-plus"></i>
           </button>
 
+          <button
+            id="ide-toggle-btn"
+            class="btn btn-secondary"
+            data-action="toggle-ide"
+            data-action-id="ide"
+            title="Toggle IDE layout"
+            aria-pressed="false"
+            hidden
+          >
+            <i data-lucide="layout-panel-left"></i>
+            <span class="btn-label">IDE</span>
+          </button>
+
           <div id="server-stats" class="server-stats">
             <span class="stat" id="stat-cpu" title="CPU">--%</span>
             <span class="stat" id="stat-ram" title="RAM">--%</span>
@@ -727,10 +740,11 @@
     <script src="/surface-windows.js?v=20260612a"></script>
     <script src="/view-host.js?v=20260616a"></script>
     <script src="/file-tree-store.js?v=20260616a"></script>
+    <script src="/ide-shell.js?v=20260616b"></script>
     <script src="/file-explorer.js?v=20260616c"></script>
     <script src="/file-editor.js?v=20260611a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260616b"></script>
+    <script src="/app.js?v=20260616e"></script>
   </body>
 </html>

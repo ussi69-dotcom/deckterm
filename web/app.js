@@ -4693,6 +4693,7 @@ class TerminalManager {
     this.initTaskSignalBadge();
     this.initSessionsDock();
     this.initSettingsRuntime();
+    this.initIdeShell();
 
     // Button handlers
     document
@@ -5561,6 +5562,7 @@ class TerminalManager {
     else if (action === "fullscreen") this.toggleFullscreen();
     else if (action === "wrap-lines") this.toggleWrapLines();
     else if (action === "dock-sessions") this.toggleSessionsDock();
+    else if (action === "toggle-ide") this.toggleIdeMode();
     else if (action === "help") this.openHelp();
     else if (action === "palette") this.toggleCommandPalette();
 
@@ -8918,6 +8920,78 @@ class TerminalManager {
     this.dockState.enabled = !this.dockState.enabled;
     this.applyDockState();
   }
+
+  // --- IDE shell (phase 5, slice 2) -----------------------------------------
+
+  // Build the IDE shell controller and apply the stored (viewport-gated) mode
+  // once settings resolve. The controller reparents the single #file-explorer
+  // element + toggles `body.ide-mode`; terminals are docked via CSS only (no
+  // PTY/WebSocket teardown — the mode-transition contract).
+  initIdeShell() {
+    if (!window.IdeShell?.IdeShellController) return;
+    this.ideShell = new window.IdeShell.IdeShellController({
+      document,
+      settingsStore: this.settingsStore,
+      isDesktop: () => this.isWindowedSurfaces(),
+      getExplorerView: () => this.fileExplorer,
+      onEnterIde: () => this.onEnterIdeMode(),
+      onExitIde: () => this.onExitIdeMode(),
+      // Refit terminals + re-render the explorer after the container resizes.
+      afterRender: () => {
+        window.dispatchEvent(new Event("resize"));
+        this.fileExplorer?.resize?.();
+        this.syncSurfaceButtonState();
+      },
+    });
+    // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
+    // breakpoint and re-apply the resolved mode (a narrow viewport renders
+    // terminal WITHOUT overwriting the stored desktop preference).
+    platformDetector.onChange(() => this.syncIdeAffordance());
+    void this.settingsReady.then(() => {
+      window.IdeShell.migrateLayoutState(this.settingsStore);
+      this.syncIdeAffordance();
+      this.ideShell?.applyMode();
+    });
+  }
+
+  // Show the IDE toggle only on desktop; keep its pressed state in sync and let
+  // the controller reconcile the rendered mode to the current viewport.
+  syncIdeAffordance() {
+    const btn = document.getElementById("ide-toggle-btn");
+    const desktop = this.isWindowedSurfaces();
+    if (btn) {
+      btn.hidden = !desktop;
+      const ide = this.ideShell?.renderedMode?.() === "ide";
+      btn.classList.toggle("active", ide);
+      btn.setAttribute("aria-pressed", ide ? "true" : "false");
+    }
+    // Re-apply so a viewport crossing 768px docks/undocks correctly.
+    this.ideShell?.applyMode();
+  }
+
+  toggleIdeMode() {
+    if (!this.ideShell || !this.isWindowedSurfaces()) return;
+    this.ideShell.toggle();
+    this.syncIdeAffordance();
+  }
+
+  // Entering IDE mode: the `body.ide-mode` class (set by the controller) docks
+  // the terminal container to the bottom panel via CSS only — no PTY touch. If
+  // the Files surface-window currently holds the #file-explorer element, release
+  // it first so the controller can reparent that element into the sidebar.
+  // Other floating windows are left as-is (they float above the shell —
+  // pop-out/dock is slice 3).
+  onEnterIdeMode() {
+    this.releaseSurfaceWindowContent(
+      "files",
+      document.getElementById("file-explorer"),
+    );
+  }
+
+  // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
+  // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
+  // element). No undock bookkeeping is needed here.
+  onExitIdeMode() {}
 
   setDockHeight(pct) {
     this.dockState.heightPct =

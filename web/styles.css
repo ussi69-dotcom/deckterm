@@ -5498,6 +5498,167 @@ body.sessions-docked .dock-sash.dragging {
 }
 
 /* =============================================================================
+   IDE SHELL (Phase 5, slice 2) — VS Code layout: activity bar + sidebar +
+   editor-area placeholder, with terminals docked to the bottom panel.
+   Mode switching is a pure presentation change (no PTY recreation): IDE mode
+   only adds these classes + reparents the single #file-explorer element.
+   ============================================================================= */
+
+/* The shell scaffold is hidden by default and revealed in IDE mode. It holds
+   the activity bar + sidebar; the editor-area placeholder is a sibling. */
+.ide-shell[hidden] {
+  display: none !important;
+}
+
+body.ide-mode #workspace-area {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  grid-template-rows: 1fr;
+}
+
+.ide-shell {
+  grid-column: 1 / 3;
+  grid-row: 1;
+  display: flex;
+  min-height: 0;
+  z-index: 600;
+}
+
+.ide-activity-bar {
+  width: 48px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  gap: 4px;
+  background: var(--bg-tertiary, #1e1e1e);
+  border-right: 1px solid var(--border-primary);
+}
+
+.ide-activity-item {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #858585);
+  cursor: pointer;
+  border-left: 2px solid transparent;
+  border-radius: 0;
+}
+
+.ide-activity-item:hover {
+  color: var(--text-primary, #fff);
+}
+
+.ide-activity-item.active {
+  color: var(--text-primary, #fff);
+  border-left-color: var(--accent-blue);
+}
+
+.ide-activity-item i {
+  width: 22px;
+  height: 22px;
+}
+
+.ide-sidebar {
+  width: 280px;
+  min-width: 180px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-secondary, #252526);
+  border-right: 1px solid var(--border-primary);
+}
+
+.ide-sidebar-header {
+  padding: 8px 12px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary, #858585);
+  flex: 0 0 auto;
+}
+
+.ide-sidebar-body {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: auto;
+}
+
+.ide-editor-area {
+  grid-column: 3;
+  grid-row: 1;
+  display: none;
+  min-height: 0;
+  background: var(--bg-primary);
+}
+
+body.ide-mode .ide-editor-area {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ide-editor-placeholder {
+  color: var(--text-secondary, #858585);
+  font-size: 13px;
+  padding: 24px;
+  text-align: center;
+}
+
+/* In IDE mode the terminal area docks to the bottom-right (below the editor
+   placeholder). Reuses the dock height variable so the bottom panel feels like
+   the phase-1 sessions dock. Only repositions the container — terminals are
+   never recreated. */
+body.ide-mode #terminal-container {
+  grid-column: 3;
+  grid-row: 1;
+  align-self: end;
+  height: var(--dock-height, 35%);
+  border-top: 1px solid var(--border-primary);
+}
+
+body.ide-mode #surface-windows-layer {
+  grid-column: 3;
+  grid-row: 1;
+}
+
+/* Explorer hosted inside the sidebar (not a modal sheet): drop the fixed
+   overlay chrome so it flows in the sidebar body. */
+#file-explorer.ide-hosted {
+  position: static;
+  inset: auto;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  background: transparent;
+  display: block;
+  pointer-events: auto;
+}
+
+#file-explorer.ide-hosted .file-explorer-backdrop {
+  display: none;
+}
+
+#file-explorer.ide-hosted .file-explorer-shell {
+  position: static;
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  transform: none;
+}
+
+/* =============================================================================
    GIT SOURCE CONTROL (Phase 2) — VS Code-style changes tree + diff editor
    ============================================================================= */
 
