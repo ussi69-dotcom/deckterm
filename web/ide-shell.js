@@ -40,7 +40,12 @@
 // sidebar view popped out into a floating SurfaceWindow?". The key was reserved
 // in slice 2; v2 just stamps the version (the map defaults to {} and never
 // clobbers existing keys).
-const LAYOUT_SCHEMA_VERSION = 2;
+// Schema v3 (slice 4) adds `layout.editorTabs` — the persisted editor tab set
+// (file + diff descriptors, active + preview slot; NEVER file content). The
+// editor-tabs module owns the seed/migrate of that key; this version bump just
+// stamps the umbrella layout schema so a v2 store upgrades idempotently. The
+// per-key migration (editorTabs seed) never clobbers `layout.mode`/`detached`.
+const LAYOUT_SCHEMA_VERSION = 3;
 const LAYOUT_MODE_KEY = "layout.mode";
 const LAYOUT_SCHEMA_VERSION_KEY = "layout.schemaVersion";
 const LAYOUT_DETACHED_KEY = "layout.detached";
@@ -112,9 +117,21 @@ function migrateLayoutState(store) {
   }
   const current = Number(store.get(LAYOUT_SCHEMA_VERSION_KEY, 0)) || 0;
   if (current >= LAYOUT_SCHEMA_VERSION) return { migrated: false };
-  // v2 only stamps the version. `layout.detached` defaults to {} lazily on read,
-  // so we never need to seed it — and never clobber an existing value if a future
-  // newer-schema client already wrote one. Existing layout.mode is untouched.
+  // v2 stamped the version; `layout.detached` defaults to {} lazily on read.
+  // v3 additionally seeds an empty `layout.editorTabs` (via the editor-tabs
+  // migrator, which never clobbers an existing value). We never clobber an
+  // existing layout.mode / layout.detached — only stamp the version + lazily
+  // seed editorTabs. Idempotent once the version is current.
+  if (
+    typeof window !== "undefined" &&
+    window.EditorTabs?.migrateEditorTabsState
+  ) {
+    try {
+      window.EditorTabs.migrateEditorTabsState(store);
+    } catch {
+      // Seeding editorTabs is best-effort; never block the version stamp.
+    }
+  }
   store.set(LAYOUT_SCHEMA_VERSION_KEY, LAYOUT_SCHEMA_VERSION);
   return { migrated: true };
 }

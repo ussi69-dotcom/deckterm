@@ -3856,11 +3856,30 @@ class GitManager {
   }
 
   async renderMergeDiff(original, modified, relPath) {
-    this.cm ||= await import("/vendor/codemirror.js");
     const container = this.panel.querySelector("#git-diff");
-    container.innerHTML = "";
     this._mergeView?.destroy?.();
     this._mergeView = null;
+    this._mergeView = await this.buildMergeView(
+      container,
+      original,
+      modified,
+      relPath,
+    );
+  }
+
+  // Render a merge diff into an editor TAB body (IDE slice 4). Returns the view
+  // so the tab controller can keep it; reuses the exact CodeMirror machinery as
+  // the git panel diff. Each call owns its own view (no shared _mergeView).
+  async renderMergeDiffInto(container, original, modified, relPath) {
+    return this.buildMergeView(container, original, modified, relPath);
+  }
+
+  // Shared merge-view builder (git panel + editor tab). Reads the diff-layout
+  // preference (split vs inline). Returns the live view/MergeView.
+  async buildMergeView(container, original, modified, relPath) {
+    this.cm ||= await import("/vendor/codemirror.js");
+    if (!container) return null;
+    container.innerHTML = "";
 
     const langName = window.FileEditorModule?.detectEditorLanguage?.(relPath);
     const langExt =
@@ -3875,7 +3894,7 @@ class GitManager {
     ];
 
     if (this.getDiffLayout() === "inline") {
-      this._mergeView = new this.cm.EditorView({
+      return new this.cm.EditorView({
         doc: modified,
         extensions: [
           ...shared,
@@ -3887,10 +3906,9 @@ class GitManager {
         ],
         parent: container,
       });
-      return;
     }
 
-    this._mergeView = new this.cm.MergeView({
+    return new this.cm.MergeView({
       a: { doc: original, extensions: shared },
       b: { doc: modified, extensions: shared },
       parent: container,
@@ -4831,7 +4849,10 @@ class TerminalManager {
       });
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
-      this.fileExplorer.onOpenFile = (path) => void this.openFileInEditor(path);
+      // In IDE mode an explorer file click opens a preview editor TAB; outside
+      // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
+      this.fileExplorer.onOpenFile = (path) =>
+        this.handleExplorerOpenFile(path);
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -8962,6 +8983,7 @@ class TerminalManager {
       detachExplorerWindow: (el) => this.detachIdeExplorerWindow(el),
       dockExplorerWindow: () => this.dockIdeExplorerWindow(),
     });
+    this.initEditorTabs();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -8978,8 +9000,210 @@ class TerminalManager {
       } finally {
         this.syncIdeAffordance();
         this.ideShell?.applyMode();
+        // Restore persisted editor tabs AFTER the shell is rendered (the editor
+        // area exists only once enterIde() ran). Revalidates each tab through the
+        // gated endpoints + silently drops dead ones.
+        void this.restoreEditorTabs();
       }
     });
+  }
+
+  // --- IDE editor tabs (phase 5, slice 4) -----------------------------------
+
+  // Build the editor-tabs controller that renders a tab bar + content host into
+  // the IDE editor area. File bodies reuse FileEditor's CodeMirror machinery
+  // (mountInto) + the phase-3 HEAD change-bar gutter; diff bodies reuse
+  // renderMergeDiff. The controller never imports CodeMirror itself.
+  initEditorTabs() {
+    if (!window.EditorTabs?.EditorTabsController) return;
+    // Per-tab live editor/diff handles, keyed by tabKey (for save/refresh/teardown).
+    this.editorTabHandles = new Map();
+    this.editorTabs = new window.EditorTabs.EditorTabsController({
+      document,
+      // The editor area + placeholder are created lazily on first enterIde, so
+      // resolve them through getters every render.
+      areaEl: () => this.ideShell?.editorAreaEl || null,
+      placeholderEl: () =>
+        this.ideShell?.editorAreaEl?.querySelector(".ide-editor-placeholder") ||
+        null,
+      mountFileBody: (hostEl, tab) => this.mountEditorFileTab(hostEl, tab),
+      mountDiffBody: (hostEl, tab) => this.mountEditorDiffTab(hostEl, tab),
+      onActiveBodyMeasure: () => this.refreshActiveEditorTab(),
+      // Destroy the live CodeMirror view/handle when a tab body is torn down.
+      onBodyTeardown: (key) => {
+        const handle = this.editorTabHandles?.get(key);
+        handle?.destroy?.();
+        this.editorTabHandles?.delete(key);
+      },
+      // Persist descriptors only (never content). Debounced via settingsStore.
+      onChange: (state) =>
+        this.settingsStore?.set(
+          window.EditorTabs.EDITOR_TABS_KEY,
+          window.EditorTabs.serializeTabs(state),
+        ),
+    });
+  }
+
+  // Explorer file click: route to an editor TAB in IDE mode, else the modal.
+  handleExplorerOpenFile(path) {
+    if (this.isIdeModeActive() && this.editorTabs) {
+      this.editorTabs.openFile(path, { preview: true });
+      return;
+    }
+    void this.openFileInEditor(path);
+  }
+
+  // Is the IDE editor area live (rendered IDE mode)? Tabs only make sense then.
+  isIdeModeActive() {
+    return this.ideShell?.renderedMode?.() === "ide" && this.ideShell?.rendered;
+  }
+
+  // Mount a file editor into a tab body via FileEditor.mountInto (reuses the
+  // gated load + the phase-3 gutter). Editing the file pins the preview tab
+  // (VS Code "edit promotes to pinned"). The returned handle drives refresh.
+  async mountEditorFileTab(hostEl, tab) {
+    if (!this.fileEditor?.mountInto) return;
+    const key = window.EditorTabs.tabKey(tab);
+    const handle = await this.fileEditor.mountInto(hostEl, tab.ref, {
+      onEdit: () => this.editorTabs?.model.pin(key),
+    });
+    if (!handle) {
+      // Load failed (binary / 403 / 404): drop the tab so we don't leave an
+      // empty body. Silent — matches the revalidation contract.
+      this.editorTabs?.closeKey(key);
+      return;
+    }
+    this.editorTabHandles?.set(key, handle);
+  }
+
+  // Mount a merge diff into a tab body, reusing the git panel's renderMergeDiff
+  // machinery. The diff ref carries everything needed to re-fetch both sides.
+  async mountEditorDiffTab(hostEl, tab) {
+    const r = tab.ref || {};
+    try {
+      const [original, modified] = await this.fetchDiffTabSources(r);
+      // Reuse the GitManager's CodeMirror merge-view machinery (split/inline per
+      // the diff-layout preference) — rendered into the tab body, not #git-diff.
+      if (window.gitManager?.renderMergeDiffInto) {
+        await window.gitManager.renderMergeDiffInto(
+          hostEl,
+          original,
+          modified,
+          r.relPath,
+        );
+      }
+    } catch {
+      hostEl.replaceChildren();
+      const err = document.createElement("p");
+      err.className = "muted";
+      err.textContent = "Failed to load diff.";
+      hostEl.appendChild(err);
+    }
+  }
+
+  // Resolve a diff tab's two document sides through the gated git/file endpoints.
+  async fetchDiffTabSources(ref) {
+    const cwd = ref.cwd || this.currentCwd || "";
+    const relPath = ref.relPath;
+    const mode = ref.mode || "working";
+    const showAt = async (commit) => {
+      const params = new URLSearchParams({ cwd, commit, path: relPath });
+      const res = await fetch(`/api/git/show?${params.toString()}`);
+      if (res.status === 404) return "";
+      if (!res.ok) return "";
+      const data = await res.json().catch(() => ({}));
+      return typeof data.content === "string" ? data.content : "";
+    };
+    const worktree = async () => {
+      const abs = `${cwd.replace(/\/$/, "")}/${relPath}`;
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      if (!res.ok) return "";
+      const data = await res.json().catch(() => ({}));
+      return typeof data.content === "string" ? data.content : "";
+    };
+    if (mode === "staged") {
+      return Promise.all([showAt("HEAD"), showAt(":0")]);
+    }
+    if (mode === "commit" && ref.commit) {
+      return Promise.all([showAt(`${ref.commit}~1`), showAt(ref.commit)]);
+    }
+    // working tree (default): HEAD vs the on-disk file.
+    return Promise.all([showAt("HEAD"), worktree()]);
+  }
+
+  // Open a diff as an editor tab (the SCM list in slice 5 calls this). cwd
+  // defaults to the active git panel cwd so an explicit cwd is optional.
+  openDiffTab({ relPath, mode = "working", cwd, commit, title } = {}) {
+    if (!this.editorTabs || !relPath) return;
+    this.editorTabs.openDiff({
+      relPath,
+      mode,
+      cwd:
+        cwd ||
+        window.gitManager?.state?.cwd ||
+        window.gitManager?.currentCwd ||
+        this.currentCwd ||
+        "",
+      commit,
+      title:
+        title ||
+        `${relPath} (${mode === "staged" ? "Staged" : mode === "commit" ? "Commit" : "Working Tree"})`,
+    });
+  }
+
+  // Refresh (measure) the active editor-tab body after a resize / activation.
+  refreshActiveEditorTab() {
+    const tab = this.editorTabs?.model.activeTab?.();
+    if (!tab) return;
+    const key = window.EditorTabs.tabKey(tab);
+    this.editorTabHandles?.get(key)?.refresh?.();
+  }
+
+  // Persist + revalidated restore (Codex xhigh). Reads the v3 descriptors and
+  // re-opens each through the gated file/git endpoints; anything that fails
+  // (deleted / moved / unauthorized) is SILENTLY dropped. Only runs in IDE mode
+  // (the editor area must exist); terminal mode leaves the descriptors persisted.
+  async restoreEditorTabs() {
+    if (!this.editorTabs || !this.isIdeModeActive()) return;
+    const raw = this.settingsStore?.get(
+      window.EditorTabs.EDITOR_TABS_KEY,
+      null,
+    );
+    const restored = window.EditorTabs.deserializeTabs(raw);
+    if (!restored.tabs.length) return;
+    const survived = await window.EditorTabs.filterRestoredTabs(
+      restored,
+      (tab) => this.canReopenTab(tab),
+    );
+    this.editorTabs.restoreState(survived);
+  }
+
+  // Probe whether a persisted tab can still be opened through the capability
+  // layer. We attempt the SAME gated load the body mount would do; a non-OK
+  // response (403/404) or a throw resolves falsy → the tab is dropped. The probe
+  // never renders — it only validates access + existence.
+  async canReopenTab(tab) {
+    try {
+      if (tab.type === window.EditorTabs.TAB_DIFF) {
+        const r = tab.ref || {};
+        const cwd = r.cwd || this.currentCwd || "";
+        const abs = `${cwd.replace(/\/$/, "")}/${r.relPath}`;
+        const res = await fetch(
+          `/api/files/content?path=${encodeURIComponent(abs)}`,
+        );
+        // A diff against a deleted working file is still meaningful, but an
+        // access denial (403) means the root is no longer authorized → drop.
+        return res.status !== 403;
+      }
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(tab.ref)}`,
+      );
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 
   // Show the IDE toggle only on desktop; keep its pressed state in sync and let

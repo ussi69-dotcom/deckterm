@@ -181,12 +181,17 @@ class FileEditor {
       ?.classList.toggle("visible", dirty);
   }
 
-  async open(path) {
+  // Load a file's content + HEAD-original through the GATED file/git endpoints.
+  // Returns { payload, headOriginal } on success, or null on any error (binary,
+  // 403/404, fetch failure). `silent` suppresses the user-facing alert — used by
+  // the IDE editor-tab path where a failed open SILENTLY drops the tab instead
+  // of popping an alert (the modal path keeps the alert for direct opens).
+  async loadFile(path, { silent = false } = {}) {
     if (!isProbablyEditable(path)) {
-      this.alertImpl("This looks like a binary file — download it instead.");
-      return;
+      if (!silent)
+        this.alertImpl("This looks like a binary file — download it instead.");
+      return null;
     }
-
     let payload;
     try {
       const res = await this.fetchImpl(
@@ -194,28 +199,27 @@ class FileEditor {
       );
       payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const denial = window.AccessDenied?.describeAccessDenied(payload);
-        this.alertImpl(
-          denial?.text || payload.error || "Cannot open file for editing",
-        );
-        return;
+        if (!silent) {
+          const denial = window.AccessDenied?.describeAccessDenied(payload);
+          this.alertImpl(
+            denial?.text || payload.error || "Cannot open file for editing",
+          );
+        }
+        return null;
       }
     } catch {
-      this.alertImpl("Cannot open file for editing");
-      return;
+      if (!silent) this.alertImpl("Cannot open file for editing");
+      return null;
     }
-
-    const cm = await this.ensureModule();
-    const modal = this.ensureModal();
-
-    // Best-effort change gutter vs HEAD. Failures (not a repo, untracked,
-    // fetch error) return null and the editor stays a plain editor.
     const headOriginal = await this.fetchHeadOriginal(payload.path);
+    return { payload, headOriginal };
+  }
 
-    this.view?.destroy();
-    const mount = modal.querySelector(".file-editor-mount");
-    mount.replaceChildren();
-
+  // Build a CodeMirror EditorView for a loaded file into `mount`. Shared by the
+  // modal (open) and the IDE editor-tab body (mountInto) so the phase-3 HEAD
+  // change-bar gutter + language setup stay identical. `onDocChanged` fires on
+  // the first edit (the modal sets dirty; the tab path pins the preview tab).
+  buildEditorView(cm, mount, payload, headOriginal, path, onDocChanged) {
     const language = detectEditorLanguage(path);
     const languageExtensions = {
       javascript: () => cm.javascript({ typescript: true, jsx: true }),
@@ -225,8 +229,7 @@ class FileEditor {
       html: () => cm.html(),
       css: () => cm.css(),
     };
-
-    this.view = new cm.EditorView({
+    return new cm.EditorView({
       state: cm.EditorState.create({
         doc: payload.content,
         extensions: [
@@ -246,12 +249,35 @@ class FileEditor {
               ]
             : []),
           cm.EditorView.updateListener.of((update) => {
-            if (update.docChanged) this.setDirty(true);
+            if (update.docChanged && typeof onDocChanged === "function")
+              onDocChanged(update);
           }),
         ],
       }),
       parent: mount,
     });
+  }
+
+  async open(path) {
+    const loaded = await this.loadFile(path);
+    if (!loaded) return;
+    const { payload, headOriginal } = loaded;
+
+    const cm = await this.ensureModule();
+    const modal = this.ensureModal();
+
+    this.view?.destroy();
+    const mount = modal.querySelector(".file-editor-mount");
+    mount.replaceChildren();
+
+    this.view = this.buildEditorView(
+      cm,
+      mount,
+      payload,
+      headOriginal,
+      path,
+      () => this.setDirty(true),
+    );
 
     this.current = { path: payload.path, mtimeMs: payload.mtimeMs };
     this.setDirty(false);
@@ -259,6 +285,95 @@ class FileEditor {
     modal.querySelector(".file-editor-title").textContent = payload.path;
     modal.classList.remove("hidden");
     this.view.focus();
+  }
+
+  // Mount a standalone CodeMirror editor for `path` into an arbitrary host (the
+  // IDE editor-tab body) — NO modal, NO SurfaceWindow. Reuses the exact gated
+  // load + the phase-3 HEAD change-bar gutter via buildEditorView. Returns a
+  // small handle the tab controller drives:
+  //   { view, save(), refresh(), destroy() }  (or null when the load failed —
+  //   the caller silently drops the tab).
+  // `onEdit` fires on the first edit so the tab controller can pin the preview.
+  // Each mounted tab owns its OWN view + current pointer (the modal's this.view
+  // / this.current stay reserved for the modal path).
+  async mountInto(hostEl, path, { onEdit } = {}) {
+    if (!hostEl) return null;
+    const loaded = await this.loadFile(path, { silent: true });
+    if (!loaded) return null;
+    const { payload, headOriginal } = loaded;
+    const cm = await this.ensureModule();
+
+    hostEl.replaceChildren();
+    let current = { path: payload.path, mtimeMs: payload.mtimeMs };
+    let edited = false;
+    const view = this.buildEditorView(
+      cm,
+      hostEl,
+      payload,
+      headOriginal,
+      path,
+      () => {
+        if (!edited) {
+          edited = true;
+          if (typeof onEdit === "function") onEdit();
+        }
+      },
+    );
+
+    const handle = {
+      view,
+      path: payload.path,
+      // Atomic save through the gated PUT, mirroring the modal's save() (409 +
+      // access-denied handling). Returns true on success.
+      save: async () => {
+        try {
+          const res = await this.fetchImpl("/api/files/content", {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              path: current.path,
+              content: view.state.doc.toString(),
+              expectedMtimeMs: current.mtimeMs,
+            }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (res.status === 409) {
+            this.alertImpl(
+              "The file changed on disk since you opened it. Close the tab and reopen to pick up the new content (your version stays in this tab until then).",
+            );
+            return false;
+          }
+          if (!res.ok) {
+            const denial = window.AccessDenied?.describeAccessDenied(body);
+            this.alertImpl(denial?.text || body.error || "Save failed");
+            return false;
+          }
+          current.mtimeMs = body.mtimeMs;
+          edited = false;
+          return true;
+        } catch {
+          this.alertImpl("Save failed");
+          return false;
+        }
+      },
+      // CodeMirror needs a measure after its container resizes (mode switch,
+      // dock sash drag, tab activation).
+      refresh: () => {
+        try {
+          view.requestMeasure();
+        } catch {
+          // best-effort
+        }
+      },
+      destroy: () => {
+        try {
+          view.destroy();
+        } catch {
+          // best-effort
+        }
+      },
+    };
+    return handle;
   }
 
   async save() {

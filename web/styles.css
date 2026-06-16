@@ -5650,6 +5650,18 @@ body.ide-mode .ide-editor-area {
   display: flex;
   align-items: center;
   justify-content: center;
+  /* Reserve the bottom strip occupied by the docked terminal panel (same grid
+     cell, align-self:end) so editor tabs/bodies don't render behind it. */
+  padding-bottom: var(--dock-height, 35%);
+}
+
+/* Once tabs exist the area becomes a column: tab bar on top, body host below
+   (the placeholder is hidden). */
+body.ide-mode .ide-editor-area.has-tabs {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
 }
 
 .ide-editor-placeholder {
@@ -5657,6 +5669,103 @@ body.ide-mode .ide-editor-area {
   font-size: 13px;
   padding: 24px;
   text-align: center;
+}
+
+.ide-editor-placeholder[hidden] {
+  display: none;
+}
+
+/* Tab bar — VS Code-style strip above the editor body. */
+.ide-editor-tabs {
+  display: flex;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  flex: 0 0 auto;
+  background: var(--bg-tertiary, #1e1e1e);
+  border-bottom: 1px solid var(--border-primary);
+  scrollbar-width: thin;
+}
+
+.ide-editor-tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 6px 8px 6px 12px;
+  font-size: 12px;
+  color: var(--text-secondary, #858585);
+  background: transparent;
+  border-right: 1px solid var(--border-primary);
+  border-top: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.ide-editor-tab:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.05));
+  color: var(--text-primary, #fff);
+}
+
+.ide-editor-tab.active {
+  color: var(--text-primary, #fff);
+  background: var(--bg-primary);
+  border-top-color: var(--accent-blue);
+}
+
+/* Preview tabs render italic (VS Code single-click preview semantics). */
+.ide-editor-tab.preview .ide-editor-tab-label {
+  font-style: italic;
+}
+
+.ide-editor-tab-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ide-editor-tab-diff-indicator {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.ide-editor-tab-close {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 3px;
+  opacity: 0.5;
+}
+
+.ide-editor-tab-close:hover {
+  opacity: 1;
+  background: var(--bg-hover, rgba(255, 255, 255, 0.12));
+}
+
+/* Body host — fills the remaining editor-area height; one body visible. */
+.ide-editor-bodies {
+  flex: 1 1 auto;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+}
+
+.ide-editor-body {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+}
+
+.ide-editor-body[hidden] {
+  display: none;
+}
+
+/* CodeMirror inside a tab body fills it (mirrors the modal mount). */
+.ide-editor-body .cm-editor {
+  height: 100%;
 }
 
 /* In IDE mode the terminal area docks to the bottom-right (below the editor

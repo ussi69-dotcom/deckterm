@@ -228,15 +228,15 @@ test("captureExplorerState defaults missing/blank fields to a closed-home state"
 
 // ── Slice 3: schema v2 + detached-state helpers ──────────────────────────────
 
-test("schema version is v2 (slice 3 bumped it for layout.detached)", () => {
-  expect(LAYOUT_SCHEMA_VERSION).toBe(2);
+test("schema version is v3 (slice 4 bumped it for layout.editorTabs)", () => {
+  expect(LAYOUT_SCHEMA_VERSION).toBe(3);
   expect(LAYOUT_DETACHED_KEY).toBe("layout.detached");
   expect(VIEW_EXPLORER).toBe("explorer");
 });
 
-test("migrateLayoutState v1 store → v2 stamps version, never clobbers keys", () => {
+test("migrateLayoutState v1 store → current stamps version, never clobbers keys", () => {
   // A store left at v1 with an existing mode + (hypothetical) detached map must
-  // be bumped to v2 WITHOUT touching either existing value.
+  // be bumped to the current schema WITHOUT touching either existing value.
   const store = makeFakeStore({
     "layout.mode": "ide",
     "layout.schemaVersion": 1,
@@ -244,7 +244,7 @@ test("migrateLayoutState v1 store → v2 stamps version, never clobbers keys", (
   });
   const result = migrateLayoutState(store);
   expect(result.migrated).toBe(true);
-  expect(store.get("layout.schemaVersion")).toBe(2);
+  expect(store.get("layout.schemaVersion")).toBe(LAYOUT_SCHEMA_VERSION);
   expect(store.get("layout.mode")).toBe("ide");
   expect(store.get("layout.detached")).toEqual({ explorer: true });
 });
