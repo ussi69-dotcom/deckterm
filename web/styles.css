@@ -5651,8 +5651,12 @@ body.ide-mode .ide-editor-area {
   align-items: center;
   justify-content: center;
   /* Reserve the bottom strip occupied by the docked terminal panel (same grid
-     cell, align-self:end) so editor tabs/bodies don't render behind it. */
-  padding-bottom: var(--dock-height, 35%);
+     cell, align-self:end, height:var(--dock-height)). The dock's height is a
+     PERCENTAGE of the row height, so reserve by HEIGHT (vertical padding %
+     resolves against WIDTH and would mismatch the dock). Occupy exactly the
+     space above the dock by topping out at 100% minus the dock height. */
+  align-self: start;
+  height: calc(100% - var(--dock-height, 35%));
 }
 
 /* Once tabs exist the area becomes a column: tab bar on top, body host below

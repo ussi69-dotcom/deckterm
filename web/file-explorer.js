@@ -650,9 +650,11 @@ class FileExplorerController {
       editBtn.className = "edit";
       editBtn.title = "Edit";
       editBtn.textContent = "✎";
+      // The edit button is a single explicit open → PREVIEW (VS Code: a single
+      // open action previews; editing or a double-click pins it).
       editBtn.addEventListener("click", (event) => {
         event.stopPropagation();
-        this.onOpenFile(item.path);
+        this.onOpenFile(item.path, { pinned: false });
       });
       actionsEl.appendChild(editBtn);
     }
@@ -699,6 +701,19 @@ class FileExplorerController {
       this.setSelectedItem(snapshot.workspaceId, item);
       this.renderList();
     });
+
+    // Double-click a file row → open PINNED (VS Code: double-click pins).
+    // Directories keep their navigate-on-open behavior (no double-click pin).
+    if (
+      !item.isDir &&
+      !item.isParent &&
+      typeof this.onOpenFile === "function"
+    ) {
+      el.addEventListener("dblclick", (event) => {
+        event.stopPropagation();
+        this.onOpenFile(item.path, { pinned: true });
+      });
+    }
 
     return el;
   }

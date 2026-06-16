@@ -501,8 +501,26 @@ class EditorTabsController {
     }
     this.ensureScaffold();
     if (this.areaEl) this.areaEl.classList.add("has-tabs");
+    // Prune any cached bodies whose tab is no longer in state (e.g. a preview
+    // tab replaced in place by openTab). Tear them down so their CodeMirror
+    // views/handles are destroyed — otherwise the replaced preview's body would
+    // leak and a pending async mount could still reveal it.
+    this.pruneOrphanBodies();
     this.renderTabBar();
     void this.renderActiveBody();
+  }
+
+  // Drop cached bodies whose key is absent from the current tab state.
+  pruneOrphanBodies() {
+    const live = new Set(this.model.state.tabs.map((t) => tabKey(t)));
+    for (const key of Array.from(this.bodies.keys())) {
+      if (live.has(key)) continue;
+      this.teardownBody(key);
+      const el = this.bodies.get(key);
+      if (el) el.remove();
+      this.bodies.delete(key);
+      if (this.mountedKey === key) this.mountedKey = null;
+    }
   }
 
   renderTabBar() {
@@ -583,6 +601,27 @@ class EditorTabsController {
         }
       } catch {
         // A mount failure leaves an empty body; never break the tab switch.
+      }
+      // The mount above is async: by the time it resolves the tab may have been
+      // replaced (preview clobbered) or another tab may now be active. If so,
+      // discard this just-mounted body (tearing down its view) instead of
+      // revealing a tab that no longer exists / isn't active.
+      const stillPresent = findTabIndex(this.model.state.tabs, activeKey) >= 0;
+      const stillActive = this.model.state.activeKey === activeKey;
+      if (!stillPresent || !stillActive) {
+        this.teardownBody(activeKey);
+        if (this.bodies.get(activeKey) === bodyEl) {
+          bodyEl.remove();
+          this.bodies.delete(activeKey);
+        }
+        // Re-render the (now-current) active body if the active tab changed.
+        if (
+          this.model.state.activeKey &&
+          this.model.state.activeKey !== activeKey
+        ) {
+          void this.renderActiveBody();
+        }
+        return;
       }
     }
     bodyEl.hidden = false;

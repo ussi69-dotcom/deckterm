@@ -4851,8 +4851,8 @@ class TerminalManager {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
       // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
-      this.fileExplorer.onOpenFile = (path) =>
-        this.handleExplorerOpenFile(path);
+      this.fileExplorer.onOpenFile = (path, intent) =>
+        this.handleExplorerOpenFile(path, intent);
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -9044,10 +9044,12 @@ class TerminalManager {
     });
   }
 
-  // Explorer file click: route to an editor TAB in IDE mode, else the modal.
-  handleExplorerOpenFile(path) {
+  // Explorer file open: route to an editor TAB in IDE mode, else the modal.
+  // The explorer passes the click intent: a single open action previews; a
+  // double-click pins (VS Code semantics). Terminal-mode modal is unchanged.
+  handleExplorerOpenFile(path, { pinned = false } = {}) {
     if (this.isIdeModeActive() && this.editorTabs) {
-      this.editorTabs.openFile(path, { preview: true });
+      this.editorTabs.openFile(path, { preview: !pinned });
       return;
     }
     void this.openFileInEditor(path);
@@ -9080,17 +9082,28 @@ class TerminalManager {
   // machinery. The diff ref carries everything needed to re-fetch both sides.
   async mountEditorDiffTab(hostEl, tab) {
     const r = tab.ref || {};
+    const key = window.EditorTabs.tabKey(tab);
     try {
       const [original, modified] = await this.fetchDiffTabSources(r);
       // Reuse the GitManager's CodeMirror merge-view machinery (split/inline per
       // the diff-layout preference) — rendered into the tab body, not #git-diff.
       if (window.gitManager?.renderMergeDiffInto) {
-        await window.gitManager.renderMergeDiffInto(
+        const view = await window.gitManager.renderMergeDiffInto(
           hostEl,
           original,
           modified,
           r.relPath,
         );
+        // Register a teardown handle so closing/clearing the tab destroys the
+        // live CodeMirror EditorView/MergeView (symmetric with the file path);
+        // otherwise diff views leak listeners + state. The handle's no-op
+        // refresh keeps refreshActiveEditorTab() total across tab types.
+        if (view?.destroy) {
+          this.editorTabHandles?.set(key, {
+            destroy: () => view.destroy(),
+            refresh: () => {},
+          });
+        }
       }
     } catch {
       hostEl.replaceChildren();
@@ -9124,7 +9137,9 @@ class TerminalManager {
       return typeof data.content === "string" ? data.content : "";
     };
     if (mode === "staged") {
-      return Promise.all([showAt("HEAD"), showAt(":0")]);
+      // Staged side: the gated /api/git/show route maps "INDEX" → git's :0
+      // (server rejects a raw ":0" — its commit regex disallows the colon).
+      return Promise.all([showAt("HEAD"), showAt("INDEX")]);
     }
     if (mode === "commit" && ref.commit) {
       return Promise.all([showAt(`${ref.commit}~1`), showAt(ref.commit)]);
@@ -9181,22 +9196,17 @@ class TerminalManager {
   }
 
   // Probe whether a persisted tab can still be opened through the capability
-  // layer. We attempt the SAME gated load the body mount would do; a non-OK
-  // response (403/404) or a throw resolves falsy → the tab is dropped. The probe
-  // never renders — it only validates access + existence.
+  // layer. We attempt the SAME gated load(s) the body mount would do and DROP on
+  // access-denied / server-error / malformed / network failure (the spec
+  // requires silently dropping unauthorized or invalid tabs — not restoring them
+  // as an empty diff). The probe never renders — it only validates access +
+  // existence. A throw (network) drops; we never trust a cached/200-on-error.
   async canReopenTab(tab) {
     try {
       if (tab.type === window.EditorTabs.TAB_DIFF) {
-        const r = tab.ref || {};
-        const cwd = r.cwd || this.currentCwd || "";
-        const abs = `${cwd.replace(/\/$/, "")}/${r.relPath}`;
-        const res = await fetch(
-          `/api/files/content?path=${encodeURIComponent(abs)}`,
-        );
-        // A diff against a deleted working file is still meaningful, but an
-        // access denial (403) means the root is no longer authorized → drop.
-        return res.status !== 403;
+        return await this.canReopenDiffTab(tab);
       }
+      // File tab: must resolve OK (a 404/403/5xx all drop it).
       const res = await fetch(
         `/api/files/content?path=${encodeURIComponent(tab.ref)}`,
       );
@@ -9204,6 +9214,52 @@ class TerminalManager {
     } catch {
       return false;
     }
+  }
+
+  // Diff-tab revalidation. A diff renders through one or two GATED endpoints
+  // depending on its mode; every probe it needs must be "renderable" or the tab
+  // is dropped. Renderable = HTTP 200 OR 404 (a 404 is a legitimate add/delete
+  // side of a diff — e.g. a tracked-but-deleted working file, or a file that
+  // doesn't exist on one of the two compared refs). NOT renderable = 401/403
+  // (access denied → root no longer authorized), 400 (malformed ref), 5xx
+  // (server error), or a network throw — all DROP. We require ALL probes to be
+  // renderable, so an access-denied git side drops even if the working file is
+  // still readable.
+  async canReopenDiffTab(tab) {
+    const r = tab.ref || {};
+    const cwd = (r.cwd || this.currentCwd || "").replace(/\/$/, "");
+    const mode = r.mode || "working";
+
+    // Probe a gated endpoint; resolve true when its status is renderable.
+    const probe = async (url) => {
+      const res = await fetch(url);
+      // 200 → fine; 404 → meaningful add/delete side; everything else drops.
+      return res.ok || res.status === 404;
+    };
+    const showProbe = (commit) =>
+      probe(
+        `/api/git/show?${new URLSearchParams({ cwd, commit, path: r.relPath }).toString()}`,
+      );
+    const fileProbe = () =>
+      probe(
+        `/api/files/content?path=${encodeURIComponent(`${cwd}/${r.relPath}`)}`,
+      );
+
+    // Map mode → the exact (endpoint, ref) probes the diff actually renders.
+    let probes;
+    if (mode === "staged") {
+      // HEAD vs the staged INDEX (the /api/git/show route maps "INDEX" → :0).
+      probes = [showProbe("HEAD"), showProbe("INDEX")];
+    } else if (mode === "commit" && r.commit) {
+      // commit~1 vs commit.
+      probes = [showProbe(`${r.commit}~1`), showProbe(r.commit)];
+    } else {
+      // working tree (default): HEAD vs the on-disk working file.
+      probes = [showProbe("HEAD"), fileProbe()];
+    }
+
+    const results = await Promise.all(probes);
+    return results.every(Boolean);
   }
 
   // Show the IDE toggle only on desktop; keep its pressed state in sync and let

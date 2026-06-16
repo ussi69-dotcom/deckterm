@@ -318,3 +318,122 @@ test("EditorTabsModel exposes the reducers as instance ops and emits change", ()
   model.close(tabKey(makeFileTab("/a")));
   expect(model.state.tabs).toHaveLength(0);
 });
+
+// ── Explorer intent → preview vs pinned open (Fix 7, slice-4 review) ──────────
+
+// The explorer threads a { pinned } intent (single open = preview, double-click
+// = pinned). handleExplorerOpenFile maps it to makeFileTab({ preview: !pinned }).
+// This covers the model-level outcome of that mapping.
+test("explorer single-open (pinned:false) opens a PREVIEW tab", () => {
+  const pinned = false;
+  let s = openTab(
+    { tabs: [], activeKey: null },
+    makeFileTab("/a", { preview: !pinned }),
+  );
+  expect(s.tabs[0].preview).toBe(true);
+  expect(s.tabs[0].pinned).toBe(false);
+});
+
+test("explorer double-click (pinned:true) opens a PINNED tab", () => {
+  const pinned = true;
+  let s = openTab(
+    { tabs: [], activeKey: null },
+    makeFileTab("/a", { preview: !pinned }),
+  );
+  expect(s.tabs[0].preview).toBe(false);
+  expect(s.tabs[0].pinned).toBe(true);
+});
+
+test("explorer double-click on the current preview pins it in place (no dup)", () => {
+  let s = openTab(
+    { tabs: [], activeKey: null },
+    makeFileTab("/a", { preview: true }),
+  );
+  // double-click the same file: pinned open promotes the existing preview.
+  s = openTab(s, makeFileTab("/a", { preview: false }));
+  expect(s.tabs).toHaveLength(1);
+  expect(s.tabs[0].preview).toBe(false);
+  expect(s.tabs[0].pinned).toBe(true);
+});
+
+// ── Controller body pruning (Fix 3, slice-4 review) ──────────────────────────
+
+// Minimal DOM stub: enough for the controller's scaffold/render/body-cache path
+// without a real browser (verifies orphan bodies are torn down + removed).
+function fakeDocument() {
+  const make = (tag) => {
+    const el = {
+      tagName: tag,
+      className: "",
+      dataset: {},
+      children: [],
+      hidden: false,
+      attrs: {},
+      _connected: true,
+      classList: {
+        _set: new Set(),
+        add(c) {
+          this._set.add(c);
+        },
+        remove(c) {
+          this._set.delete(c);
+        },
+        toggle() {},
+        contains(c) {
+          return this._set.has(c);
+        },
+      },
+      setAttribute(k, v) {
+        this.attrs[k] = v;
+      },
+      appendChild(c) {
+        this.children.push(c);
+        c.parent = el;
+        return c;
+      },
+      replaceChildren() {
+        this.children = [];
+      },
+      remove() {
+        this._connected = false;
+        if (this.parent) {
+          this.parent.children = this.parent.children.filter((x) => x !== this);
+        }
+      },
+      addEventListener() {},
+      querySelector() {
+        return null;
+      },
+      get isConnected() {
+        return this._connected;
+      },
+    };
+    return el;
+  };
+  return { createElement: (tag) => make(tag) };
+}
+
+test("controller prunes + tears down a preview body replaced in place", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  const tornDown = [];
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    onBodyTeardown: (key) => tornDown.push(key),
+  });
+
+  // Open preview /a, render + mount its body.
+  controller.openFile("/a", { preview: true });
+  await controller.renderActiveBody();
+  const keyA = tabKey(makeFileTab("/a"));
+  expect(controller.bodies.has(keyA)).toBe(true);
+
+  // Open preview /b: it REPLACES /a's preview slot. Render must prune /a's body.
+  controller.openFile("/b", { preview: true });
+  expect(controller.bodies.has(keyA)).toBe(false);
+  expect(tornDown).toContain(keyA);
+});
