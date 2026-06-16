@@ -72,6 +72,18 @@ function isProbablyEditable(path) {
   return !BINARY_EXTENSIONS.has(fileExtension(path));
 }
 
+// Decides whether the editor should show a change gutter vs HEAD. Returns the
+// HEAD content string when the file is tracked and `git show` succeeded, else
+// null (untracked file, not-a-repo, show error, or a non-string body). null
+// means "do not add the merge/change-gutter extension" — the editor stays a
+// plain editor with no false change bars.
+function headOriginalFor(showResponse, isTracked) {
+  if (!isTracked) return null;
+  if (!showResponse || !showResponse.ok) return null;
+  if (typeof showResponse.content !== "string") return null;
+  return showResponse.content;
+}
+
 class FileEditor {
   constructor({ fetchImpl, alertImpl, confirmImpl } = {}) {
     this.fetchImpl = fetchImpl || ((...args) => fetch(...args));
@@ -89,6 +101,34 @@ class FileEditor {
       this.cm = await import("/vendor/codemirror.js");
     }
     return this.cm;
+  }
+
+  // Fetches HEAD content for the file via GET /api/git/show so the editor can
+  // render change bars vs the committed version. Returns the original string
+  // when meaningful (tracked + changed), or null. Any failure (not a repo,
+  // untracked, fetch error) silently yields null — never surfaced to the user.
+  async fetchHeadOriginal(absPath) {
+    try {
+      const slash = String(absPath || "").lastIndexOf("/");
+      if (slash <= 0) return null;
+      const cwd = absPath.slice(0, slash);
+      const base = absPath.slice(slash + 1);
+      // "./<base>" makes git resolve the path relative to cwd (the file's
+      // directory) instead of the repo root, so we don't need to know the
+      // toplevel here.
+      const params = new URLSearchParams({
+        cwd,
+        commit: "HEAD",
+        path: `./${base}`,
+      });
+      const res = await this.fetchImpl(`/api/git/show?${params.toString()}`);
+      const body = await res.json().catch(() => ({}));
+      // A 404 means the file is untracked / absent at HEAD — treat as untracked.
+      const isTracked = res.ok;
+      return headOriginalFor({ ok: res.ok, content: body.content }, isTracked);
+    } catch {
+      return null;
+    }
   }
 
   ensureModal() {
@@ -168,6 +208,10 @@ class FileEditor {
     const cm = await this.ensureModule();
     const modal = this.ensureModal();
 
+    // Best-effort change gutter vs HEAD. Failures (not a repo, untracked,
+    // fetch error) return null and the editor stays a plain editor.
+    const headOriginal = await this.fetchHeadOriginal(payload.path);
+
     this.view?.destroy();
     const mount = modal.querySelector(".file-editor-mount");
     mount.replaceChildren();
@@ -190,6 +234,17 @@ class FileEditor {
           cm.keymap.of([cm.indentWithTab]),
           cm.oneDark,
           ...(language ? [languageExtensions[language]()] : []),
+          // Change bars vs HEAD (no accept/reject merge controls). Only added
+          // when the file is tracked and differs — otherwise no false markers.
+          ...(typeof headOriginal === "string"
+            ? [
+                cm.unifiedMergeView({
+                  original: headOriginal,
+                  mergeControls: false,
+                  gutter: true,
+                }),
+              ]
+            : []),
           cm.EditorView.updateListener.of((update) => {
             if (update.docChanged) this.setDirty(true);
           }),
@@ -263,6 +318,7 @@ class FileEditor {
 const FileEditorModule = {
   detectEditorLanguage,
   isProbablyEditable,
+  headOriginalFor,
   FileEditor,
 };
 
@@ -277,5 +333,6 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.detectEditorLanguage = detectEditorLanguage;
   exports.isProbablyEditable = isProbablyEditable;
+  exports.headOriginalFor = headOriginalFor;
   exports.FileEditor = FileEditor;
 }
