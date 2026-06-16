@@ -120,6 +120,19 @@ test("status reports upstream ahead/behind", async () => {
   expect(data.behind).toBe(0);
 });
 
+test("status exposes the repo toplevel as root", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  // Compare against git's own toplevel (handles symlink-resolved tmp paths).
+  const toplevel = (await git(repo, "rev-parse", "--show-toplevel")).trim();
+  expect(data.root).toBe(toplevel);
+});
+
 test("push syncs ahead commits to origin; status ahead drops to 0", async () => {
   const res = await post("/api/git/push", { cwd: repo });
   expect(res.status).toBe(200);

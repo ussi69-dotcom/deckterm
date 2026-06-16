@@ -3410,7 +3410,28 @@ export function createWebApp() {
           };
         });
 
-      return c.json({ branch, upstream, ahead, behind, files, cwd });
+      // Absolute repo toplevel — lets callers (e.g. the explorer decorations)
+      // map porcelain paths (repo-relative) to absolute paths. Best-effort:
+      // null if the lookup fails, never breaks the status response.
+      let root: string | null = null;
+      try {
+        const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
+          cwd,
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+        const rootTimeout = setTimeout(() => rootProc.kill(), 10000);
+        const [rootOut, rootExit] = await Promise.all([
+          new Response(rootProc.stdout).text(),
+          rootProc.exited,
+        ]);
+        clearTimeout(rootTimeout);
+        if (rootExit === 0) root = rootOut.trim() || null;
+      } catch {
+        root = null;
+      }
+
+      return c.json({ branch, upstream, ahead, behind, files, cwd, root });
     } catch (err) {
       return c.json(
         { error: "Not a git repository", message: String(err) },
