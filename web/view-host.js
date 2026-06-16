@@ -10,9 +10,17 @@
 //
 // Lifecycle a view controller implements:
 //   mount(container)  render into the provided DOM container + attach listeners
-//   unmount()         remove DOM + detach listeners, but KEEP model state
+//   unmount()         detach listeners + drop DOM handles, but KEEP model state
 //   dispose()         full teardown (drop the store binding / cached nodes)
 //   resize()          re-measure / relayout after the container size changed
+//
+// Slice-1 DOM-ownership contract (important): the HOST provides the view's DOM
+// skeleton. mount(container) binds listeners/handles to the skeleton ALREADY
+// PRESENT in `container`; it does NOT generate that markup. unmount() detaches
+// listeners and drops DOM handles but does NOT own or remove the skeleton.
+// (So mounting into a fresh, empty host binds nothing.) The template-owning
+// re-host — where mount() generates the skeleton and unmount() removes it — is
+// deferred to the pop-out/dock slice; slice 1 must keep "no visible change".
 //
 // A `ViewHost` is anything that provides a container element and drives those
 // calls. This module keeps that contract minimal — just the method names and a

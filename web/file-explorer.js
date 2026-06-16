@@ -41,8 +41,9 @@ function explainApiError(payload, fallback) {
 }
 
 // Resolve the FileTreeStore constructor across browser (<script>) and bun:test
-// (require), then return a fresh store. Falls back to null-safe behavior only
-// if the module is somehow unavailable (it is always loaded alongside this one).
+// (require), then return a fresh store. Returns null only if the module is
+// somehow unavailable; the constructor treats that as a fatal error (fail fast)
+// rather than pretending a missing store is null-safe.
 function resolveFileTreeStore() {
   let ctor = null;
   if (typeof window !== "undefined" && window.FileTreeStore) {
@@ -172,8 +173,22 @@ class FileExplorerController {
     // The model lives in a DOM-free store so an unmount()/mount() restores the
     // UI from state. The controller's flag/path/selection getters delegate to
     // it; callers keep using the same controller method surface as before.
+    // Fail fast if no store is resolvable — the store-backed getters/setters
+    // below assume a store exists at construction (it ships alongside this
+    // module), mirroring the "requires fetch support" guard in loadDir().
     this.store = store || resolveFileTreeStore();
+    if (!this.store) {
+      throw new Error("FileExplorerController requires FileTreeStore");
+    }
+    // NOTE: store.onChange(...) is intentionally NOT subscribed here. Slice 1
+    // keeps the exact prior render timing (the controller's own setters drive
+    // re-render) and avoids a double-render; auto-subscribing a mounted view to
+    // external store mutations is deferred to the pop-out/dock re-host slice.
     this.store.setMode(resolveFileExplorerMode(this.viewport, this.breakpoint));
+
+    // Set true by dispose(); guards post-await continuations so a teardown
+    // mid-browse no-ops instead of throwing on a null store / detached DOM.
+    this.disposed = false;
 
     // Per-load bookkeeping is transient (not part of the persisted model).
     this.pendingLoadByWorkspace = new Map();
@@ -268,9 +283,16 @@ class FileExplorerController {
 
   // --- ViewHost lifecycle ---------------------------------------------------
 
-  // Render into the provided DOM container and attach listeners. Safe to call
-  // after an unmount() to re-host the same view into a different container; the
-  // model persists in the store so the UI restores itself.
+  // Render into the provided DOM container and attach listeners.
+  //
+  // Slice-1 DOM-ownership contract: the HOST provides the explorer DOM skeleton
+  // (see #file-explorer in index.html). mount(container) only QUERIES and binds
+  // listeners/handles to the skeleton already present in `container` — it does
+  // NOT generate markup. Mounting into a fresh, empty container binds nothing.
+  // Safe to call after an unmount() to re-host into another skeleton-bearing
+  // container; the model persists in the store so the UI restores itself.
+  // Template-owning re-host (mount generates the skeleton, unmount removes it)
+  // is deferred to the pop-out/dock slice.
   mount(container) {
     if (this.root === container) return;
     if (this.root) this.unmount();
@@ -279,15 +301,20 @@ class FileExplorerController {
     this.render();
   }
 
-  // Remove DOM bindings + detach listeners but KEEP model state. After this the
-  // view can be mount()ed into another container.
+  // Detach listeners and drop cached DOM handles but KEEP model state. Per the
+  // Slice-1 contract above, unmount() does NOT own or remove the skeleton it
+  // bound to — the host keeps that markup. After this the view can be
+  // mount()ed into another skeleton-bearing container.
   unmount() {
     this.unbindDom();
     this.root = null;
   }
 
-  // Full teardown: unmount and drop the store binding.
+  // Full teardown: unmount and drop the store binding. Sets `disposed` so any
+  // in-flight async continuation (e.g. a loadDir() awaiting fetch) no-ops on
+  // resume instead of touching the now-null store / detached DOM.
   dispose() {
+    this.disposed = true;
     this.unmount();
     this.store = null;
   }
@@ -851,6 +878,9 @@ class FileExplorerController {
         `/api/browse?path=${encodeURIComponent(nextPath)}&files=true`,
       );
       const data = await res.json().catch(() => ({}));
+      // Disposed mid-browse: store is gone and DOM is detached — drop the result
+      // rather than write to a null store / re-render a torn-down view.
+      if (this.disposed) return null;
       if (
         this.pendingLoadByWorkspace.get(normalizedWorkspaceId) !== requestId
       ) {
@@ -884,6 +914,8 @@ class FileExplorerController {
 
       return data;
     } catch (err) {
+      // Disposed mid-browse: skip the error write-back to the now-null store.
+      if (this.disposed) return null;
       if (
         this.pendingLoadByWorkspace.get(normalizedWorkspaceId) !== requestId
       ) {
@@ -926,6 +958,8 @@ class FileExplorerController {
         { method: "DELETE" },
       );
       const payload = await res.json().catch(() => ({}));
+      // Disposed mid-delete: store/DOM are gone — stop before touching them.
+      if (this.disposed) return false;
       if (!res.ok) {
         this.alertImpl(explainApiError(payload, "Failed to delete"));
         return false;
@@ -972,6 +1006,8 @@ class FileExplorerController {
         { method: "POST" },
       );
       const payload = await res.json().catch(() => ({}));
+      // Disposed mid-mkdir: skip the follow-up reload of the now-null store.
+      if (this.disposed) return false;
       if (!res.ok) {
         this.alertImpl(explainApiError(payload, "Failed"));
         return false;
@@ -1033,6 +1069,8 @@ class FileExplorerController {
       }
     }
 
+    // Disposed mid-upload: loadDir() itself guards, but skip kicking it off.
+    if (this.disposed) return false;
     await this.loadDir(basePath, normalizedWorkspaceId);
     return true;
   }
