@@ -2697,6 +2697,9 @@ class GitManager {
       activePanel: "files", // 'files' | 'history' | 'branches'
       diff: null,
       diffMode: "working", // 'working' | 'staged' | 'commit'
+      rightView: "diff", // 'diff' | 'timeline'
+      timelineEntries: [],
+      timelinePath: null,
       selectedCommit: null,
       collapsedFolders: new Set(),
       loading: false,
@@ -2737,6 +2740,10 @@ class GitManager {
         <div class="git-right-panel">
           <div class="git-diff-header">
             <span id="git-diff-title">Diff</span>
+            <div class="git-right-views">
+              <button class="git-right-view active" data-view="diff" title="Diff of the selected file">Diff</button>
+              <button class="git-right-view" data-view="timeline" title="Commit history of the selected file">Timeline</button>
+            </div>
             <div class="git-diff-modes">
               <button class="git-diff-mode active" data-mode="working">Working Tree</button>
               <button class="git-diff-mode" data-mode="staged">Staged</button>
@@ -2744,6 +2751,7 @@ class GitManager {
               <button id="git-diff-layout" class="git-diff-mode git-diff-layout" title="Toggle split / inline diff">⫿⫿</button>
             </div>
           </div>
+          <div id="git-timeline" class="git-timeline hidden"></div>
           <div id="git-diff" class="git-diff"></div>
           <div class="git-history-header">
             <span>History</span>
@@ -2814,6 +2822,45 @@ class GitManager {
           this.showDiff(this.state.selectedPath);
         }
       });
+    this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
+      btn.addEventListener("click", () => this.setRightView(btn.dataset.view));
+    });
+  }
+
+  // Switches the right pane between the Diff editor and the per-file Timeline.
+  setRightView(view) {
+    if (!view || view === this.state.rightView) {
+      if (view === "timeline") this.showTimeline(this.state.selectedPath);
+      return;
+    }
+    this.state.rightView = view;
+    this.updateRightViewUI();
+    if (view === "timeline") {
+      this.showTimeline(this.state.selectedPath);
+    } else if (this.state.selectedPath) {
+      this.showDiff(this.state.selectedPath);
+    }
+  }
+
+  updateRightViewUI() {
+    const view = this.state.rightView || "diff";
+    this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.view === view);
+    });
+    const isTimeline = view === "timeline";
+    const timelineEl = this.panel.querySelector("#git-timeline");
+    const diffEl = this.panel.querySelector("#git-diff");
+    const modesEl = this.panel.querySelector(".git-diff-modes");
+    if (timelineEl) timelineEl.classList.toggle("hidden", !isTimeline);
+    // Diff editor stays visible in timeline mode (a clicked commit renders into
+    // it); only the working/staged/commit mode buttons are hidden, since they
+    // do not apply to a historical revision.
+    if (modesEl) modesEl.classList.toggle("hidden", isTimeline);
+    if (diffEl && !this.state.selectedPath) {
+      diffEl.classList.toggle("hidden", isTimeline);
+    } else if (diffEl) {
+      diffEl.classList.remove("hidden");
+    }
   }
 
   setupKeyboardShortcuts() {
@@ -3327,7 +3374,11 @@ class GitManager {
         this.state.selectedIndex = parseInt(el.dataset.index, 10);
         this.state.selectedPath = el.dataset.path;
         this.highlightSelectedFile();
-        this.showDiff(el.dataset.path);
+        if (this.state.rightView === "timeline") {
+          this.showTimeline(el.dataset.path);
+        } else {
+          this.showDiff(el.dataset.path);
+        }
       });
     });
 
@@ -3796,6 +3847,124 @@ class GitManager {
       parent: container,
       collapseUnchanged: { margin: 3, minSize: 4 },
     });
+  }
+
+  // Per-file timeline: lists the commit history of the selected file and lets
+  // the user diff any revision against its previous revision (root commit ->
+  // empty tree). Reuses renderMergeDiff for the diff itself.
+  async showTimeline(path) {
+    const container = this.panel.querySelector("#git-timeline");
+    if (!container) return;
+    const resolvedPath = path || this.state.selectedPath;
+
+    if (!resolvedPath) {
+      this.state.timelineEntries = [];
+      this.state.timelinePath = null;
+      container.innerHTML =
+        '<p class="muted centered">Select a file to see its history</p>';
+      return;
+    }
+
+    container.innerHTML = '<p class="muted centered">Loading history…</p>';
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const params = new URLSearchParams({ cwd, path: resolvedPath });
+      const res = await fetch(`/api/git/log?${params.toString()}`);
+      const data = await res.json();
+      if (data.error) {
+        container.innerHTML = `<p class="error">${this.escapeHtml(data.error)}</p>`;
+        return;
+      }
+      const entries = window.GitTimeline.buildTimelineEntries(data.commits);
+      this.state.timelineEntries = entries;
+      this.state.timelinePath = resolvedPath;
+      this.renderTimeline(resolvedPath);
+    } catch (err) {
+      console.error("Timeline error:", err);
+      container.innerHTML = '<p class="error">Failed to load history</p>';
+    }
+  }
+
+  renderTimeline(path) {
+    const container = this.panel.querySelector("#git-timeline");
+    if (!container) return;
+    const entries = this.state.timelineEntries || [];
+
+    if (entries.length === 0) {
+      container.innerHTML =
+        '<p class="muted centered">No commit history for this file</p>';
+      return;
+    }
+
+    const rows = entries
+      .map(
+        (e, i) => `
+      <div class="git-timeline-row" data-index="${i}" title="${this.escapeHtml(e.message)}">
+        <span class="git-timeline-hash">${this.escapeHtml(e.shortHash)}</span>
+        <span class="git-timeline-message">${this.escapeHtml(this.truncateMessage(e.message))}</span>
+        <span class="git-timeline-meta">${this.escapeHtml(e.author)} · ${this.escapeHtml(e.relativeDate)}</span>
+      </div>`,
+      )
+      .join("");
+    container.innerHTML = `<div class="git-timeline-path">${this.escapeHtml(path)}</div>${rows}`;
+
+    container.querySelectorAll(".git-timeline-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        container
+          .querySelectorAll(".git-timeline-row")
+          .forEach((r) => r.classList.remove("selected"));
+        el.classList.add("selected");
+        this.showTimelineDiff(parseInt(el.dataset.index, 10));
+      });
+    });
+  }
+
+  async showTimelineDiff(index) {
+    const entries = this.state.timelineEntries || [];
+    const entry = entries[index];
+    const path = this.state.timelinePath || this.state.selectedPath;
+    if (!entry || !path) return;
+
+    const diffEl = this.panel.querySelector("#git-diff");
+    if (diffEl) diffEl.classList.remove("hidden");
+    diffEl.innerHTML = '<p class="muted">Loading…</p>';
+    this.panel.querySelector("#git-diff-title").textContent =
+      `${path} @ ${entry.shortHash}`;
+
+    // prevCommit = next-older revision of THIS file (or undefined at root).
+    const prevEntry = entries[index + 1];
+    const { ref, prevRef } = window.GitTimeline.revPairForCommit(
+      entry,
+      entry.isRoot,
+      prevEntry,
+    );
+
+    try {
+      const [original, modified] = await Promise.all([
+        this.fetchRevisionContent(prevRef, path),
+        this.fetchRevisionContent(ref, path),
+      ]);
+      await this.renderMergeDiff(original, modified, path);
+    } catch (err) {
+      console.error("Timeline diff error:", err);
+      diffEl.innerHTML = '<p class="error">Failed to load revision diff</p>';
+    }
+  }
+
+  // Fetches a file's content at a git ref via /api/git/show. A 404 (path absent
+  // at that ref — additions/deletions/empty-tree side) and any other failure
+  // map to "" so the diff renders as a clean add/delete instead of erroring.
+  async fetchRevisionContent(ref, relPath) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const params = new URLSearchParams({ cwd, commit: ref, path: relPath });
+      const res = await fetch(`/api/git/show?${params.toString()}`);
+      if (!res.ok) return "";
+      const data = await res.json();
+      return typeof data.content === "string" ? data.content : "";
+    } catch (err) {
+      return "";
+    }
   }
 
   async toggleStage(path, isCurrentlyStaged) {

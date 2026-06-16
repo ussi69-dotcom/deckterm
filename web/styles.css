@@ -4565,6 +4565,91 @@ body.virtual-keyboard-open .extra-keys {
   background: rgba(88, 166, 255, 0.12);
 }
 
+/* Diff / Timeline view switch in the right pane header */
+.git-right-views {
+  display: flex;
+  gap: 4px;
+}
+
+.git-right-view {
+  padding: 3px 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.git-right-view.active {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+  background: rgba(88, 166, 255, 0.12);
+}
+
+/* Per-file timeline (commit history list) */
+.git-timeline {
+  overflow-y: auto;
+  flex: 0 0 auto;
+  max-height: 45%;
+  border-bottom: 1px solid var(--border-primary);
+  padding: 4px 0;
+}
+
+.git-timeline.hidden {
+  display: none;
+}
+
+.git-timeline-path {
+  padding: 4px 10px 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono, monospace);
+  border-bottom: 1px solid var(--border-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.git-timeline-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  border-left: 2px solid transparent;
+}
+
+.git-timeline-row:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.05));
+}
+
+.git-timeline-row.selected {
+  background: rgba(88, 166, 255, 0.12);
+  border-left-color: var(--accent-blue);
+}
+
+.git-timeline-hash {
+  font-family: var(--font-mono, monospace);
+  color: var(--accent-blue);
+  flex: 0 0 auto;
+}
+
+.git-timeline-message {
+  flex: 1 1 auto;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.git-timeline-meta {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
 /* diff2html overrides for dark theme */
 .d2h-wrapper {
   background: transparent !important;
