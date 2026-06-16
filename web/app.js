@@ -369,6 +369,13 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-setup",
     desktopTone: "secondary",
   }),
+  settings: Object.freeze({
+    label: "Settings",
+    icon: "settings",
+    action: "settings",
+    toolsId: "tools-sheet-settings",
+    desktopTone: "secondary",
+  }),
   clipboard: Object.freeze({
     label: "Clipboard",
     icon: "clipboard",
@@ -4243,6 +4250,291 @@ class SessionRegistry {
 }
 
 // =============================================================================
+// SETTINGS MANAGER - VS Code-style two-pane settings window
+// =============================================================================
+
+// Renders the settings window content (category sidebar + search + a control
+// per setting + a read-only Server Config section). Reads/writes through the
+// shared settingsStore; live changes flow through the settings runtime so side
+// effects apply even when the window is closed. Pure render helpers live in
+// settings-ui.js; coercion + schema in settings-schema.js.
+class SettingsManager {
+  constructor({ settingsStore, runtime, fetchImpl } = {}) {
+    this.settingsStore = settingsStore || null;
+    this.runtime = runtime || null;
+    this.fetchImpl =
+      fetchImpl ||
+      (typeof fetch === "function" ? fetch.bind(globalThis) : null);
+    this.schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    this.ui = window.SettingsUI || null;
+    this.activeCategory = null;
+    this.query = "";
+    this.envLoaded = false;
+    this.envRows = [];
+    this.root = null;
+  }
+
+  // Build (once) the detached content element the SurfaceWindow will host.
+  buildContent() {
+    if (this.root) return this.root;
+    const root = document.createElement("div");
+    root.className = "settings-panel";
+    root.innerHTML = `
+      <aside class="settings-sidebar" role="tablist" aria-label="Settings categories"></aside>
+      <div class="settings-main">
+        <div class="settings-search">
+          <input type="search" class="settings-search-input"
+            placeholder="Search settings" aria-label="Search settings" />
+        </div>
+        <div class="settings-list" role="region" aria-label="Settings"></div>
+      </div>
+    `;
+    this.sidebarEl = root.querySelector(".settings-sidebar");
+    this.searchInputEl = root.querySelector(".settings-search-input");
+    this.listEl = root.querySelector(".settings-list");
+
+    this.searchInputEl.addEventListener("input", () => {
+      this.query = this.searchInputEl.value || "";
+      this.renderList();
+    });
+    this.sidebarEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-settings-category]");
+      if (!btn) return;
+      this.activeCategory = btn.dataset.settingsCategory;
+      this.query = "";
+      if (this.searchInputEl) this.searchInputEl.value = "";
+      this.renderSidebar();
+      this.renderList();
+    });
+    this.listEl.addEventListener("change", (e) => this.handleControlChange(e));
+
+    this.root = root;
+    return root;
+  }
+
+  renderSidebar() {
+    if (!this.sidebarEl) return;
+    const categories = window.SettingsSchema?.categoriesOf?.(this.schema) || [];
+    if (!this.activeCategory && categories.length) {
+      this.activeCategory = categories[0];
+    }
+    this.sidebarEl.replaceChildren();
+    for (const category of categories) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "settings-category-btn";
+      btn.dataset.settingsCategory = category;
+      btn.setAttribute("role", "tab");
+      const active = !this.query && category === this.activeCategory;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+      btn.textContent = category;
+      this.sidebarEl.appendChild(btn);
+    }
+  }
+
+  // The list shows either the active category (no query) or the search results
+  // across all categories (with a query).
+  renderList() {
+    if (!this.listEl || !this.ui) return;
+    this.listEl.replaceChildren();
+
+    const trimmed = this.query.trim();
+    let groups;
+    if (trimmed) {
+      groups = this.ui.filterSchemaView(this.schema, trimmed);
+    } else {
+      groups = this.ui
+        .groupByCategory(this.schema)
+        .filter((g) => g.category === this.activeCategory);
+    }
+    this.renderSidebar();
+
+    if (!groups.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-empty";
+      empty.textContent = "No settings match your search.";
+      this.listEl.appendChild(empty);
+    }
+
+    for (const group of groups) {
+      if (trimmed) {
+        const heading = document.createElement("h3");
+        heading.className = "settings-group-heading";
+        heading.textContent = group.category;
+        this.listEl.appendChild(heading);
+      }
+      for (const def of group.entries) {
+        const stored = this.settingsStore?.get(def.key, def.default);
+        const descriptor = this.ui.buildControlDescriptor(def, stored);
+        if (descriptor)
+          this.listEl.appendChild(this.renderControlRow(descriptor));
+      }
+    }
+
+    this.listEl.appendChild(this.renderServerConfig());
+  }
+
+  renderControlRow(descriptor) {
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    row.dataset.settingKey = descriptor.key;
+
+    const labelWrap = document.createElement("div");
+    labelWrap.className = "settings-row-label";
+    const label = document.createElement("label");
+    label.className = "settings-row-title";
+    label.textContent = descriptor.label;
+    labelWrap.appendChild(label);
+    if (descriptor.description) {
+      const desc = document.createElement("p");
+      desc.className = "settings-row-desc";
+      desc.textContent = descriptor.description;
+      labelWrap.appendChild(desc);
+    }
+
+    const controlWrap = document.createElement("div");
+    controlWrap.className = "settings-row-control";
+    const control = this.buildControlElement(descriptor);
+    if (control.id) label.setAttribute("for", control.id);
+    controlWrap.appendChild(control);
+
+    row.appendChild(labelWrap);
+    row.appendChild(controlWrap);
+    return row;
+  }
+
+  buildControlElement(descriptor) {
+    const id = `setting-${descriptor.key.replace(/[^a-z0-9]+/gi, "-")}`;
+    let el;
+    switch (descriptor.type) {
+      case "toggle": {
+        el = document.createElement("input");
+        el.type = "checkbox";
+        el.className = "settings-control settings-toggle";
+        el.checked = Boolean(descriptor.value);
+        break;
+      }
+      case "number": {
+        el = document.createElement("input");
+        el.type = "number";
+        el.className = "settings-control settings-number";
+        if (typeof descriptor.min === "number") el.min = String(descriptor.min);
+        if (typeof descriptor.max === "number") el.max = String(descriptor.max);
+        el.value = String(descriptor.value);
+        break;
+      }
+      case "select": {
+        el = document.createElement("select");
+        el.className = "settings-control settings-select";
+        for (const opt of descriptor.options || []) {
+          const option = document.createElement("option");
+          option.value = opt.value;
+          option.textContent = opt.label || opt.value;
+          if (opt.value === descriptor.value) option.selected = true;
+          el.appendChild(option);
+        }
+        break;
+      }
+      case "text":
+      default: {
+        el = document.createElement("input");
+        el.type = "text";
+        el.className = "settings-control settings-text";
+        el.value = descriptor.value == null ? "" : String(descriptor.value);
+        break;
+      }
+    }
+    el.id = id;
+    el.dataset.settingKey = descriptor.key;
+    el.dataset.settingType = descriptor.type;
+    return el;
+  }
+
+  handleControlChange(e) {
+    const el = e.target.closest("[data-setting-key]");
+    if (!el) return;
+    const key = el.dataset.settingKey;
+    const raw = el.type === "checkbox" ? el.checked : el.value;
+    if (this.runtime) {
+      this.runtime.apply(key, raw);
+    } else if (this.settingsStore) {
+      const def = this.schema.find((d) => d.key === key);
+      const value = window.SettingsSchema?.coerceValue?.(def, raw) ?? raw;
+      this.settingsStore.set(key, value);
+    }
+  }
+
+  renderServerConfig() {
+    const section = document.createElement("section");
+    section.className = "settings-server-config";
+    const heading = document.createElement("h3");
+    heading.className = "settings-group-heading";
+    heading.textContent = "Server Config";
+    section.appendChild(heading);
+
+    const note = document.createElement("p");
+    note.className = "settings-server-note";
+    note.textContent = "Read-only server configuration.";
+    section.appendChild(note);
+
+    const table = document.createElement("div");
+    table.className = "settings-env-table";
+    if (!this.envRows.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-empty";
+      empty.textContent = this.envLoaded
+        ? "No server config available."
+        : "Loading server config…";
+      table.appendChild(empty);
+    }
+    for (const row of this.envRows) {
+      const envRow = document.createElement("div");
+      envRow.className = "settings-env-row";
+      const key = document.createElement("code");
+      key.className = "settings-env-key";
+      key.textContent = row.key;
+      const value = document.createElement("span");
+      value.className = "settings-env-value";
+      value.textContent = row.value;
+      const desc = document.createElement("p");
+      desc.className = "settings-env-desc";
+      desc.textContent = row.description || "";
+      envRow.appendChild(key);
+      envRow.appendChild(value);
+      envRow.appendChild(desc);
+      table.appendChild(envRow);
+    }
+    section.appendChild(table);
+    return section;
+  }
+
+  async loadServerConfig() {
+    if (this.envLoaded || !this.fetchImpl) return;
+    try {
+      const res = await this.fetchImpl("/api/settings/env-info");
+      if (res && res.ok) {
+        const body = await res.json();
+        if (Array.isArray(body?.env)) this.envRows = body.env;
+      }
+    } catch {
+      // Non-fatal — the section renders an empty/error state.
+    } finally {
+      this.envLoaded = true;
+    }
+  }
+
+  async render() {
+    this.buildContent();
+    this.renderSidebar();
+    this.renderList();
+    await this.loadServerConfig();
+    // Re-render the server-config section now that rows are loaded.
+    this.renderList();
+  }
+}
+
+// =============================================================================
 // TERMINAL MANAGER - Main orchestrator
 // =============================================================================
 
@@ -4314,6 +4606,8 @@ class TerminalManager {
       ? this.settingsStore.load().catch(() => ({}))
       : Promise.resolve({});
     this.surfaceWindowManager = null;
+    this.settingsRuntime = null;
+    this.settingsManager = null;
     this.clipboardManager = new ClipboardManager();
     this.commandPaletteRegistry = null;
     this.commandPalette = null;
@@ -4340,6 +4634,7 @@ class TerminalManager {
 
     this.initTaskSignalBadge();
     this.initSessionsDock();
+    this.initSettingsRuntime();
 
     // Button handlers
     document
@@ -5175,6 +5470,11 @@ class TerminalManager {
         button.classList.toggle("active", tasksOpen);
       } else if (actionId === "setup") {
         button.classList.toggle("active", setupOpen);
+      } else if (actionId === "settings") {
+        button.classList.toggle(
+          "active",
+          Boolean(this.surfaceWindowManager?.isOpen?.("settings")),
+        );
       } else if (actionId === "more") {
         button.classList.toggle("active", moreOpen);
       } else if (actionId === "palette") {
@@ -5191,6 +5491,7 @@ class TerminalManager {
     else if (action === "git") await this.openGitPanel();
     else if (action === "tasks") await this.openTaskPanel();
     else if (action === "setup") await this.openSetupPanel();
+    else if (action === "settings") await this.openSettings();
     else if (action === "toggle-tools-sheet") this.toggleToolsSheet();
     else if (action === "open-dir-picker") this.openDirPicker();
     else if (action === "clipboard") this.clipboardManager.togglePanel();
@@ -5541,6 +5842,63 @@ class TerminalManager {
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
     this.surfaceWindowManager?.close("tasks");
+    this.syncSurfaceButtonState();
+  }
+
+  // --- Settings runtime + window ---------------------------------------------
+
+  // Construct the app-level settings runtime and apply every setting once on
+  // startup, so side effects (CSS vars, etc.) take hold even if the settings
+  // window is never opened. Real consumers are registered in Task 3; here we
+  // wire appearance.accent as a demo CSS-var side effect.
+  initSettingsRuntime() {
+    if (!window.SettingsRuntime?.createSettingsRuntime || !this.settingsStore) {
+      return;
+    }
+    this.settingsRuntime = window.SettingsRuntime.createSettingsRuntime({
+      store: this.settingsStore,
+      schema: window.SettingsSchema?.SETTINGS_SCHEMA || [],
+      sideEffects: {
+        "appearance.accent": (value) => this.applyAccentColor(value),
+      },
+    });
+    // Settings load is async; apply once it resolves so the store is populated.
+    void this.settingsReady.then(() => this.settingsRuntime?.applyAll());
+  }
+
+  applyAccentColor(name) {
+    const map = {
+      blue: "var(--accent-blue)",
+      green: "var(--accent-green)",
+      purple: "#a371f7",
+      orange: "var(--accent-orange)",
+      pink: "#f778ba",
+    };
+    const color = map[name] || map.blue;
+    document.documentElement.style.setProperty("--color-accent", color);
+  }
+
+  async openSettings() {
+    this.closeToolsSheet();
+    if (!this.settingsManager) {
+      this.settingsManager = new SettingsManager({
+        settingsStore: this.settingsStore,
+        runtime: this.settingsRuntime,
+      });
+    }
+    const content = this.settingsManager.buildContent();
+    if (this.isWindowedSurfaces()) {
+      await this.openSurfaceWindow("settings", {
+        title: "Settings",
+        icon: "⚙",
+        contentEl: content,
+        bounds: { x: 16, y: 8, width: 68, height: 82 },
+        minWidthPx: 520,
+        minHeightPx: 360,
+        onClose: () => this.surfaceWindowManager?.close("settings"),
+      });
+    }
+    await this.settingsManager.render();
     this.syncSurfaceButtonState();
   }
 
@@ -7158,6 +7516,14 @@ class TerminalManager {
         keywords: ["paste", "copy", "history"],
         priority: 30,
         run: () => this.clipboardManager.togglePanel(),
+      },
+      {
+        id: "open-settings",
+        title: "Open Settings",
+        group: "Actions",
+        keywords: ["settings", "preferences", "config", "options"],
+        priority: 35,
+        run: () => this.openSettings(),
       },
       {
         id: "search-terminal",

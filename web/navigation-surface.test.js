@@ -559,8 +559,9 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(11);
+  expect(overflow).toHaveLength(12);
   expect(overflow).toContain("setup");
+  expect(overflow).toContain("settings");
   expect(overflow).toContain("dock-sessions");
   expect(overflow).toContain("tasks");
   expect(overflow).toContain("clipboard");
