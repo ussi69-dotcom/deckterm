@@ -3332,6 +3332,114 @@ export function createWebApp() {
     return c.json({ settings: getUserSettings(state.db, actor.id) });
   });
 
+  // Does the resolved actor already hold a filesystem capability (i.e. is
+  // allowed to browse the registered roots)? Read-only: never writes an audit
+  // row (this is consulted on every settings-window open, and a deny here is
+  // an expected, benign state — not a host-access attempt). Mirrors the
+  // allow conditions of requireFoundationCapability("root.use", …) without the
+  // deny side effects.
+  async function actorHoldsFilesystemCapability(c: any): Promise<boolean> {
+    if (isFoundationLegacyBypassEnabled()) return true;
+    if (isEdgeProtectedTunnelMode(process.env)) return true;
+    const state = await getFoundationState();
+    if (!isBootstrapComplete(state)) return false;
+    const { ownerId } = getCurrentUser(c);
+    // Match the same shape requireFileAccess would check: root.use on any
+    // registered root (admins hold the "*"/"*" wildcard; per-root grants are
+    // matched by their rootId). hasScopedGrant treats "*" as a wildcard on
+    // both sides, so checking the first root's id also catches wildcard grants.
+    const firstRootId = state.roots[0]?.id;
+    return hasScopedGrant(state.db, {
+      userId: ownerId,
+      capability: "root.use",
+      resourceType: "root",
+      resourceId: firstRootId || "*",
+    });
+  }
+
+  // GET /api/settings/env-info — read-only, non-secret server config.
+  //
+  // Returns a HARDCODED allowlist of {key, value, description} rows. It NEVER
+  // echoes arbitrary process.env, and never includes secret-shaped vars
+  // (CF_ACCESS_*, *_TOKEN, *_SECRET, *_KEY). Path-valued config is COARSENED by
+  // default (label + count) because raw host paths reveal topology, usernames,
+  // and confinement boundaries — exact paths are revealed only to an actor that
+  // already holds the filesystem capability (the same gate that lets them
+  // browse those roots). Same actor gate as GET/PUT /api/settings; deliberately
+  // NOT behind requireFileAccess so any authenticated actor can read the
+  // non-path basics.
+  app.get("/api/settings/env-info", async (c) => {
+    // Resolve the actor (throws -> 401 for unauthenticated) just like
+    // GET/PUT /api/settings.
+    getCurrentActor(c);
+
+    const env: Array<{ key: string; value: string; description: string }> = [];
+
+    // --- Default (non-path) rows: shown to any authenticated actor. ---
+    env.push({
+      key: "PORT",
+      value: String(process.env.PORT || "4174"),
+      description: "HTTP port the server listens on.",
+    });
+    env.push({
+      key: "DECKTERM_RUNTIME_ENV",
+      value: String(
+        process.env.DECKTERM_RUNTIME_ENV ||
+          process.env.NODE_ENV ||
+          "production",
+      ),
+      description: "Runtime environment (development or production).",
+    });
+    env.push({
+      key: "TMUX_BACKEND",
+      value: getBackendMode() === "tmux" ? "enabled" : "disabled",
+      description:
+        "Terminal backend: tmux (persists across reconnects) or raw PTY.",
+    });
+    env.push({
+      key: "MAX_TERMINALS_PER_USER",
+      value: String(MAX_TERMINALS_PER_USER),
+      description: "Maximum concurrent terminals allowed per user.",
+    });
+    env.push({
+      key: "DECKTERM_PUBLISH_MODE",
+      value: String(process.env.DECKTERM_PUBLISH_MODE || "default"),
+      description: "How the server is published (e.g. cloudflare-tunnel).",
+    });
+
+    // --- Path-valued rows: coarsened by default, exact only with capability. ---
+    const canSeePaths = await actorHoldsFilesystemCapability(c);
+    const rootCount = ALLOWED_FILESYSTEM_ROOTS.length;
+
+    if (canSeePaths) {
+      env.push({
+        key: "ALLOWED_FILE_ROOTS",
+        value: ALLOWED_FILESYSTEM_ROOTS.join(", "),
+        description:
+          "Filesystem roots terminals and file/git access are scoped to.",
+      });
+      env.push({
+        key: "DECKTERM_STATE_DIR",
+        value: DECKTERM_STATE_DIR,
+        description: "Directory holding foundation state, sockets, and DB.",
+      });
+    } else {
+      env.push({
+        key: "ALLOWED_FILE_ROOTS",
+        value: `${rootCount} allowed root${rootCount === 1 ? "" : "s"} configured`,
+        description:
+          "Number of filesystem roots access is scoped to (exact paths hidden).",
+      });
+      env.push({
+        key: "DECKTERM_STATE_DIR",
+        value: "configured",
+        description: "Server state directory (exact path hidden).",
+      });
+    }
+
+    return c.json({ env });
+  });
+
   // GET /api/git/status?cwd=/path/to/repo
   app.get("/api/git/status", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
