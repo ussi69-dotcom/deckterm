@@ -600,14 +600,40 @@ class IdeShellController {
     }
 
     // Don't (re)mount view bodies while the sidebar is collapsed — they're not
-    // visible and CodeMirror/measure would mis-size. Re-opening re-mounts.
-    if (collapsed) return;
+    // visible and CodeMirror/measure would mis-size. Re-opening re-mounts. The
+    // previously-mounted secondary view (e.g. SCM) must be UNMOUNTED here so its
+    // status-store subscription doesn't stay live + re-render while hidden.
+    if (collapsed) {
+      this.unmountSecondaryView();
+      return;
+    }
 
     if (explorerActive) {
+      // Switching to the Explorer: unmount any mounted secondary view first so
+      // its subscription tears down (otherwise the hidden SCM view keeps
+      // re-rendering on every status change). Re-opening it re-mounts from state.
+      this.unmountSecondaryView();
       // Explorer is hosted via its own reparent path (sidebar or detached).
       this.mountExplorerForHost();
     } else {
       this.mountSecondaryView(activeId);
+    }
+  }
+
+  // Unmount whichever non-explorer view is mounted into the secondary body slot
+  // (if any) and clear the tracker. Idempotent (no-op when nothing is mounted).
+  // Tears down the view's subscriptions via its unmount() — used when switching
+  // to the Explorer and when collapsing the sidebar.
+  unmountSecondaryView() {
+    if (!this.mountedSecondaryViewId) return;
+    const prev = this.viewById.get(this.mountedSecondaryViewId);
+    this.mountedSecondaryViewId = null;
+    if (prev && typeof prev.unmount === "function") {
+      try {
+        prev.unmount();
+      } catch {
+        // best-effort
+      }
     }
   }
 
@@ -628,16 +654,7 @@ class IdeShellController {
       return;
     }
     // Unmount the previous secondary view (its model persists in its own store).
-    if (this.mountedSecondaryViewId) {
-      const prev = this.viewById.get(this.mountedSecondaryViewId);
-      if (prev && typeof prev.unmount === "function") {
-        try {
-          prev.unmount();
-        } catch {
-          // best-effort
-        }
-      }
-    }
+    this.unmountSecondaryView();
     if (typeof view.mount === "function") view.mount(this.secondaryBodyEl);
     this.mountedSecondaryViewId = viewId;
     if (typeof view.resize === "function") {

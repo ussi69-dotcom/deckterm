@@ -761,3 +761,81 @@ test("controller restores explorer state losslessly via the app hook on exit", (
     surfaceWindow: "files",
   });
 });
+
+// ── (6) Secondary view is UNMOUNTED on switch-to-Explorer + on collapse ───────
+// (slice-5 review Fix 1): a secondary sidebar view (e.g. SCM) must have its
+// unmount() called — tearing down its status-store subscription — when the
+// active view switches BACK to the Explorer or when the sidebar collapses,
+// otherwise it keeps a live onChange subscription + re-renders while hidden.
+
+// A spy secondary ViewHost (SCM stand-in): records mount/unmount/resize.
+function makeFakeSecondaryView(id) {
+  const calls = { mount: 0, unmount: 0, resize: 0 };
+  return {
+    id,
+    icon: "git-branch",
+    title: "Source Control",
+    calls,
+    mount() {
+      calls.mount += 1;
+    },
+    unmount() {
+      calls.unmount += 1;
+    },
+    resize() {
+      calls.resize += 1;
+    },
+  };
+}
+
+test("secondary view unmounts when switching back to the Explorer", () => {
+  const h = makeController();
+  const scm = makeFakeSecondaryView(VIEW_SCM);
+  h.controller.addView(scm);
+  h.controller.applyMode(); // enter IDE (Explorer active by default)
+
+  // Switch to the SCM view → it mounts.
+  h.controller.onActivityClick(VIEW_SCM);
+  expect(h.controller.activeView()).toBe(VIEW_SCM);
+  expect(scm.calls.mount).toBe(1);
+  expect(scm.calls.unmount).toBe(0);
+  expect(h.controller.mountedSecondaryViewId).toBe(VIEW_SCM);
+
+  // Switch back to the Explorer → the SCM view must be unmounted (subscription
+  // torn down) and the secondary slot tracker cleared.
+  h.controller.onActivityClick(VIEW_EXPLORER);
+  expect(h.controller.activeView()).toBe(VIEW_EXPLORER);
+  expect(scm.calls.unmount).toBe(1);
+  expect(h.controller.mountedSecondaryViewId).toBe(null);
+});
+
+test("secondary view unmounts when the sidebar collapses", () => {
+  const h = makeController();
+  const scm = makeFakeSecondaryView(VIEW_SCM);
+  h.controller.addView(scm);
+  h.controller.applyMode();
+
+  // Activate SCM (mounts), then click its icon again → collapse the sidebar.
+  h.controller.onActivityClick(VIEW_SCM);
+  expect(scm.calls.mount).toBe(1);
+  expect(h.controller.isSidebarCollapsed()).toBe(false);
+
+  h.controller.onActivityClick(VIEW_SCM); // active icon + open → collapse
+  expect(h.controller.isSidebarCollapsed()).toBe(true);
+  // Collapsing must unmount the (now-hidden) SCM view, not leave it subscribed.
+  expect(scm.calls.unmount).toBe(1);
+  expect(h.controller.mountedSecondaryViewId).toBe(null);
+
+  // Re-opening (click again) re-mounts it from state.
+  h.controller.onActivityClick(VIEW_SCM);
+  expect(h.controller.isSidebarCollapsed()).toBe(false);
+  expect(scm.calls.mount).toBe(2);
+});
+
+test("unmountSecondaryView is idempotent + a no-op when nothing is mounted", () => {
+  const h = makeController();
+  h.controller.applyMode(); // Explorer active, no secondary view mounted
+  // No secondary view mounted → no throw, tracker stays null.
+  h.controller.unmountSecondaryView();
+  expect(h.controller.mountedSecondaryViewId).toBe(null);
+});

@@ -148,7 +148,11 @@ class GitScmViewController {
     this.root = root;
     this.bindEvents();
 
-    // Subscribe to the shared status store so an external mutation refreshes us.
+    // Subscribe to the shared status store so an EXTERNAL mutation refreshes us.
+    // render() dedupes by a content signature, so a self-induced onChange from
+    // this view's own refresh() (identical state) is a no-op rebuild, while a
+    // genuine external change rebuilds us — without a fragile timing guard.
+    this._renderSig = null;
     const store = this.statusStore;
     if (store && typeof store.onChange === "function") {
       this._unsubscribe = store.onChange(() => this.render());
@@ -207,6 +211,13 @@ class GitScmViewController {
     } catch {
       // refresh failures are surfaced in-panel; never throw into the view.
     }
+    // Render once after the state is fresh. gm.refresh() also fires a
+    // fire-and-forget force-refresh of the shared status store that later EMITS
+    // onChange → our subscription's render(); render() DEDUPES by a content
+    // signature, so those self-induced onChange renders that rebuild identical
+    // state are skipped. Net: a manual refresh produces exactly one DOM rebuild
+    // (the review-flagged double render is gone), while a genuine external
+    // change — a different signature — still rebuilds us.
     this.render();
   }
 
@@ -274,6 +285,17 @@ class GitScmViewController {
       untracked: [],
     };
 
+    // Dedupe: skip the DOM rebuild when nothing the SCM view shows has changed.
+    // A manual refresh triggers BOTH an explicit render() and (later, async) a
+    // self-induced store onChange → render() of identical state; this guard makes
+    // the redundant rebuild a no-op (the review-flagged double render) while a
+    // genuine change — different signature — still rebuilds. The signature spans
+    // everything render() paints: branch/sync, grouped file path+status, branch
+    // list, stash list, and the UI-local section-collapse flags.
+    const sig = this.renderSignature(gm, groups, scm);
+    if (sig !== null && sig === this._renderSig) return;
+    this._renderSig = sig;
+
     // Branch + sync header.
     const branchEl = this.q(".ide-scm-branch");
     if (branchEl) branchEl.textContent = gm.state?.branches?.current || "";
@@ -292,6 +314,37 @@ class GitScmViewController {
     this.renderTree(groups, scm);
     this.renderBranches(gm);
     this.renderStashes(gm);
+  }
+
+  // A cheap content signature over EVERYTHING render() paints, so identical
+  // re-renders (e.g. a self-induced store onChange after a manual refresh) can be
+  // skipped. Returns null when state is too sparse to fingerprint safely (then
+  // render() never dedupes). Includes the UI-local section-collapse flags so a
+  // collapse/expand still rebuilds.
+  renderSignature(gm, groups, scm) {
+    try {
+      const fileSig = (arr) =>
+        (Array.isArray(arr) ? arr : [])
+          .map((f) => `${f.path}:${scm.statusLetter(f)}`)
+          .join(",");
+      const sync = gm.state?.sync || {};
+      const branches = gm.state?.branches || {};
+      const stashes = gm.state?.stashes || [];
+      return JSON.stringify({
+        branch: branches.current || "",
+        ahead: sync.ahead || 0,
+        behind: sync.behind || 0,
+        staged: fileSig(groups.staged),
+        changes: fileSig(groups.changes),
+        untracked: fileSig(groups.untracked),
+        branchList: Array.isArray(branches.list) ? branches.list : [],
+        stashes: stashes.map((s) => `${s.index}:${s.message}`),
+        collBranches: !!this.collapsed.branches,
+        collStashes: !!this.collapsed.stashes,
+      });
+    } catch {
+      return null;
+    }
   }
 
   renderTree(groups, scm) {
@@ -589,20 +642,31 @@ class GitScmViewController {
       if (statusEl) statusEl.textContent = "Commit message required";
       return;
     }
-    // Drive the GitManager's commit by mirroring our box into its hidden panel
-    // controls (its commit() reads #git-message / #git-amend), then run it.
-    const panelMsg = gm.panel?.querySelector("#git-message");
-    const panelAmend = gm.panel?.querySelector("#git-amend");
-    if (panelMsg) panelMsg.value = message;
-    if (panelAmend) panelAmend.checked = Boolean(amendEl?.checked);
-    void gm.commit?.().then(() => {
-      // GitManager clears its own box on success; mirror back + refresh ours.
-      if (msgEl && !(panelMsg?.value || "")) msgEl.value = "";
-      if (amendEl) amendEl.checked = false;
-      const ps = gm.panel?.querySelector("#git-commit-status");
-      if (statusEl && ps) statusEl.textContent = ps.textContent || "";
-      this.render();
-    });
+    if (typeof gm.commitWith !== "function") {
+      if (statusEl) statusEl.textContent = "Commit unavailable";
+      return;
+    }
+    // Drive the commit directly through the parameterized op — no hidden-DOM
+    // mirroring. The op POSTs /api/git/commit + refreshes; we reflect the
+    // outcome in OUR controls (clear the box on success, surface the error).
+    const amend = Boolean(amendEl?.checked);
+    void gm
+      .commitWith({ message, amend })
+      .then((result) => {
+        if (result?.ok) {
+          if (msgEl) msgEl.value = "";
+          if (amendEl) amendEl.checked = false;
+          if (statusEl) statusEl.textContent = amend ? "Amended" : "Committed";
+        } else if (statusEl) {
+          statusEl.textContent = result?.error || "Commit failed";
+        }
+        this.render();
+      })
+      .catch((err) => {
+        if (statusEl)
+          statusEl.textContent =
+            err instanceof Error ? err.message : "Commit failed";
+      });
   }
 }
 

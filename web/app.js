@@ -4111,21 +4111,41 @@ class GitManager {
     }
   }
 
+  // Legacy panel commit: reads the hidden #git-message / #git-amend controls,
+  // then delegates to the parameterized commitWith() op. The IDE SCM view calls
+  // commitWith() directly (no hidden-DOM mirroring).
   async commit() {
     const message = this.panel.querySelector("#git-message").value.trim();
-    if (!message) {
+    const amendEl = this.panel.querySelector("#git-amend");
+    const amend = !!amendEl?.checked;
+    const result = await this.commitWith({ message, amend });
+    // On success the legacy panel clears its own controls (commitWith doesn't
+    // touch DOM, so the caller owns its inputs).
+    if (result?.ok) {
+      this.panel.querySelector("#git-message").value = "";
+      if (amendEl) amendEl.checked = false;
+    }
+    return result;
+  }
+
+  // Parameterized commit op (DOM-free): POST /api/git/commit with an explicit
+  // message + amend flag, surface status, refresh on success. Returns
+  // { ok: true } | { ok: false, error } so any caller (legacy panel OR the IDE
+  // SCM view) can reflect the outcome in its own UI without reading DOM nodes.
+  async commitWith({ message, amend } = {}) {
+    const trimmed = (message || "").trim();
+    if (!trimmed) {
       this.showCommitStatus("Commit message required", "error");
-      return;
+      return { ok: false, error: "Commit message required" };
     }
 
     const cwd = this.state.cwd || this.currentCwd;
-    const amendEl = this.panel.querySelector("#git-amend");
-    const amend = !!amendEl?.checked;
+    const doAmend = Boolean(amend);
     try {
       const res = await fetch("/api/git/commit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, message, amend }),
+        body: JSON.stringify({ cwd, message: trimmed, amend: doAmend }),
       });
 
       const data = await res.json();
@@ -4136,17 +4156,18 @@ class GitManager {
           typeof formatGitError === "function"
             ? formatGitError
             : (p) => (p && p.error) || "Commit failed";
-        this.showCommitStatus(formatGit(data, "Commit failed"), "error");
-        return;
+        const msg = formatGit(data, "Commit failed");
+        this.showCommitStatus(msg, "error");
+        return { ok: false, error: msg };
       }
 
-      this.panel.querySelector("#git-message").value = "";
-      if (amendEl) amendEl.checked = false;
-      this.showCommitStatus(amend ? "Amended" : "Committed", "success");
+      this.showCommitStatus(doAmend ? "Amended" : "Committed", "success");
       await this.refresh();
+      return { ok: true };
     } catch (err) {
       console.error("Commit error:", err);
       this.showCommitStatus("Commit failed: network error", "error");
+      return { ok: false, error: "Commit failed: network error" };
     }
   }
 
