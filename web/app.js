@@ -4223,9 +4223,9 @@ class GitManager {
     const html = this.state.commits
       .map(
         (commit) => `
-      <div class="git-commit-item" data-hash="${commit.hash}" title="${this.escapeHtml(commit.message)}">
+      <div class="git-commit-item" data-hash="${this.escapeHtml(commit.hash)}" title="${this.escapeHtml(commit.message)}">
         <span class="git-commit-graph">${this.escapeHtml(commit.graph)}</span>
-        <span class="git-commit-hash">${commit.hash}</span>
+        <span class="git-commit-hash">${this.escapeHtml(commit.hash)}</span>
         <span class="git-commit-message">${this.escapeHtml(this.truncateMessage(commit.message))}</span>
         <span class="git-commit-date">${this.formatDate(commit.date)}</span>
       </div>
