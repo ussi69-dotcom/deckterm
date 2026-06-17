@@ -21,6 +21,7 @@ import {
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
+  IdeShellController,
 } from "./ide-shell";
 
 // ── normalizeLayoutMode ──────────────────────────────────────────────────────
@@ -307,4 +308,358 @@ test("resolveExplorerHost routes the single element to home/sidebar/detached", (
   expect(resolveExplorerHost("ide", true)).toBe(EXPLORER_HOST_DETACHED);
   // Junk mode normalizes to terminal → home.
   expect(resolveExplorerHost("garbage", true)).toBe("home");
+});
+
+// ── Slice 3 follow-up: IdeShellController imperative pop-out/dock reparent ────
+//
+// The pure helpers above are exhaustively covered. These tests instead drive the
+// CONTROLLER's imperative reparent dispatch (mount/unmount, detach/dock hooks,
+// element reparenting), the part the slice-3 fix commit (b477749) hardened that
+// had zero automated coverage. We keep it DOM-free: hand-rolled fake elements +
+// a fake document, in the same spirit as the rest of the codebase's web tests.
+
+// A minimal fake DOM element: enough surface for the controller's reparent path.
+// `appendChild` sets the child's `parentElement` (and removes it from a prior
+// parent's children) so tests can assert WHERE the single #file-explorer lands.
+function makeFakeEl(id = null) {
+  const el = {
+    id,
+    parentElement: null,
+    children: [],
+    hidden: false,
+    _classes: new Set(),
+    _attrs: {},
+    dataset: {},
+    classList: {
+      add(...names) {
+        for (const n of names) el._classes.add(n);
+      },
+      remove(...names) {
+        for (const n of names) el._classes.delete(n);
+      },
+      contains(name) {
+        return el._classes.has(name);
+      },
+      toggle(name, force) {
+        const want = force === undefined ? !el._classes.has(name) : !!force;
+        if (want) el._classes.add(name);
+        else el._classes.delete(name);
+        return want;
+      },
+    },
+    setAttribute(key, value) {
+      el._attrs[key] = String(value);
+    },
+    getAttribute(key) {
+      return Object.prototype.hasOwnProperty.call(el._attrs, key)
+        ? el._attrs[key]
+        : null;
+    },
+    addEventListener() {},
+    removeEventListener() {},
+    appendChild(child) {
+      if (child.parentElement && child.parentElement !== el) {
+        const sibs = child.parentElement.children;
+        const i = sibs.indexOf(child);
+        if (i >= 0) sibs.splice(i, 1);
+      }
+      if (!el.children.includes(child)) el.children.push(child);
+      child.parentElement = el;
+      return child;
+    },
+    insertBefore(node /*, ref */) {
+      return el.appendChild(node);
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
+    get firstChild() {
+      return el.children[0] || null;
+    },
+  };
+  return el;
+}
+
+// A fake document with a fixed registry of elements by id. `createElement`
+// returns fresh fake elements (used for the shell scaffold the controller builds
+// lazily). `getElementById` returns a registered element or null.
+function makeFakeDoc() {
+  const byId = new Map();
+  const register = (id) => {
+    const el = makeFakeEl(id);
+    byId.set(id, el);
+    return el;
+  };
+  // Stable elements the controller reaches for by id.
+  register("workspace-area");
+  register("terminal-container");
+  register("app");
+  register("file-explorer");
+  const body = makeFakeEl("body");
+  const doc = {
+    body,
+    getElementById(id) {
+      return byId.get(id) || null;
+    },
+    createElement() {
+      return makeFakeEl(null);
+    },
+    _byId: byId,
+    _register: register,
+  };
+  return doc;
+}
+
+// A spy FileExplorerController (ViewHost contract). Records mount/unmount/resize
+// call counts + the last mount target so tests can assert the SAME instance is
+// reused (never reconstructed) across enter/toggle/exit.
+function makeFakeView() {
+  const calls = { mount: 0, unmount: 0, resize: 0 };
+  return {
+    calls,
+    lastMountEl: null,
+    mount(el) {
+      calls.mount += 1;
+      this.lastMountEl = el;
+    },
+    unmount() {
+      calls.unmount += 1;
+    },
+    resize() {
+      calls.resize += 1;
+    },
+  };
+}
+
+// Wire a controller with sensible fakes; `overrides` replaces any option.
+function makeController(overrides = {}) {
+  const doc = overrides.document || makeFakeDoc();
+  const store = overrides.settingsStore || makeFakeStore();
+  const view = overrides.view || makeFakeView();
+  // The detached host: a container the detach hook returns + reparents into.
+  const detachedHost =
+    overrides.detachedHost || makeFakeEl("ide-explorer-window");
+  const detachHookCalls = { count: 0 };
+  const dockHookCalls = { count: 0 };
+
+  const options = {
+    document: doc,
+    settingsStore: store,
+    isDesktop: () => true,
+    getExplorerView: () => view,
+    // Default detach hook: return the detached host (success path). Overridable.
+    detachExplorerWindow:
+      overrides.detachExplorerWindow !== undefined
+        ? overrides.detachExplorerWindow
+        : (el) => {
+            detachHookCalls.count += 1;
+            detachHookCalls.lastEl = el;
+            return detachedHost;
+          },
+    dockExplorerWindow:
+      overrides.dockExplorerWindow !== undefined
+        ? overrides.dockExplorerWindow
+        : () => {
+            dockHookCalls.count += 1;
+          },
+    ...overrides.extraOptions,
+  };
+  // Start in IDE mode unless told otherwise.
+  if (overrides.startMode !== "terminal") {
+    store.set(LAYOUT_MODE_KEY, "ide");
+  }
+  const controller = new IdeShellController(options);
+  return {
+    controller,
+    doc,
+    store,
+    view,
+    detachedHost,
+    detachHookCalls,
+    dockHookCalls,
+    explorerEl: () => doc.getElementById("file-explorer"),
+    sidebarBody: () => controller.sidebarBodyEl,
+  };
+}
+
+// ── (1) toggleExplorerDetached happy path ────────────────────────────────────
+
+test("toggleExplorerDetached pops out into the detached host, then docks back", () => {
+  const h = makeController();
+  h.controller.applyMode(); // enter IDE → explorer mounts in the sidebar
+  expect(h.controller.rendered).toBe(true);
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(h.explorerEl().parentElement).toBe(h.sidebarBody());
+
+  // Toggle → detached: flag persisted true, hook called, element in detached host.
+  h.controller.toggleExplorerDetached();
+  expect(h.controller.isExplorerDetached()).toBe(true);
+  expect(h.store.get(LAYOUT_DETACHED_KEY)).toEqual({ explorer: true });
+  expect(h.detachHookCalls.count).toBe(1);
+  expect(h.detachHookCalls.lastEl).toBe(h.explorerEl());
+  expect(h.explorerEl().parentElement).toBe(h.detachedHost);
+
+  // Toggle again → docked: flag cleared, dock hook called, element back in sidebar.
+  h.controller.toggleExplorerDetached();
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  // Persisted map has the explorer key dropped (minimal shape: empty map).
+  expect(normalizeDetachedState(h.store.get(LAYOUT_DETACHED_KEY))).toEqual({});
+  expect(h.dockHookCalls.count).toBe(1);
+  expect(h.explorerEl().parentElement).toBe(h.sidebarBody());
+});
+
+test("toggleExplorerDetached is a no-op outside rendered IDE mode", () => {
+  const h = makeController();
+  // Not entered yet (rendered === false).
+  h.controller.toggleExplorerDetached();
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(h.detachHookCalls.count).toBe(0);
+});
+
+// ── (2) Detach-fallback flag rollback (Codex slice-3 #2) ─────────────────────
+
+test("mountExplorerDetached falls back to sidebar + rolls back flag when no detach hook is wired", () => {
+  // detachExplorerWindow absent → mountExplorerDetached must fall back.
+  const h = makeController({ detachExplorerWindow: null });
+  h.controller.applyMode(); // enter IDE
+  h.controller.toggleExplorerDetached();
+  // Persisted flag rolled back to false; element landed in the sidebar.
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(normalizeDetachedState(h.store.get(LAYOUT_DETACHED_KEY))).toEqual({});
+  expect(h.explorerEl().parentElement).toBe(h.sidebarBody());
+});
+
+test("mountExplorerDetached rolls back when the detach hook returns null", () => {
+  const h = makeController({ detachExplorerWindow: () => null });
+  h.controller.applyMode();
+  h.controller.toggleExplorerDetached();
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(normalizeDetachedState(h.store.get(LAYOUT_DETACHED_KEY))).toEqual({});
+  expect(h.explorerEl().parentElement).toBe(h.sidebarBody());
+});
+
+test("mountExplorerDetached rolls back when the detach hook throws", () => {
+  const h = makeController({
+    detachExplorerWindow: () => {
+      throw new Error("window failed to open");
+    },
+  });
+  h.controller.applyMode();
+  h.controller.toggleExplorerDetached();
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(normalizeDetachedState(h.store.get(LAYOUT_DETACHED_KEY))).toEqual({});
+  expect(h.explorerEl().parentElement).toBe(h.sidebarBody());
+});
+
+// ── (3) Dock-back element survival + dock hook (no onClose loop) ──────────────
+
+test("docking back closes via the dock hook and reparents the SAME element home", () => {
+  // Enter IDE detached from the start (persisted flag set before render).
+  const h = makeController();
+  h.store.set(LAYOUT_DETACHED_KEY, { explorer: true });
+  h.controller.applyMode();
+  // Entered straight into the detached host.
+  expect(h.controller.isExplorerDetached()).toBe(true);
+  expect(h.explorerEl().parentElement).toBe(h.detachedHost);
+  const elBefore = h.explorerEl();
+
+  // Dock back: dock hook fires exactly once (maps to manager.close = hide-only),
+  // and the single element survives — reparented into the sidebar, not lost.
+  h.controller.toggleExplorerDetached();
+  expect(h.dockHookCalls.count).toBe(1);
+  expect(h.explorerEl()).toBe(elBefore); // same node (not recreated/lost)
+  expect(elBefore.parentElement).toBe(h.sidebarBody());
+  expect(h.detachedHost.children.includes(elBefore)).toBe(false);
+});
+
+test("dockExplorer (activity-bar click) docks only when detached, else no-op", () => {
+  const h = makeController();
+  h.store.set(LAYOUT_DETACHED_KEY, { explorer: true });
+  h.controller.applyMode();
+  expect(h.controller.isExplorerDetached()).toBe(true);
+
+  h.controller.dockExplorer();
+  expect(h.controller.isExplorerDetached()).toBe(false);
+  expect(h.dockHookCalls.count).toBe(1);
+
+  // Already docked → no-op (no extra dock-hook fire).
+  h.controller.dockExplorer();
+  expect(h.dockHookCalls.count).toBe(1);
+});
+
+// ── (4) resolveExplorerHost across mode × detached via the controller ────────
+// (the pure resolver itself is covered above; here we exercise the controller's
+//  live host resolution wiring through renderedMode + isExplorerDetached.)
+
+test("controller.explorerHost reflects mode × detached × viewport", () => {
+  const desktop = makeController();
+  // Terminal mode → home regardless of detached flag.
+  desktop.store.set(LAYOUT_MODE_KEY, "terminal");
+  desktop.store.set(LAYOUT_DETACHED_KEY, { explorer: true });
+  expect(desktop.controller.explorerHost()).toBe("home");
+
+  // IDE + docked → sidebar.
+  desktop.store.set(LAYOUT_MODE_KEY, "ide");
+  desktop.store.set(LAYOUT_DETACHED_KEY, {});
+  expect(desktop.controller.explorerHost()).toBe(EXPLORER_HOST_SIDEBAR);
+
+  // IDE + detached → detached.
+  desktop.store.set(LAYOUT_DETACHED_KEY, { explorer: true });
+  expect(desktop.controller.explorerHost()).toBe(EXPLORER_HOST_DETACHED);
+
+  // Non-desktop viewport forces terminal → home even with IDE stored + detached.
+  const mobile = makeController({ extraOptions: { isDesktop: () => false } });
+  mobile.store.set(LAYOUT_MODE_KEY, "ide");
+  mobile.store.set(LAYOUT_DETACHED_KEY, { explorer: true });
+  expect(mobile.controller.explorerHost()).toBe("home");
+});
+
+// ── (5) Controller REUSES the injected view (never reconstructs it) ──────────
+
+test("controller reuses the same explorer view instance across enter/toggle/exit", () => {
+  const view = makeFakeView();
+  const h = makeController({ view });
+  // The getter always returns the same injected instance.
+  expect(h.controller.explorerView).toBe(view);
+
+  h.controller.applyMode(); // enter → rebind (unmount+mount+resize)
+  const afterEnter = { ...view.calls };
+  expect(afterEnter.mount).toBeGreaterThanOrEqual(1);
+  expect(h.controller.explorerView).toBe(view);
+
+  h.controller.toggleExplorerDetached(); // pop out → rebind on same view
+  expect(view.calls.mount).toBeGreaterThan(afterEnter.mount);
+  expect(view.calls.unmount).toBeGreaterThan(afterEnter.unmount);
+  expect(h.controller.explorerView).toBe(view);
+
+  h.controller.toggleExplorerDetached(); // dock back → rebind on same view
+  h.controller.exitIde(); // exit → unmount/mount once more (fallback restore)
+  expect(h.controller.explorerView).toBe(view);
+  // Mount target was always the single #file-explorer element.
+  expect(view.lastMountEl).toBe(h.explorerEl());
+});
+
+test("controller restores explorer state losslessly via the app hook on exit", () => {
+  const restored = [];
+  const h = makeController({
+    extraOptions: {
+      readExplorerState: () => ({
+        parentId: "app",
+        isOpen: true,
+        surfaceWindow: "files",
+      }),
+      restoreExplorerState: (descriptor) => restored.push(descriptor),
+    },
+  });
+  h.controller.applyMode(); // enter (captures prior state)
+  h.controller.exitIde(); // exit → app hook restores the captured descriptor
+  expect(restored).toHaveLength(1);
+  expect(restored[0]).toEqual({
+    parentId: "app",
+    isOpen: true,
+    surfaceWindow: "files",
+  });
 });
