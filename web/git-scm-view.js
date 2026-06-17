@@ -24,6 +24,33 @@
 
 // ── git-scm.js bridge (browser globals OR CommonJS under bun) ─────────────────
 
+// Resolve the shared HTML escaper (browser global OR CommonJS under bun). The
+// single security primitive for escaping user-controlled text into innerHTML —
+// including ATTRIBUTE contexts (it escapes " and ' too, unlike the old
+// textContent round-trip). Falls back to an inline copy of the same algorithm
+// if the module can't be resolved, so the view never degrades to an unsafe
+// escape. Sites it protects here include data-path, title=…, data-branch, and
+// the user-supplied stash message.
+function resolveEscapeHtml() {
+  if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+    return window.HtmlEscape.escapeHtml;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./html-escape").escapeHtml;
+    } catch {
+      // fall through to the inline copy
+    }
+  }
+  return (text) =>
+    String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+}
+
 function getScm() {
   if (
     typeof statusLetter === "function" &&
@@ -266,10 +293,10 @@ class GitScmViewController {
     return this.root ? this.root.querySelector(sel) : null;
   }
 
+  // Delegate to the shared HTML escaper (escapes & < > " ' — safe for the
+  // attribute interpolation sites: data-path, title=…, data-branch, stash msg).
   esc(text) {
-    const div = this.doc.createElement("div");
-    div.textContent = text == null ? "" : String(text);
-    return div.innerHTML;
+    return resolveEscapeHtml()(text);
   }
 
   render() {

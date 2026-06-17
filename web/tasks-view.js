@@ -24,6 +24,31 @@
 
 // ── task-board.js bridge (browser globals OR CommonJS under bun) ─────────────
 
+// Resolve the shared HTML escaper (browser global OR CommonJS under bun). This
+// is the single security primitive for escaping user-controlled text into
+// innerHTML — including ATTRIBUTE contexts (it escapes " and ' too). Falls back
+// to an inline copy of the same algorithm if the module can't be resolved, so
+// the view never silently degrades to an unsafe escape.
+function resolveEscapeHtml() {
+  if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+    return window.HtmlEscape.escapeHtml;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./html-escape").escapeHtml;
+    } catch {
+      // fall through to the inline copy
+    }
+  }
+  return (text) =>
+    String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+}
+
 function getBoard() {
   if (typeof groupTasksForBoard === "function") {
     return { groupTasksForBoard };
@@ -58,17 +83,57 @@ function tasksTotalCount(tasks) {
   return Array.isArray(tasks) ? tasks.length : 0;
 }
 
+// The set of task statuses that are safe to use verbatim as the trailing token
+// of a `ide-tasks-badge-<token>` CSS class. Mirrors task-board.js's column
+// status truth (draft/ready/paused/worker-running/checks-running/judge-running/
+// needs-judge/needs-user/complete/failed). Anything else (a space, odd chars, a
+// future/unknown status) maps to "unknown" so a raw user-controlled status can
+// never inject a surprising class token — even though esc() also quote-escapes,
+// the class token gets an explicit allow-list, not just escaping.
+const TASKS_BADGE_STATUS_TOKENS = new Set([
+  "draft",
+  "ready",
+  "paused",
+  "worker-running",
+  "checks-running",
+  "judge-running",
+  "needs-judge",
+  "needs-user",
+  "complete",
+  "failed",
+]);
+
+// Map a task status to a safe CSS class token via the allow-list above. Pure.
+function tasksBadgeStatusClass(status) {
+  return TASKS_BADGE_STATUS_TOKENS.has(status) ? status : "unknown";
+}
+
 // A cheap content signature over EVERYTHING the Tasks view paints, so identical
 // re-renders (e.g. a self-induced poll that returns the same tasks) can be
 // skipped — mirrors git-scm-view's renderSignature dedupe. Spans each task's
-// id+status+title, the selected id, the view mode (list|board), and the
+// id+status+title+workingDirectory+projectRoot+workerProvider+checks (every
+// rendered field), the selected id, the view mode (list|board), and the
 // loading/status flags. Returns null when the input is too sparse to fingerprint
 // (then render() never dedupes). Pure.
 function tasksRenderSignature({ tasks, selectedId, viewMode, status } = {}) {
   try {
     const list = Array.isArray(tasks) ? tasks : [];
+    // Project EVERY field the list/board/detail render paths paint, not just
+    // id/status/title — otherwise a change to e.g. workingDirectory, projectRoot,
+    // workerProvider, or a check's label/command (all rendered) with an unchanged
+    // id/status/title would dedupe to the same signature → stale sidebar.
     return JSON.stringify({
-      tasks: list.map((t) => `${t.id}:${t.status || ""}:${t.title || ""}`),
+      tasks: list.map((t) => ({
+        id: t.id,
+        status: t.status || "",
+        title: t.title || "",
+        workingDirectory: t.workingDirectory || "",
+        projectRoot: t.projectRoot || "",
+        workerProvider: t.workerProvider || "",
+        checks: Array.isArray(t.checks)
+          ? t.checks.map((c) => `${c.label || ""}:${c.command || ""}`)
+          : [],
+      })),
       selected: selectedId || "",
       view: viewMode === "board" ? "board" : "list",
       status: status || "",
@@ -211,10 +276,10 @@ class TasksViewController {
     return this.root ? this.root.querySelector(sel) : null;
   }
 
+  // Delegate to the shared HTML escaper (escapes & < > " ' — safe for the
+  // attribute interpolation sites below: data-task-id, title=, class tokens).
   esc(text) {
-    const div = this.doc.createElement("div");
-    div.textContent = text == null ? "" : String(text);
-    return div.innerHTML;
+    return resolveEscapeHtml()(text);
   }
 
   viewMode() {
@@ -279,7 +344,7 @@ class TasksViewController {
       <button type="button" class="ide-tasks-item${active}" data-task-id="${this.esc(task.id)}">
         <span class="ide-tasks-item-header">
           <span class="ide-tasks-item-title" title="${this.esc(title)}">${this.esc(title)}</span>
-          <span class="ide-tasks-badge ide-tasks-badge-${this.esc(statusText)}">${this.esc(statusText)}</span>
+          <span class="ide-tasks-badge ide-tasks-badge-${tasksBadgeStatusClass(statusText)}">${this.esc(statusText)}</span>
         </span>
         <span class="ide-tasks-item-meta" title="${this.esc(meta)}">${this.esc(meta)}</span>
       </button>`;
@@ -328,7 +393,7 @@ class TasksViewController {
     detail.innerHTML = `
       <div class="ide-tasks-detail-header">
         <span class="ide-tasks-detail-title" title="${this.esc(title)}">${this.esc(title)}</span>
-        <span class="ide-tasks-badge ide-tasks-badge-${this.esc(statusText)}">${this.esc(statusText)}</span>
+        <span class="ide-tasks-badge ide-tasks-badge-${tasksBadgeStatusClass(statusText)}">${this.esc(statusText)}</span>
       </div>
       <div class="ide-tasks-detail-meta" title="${this.esc(meta)}">${this.esc(meta)}</div>
       <ul class="ide-tasks-checks">${checks || "<li>No checks</li>"}</ul>
@@ -414,6 +479,7 @@ class TasksViewController {
 const TasksViewModule = {
   tasksBoardColumns,
   tasksTotalCount,
+  tasksBadgeStatusClass,
   tasksRenderSignature,
   TasksViewController,
 };
@@ -429,6 +495,7 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.tasksBoardColumns = tasksBoardColumns;
   exports.tasksTotalCount = tasksTotalCount;
+  exports.tasksBadgeStatusClass = tasksBadgeStatusClass;
   exports.tasksRenderSignature = tasksRenderSignature;
   exports.TasksViewController = TasksViewController;
 }

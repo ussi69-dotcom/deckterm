@@ -2714,9 +2714,20 @@ class ClipboardManager {
   }
 
   escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    // Delegate to the shared escaper (escapes & < > " ' — safe for the quoted
+    // attribute interpolation sites in the legacy git panel: data-branch,
+    // data-path, data-folder-key, title="${message}", etc.). The old
+    // textContent→innerHTML round-trip left " and ' intact → attribute-breakout
+    // stored XSS when a branch/file/commit/stash value contained a quote.
+    if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+      return window.HtmlEscape.escapeHtml(text);
+    }
+    return String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   formatTime(timestamp) {
@@ -4186,9 +4197,19 @@ class GitManager {
   }
 
   escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    // Delegate to the shared escaper (escapes & < > " ' — safe in quoted
+    // attributes, e.g. the timeline/commit title="${message}" sites). See the
+    // matching note on the other escapeHtml: the old round-trip left quotes
+    // intact → attribute-breakout stored XSS.
+    if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+      return window.HtmlEscape.escapeHtml(text);
+    }
+    return String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   renderHistory() {

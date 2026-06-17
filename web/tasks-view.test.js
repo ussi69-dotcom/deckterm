@@ -2,6 +2,7 @@ import { test, expect } from "bun:test";
 import {
   tasksBoardColumns,
   tasksTotalCount,
+  tasksBadgeStatusClass,
   tasksRenderSignature,
 } from "./tasks-view.js";
 
@@ -60,6 +61,70 @@ test("tasksRenderSignature is stable for identical state and varies on change", 
   expect(sig).not.toBe(tasksRenderSignature({ ...base, viewMode: "board" }));
   // A status-text change changes the signature.
   expect(sig).not.toBe(tasksRenderSignature({ ...base, status: "Loading..." }));
+});
+
+test("tasksRenderSignature varies on rendered-but-previously-omitted fields", () => {
+  // Regression for the stale-sidebar bug: the signature used to span only
+  // id/status/title, but render() also paints workingDirectory, projectRoot,
+  // workerProvider, and checks[].label/command. A change to any of those (with
+  // id/status/title unchanged) MUST produce a different signature.
+  const base = {
+    tasks: [
+      {
+        id: "a",
+        status: "ready",
+        title: "T",
+        workingDirectory: "/w/a",
+        projectRoot: "/p/a",
+        workerProvider: "claude",
+        checks: [{ label: "build", command: "bun run build" }],
+      },
+    ],
+    selectedId: "a",
+    viewMode: "list",
+    status: "",
+  };
+  const sig = tasksRenderSignature(base);
+
+  const vary = (patch) =>
+    tasksRenderSignature({ ...base, tasks: [{ ...base.tasks[0], ...patch }] });
+
+  expect(sig).not.toBe(vary({ workingDirectory: "/w/b" }));
+  expect(sig).not.toBe(vary({ projectRoot: "/p/b" }));
+  expect(sig).not.toBe(vary({ workerProvider: "codex" }));
+  // A check label change.
+  expect(sig).not.toBe(
+    vary({ checks: [{ label: "test", command: "bun run build" }] }),
+  );
+  // A check command change.
+  expect(sig).not.toBe(
+    vary({ checks: [{ label: "build", command: "bun run test" }] }),
+  );
+  // An identical projection still dedupes.
+  expect(sig).toBe(vary({}));
+});
+
+test("tasksBadgeStatusClass passes known statuses, maps unknown to 'unknown'", () => {
+  for (const s of [
+    "draft",
+    "ready",
+    "paused",
+    "worker-running",
+    "checks-running",
+    "judge-running",
+    "needs-judge",
+    "needs-user",
+    "complete",
+    "failed",
+  ]) {
+    expect(tasksBadgeStatusClass(s)).toBe(s);
+  }
+  // Anything off the allow-list — including a class-token-breaking value — maps
+  // to a safe literal, so a raw user status can't inject a surprising class.
+  expect(tasksBadgeStatusClass('" onmouseover="alert(1)')).toBe("unknown");
+  expect(tasksBadgeStatusClass("weird status")).toBe("unknown");
+  expect(tasksBadgeStatusClass("")).toBe("unknown");
+  expect(tasksBadgeStatusClass(undefined)).toBe("unknown");
 });
 
 test("tasksRenderSignature tolerates sparse / missing input", () => {
