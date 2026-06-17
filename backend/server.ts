@@ -1119,6 +1119,11 @@ const SECRET_BASENAME_PREDICATES: Array<(name: string) => boolean> = [
   (n) => n.endsWith(".pkcs12"),
   (n) => n.endsWith(".keystore"),
   (n) => n.endsWith(".jks"),
+  (n) => n.endsWith(".gpg"), // gpg-encrypted file (the .gpg DIR is covered too)
+  (n) => n.endsWith(".asc"), // PGP armored key/signature
+  (n) => n.endsWith(".p8"), // PKCS#8 / Apple auth key
+  (n) => n === ".pgpass",
+  (n) => n === ".boto",
   (n) => n.startsWith("id_rsa"),
   (n) => n.startsWith("id_dsa"),
   (n) => n.startsWith("id_ecdsa"),
@@ -1143,6 +1148,8 @@ const SECRET_DIR_SEGMENTS = new Set([
   ".aws",
   ".gnupg",
   ".gpg",
+  ".kube", // kube configs carry bearer tokens
+  ".docker", // config.json carries registry creds
   "secrets",
   ".secrets",
 ]);
@@ -1245,7 +1252,7 @@ async function runScopedSearch(opts: {
   // absolute path resolved at module load so a planted ./grep can't be run.
   const args = [
     GREP_BINARY,
-    "-rInIZ",
+    "-rnIZ",
     regex ? "-E" : "-F",
     ...excludeArgs,
     "-e",

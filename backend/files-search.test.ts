@@ -62,6 +62,12 @@ beforeAll(async () => {
     join(allowedRoot, "secrets", "notes.txt"),
     "x=NEEDLE_MARKER\n",
   );
+  // Broadened (review follow-up) secret shapes: .gpg / .asc files + a file
+  // under a .kube/ directory segment.
+  await writeFile(join(allowedRoot, "vault.gpg"), "g=NEEDLE_MARKER\n");
+  await writeFile(join(allowedRoot, "pub.asc"), "a=NEEDLE_MARKER\n");
+  await mkdir(join(allowedRoot, ".kube"), { recursive: true });
+  await writeFile(join(allowedRoot, ".kube", "config"), "k=NEEDLE_MARKER\n");
 
   // A secret OUTSIDE every root, reachable only via a symlink placed inside the
   // root — grep must not follow it out (symlink-escape).
@@ -182,6 +188,10 @@ test("secret exclusion: case / name variants are absent (server-side policy, cas
   expect(paths.some((p: string) => p.endsWith("/token.json"))).toBe(false);
   // File under a secret DIRECTORY segment.
   expect(paths.some((p: string) => p.includes("/secrets/"))).toBe(false);
+  // Broadened secret shapes (review follow-up): .gpg/.asc files + .kube/ dir.
+  expect(paths.some((p: string) => p.endsWith("/vault.gpg"))).toBe(false);
+  expect(paths.some((p: string) => p.endsWith("/pub.asc"))).toBe(false);
+  expect(paths.some((p: string) => p.includes("/.kube/"))).toBe(false);
 });
 
 test("bound: an over-length cwd is rejected (400)", async () => {
