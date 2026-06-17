@@ -32,7 +32,6 @@ function getScm() {
   ) {
     return { statusLetter, statusClass, groupStatusFiles };
   }
-  if (typeof window !== "undefined" && window.GitScm) return window.GitScm;
   if (typeof require !== "undefined") {
     try {
       return require("./git-scm");
@@ -547,8 +546,11 @@ class GitScmViewController {
         const staged = sectionKey === "staged";
         void gm.toggleStage?.(path, staged).then(() => this.render());
       } else if (action === "discard") {
-        const file = this.findFile(gm, path) || { path };
-        void gm.discardFile?.(file).then(() => this.render());
+        // Discard the resolved file object (it carries the status letter so
+        // discardFile picks delete-vs-revert correctly). If the file is no
+        // longer in the model, no-op rather than mis-classify a bare path.
+        const file = this.findFile(gm, path);
+        if (file) void gm.discardFile?.(file).then(() => this.render());
       } else if (action === "open") {
         this.openFile(path);
       }
