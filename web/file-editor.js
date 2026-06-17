@@ -219,7 +219,21 @@ class FileEditor {
   // modal (open) and the IDE editor-tab body (mountInto) so the phase-3 HEAD
   // change-bar gutter + language setup stay identical. `onDocChanged` fires on
   // the first edit (the modal sets dirty; the tab path pins the preview tab).
-  buildEditorView(cm, mount, payload, headOriginal, path, onDocChanged) {
+  // `extraKeymaps` is an optional array of CodeMirror key bindings the IDE tab
+  // path injects (e.g. a Mod-s save) — it's bound at HIGH precedence (before
+  // basicSetup) so it's naturally scoped to when THIS editor view has focus,
+  // and the modal path leaves it empty (the modal owns its own Ctrl+S on the
+  // modal element). Returning true from such a binding swallows the browser's
+  // "save page" default without a global document listener.
+  buildEditorView(
+    cm,
+    mount,
+    payload,
+    headOriginal,
+    path,
+    onDocChanged,
+    extraKeymaps = null,
+  ) {
     const language = detectEditorLanguage(path);
     const languageExtensions = {
       javascript: () => cm.javascript({ typescript: true, jsx: true }),
@@ -233,6 +247,9 @@ class FileEditor {
       state: cm.EditorState.create({
         doc: payload.content,
         extensions: [
+          ...(Array.isArray(extraKeymaps) && extraKeymaps.length
+            ? [cm.keymap.of(extraKeymaps)]
+            : []),
           cm.basicSetup,
           cm.keymap.of([cm.indentWithTab]),
           cm.oneDark,
@@ -306,6 +323,14 @@ class FileEditor {
     hostEl.replaceChildren();
     let current = { path: payload.path, mtimeMs: payload.mtimeMs };
     let edited = false;
+    // Forward reference so the Mod-s keymap (built before the handle) can route
+    // to the handle's CURRENT save(). It points at the handle object (not a
+    // captured function) so a caller that WRAPS handle.save (e.g. the app adding
+    // a success toast) is still invoked by the keybinding. The binding only
+    // fires when THIS view has DOM focus, so Ctrl/Cmd+S is naturally scoped to
+    // the focused editor tab and never steals the shortcut from a terminal, the
+    // modal, or the explorer.
+    const handleRef = { handle: null };
     const view = this.buildEditorView(
       cm,
       hostEl,
@@ -318,6 +343,18 @@ class FileEditor {
           if (typeof onEdit === "function") onEdit();
         }
       },
+      [
+        {
+          key: "Mod-s",
+          preventDefault: true,
+          run: () => {
+            void handleRef.handle?.save?.();
+            // Returning true marks the key as handled → CodeMirror swallows the
+            // browser "save page" default without a global document listener.
+            return true;
+          },
+        },
+      ],
     );
 
     const handle = {
@@ -373,6 +410,9 @@ class FileEditor {
         }
       },
     };
+    // Bind the forward reference so the Mod-s keymap routes to this handle's
+    // current save (including a wrapper a caller may install on handle.save).
+    handleRef.handle = handle;
     return handle;
   }
 

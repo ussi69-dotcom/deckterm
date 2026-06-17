@@ -437,3 +437,76 @@ test("controller prunes + tears down a preview body replaced in place", async ()
   expect(controller.bodies.has(keyA)).toBe(false);
   expect(tornDown).toContain(keyA);
 });
+
+// ── Concurrent same-key mount guard (Fix 1, slice-4 code-quality follow-up) ───
+
+// Two activations of the SAME key racing a slow async mount must NOT start two
+// mounts: a second body/handle would orphan the first (the body-mount path
+// overwrites the per-key handle unconditionally, leaking the first view). The
+// in-flight guard makes the second activation a no-op until the first resolves.
+test("controller guards a concurrent same-key mount (only one body/handle, none dropped)", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+
+  // Simulate the app's body-mount path: it registers a handle per key (like
+  // app.mountEditorFileTab → editorTabHandles.set(key, handle)) and the
+  // controller destroys it on teardown via onBodyTeardown.
+  const handles = new Map();
+  const destroyed = [];
+  let mountCount = 0;
+  let releaseMount;
+  const mountGate = new Promise((resolve) => {
+    releaseMount = resolve;
+  });
+
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async (_hostEl, tab) => {
+      mountCount += 1;
+      const key = tabKey(tab);
+      await mountGate; // slow mount: stays pending until released
+      // Unconditional overwrite (mirrors app.mountEditorFileTab).
+      handles.set(key, { id: mountCount });
+    },
+    onBodyTeardown: (key) => {
+      // Destroying the live handle for a torn-down body (mirrors the app).
+      if (handles.has(key)) {
+        destroyed.push(key);
+        handles.delete(key);
+      }
+    },
+  });
+
+  const keyR = tabKey(makeFileTab("/race"));
+
+  // Open the file: render() starts the gated mount #1 (mountCount → 1) and marks
+  // the key pending. The mount stays in flight until we release the gate.
+  controller.openFile("/race", { preview: true });
+  await Promise.resolve(); // let the sync part of render()/mountFileBody run
+  expect(mountCount).toBe(1);
+  expect(controller.pendingMounts.has(keyR)).toBe(true);
+
+  // Close + reopen the SAME key WHILE mount #1 is still in flight. closeKey drops
+  // the cached body (so the cache is empty for that key) and reopen re-renders.
+  // Without the guard, that re-render would see bodies.get(key) undefined and
+  // start a SECOND mount, overwriting the first handle (the leak). The in-flight
+  // guard makes the reopen's render a no-op until mount #1 resolves.
+  controller.closeKey(keyR);
+  controller.openFile("/race", { preview: true });
+  await Promise.resolve();
+  expect(mountCount).toBe(1); // guarded: no second mount started
+
+  releaseMount();
+  // Let mount #1 resolve + its post-await re-check + any follow-on render drain.
+  await new Promise((r) => setTimeout(r, 0));
+
+  // The mount ran exactly once; at most one handle survives and no handle was
+  // ever left dropped without a destroy (handles dropped → recorded in
+  // `destroyed`). No second mount means no orphaned/leaked view.
+  expect(mountCount).toBe(1);
+  expect(handles.size).toBeLessThanOrEqual(1);
+  expect(controller.pendingMounts.size).toBe(0);
+});

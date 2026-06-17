@@ -9075,6 +9075,18 @@ class TerminalManager {
       this.editorTabs?.closeKey(key);
       return;
     }
+    // Wrap save() with a minimal success toast (failures already surface their
+    // own alert from mountInto's save). The Mod-s keymap inside the editor view
+    // routes through this wrapped handle, so a successful Ctrl/Cmd+S flashes
+    // "Saved ✓" — keeping feedback cheap without a status bar.
+    const innerSave = handle.save;
+    if (typeof innerSave === "function") {
+      handle.save = async () => {
+        const ok = await innerSave();
+        if (ok) this.showToast?.("Saved ✓", "success");
+        return ok;
+      };
+    }
     this.editorTabHandles?.set(key, handle);
   }
 

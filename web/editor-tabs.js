@@ -431,6 +431,12 @@ class EditorTabsController {
     this.bodies = new Map();
     // The key whose body is currently shown.
     this.mountedKey = null;
+    // Keys whose async body mount is still in flight. Guards a second
+    // activation of the SAME key (re-render mid-mount) from starting a second
+    // mount that would orphan the first body + leak its CodeMirror view (the
+    // body-mount path overwrites editorTabHandles unconditionally, so the first
+    // handle would never be destroyed).
+    this.pendingMounts = new Set();
 
     this.model.onChange = (state) => {
       this.render();
@@ -588,6 +594,12 @@ class EditorTabsController {
 
     let bodyEl = this.bodies.get(activeKey);
     if (!bodyEl) {
+      // In-flight guard: if a mount for this key is already pending, don't start
+      // a second one. The pending mount's own post-await re-check reveals the
+      // correct body when it resolves — racing a second mount here would create
+      // a second bodyEl + overwrite the first handle (leaking its view).
+      if (this.pendingMounts.has(activeKey)) return;
+      this.pendingMounts.add(activeKey);
       bodyEl = this.doc.createElement("div");
       bodyEl.className = "ide-editor-body";
       bodyEl.dataset.tabKey = activeKey;
@@ -601,6 +613,8 @@ class EditorTabsController {
         }
       } catch {
         // A mount failure leaves an empty body; never break the tab switch.
+      } finally {
+        this.pendingMounts.delete(activeKey);
       }
       // The mount above is async: by the time it resolves the tab may have been
       // replaced (preview clobbered) or another tab may now be active. If so,
