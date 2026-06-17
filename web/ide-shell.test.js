@@ -7,6 +7,7 @@ import {
   LAYOUT_ACTIVE_VIEW_KEY,
   VIEW_EXPLORER,
   VIEW_SCM,
+  VIEW_TASKS,
   DEFAULT_ACTIVE_VIEW,
   EXPLORER_HOST_SIDEBAR,
   EXPLORER_HOST_DETACHED,
@@ -244,6 +245,7 @@ test("schema version is v4 (slice 5 bumped it for layout.activeView)", () => {
   expect(LAYOUT_ACTIVE_VIEW_KEY).toBe("layout.activeView");
   expect(VIEW_EXPLORER).toBe("explorer");
   expect(VIEW_SCM).toBe("scm");
+  expect(VIEW_TASKS).toBe("tasks");
   expect(DEFAULT_ACTIVE_VIEW).toBe("explorer");
 });
 
@@ -268,8 +270,13 @@ test("normalizeActiveView coerces against registered ids, defaults to the first"
   expect(normalizeActiveView("search", ["explorer", "scm"])).toBe("explorer");
   expect(normalizeActiveView("", ["explorer", "scm"])).toBe("explorer");
   expect(normalizeActiveView(null, ["explorer", "scm"])).toBe("explorer");
-  // Empty registry falls back to the default [explorer, scm].
+  // Empty registry falls back to the built-in default [explorer, scm, tasks].
   expect(normalizeActiveView("scm", [])).toBe("scm");
+  // The Tasks view (slice 6) is an accepted id in the registry + built-in set.
+  expect(normalizeActiveView("tasks", ["explorer", "scm", "tasks"])).toBe(
+    "tasks",
+  );
+  expect(normalizeActiveView("tasks", [])).toBe("tasks");
 });
 
 test("loadActiveView reads the persisted view, defaulting to explorer", () => {
@@ -277,8 +284,12 @@ test("loadActiveView reads the persisted view, defaulting to explorer", () => {
   expect(loadActiveView(makeFakeStore({ "layout.activeView": "scm" }))).toBe(
     "scm",
   );
-  // A stale/unknown persisted id is coerced to the first registered view.
+  // The Tasks view (slice 6) is an accepted persisted id (built-in default set).
   expect(loadActiveView(makeFakeStore({ "layout.activeView": "tasks" }))).toBe(
+    "tasks",
+  );
+  // A stale/unknown persisted id is still coerced to the first registered view.
+  expect(loadActiveView(makeFakeStore({ "layout.activeView": "search" }))).toBe(
     "explorer",
   );
 });

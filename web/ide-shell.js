@@ -58,11 +58,12 @@ const LAYOUT_ACTIVE_VIEW_KEY = "layout.activeView";
 const LAYOUT_MODE_IDE = "ide";
 const LAYOUT_MODE_TERMINAL = "terminal";
 
-// Activity-bar view ids. Explorer (slice 2) + Source Control (slice 5). Search /
-// Tasks arrive in slices 6-7 and just register another id (YAGNI: the registry
-// stays a flat ordered list — Explorer first, SCM second).
+// Activity-bar view ids. Explorer (slice 2) + Source Control (slice 5) + Tasks
+// (slice 6). Search arrives in slice 7 and just registers another id (YAGNI: the
+// registry stays a flat ordered list — Explorer 1st, SCM 2nd, Tasks 3rd).
 const VIEW_EXPLORER = "explorer";
 const VIEW_SCM = "scm";
+const VIEW_TASKS = "tasks";
 
 // The default active sidebar view when nothing is persisted.
 const DEFAULT_ACTIVE_VIEW = VIEW_EXPLORER;
@@ -208,12 +209,13 @@ function resolveExplorerHost(renderedMode, isDetached) {
 // unknown / blank id falls back to the first registered view (Explorer), so a
 // stale persisted id (e.g. a removed view) can never strand the sidebar.
 //   viewId   the candidate active view id
-//   viewIds  the ordered list of registered view ids (defaults to [explorer,scm])
+//   viewIds  the ordered list of registered view ids (defaults to the built-in
+//            set [explorer, scm, tasks]; the live app passes its real registry)
 function normalizeActiveView(viewId, viewIds) {
   const ids =
     Array.isArray(viewIds) && viewIds.length
       ? viewIds
-      : [VIEW_EXPLORER, VIEW_SCM];
+      : [VIEW_EXPLORER, VIEW_SCM, VIEW_TASKS];
   const v = typeof viewId === "string" ? viewId.trim() : "";
   return ids.includes(v) ? v : ids[0];
 }
@@ -1121,6 +1123,7 @@ const IdeShell = {
   LAYOUT_MODE_TERMINAL,
   VIEW_EXPLORER,
   VIEW_SCM,
+  VIEW_TASKS,
   DEFAULT_ACTIVE_VIEW,
   EXPLORER_HOST_SIDEBAR,
   EXPLORER_HOST_DETACHED,
@@ -1162,6 +1165,7 @@ if (typeof exports !== "undefined") {
   exports.LAYOUT_MODE_TERMINAL = LAYOUT_MODE_TERMINAL;
   exports.VIEW_EXPLORER = VIEW_EXPLORER;
   exports.VIEW_SCM = VIEW_SCM;
+  exports.VIEW_TASKS = VIEW_TASKS;
   exports.DEFAULT_ACTIVE_VIEW = DEFAULT_ACTIVE_VIEW;
   exports.EXPLORER_HOST_SIDEBAR = EXPLORER_HOST_SIDEBAR;
   exports.EXPLORER_HOST_DETACHED = EXPLORER_HOST_DETACHED;

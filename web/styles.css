@@ -5934,6 +5934,227 @@ body.ide-mode #workspace-area {
   color: var(--text-primary, #fff);
 }
 
+/* ── Tasks sidebar view (slice 6) ────────────────────────────────────────── */
+.ide-tasks-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  font-size: 13px;
+  color: var(--text-primary, #ddd);
+}
+
+.ide-tasks-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.ide-tasks-actions-spacer {
+  flex: 1;
+}
+
+.ide-tasks-action {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #999);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 4px;
+}
+
+.ide-tasks-action:hover {
+  color: var(--text-primary, #fff);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.ide-tasks-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  padding: 0 8px;
+  min-height: 0;
+}
+
+.ide-tasks-status:empty {
+  display: none;
+}
+
+.ide-tasks-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0;
+}
+
+.ide-tasks-list.board {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 8px;
+}
+
+.ide-tasks-empty {
+  padding: 8px 12px;
+  font-size: 12px;
+  color: var(--text-secondary, #999);
+}
+
+.ide-tasks-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--text-primary, #ddd);
+  cursor: pointer;
+  padding: 5px 12px;
+  font-size: 13px;
+}
+
+.ide-tasks-item:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.ide-tasks-item.active {
+  background: var(--bg-selected, rgba(14, 99, 156, 0.35));
+}
+
+.ide-tasks-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.ide-tasks-item-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-tasks-item-meta {
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-tasks-badge {
+  flex: 0 0 auto;
+  font-size: 10px;
+  padding: 1px 5px;
+  border-radius: 8px;
+  background: var(--bg-input, #1e1e1e);
+  color: var(--text-secondary, #999);
+}
+
+.ide-tasks-column {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ide-tasks-column-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary, #999);
+  padding: 2px 4px;
+}
+
+.ide-tasks-card {
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 5px 8px;
+}
+
+.ide-tasks-detail {
+  flex: 0 0 auto;
+  max-height: 45%;
+  overflow: auto;
+  border-top: 1px solid var(--border-primary);
+  padding: 8px;
+}
+
+.ide-tasks-detail:empty {
+  display: none;
+}
+
+.ide-tasks-detail-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.ide-tasks-detail-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-tasks-detail-meta {
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-tasks-checks {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+}
+
+.ide-tasks-checks li {
+  padding: 1px 0;
+}
+
+.ide-tasks-detail-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.ide-tasks-detail-action {
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary, #ddd);
+  cursor: pointer;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.ide-tasks-detail-action.primary {
+  background: var(--accent-blue, #0e639c);
+  border-color: var(--accent-blue, #0e639c);
+  color: #fff;
+}
+
+.ide-tasks-detail-action:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.ide-tasks-detail-action.primary:hover {
+  background: var(--accent-blue-hover, #1177bb);
+}
+
 .ide-editor-area {
   grid-column: 3;
   grid-row: 1;

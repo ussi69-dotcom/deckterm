@@ -9057,6 +9057,7 @@ class TerminalManager {
     });
     this.initEditorTabs();
     this.initScmView();
+    this.initTasksView();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -9138,6 +9139,31 @@ class TerminalManager {
       mount: (container) => this.scmView.mount(container),
       unmount: () => this.scmView.unmount(),
       resize: () => this.scmView.resize(),
+    });
+  }
+
+  // --- IDE Tasks view (phase 5, slice 6) ------------------------------------
+
+  // Build the Tasks sidebar view + register it as the third activity-bar view
+  // (Explorer 1st, Source Control 2nd, Tasks 3rd). The view re-skins the task
+  // panel into a sidebar list/board; it reuses the live task OPERATIONS on this
+  // TerminalManager (refreshTasks / handleTaskAction / selectTask /
+  // toggleTaskViewMode / openTaskPanel + the shared taskState model). The
+  // floating #task-panel keeps working (additive — the view subscribes via a
+  // poll on mount and tears it down on unmount).
+  initTasksView() {
+    if (!window.TasksView?.TasksViewController || !this.ideShell) return;
+    this.tasksView = new window.TasksView.TasksViewController({
+      document,
+      getTaskManager: () => this,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_TASKS,
+      icon: "list-checks",
+      title: "Tasks",
+      mount: (container) => this.tasksView.mount(container),
+      unmount: () => this.tasksView.unmount(),
+      resize: () => this.tasksView.resize(),
     });
   }
 
