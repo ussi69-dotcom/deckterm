@@ -43,10 +43,25 @@ beforeAll(async () => {
   );
 
   // Secret-shaped files inside the root, each CONTAINING the marker — they must
-  // NOT appear in default results (secret-exclusion stance).
+  // NOT appear in default results (secret-exclusion stance). Includes CASE and
+  // NAME variants that the old case-sensitive grep --exclude globs missed; the
+  // authoritative server-side isSecretSearchMatch() (lower-cased) must catch
+  // these regardless of grep's case-sensitivity.
   await writeFile(join(allowedRoot, ".env"), "API=NEEDLE_MARKER\n");
+  await writeFile(join(allowedRoot, ".ENV"), "API=NEEDLE_MARKER\n");
   await writeFile(join(allowedRoot, "app_token.txt"), "t=NEEDLE_MARKER\n");
   await writeFile(join(allowedRoot, "id_rsa"), "KEY NEEDLE_MARKER\n");
+  await writeFile(join(allowedRoot, "ID_RSA"), "KEY NEEDLE_MARKER\n");
+  // No underscore — the old "*_token*" glob missed these; "*token*" + the
+  // server-side .includes("token") catch them.
+  await writeFile(join(allowedRoot, "github-token.txt"), "gh=NEEDLE_MARKER\n");
+  await writeFile(join(allowedRoot, "token.json"), "{ }NEEDLE_MARKER\n");
+  // Secret DIRECTORY segment — a plain .txt under secrets/ must be dropped.
+  await mkdir(join(allowedRoot, "secrets"), { recursive: true });
+  await writeFile(
+    join(allowedRoot, "secrets", "notes.txt"),
+    "x=NEEDLE_MARKER\n",
+  );
 
   // A secret OUTSIDE every root, reachable only via a symlink placed inside the
   // root — grep must not follow it out (symlink-escape).
@@ -149,6 +164,32 @@ test("secret exclusion: .env / *_token / id_rsa matches are absent by default", 
   expect(paths.some((p: string) => p.endsWith("/.env"))).toBe(false);
   expect(paths.some((p: string) => p.endsWith("/app_token.txt"))).toBe(false);
   expect(paths.some((p: string) => p.endsWith("/id_rsa"))).toBe(false);
+});
+
+test("secret exclusion: case / name variants are absent (server-side policy, case-insensitive)", async () => {
+  const res = await search({ cwd: allowedRoot, query: "NEEDLE_MARKER" });
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  const paths = (data.matches || []).map((m: any) => m.path);
+  // Upper-case .ENV / ID_RSA (grep --exclude is case-sensitive; server filter
+  // lower-cases and drops them).
+  expect(paths.some((p: string) => p.endsWith("/.ENV"))).toBe(false);
+  expect(paths.some((p: string) => p.endsWith("/ID_RSA"))).toBe(false);
+  // No-underscore token names the old "*_token*" glob missed.
+  expect(paths.some((p: string) => p.endsWith("/github-token.txt"))).toBe(
+    false,
+  );
+  expect(paths.some((p: string) => p.endsWith("/token.json"))).toBe(false);
+  // File under a secret DIRECTORY segment.
+  expect(paths.some((p: string) => p.includes("/secrets/"))).toBe(false);
+});
+
+test("bound: an over-length cwd is rejected (400)", async () => {
+  const res = await search({
+    cwd: allowedRoot + "/" + "a".repeat(5000),
+    query: "NEEDLE_MARKER",
+  });
+  expect(res.status).toBe(400);
 });
 
 test("bound: an over-length query is rejected (400)", async () => {

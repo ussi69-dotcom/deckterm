@@ -90,7 +90,7 @@ function searchResultLineLabel(match) {
 //   fetchImpl           fetch (defaults to global fetch) — injectable for tests
 //   debounceMs          query debounce (default 250)
 const DEFAULT_DEBOUNCE_MS = 250;
-const MAX_QUERY_LEN = 200; // mirror the server cap
+const MAX_QUERY_LEN = 200; // stricter UI limit; the server cap is 1024 (SEARCH_MAX_QUERY_LEN)
 
 class SearchViewController {
   constructor(options = {}) {

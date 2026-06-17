@@ -8,7 +8,7 @@ import {
   type CloudflareAccessPayload,
 } from "@hono/cloudflare-access";
 import { mkdir, readdir, unlink, stat, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   classifyAgentOutputPhase,
@@ -1060,9 +1060,12 @@ const SEARCH_MAX_LINE_LEN = 500; // truncate each returned match line to this ma
 const SEARCH_TIMEOUT_MS = 5000; // hard-kill grep after this
 const SEARCH_MAX_STDOUT_BYTES = 2 * 1024 * 1024; // stop reading stdout past 2 MB
 
-// Secret-shaped basenames excluded from search by DEFAULT. There is no client
-// flag to disable this — bypass would require a privileged capability that is
-// simply never granted. Matched by grep --exclude (basename globs).
+// Secret-shaped basenames excluded from search by DEFAULT. These grep
+// --exclude globs are a FIRST-PASS PERF filter only — grep --exclude is
+// case-SENSITIVE, so the authoritative policy is the server-side
+// isSecretSearchMatch() check below (which lower-cases and broadens). There is
+// no client flag to disable this; a privileged bypass (if ever introduced)
+// would stay a server-side boolean that is OFF with no client input.
 const SEARCH_SECRET_EXCLUDES = [
   ".env",
   ".env.*",
@@ -1070,7 +1073,9 @@ const SEARCH_SECRET_EXCLUDES = [
   "*.key",
   "*.p12",
   "*.pfx",
+  "*.pkcs12",
   "*.keystore",
+  "*.jks",
   "id_rsa*",
   "id_dsa*",
   "id_ecdsa*",
@@ -1078,10 +1083,14 @@ const SEARCH_SECRET_EXCLUDES = [
   "*.ppk",
   ".netrc",
   ".git-credentials",
-  "*_token*",
-  "*_secret*",
+  ".npmrc",
+  ".pypirc",
+  ".htpasswd",
+  "*token*",
   "*secret*",
   "*credential*",
+  "*password*",
+  "*.kdbx",
 ];
 
 // Directories never recursed into (noise + perf).
@@ -1097,6 +1106,78 @@ const SEARCH_EXCLUDE_DIRS = [
   ".cache",
 ];
 
+// ── Authoritative server-side secret policy (case-insensitive) ───────────────
+// The grep --exclude globs above are a perf first-pass; THIS is the policy of
+// record. Every grep match is re-checked here (lower-cased) before being
+// surfaced. Predicates over a normalized (lower-cased) basename.
+const SECRET_BASENAME_PREDICATES: Array<(name: string) => boolean> = [
+  (n) => n === ".env" || n.startsWith(".env"), // .env and .env.*  (.env*)
+  (n) => n.endsWith(".pem"),
+  (n) => n.endsWith(".key"),
+  (n) => n.endsWith(".p12"),
+  (n) => n.endsWith(".pfx"),
+  (n) => n.endsWith(".pkcs12"),
+  (n) => n.endsWith(".keystore"),
+  (n) => n.endsWith(".jks"),
+  (n) => n.startsWith("id_rsa"),
+  (n) => n.startsWith("id_dsa"),
+  (n) => n.startsWith("id_ecdsa"),
+  (n) => n.startsWith("id_ed25519"),
+  (n) => n.endsWith(".ppk"),
+  (n) => n === ".netrc",
+  (n) => n === ".git-credentials",
+  (n) => n === ".npmrc",
+  (n) => n === ".pypirc",
+  (n) => n === ".htpasswd",
+  (n) => n.includes("token"),
+  (n) => n.includes("secret"),
+  (n) => n.includes("credential"),
+  (n) => n.includes("password"),
+  (n) => n.endsWith(".kdbx"),
+];
+
+// Secret directory segments (lower-cased path-segment test). ".config/gcloud"
+// is a two-segment marker handled separately.
+const SECRET_DIR_SEGMENTS = new Set([
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".gpg",
+  "secrets",
+  ".secrets",
+]);
+
+// Returns true if the given absolute path is secret-shaped and must be dropped
+// from search results, regardless of grep's case-sensitive --exclude pass.
+function isSecretSearchMatch(absPath: string): boolean {
+  const lower = absPath.toLowerCase();
+  const base = basename(lower);
+  for (const pred of SECRET_BASENAME_PREDICATES) {
+    if (pred(base)) return true;
+  }
+  const segments = lower.split("/").filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (SECRET_DIR_SEGMENTS.has(segments[i])) return true;
+    if (segments[i] === ".config" && segments[i + 1] === "gcloud") return true;
+  }
+  return false;
+}
+
+// ── grep binary resolved ONCE from a trusted absolute location ───────────────
+// Bun.spawn resolves a bare "grep" via PATH while cwd is the user's search
+// root; a writable/relative PATH entry could run a planted grep. Resolve from a
+// fixed absolute path at module load and pass a sanitized PATH to the spawn.
+const SEARCH_SAFE_PATH = "/usr/bin:/bin";
+const GREP_BINARY: string = (() => {
+  for (const candidate of ["/usr/bin/grep", "/bin/grep"]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  console.warn(
+    "[search] neither /usr/bin/grep nor /bin/grep found; falling back to PATH-resolved 'grep'",
+  );
+  return "grep";
+})();
+
 interface ScopedSearchMatch {
   path: string;
   line: number;
@@ -1109,20 +1190,23 @@ interface ScopedSearchMatch {
 const inFlightSearches = new Map<string, ReturnType<typeof Bun.spawn>>();
 
 function parseGrepLine(line: string): ScopedSearchMatch | null {
-  // grep -n output is `path:lineno:text`. The path itself can contain colons,
-  // but we control the start dir (no colon-bearing roots in practice) and the
-  // line number is the first all-digit field after a colon, so split on the
-  // first two colons that bracket the digit run.
-  const firstColon = line.indexOf(":");
-  if (firstColon < 0) return null;
-  const secondColon = line.indexOf(":", firstColon + 1);
-  if (secondColon < 0) return null;
-  const path = line.slice(0, firstColon);
-  const lineNoRaw = line.slice(firstColon + 1, secondColon);
+  // With grep -Z/--null the filename is NUL-delimited: `path\0lineno:text`.
+  // Parsing the path on \0 (rather than ':') makes paths containing colons or
+  // newlines safe — a filename can no longer forge result framing, and a
+  // colon-bearing path parses correctly. (record framing is on \0; we split
+  // records on \0 before reaching here only for the filename portion.)
+  const nul = line.indexOf("\0");
+  if (nul < 0) return null;
+  const path = line.slice(0, nul);
+  if (!path) return null;
+  const rest = line.slice(nul + 1);
+  const colon = rest.indexOf(":");
+  if (colon < 0) return null;
+  const lineNoRaw = rest.slice(0, colon);
   if (!/^\d+$/.test(lineNoRaw)) return null;
   const lineNo = parseInt(lineNoRaw, 10);
   if (!Number.isFinite(lineNo) || lineNo <= 0) return null;
-  let text = line.slice(secondColon + 1);
+  let text = rest.slice(colon + 1);
   if (text.length > SEARCH_MAX_LINE_LEN) {
     text = text.slice(0, SEARCH_MAX_LINE_LEN);
   }
@@ -1155,11 +1239,13 @@ async function runScopedSearch(opts: {
     excludeArgs.push(`--exclude-dir=${dir}`);
 
   // -r (lowercase) → recurse but do NOT follow symlinks found during recursion.
-  // -I skip binary files, -n line numbers, -F literal / -E regex, -e <query> so
-  // a leading-dash query can't be argv-flag-smuggled.
+  // -I skip binary files, -n line numbers, -Z/--null NUL-delimit the filename
+  // (newline-in-filename framing safety), -F literal / -E regex, -e <query> so
+  // a leading-dash query can't be argv-flag-smuggled. GREP_BINARY is an
+  // absolute path resolved at module load so a planted ./grep can't be run.
   const args = [
-    "grep",
-    "-rInI",
+    GREP_BINARY,
+    "-rInIZ",
     regex ? "-E" : "-F",
     ...excludeArgs,
     "-e",
@@ -1171,7 +1257,9 @@ async function runScopedSearch(opts: {
     cwd: root,
     stdout: "pipe",
     stderr: "ignore",
-    env: { ...process.env, LC_ALL: "C" },
+    // Sanitized PATH (not the possibly-poisoned process.env.PATH); the binary
+    // itself is absolute, this just hardens any grep-internal subprocess.
+    env: { ...process.env, PATH: SEARCH_SAFE_PATH, LC_ALL: "C" },
   });
   inFlightSearches.set(ownerId, proc);
 
@@ -1197,6 +1285,9 @@ async function runScopedSearch(opts: {
     }
     const parsed = parseGrepLine(line);
     if (!parsed) return;
+    // Authoritative secret policy (case-insensitive) — grep --exclude is only a
+    // perf first-pass; this drops case/name variants it misses.
+    if (isSecretSearchMatch(parsed.path)) return;
     const seen = perFile.get(parsed.path) || 0;
     if (seen >= SEARCH_MAX_PER_FILE) {
       truncated = true;
@@ -1249,7 +1340,30 @@ async function runScopedSearch(opts: {
     }
   }
 
-  return { matches, truncated };
+  // ── Authoritative server-side post-filter (the SERVER is the authority on
+  // every returned match, not grep's flags) ─────────────────────────────────
+  // For each match path: (1) realpath it and require the canonical result to be
+  // inside an allowed root (closes TOCTOU/symlink-swap where a path leaked
+  // outside the roots — its realpath then falls outside and is dropped), and
+  // (2) re-apply the secret policy. Drop silently. realpath is cached per
+  // unique path so we pay it once per file, not per match line.
+  const realpathCache = new Map<string, string | null>();
+  const filtered: ScopedSearchMatch[] = [];
+  for (const m of matches) {
+    if (isSecretSearchMatch(m.path)) continue;
+    let canonical = realpathCache.get(m.path);
+    if (canonical === undefined) {
+      canonical = await resolveAllowedPath(m.path);
+      realpathCache.set(m.path, canonical);
+    }
+    if (!canonical) continue; // outside allowed roots → dropped
+    // Re-check the secret policy against the canonical path too (a symlinked
+    // name could disguise a secret target).
+    if (isSecretSearchMatch(canonical)) continue;
+    filtered.push(m);
+  }
+
+  return { matches: filtered, truncated };
 }
 
 function resolveFoundationRootIdForPath(
@@ -3143,13 +3257,21 @@ export function createWebApp() {
   //    REALPATH is the grep start dir so a symlinked root can't escape.
   //  - grep -r (lowercase) does NOT follow symlinks found during recursion, so a
   //    symlink placed inside the root pointing outside is never traversed.
-  //  - secret-shaped files are excluded by default (server-fixed --exclude
-  //    globs, no client flag to disable).
+  //  - SERVER-AUTHORITATIVE post-filter: every returned match path is
+  //    realpath-resolved + allowed-root-gated again (closes TOCTOU/symlink-swap
+  //    surfacing a file outside the roots) and re-checked against the secret
+  //    policy in server code (grep --exclude is only a perf first-pass).
+  //  - secret-shaped files are excluded by default via a case-insensitive
+  //    server-side policy (isSecretSearchMatch), no client flag to disable.
+  //  - grep is invoked by ABSOLUTE path (resolved at module load) with a
+  //    sanitized PATH so a planted ./grep on the search root can't run.
+  //  - output is NUL-delimited (-Z) so a newline-in-filename can't forge result
+  //    framing; the path is parsed on \0, the line number on the first colon.
   //  - literal-by-default (-F); regex is opt-in (-E).
   //  - query never reaches a shell (argv-style Bun.spawn) and is passed via -e so
   //    a leading dash can't be argv-flag-smuggled.
-  //  - the raw query text is NEVER audited (it can contain secrets the user is
-  //    hunting); only queryLength/regex/matchCount/truncated are logged.
+  //  - the raw query text and cwd are NEVER audited (they can contain secrets);
+  //    only queryLength/regex/matchCount/truncated are logged on allow.
   app.post("/api/files/search", async (c) => {
     const { ownerId } = getCurrentUser(c);
     const body = (await c.req.json().catch(() => ({}))) as {
@@ -3160,11 +3282,32 @@ export function createWebApp() {
       requestId?: unknown;
     };
 
-    const requestId = body.requestId;
+    // Normalize requestId: accept only a finite number or a short string
+    // (echoed back for client staleness matching); default to 0 otherwise so a
+    // hostile/oversized value can't bloat the response.
+    let requestId: number | string = 0;
+    if (typeof body.requestId === "number" && Number.isFinite(body.requestId)) {
+      requestId = body.requestId;
+    } else if (
+      typeof body.requestId === "string" &&
+      body.requestId.length <= 64
+    ) {
+      requestId = body.requestId;
+    }
+
     const regex = Boolean(body.regex);
     const rawQuery = typeof body.query === "string" ? body.query : "";
+    const requestedCwd = typeof body.cwd === "string" ? body.cwd : "";
 
     // ── Validation / bounds ──────────────────────────────────────────────────
+    // Bound cwd before any work — it is unbounded user input and is written to
+    // the deny audit row, so cap it to avoid response/audit bloat on hostile
+    // requests.
+    const SEARCH_MAX_CWD_LEN = 4096;
+    if (requestedCwd.length > SEARCH_MAX_CWD_LEN) {
+      return c.json({ error: "cwd too long", requestId }, 400);
+    }
+
     const query = rawQuery.trim();
     if (!query) {
       return c.json({ error: "Empty query", requestId }, 400);
@@ -3184,8 +3327,6 @@ export function createWebApp() {
       );
     }
 
-    const requestedCwd = typeof body.cwd === "string" ? body.cwd : "";
-
     // ── Gating: realpath-resolve cwd to an allowed root ──────────────────────
     const resolvedRoot = await resolveAllowedPath(requestedCwd);
     if (!resolvedRoot) {
@@ -3203,6 +3344,18 @@ export function createWebApp() {
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
     if (!fileAccess.ok) {
+      // Attribute the denial to THIS endpoint in the audit trail (in addition
+      // to whatever requireFileAccess logs internally). Never log the raw query
+      // or cwd here — reason only, empty data.
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.search",
+        resourceType: "root",
+        decision: "deny",
+        reason: "file_access_denied",
+        data: {},
+      });
       return c.json(
         { ...fileAccess.body, requestId },
         { status: fileAccess.status as any },
