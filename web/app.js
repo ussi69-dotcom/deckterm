@@ -3160,6 +3160,41 @@ class GitManager {
     this.panel.classList.contains("hidden") ? this.show() : this.hide();
   }
 
+  // ── ViewHost contract (IDE shell slice 5) ───────────────────────────────────
+  // GitManager conforms to the ViewHost lifecycle so the live instance can be
+  // re-hosted (its #git-panel moved into another container) without recreation.
+  // The IDE sidebar SCM presentation is a separate re-skin (git-scm-view.js) that
+  // reuses this instance's git OPERATIONS; these methods cover the legacy
+  // floating-window / terminal-mode panel re-host. mount(container) moves the
+  // panel element into the container + reveals it; unmount() returns it home +
+  // hides it (model state lives in this.state, so a re-mount restores from it).
+  mount(container) {
+    if (!container || !this.panel) return;
+    if (this.panel.parentElement !== container)
+      container.appendChild(this.panel);
+    this.panel.classList.remove("hidden");
+  }
+
+  unmount() {
+    if (!this.panel) return;
+    const home = document.getElementById("app");
+    if (home && this.panel.parentElement !== home) home.appendChild(this.panel);
+    this.panel.classList.add("hidden");
+  }
+
+  dispose() {
+    this.unmount();
+  }
+
+  // The diff editor (#git-diff) is a CodeMirror MergeView that needs a measure
+  // pass when its container resizes. Re-render the current diff if one is shown.
+  resize() {
+    if (this.panel?.classList.contains("hidden")) return;
+    if (this.state?.selectedPath && this.state?.rightView !== "timeline") {
+      void this.showDiff(this.state.selectedPath);
+    }
+  }
+
   async refresh() {
     if (!this.state.cwd && !this.currentCwd) return;
     const cwd = this.state.cwd || this.currentCwd;
@@ -3210,11 +3245,13 @@ class GitManager {
         }
       }
 
-      // Keep explorer git decorations in sync with the panel: invalidate the
-      // shared status cache for this cwd, then re-derive decorations.
+      // Keep explorer git decorations + the IDE SCM view in sync with the panel:
+      // force-refresh the shared status cache (which EMITS onChange so the SCM
+      // view's subscriber re-renders), then re-derive explorer decorations. The
+      // force read repopulates the cache the decoration pass reuses.
       const tm = window.terminalManager;
       if (tm?.gitStatusStore) {
-        tm.gitStatusStore.invalidate(cwd);
+        void tm.gitStatusStore.refreshStatus(cwd);
         void tm.refreshExplorerDecorations();
       }
 
@@ -3991,6 +4028,20 @@ class GitManager {
     const entry = entries[index];
     const path = this.state.timelinePath || this.state.selectedPath;
     if (!entry || !path) return;
+
+    // IDE mode (slice 5): open the revision diff as a commit-mode EDITOR TAB
+    // (keyed on the commit sha) instead of the legacy in-panel #git-diff pane.
+    const tm = window.terminalManager;
+    if (tm?.isIdeModeActive?.() && tm.openDiffTab) {
+      tm.openDiffTab({
+        relPath: path,
+        mode: "commit",
+        cwd: this.state.cwd || this.currentCwd,
+        commit: entry.hash || entry.shortHash,
+        title: `${path} @ ${entry.shortHash}`,
+      });
+      return;
+    }
 
     const diffEl = this.panel.querySelector("#git-diff");
     if (diffEl) diffEl.classList.remove("hidden");
@@ -8984,6 +9035,7 @@ class TerminalManager {
       dockExplorerWindow: () => this.dockIdeExplorerWindow(),
     });
     this.initEditorTabs();
+    this.initScmView();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -9041,6 +9093,30 @@ class TerminalManager {
           window.EditorTabs.EDITOR_TABS_KEY,
           window.EditorTabs.serializeTabs(state),
         ),
+    });
+  }
+
+  // --- IDE Source Control view (phase 5, slice 5) ---------------------------
+
+  // Build the SCM sidebar view + register it as the second activity-bar view
+  // (Explorer first). The view re-skins the git panel into a VS Code SCM tree;
+  // it reuses the live GitManager's git OPERATIONS + the shared git-status-store
+  // (decoration sync), and opens diffs as editor tabs via openDiffTab.
+  initScmView() {
+    if (!window.GitScmView?.GitScmViewController || !this.ideShell) return;
+    this.scmView = new window.GitScmView.GitScmViewController({
+      document,
+      getGitManager: () => window.gitManager || null,
+      getTerminalManager: () => this,
+      getStatusStore: () => this.gitStatusStore || null,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_SCM,
+      icon: "git-branch",
+      title: "Source Control",
+      mount: (container) => this.scmView.mount(container),
+      unmount: () => this.scmView.unmount(),
+      resize: () => this.scmView.resize(),
     });
   }
 

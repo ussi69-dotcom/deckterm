@@ -45,17 +45,27 @@
 // editor-tabs module owns the seed/migrate of that key; this version bump just
 // stamps the umbrella layout schema so a v2 store upgrades idempotently. The
 // per-key migration (editorTabs seed) never clobbers `layout.mode`/`detached`.
-const LAYOUT_SCHEMA_VERSION = 3;
+// Schema v4 (slice 5) adds `layout.activeView` — which sidebar view is active in
+// the activity-bar view registry ("explorer" | "scm"). The version bump just
+// stamps the umbrella schema; the key defaults lazily to "explorer" on read and
+// the migration never clobbers existing keys.
+const LAYOUT_SCHEMA_VERSION = 4;
 const LAYOUT_MODE_KEY = "layout.mode";
 const LAYOUT_SCHEMA_VERSION_KEY = "layout.schemaVersion";
 const LAYOUT_DETACHED_KEY = "layout.detached";
+const LAYOUT_ACTIVE_VIEW_KEY = "layout.activeView";
 
 const LAYOUT_MODE_IDE = "ide";
 const LAYOUT_MODE_TERMINAL = "terminal";
 
-// The only view that gets pop-out/dock this slice (YAGNI: no multi-view
-// registry — Source Control / Search / Tasks arrive in slices 5-7).
+// Activity-bar view ids. Explorer (slice 2) + Source Control (slice 5). Search /
+// Tasks arrive in slices 6-7 and just register another id (YAGNI: the registry
+// stays a flat ordered list — Explorer first, SCM second).
 const VIEW_EXPLORER = "explorer";
+const VIEW_SCM = "scm";
+
+// The default active sidebar view when nothing is persisted.
+const DEFAULT_ACTIVE_VIEW = VIEW_EXPLORER;
 
 // Where the single #file-explorer element is hosted in IDE mode.
 const EXPLORER_HOST_SIDEBAR = "sidebar";
@@ -102,7 +112,8 @@ function loadLayoutState(store) {
         LAYOUT_SCHEMA_VERSION
       : LAYOUT_SCHEMA_VERSION;
   const detached = loadDetachedState(store);
-  return { mode, schemaVersion, detached };
+  const activeView = loadActiveView(store);
+  return { mode, schemaVersion, detached, activeView };
 }
 
 // Stamp the current schema version onto a versionless store. Never clobbers an
@@ -119,9 +130,11 @@ function migrateLayoutState(store) {
   if (current >= LAYOUT_SCHEMA_VERSION) return { migrated: false };
   // v2 stamped the version; `layout.detached` defaults to {} lazily on read.
   // v3 additionally seeds an empty `layout.editorTabs` (via the editor-tabs
-  // migrator, which never clobbers an existing value). We never clobber an
-  // existing layout.mode / layout.detached — only stamp the version + lazily
-  // seed editorTabs. Idempotent once the version is current.
+  // migrator, which never clobbers an existing value).
+  // v4 adds `layout.activeView`; it defaults to "explorer" lazily on read, so
+  // there's nothing to seed — just stamp the version. We never clobber an
+  // existing layout.mode / layout.detached / layout.activeView — only stamp the
+  // version + lazily seed editorTabs. Idempotent once the version is current.
   if (
     typeof window !== "undefined" &&
     window.EditorTabs?.migrateEditorTabsState
@@ -187,6 +200,51 @@ function setViewDetached(detached, viewId, isDetached) {
 function resolveExplorerHost(renderedMode, isDetached) {
   if (normalizeLayoutMode(renderedMode) !== LAYOUT_MODE_IDE) return "home";
   return isDetached ? EXPLORER_HOST_DETACHED : EXPLORER_HOST_SIDEBAR;
+}
+
+// ── Pure activity-bar view-registry reducers (DOM-free, unit-tested) ─────────
+
+// Coerce a stored active-view id against the set of registered view ids. An
+// unknown / blank id falls back to the first registered view (Explorer), so a
+// stale persisted id (e.g. a removed view) can never strand the sidebar.
+//   viewId   the candidate active view id
+//   viewIds  the ordered list of registered view ids (defaults to [explorer,scm])
+function normalizeActiveView(viewId, viewIds) {
+  const ids =
+    Array.isArray(viewIds) && viewIds.length
+      ? viewIds
+      : [VIEW_EXPLORER, VIEW_SCM];
+  const v = typeof viewId === "string" ? viewId.trim() : "";
+  return ids.includes(v) ? v : ids[0];
+}
+
+// Read the persisted active sidebar view from a settings store. Defaults to the
+// first registered view (Explorer) when absent/unknown.
+function loadActiveView(store, viewIds) {
+  const raw =
+    store && typeof store.get === "function"
+      ? store.get(LAYOUT_ACTIVE_VIEW_KEY, DEFAULT_ACTIVE_VIEW)
+      : DEFAULT_ACTIVE_VIEW;
+  return normalizeActiveView(raw, viewIds);
+}
+
+// Pure activity-bar reducer: given the CURRENT { activeView, collapsed } sidebar
+// state + the clicked view id, return the NEXT state (VS Code behavior).
+//   - clicking the ACTIVE view while the sidebar is OPEN collapses it (active
+//     view id is preserved so re-opening restores the same view).
+//   - clicking the active view while COLLAPSED re-opens it.
+//   - clicking a DIFFERENT view switches to it AND opens the sidebar.
+// Pure + total: never mutates the input; tolerates junk via normalizeActiveView.
+function reduceActivityClick(state, clickedView, viewIds) {
+  const activeView = normalizeActiveView(state?.activeView, viewIds);
+  const collapsed = Boolean(state?.collapsed);
+  const clicked = normalizeActiveView(clickedView, viewIds);
+  if (clicked === activeView) {
+    // Toggle the sidebar; keep the same active view either way.
+    return { activeView, collapsed: !collapsed };
+  }
+  // Different view: switch + always reveal the sidebar.
+  return { activeView: clicked, collapsed: false };
 }
 
 // ── Pure focus-target resolution (DOM-free, unit-tested) ─────────────────────
@@ -341,16 +399,71 @@ class IdeShellController {
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
 
+    // ── Activity-bar view registry (slice 5) ────────────────────────────────
+    // An ordered list of sidebar views, each a thin ViewHost adapter:
+    //   { id, icon, title, mount(container), unmount(), resize() }
+    // The Explorer (VIEW_EXPLORER) is registered FIRST by the controller itself
+    // (it keeps its special pop-out/dock + #file-explorer reparent path). The
+    // app registers additional views (Source Control this slice) via addView().
+    // The Explorer's mount/unmount are the controller's own host methods; other
+    // views mount into a shared secondary-view body slot.
+    this.views = [];
+    this.viewById = new Map();
+    // The view currently mounted into the secondary-view body slot (non-explorer
+    // views), so a switch can unmount it before mounting the next.
+    this.mountedSecondaryViewId = null;
+    // Register the Explorer view first (icon resolved by the activity-bar render).
+    this.addView({
+      id: VIEW_EXPLORER,
+      icon: "files",
+      title: "Explorer",
+      // Explorer hosting is the controller's existing reparent path.
+      mount: () => this.mountExplorerForHost(),
+      unmount: () => {},
+      resize: () => {
+        const v = this.explorerView;
+        if (v && typeof v.resize === "function") {
+          try {
+            v.resize();
+          } catch {
+            // best-effort
+          }
+        }
+      },
+    });
+
     // DOM handles, created lazily on first IDE render.
     this.shellEl = null;
     this.activityBarEl = null;
     this.sidebarEl = null;
     this.sidebarBodyEl = null;
+    this.secondaryBodyEl = null;
+    this.sidebarTitleEl = null;
     this.editorAreaEl = null;
     this.popOutBtnEl = null;
 
     // True while the shell is actually rendered (IDE presentation active).
     this.rendered = false;
+  }
+
+  // Register a sidebar view (ViewHost adapter). Idempotent on id (re-registering
+  // replaces the prior entry — the app may register after the controller is
+  // built). Re-renders the activity bar if the shell is already up.
+  addView(view) {
+    if (!view || typeof view.id !== "string" || !view.id) return;
+    if (this.viewById.has(view.id)) {
+      const idx = this.views.findIndex((v) => v.id === view.id);
+      if (idx >= 0) this.views[idx] = view;
+    } else {
+      this.views.push(view);
+    }
+    this.viewById.set(view.id, view);
+    if (this.activityBarEl) this.renderActivityBar();
+  }
+
+  // The ordered list of registered view ids (Explorer first).
+  viewIds() {
+    return this.views.map((v) => v.id);
   }
 
   // The live FileExplorerController (resolved lazily; may be null pre-init).
@@ -397,6 +510,176 @@ class IdeShellController {
   // Where the Explorer element should be hosted right now (pure resolver).
   explorerHost() {
     return resolveExplorerHost(this.renderedMode(), this.isExplorerDetached());
+  }
+
+  // ── Active sidebar view (slice 5 view registry) ─────────────────────────────
+
+  // The persisted active sidebar view id (coerced against registered views).
+  activeView() {
+    return loadActiveView(this.settingsStore, this.viewIds());
+  }
+
+  // Persist the active view id (coerced) for the next IDE entry.
+  persistActiveView(viewId) {
+    if (!this.settingsStore) return;
+    this.settingsStore.set(
+      LAYOUT_ACTIVE_VIEW_KEY,
+      normalizeActiveView(viewId, this.viewIds()),
+    );
+  }
+
+  // Is the sidebar collapsed? In-memory only (collapse is a transient UI state;
+  // the design reserves only layout.activeView for persistence). Defaults open.
+  isSidebarCollapsed() {
+    return Boolean(this._sidebarCollapsed);
+  }
+
+  // Handle an activity-bar icon click via the pure reducer: switch view (and open
+  // the sidebar) on a different icon; toggle collapse on the active icon. The
+  // active view id is persisted; collapse stays in-memory. No-op outside IDE.
+  onActivityClick(viewId) {
+    if (!this.rendered) return;
+    const prevActive = this.activeView();
+    // VS Code "click the active view re-homes it": if the Explorer is the active
+    // view AND popped out, clicking its icon docks it back rather than collapsing.
+    if (
+      viewId === VIEW_EXPLORER &&
+      prevActive === VIEW_EXPLORER &&
+      this.isExplorerDetached()
+    ) {
+      this.dockExplorer();
+      return;
+    }
+    const prev = {
+      activeView: prevActive,
+      collapsed: this.isSidebarCollapsed(),
+    };
+    const next = reduceActivityClick(prev, viewId, this.viewIds());
+    const viewChanged = next.activeView !== prevActive;
+    this._sidebarCollapsed = next.collapsed;
+    if (viewChanged) this.persistActiveView(next.activeView);
+    this.applyActiveView();
+  }
+
+  // Reconcile the sidebar DOM to the active-view + collapsed state: mount the
+  // active view into its slot, toggle the Explorer ⇄ secondary slots, update the
+  // header title + activity-bar selection, and apply the collapsed class.
+  applyActiveView() {
+    if (!this.rendered) return;
+    const activeId = this.activeView();
+    const collapsed = this.isSidebarCollapsed();
+
+    // Collapse: hide the whole sidebar (VS Code). The activity bar stays.
+    if (this.sidebarEl) this.sidebarEl.classList.toggle("collapsed", collapsed);
+    if (this.shellEl)
+      this.shellEl.classList.toggle("sidebar-collapsed", collapsed);
+
+    // Toggle Explorer vs secondary body slots by the active view.
+    const explorerActive = activeId === VIEW_EXPLORER;
+    if (this.sidebarBodyEl)
+      this.sidebarBodyEl.classList.toggle("hidden", !explorerActive);
+    if (this.secondaryBodyEl)
+      this.secondaryBodyEl.classList.toggle("hidden", explorerActive);
+    // The Explorer-only pop-out affordance is meaningful for the Explorer view.
+    if (this.popOutBtnEl) this.popOutBtnEl.hidden = !explorerActive;
+
+    // Header title reflects the active view.
+    const view = this.viewById.get(activeId);
+    if (this.sidebarTitleEl)
+      this.sidebarTitleEl.textContent = view?.title || "Explorer";
+
+    // Activity-bar selected state.
+    if (this.activityBarEl) {
+      this.activityBarEl
+        .querySelectorAll(".ide-activity-item")
+        .forEach((btn) => {
+          const sel = btn.dataset.view === activeId;
+          btn.classList.toggle("active", sel);
+          btn.setAttribute("aria-selected", sel ? "true" : "false");
+        });
+    }
+
+    // Don't (re)mount view bodies while the sidebar is collapsed — they're not
+    // visible and CodeMirror/measure would mis-size. Re-opening re-mounts.
+    if (collapsed) return;
+
+    if (explorerActive) {
+      // Explorer is hosted via its own reparent path (sidebar or detached).
+      this.mountExplorerForHost();
+    } else {
+      this.mountSecondaryView(activeId);
+    }
+  }
+
+  // Mount a non-explorer registered view into the shared secondary body slot,
+  // unmounting whichever view was there before (ViewHost re-host). Idempotent:
+  // re-mounting the already-mounted view just re-runs resize().
+  mountSecondaryView(viewId) {
+    const view = this.viewById.get(viewId);
+    if (!view || !this.secondaryBodyEl) return;
+    if (this.mountedSecondaryViewId === viewId) {
+      if (typeof view.resize === "function") {
+        try {
+          view.resize();
+        } catch {
+          // best-effort
+        }
+      }
+      return;
+    }
+    // Unmount the previous secondary view (its model persists in its own store).
+    if (this.mountedSecondaryViewId) {
+      const prev = this.viewById.get(this.mountedSecondaryViewId);
+      if (prev && typeof prev.unmount === "function") {
+        try {
+          prev.unmount();
+        } catch {
+          // best-effort
+        }
+      }
+    }
+    if (typeof view.mount === "function") view.mount(this.secondaryBodyEl);
+    this.mountedSecondaryViewId = viewId;
+    if (typeof view.resize === "function") {
+      try {
+        view.resize();
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  // Render the activity bar from the view registry (one icon per view). Called
+  // once on ensureShell + on a later addView. Each icon clicks through the pure
+  // reducer (onActivityClick).
+  renderActivityBar() {
+    if (!this.activityBarEl || !this.doc) return;
+    const activeId = this.activeView();
+    this.activityBarEl.replaceChildren();
+    for (const view of this.views) {
+      const btn = this.doc.createElement("button");
+      btn.type = "button";
+      btn.className = "ide-activity-item";
+      if (view.id === activeId) btn.classList.add("active");
+      btn.dataset.view = view.id;
+      btn.title = view.title || view.id;
+      btn.setAttribute("role", "tab");
+      btn.setAttribute("aria-label", view.title || view.id);
+      btn.setAttribute(
+        "aria-selected",
+        view.id === activeId ? "true" : "false",
+      );
+      btn.innerHTML = `<i data-lucide="${view.icon || "circle"}"></i>`;
+      btn.addEventListener("click", () => this.onActivityClick(view.id));
+      this.activityBarEl.appendChild(btn);
+    }
+    if (typeof window !== "undefined" && window.lucide?.createIcons) {
+      try {
+        window.lucide.createIcons();
+      } catch {
+        // cosmetic
+      }
+    }
   }
 
   // Persist a new desktop preference (device-local) + apply live. Does NOT write
@@ -449,13 +732,19 @@ class IdeShellController {
     // Host the Explorer in its resolved IDE home: the sidebar by default, or a
     // floating SurfaceWindow when the persisted detached flag is set. Either way
     // the single #file-explorer element is MOVED (not cloned) and the controller
-    // is REUSED via the ViewHost contract — never recreated.
+    // is REUSED via the ViewHost contract — never recreated. (Always reparent on
+    // enter even if another view is active, so the Explorer element leaves its
+    // terminal-mode home and exit can restore it losslessly.)
     this.mountExplorerForHost();
 
     // App hook: dock terminals to the bottom panel (CSS only — no PTY touch).
     if (this.onEnterIde) this.onEnterIde();
 
     this.rendered = true;
+
+    // Reconcile the active sidebar view (Explorer or a registered secondary
+    // view, e.g. Source Control) + collapsed state from persistence.
+    this.applyActiveView();
 
     // Resize/measure pass AFTER reparenting (xterm fit, explorer re-render).
     this.runAfterRender();
@@ -519,24 +808,14 @@ class IdeShellController {
     shell.className = "ide-shell";
     shell.hidden = true;
 
-    // Activity bar — Explorer icon only this slice.
+    // Activity bar — one icon per registered view (slice 5 view registry).
     const activityBar = this.doc.createElement("div");
     activityBar.className = "ide-activity-bar";
     activityBar.setAttribute("role", "tablist");
     activityBar.setAttribute("aria-label", "Activity bar");
-    const explorerBtn = this.doc.createElement("button");
-    explorerBtn.type = "button";
-    explorerBtn.className = "ide-activity-item active";
-    explorerBtn.dataset.view = "explorer";
-    explorerBtn.title = "Explorer";
-    explorerBtn.setAttribute("aria-label", "Explorer");
-    explorerBtn.innerHTML = '<i data-lucide="files"></i>';
-    // Clicking the (active) Explorer icon while it's popped out docks it back —
-    // VS Code "click the active view re-homes it in the sidebar".
-    explorerBtn.addEventListener("click", () => this.dockExplorer());
-    activityBar.appendChild(explorerBtn);
 
-    // Sidebar — hosts the Explorer skeleton (#file-explorer) this slice.
+    // Sidebar — hosts the active view (Explorer's #file-explorer reparent OR a
+    // registered secondary view mounted into the secondary body slot).
     const sidebar = this.doc.createElement("div");
     sidebar.className = "ide-sidebar";
     const sidebarHeader = this.doc.createElement("div");
@@ -545,6 +824,7 @@ class IdeShellController {
     sidebarTitle.className = "ide-sidebar-title";
     sidebarTitle.textContent = "Explorer";
     // Pop-out control — detaches the Explorer into a floating SurfaceWindow.
+    // Explorer-only this slice (hidden for other views by applyActiveView).
     const popOutBtn = this.doc.createElement("button");
     popOutBtn.type = "button";
     popOutBtn.className = "ide-sidebar-action ide-popout-btn";
@@ -555,16 +835,23 @@ class IdeShellController {
     popOutBtn.addEventListener("click", () => this.toggleExplorerDetached());
     sidebarHeader.appendChild(sidebarTitle);
     sidebarHeader.appendChild(popOutBtn);
+    // Explorer body slot (hosts the reparented #file-explorer element).
     const sidebarBody = this.doc.createElement("div");
     sidebarBody.className = "ide-sidebar-body";
+    // Secondary view body slot (hosts non-explorer registered views, e.g. SCM).
+    const secondaryBody = this.doc.createElement("div");
+    secondaryBody.className = "ide-sidebar-secondary-body hidden";
     // Hint shown when the Explorer is popped out (sidebar body is then empty).
     const detachedHint = this.doc.createElement("div");
     detachedHint.className = "ide-sidebar-detached-hint";
     detachedHint.textContent = "Explorer is in a floating window.";
     sidebar.appendChild(sidebarHeader);
     sidebar.appendChild(sidebarBody);
+    sidebar.appendChild(secondaryBody);
     sidebar.appendChild(detachedHint);
     this.popOutBtnEl = popOutBtn;
+    this.sidebarTitleEl = sidebarTitle;
+    this.secondaryBodyEl = secondaryBody;
 
     // Editor area — empty placeholder this slice (tabs come in slice 4).
     const editorArea = this.doc.createElement("div");
@@ -592,14 +879,8 @@ class IdeShellController {
     this.sidebarBodyEl = sidebarBody;
     this.editorAreaEl = editorArea;
 
-    // Render the lucide icon if the library is present.
-    if (typeof window !== "undefined" && window.lucide?.createIcons) {
-      try {
-        window.lucide.createIcons();
-      } catch {
-        // Icon rendering is cosmetic; never let it break the shell.
-      }
-    }
+    // Render the activity-bar icons from the registry (also runs lucide).
+    this.renderActivityBar();
   }
 
   // Mount the Explorer into its resolved IDE host (sidebar OR floating window),
@@ -818,9 +1099,12 @@ const IdeShell = {
   LAYOUT_MODE_KEY,
   LAYOUT_SCHEMA_VERSION_KEY,
   LAYOUT_DETACHED_KEY,
+  LAYOUT_ACTIVE_VIEW_KEY,
   LAYOUT_MODE_IDE,
   LAYOUT_MODE_TERMINAL,
   VIEW_EXPLORER,
+  VIEW_SCM,
+  DEFAULT_ACTIVE_VIEW,
   EXPLORER_HOST_SIDEBAR,
   EXPLORER_HOST_DETACHED,
   normalizeLayoutMode,
@@ -834,6 +1118,9 @@ const IdeShell = {
   isViewDetached,
   setViewDetached,
   resolveExplorerHost,
+  normalizeActiveView,
+  loadActiveView,
+  reduceActivityClick,
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
@@ -853,9 +1140,12 @@ if (typeof exports !== "undefined") {
   exports.LAYOUT_MODE_KEY = LAYOUT_MODE_KEY;
   exports.LAYOUT_SCHEMA_VERSION_KEY = LAYOUT_SCHEMA_VERSION_KEY;
   exports.LAYOUT_DETACHED_KEY = LAYOUT_DETACHED_KEY;
+  exports.LAYOUT_ACTIVE_VIEW_KEY = LAYOUT_ACTIVE_VIEW_KEY;
   exports.LAYOUT_MODE_IDE = LAYOUT_MODE_IDE;
   exports.LAYOUT_MODE_TERMINAL = LAYOUT_MODE_TERMINAL;
   exports.VIEW_EXPLORER = VIEW_EXPLORER;
+  exports.VIEW_SCM = VIEW_SCM;
+  exports.DEFAULT_ACTIVE_VIEW = DEFAULT_ACTIVE_VIEW;
   exports.EXPLORER_HOST_SIDEBAR = EXPLORER_HOST_SIDEBAR;
   exports.EXPLORER_HOST_DETACHED = EXPLORER_HOST_DETACHED;
   exports.normalizeLayoutMode = normalizeLayoutMode;
@@ -869,6 +1159,9 @@ if (typeof exports !== "undefined") {
   exports.isViewDetached = isViewDetached;
   exports.setViewDetached = setViewDetached;
   exports.resolveExplorerHost = resolveExplorerHost;
+  exports.normalizeActiveView = normalizeActiveView;
+  exports.loadActiveView = loadActiveView;
+  exports.reduceActivityClick = reduceActivityClick;
   exports.captureFocusTarget = captureFocusTarget;
   exports.resolveFocusTarget = resolveFocusTarget;
   exports.captureExplorerState = captureExplorerState;

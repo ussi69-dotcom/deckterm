@@ -4,7 +4,10 @@ import {
   LAYOUT_MODE_KEY,
   LAYOUT_SCHEMA_VERSION_KEY,
   LAYOUT_DETACHED_KEY,
+  LAYOUT_ACTIVE_VIEW_KEY,
   VIEW_EXPLORER,
+  VIEW_SCM,
+  DEFAULT_ACTIVE_VIEW,
   EXPLORER_HOST_SIDEBAR,
   EXPLORER_HOST_DETACHED,
   normalizeLayoutMode,
@@ -18,6 +21,9 @@ import {
   isViewDetached,
   setViewDetached,
   resolveExplorerHost,
+  normalizeActiveView,
+  loadActiveView,
+  reduceActivityClick,
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
@@ -109,17 +115,20 @@ test("loadLayoutState reads stored mode + version + detached, defaulting cleanly
     mode: "terminal",
     schemaVersion: LAYOUT_SCHEMA_VERSION,
     detached: {},
+    activeView: "explorer",
   });
 
   const stored = makeFakeStore({
     "layout.mode": "ide",
     "layout.schemaVersion": LAYOUT_SCHEMA_VERSION,
     "layout.detached": { explorer: true },
+    "layout.activeView": "scm",
   });
   expect(loadLayoutState(stored)).toEqual({
     mode: "ide",
     schemaVersion: LAYOUT_SCHEMA_VERSION,
     detached: { explorer: true },
+    activeView: "scm",
   });
 
   // A bad stored mode is normalized.
@@ -229,10 +238,94 @@ test("captureExplorerState defaults missing/blank fields to a closed-home state"
 
 // ── Slice 3: schema v2 + detached-state helpers ──────────────────────────────
 
-test("schema version is v3 (slice 4 bumped it for layout.editorTabs)", () => {
-  expect(LAYOUT_SCHEMA_VERSION).toBe(3);
+test("schema version is v4 (slice 5 bumped it for layout.activeView)", () => {
+  expect(LAYOUT_SCHEMA_VERSION).toBe(4);
   expect(LAYOUT_DETACHED_KEY).toBe("layout.detached");
+  expect(LAYOUT_ACTIVE_VIEW_KEY).toBe("layout.activeView");
   expect(VIEW_EXPLORER).toBe("explorer");
+  expect(VIEW_SCM).toBe("scm");
+  expect(DEFAULT_ACTIVE_VIEW).toBe("explorer");
+});
+
+test("migrateLayoutState v3 store → v4 stamps version, never clobbers activeView", () => {
+  const store = makeFakeStore({
+    "layout.mode": "ide",
+    "layout.schemaVersion": 3,
+    "layout.activeView": "scm",
+  });
+  const result = migrateLayoutState(store);
+  expect(result.migrated).toBe(true);
+  expect(store.get("layout.schemaVersion")).toBe(LAYOUT_SCHEMA_VERSION);
+  expect(store.get("layout.activeView")).toBe("scm");
+});
+
+// ── activity-bar view-registry reducers ──────────────────────────────────────
+
+test("normalizeActiveView coerces against registered ids, defaults to the first", () => {
+  expect(normalizeActiveView("scm", ["explorer", "scm"])).toBe("scm");
+  expect(normalizeActiveView("explorer", ["explorer", "scm"])).toBe("explorer");
+  // Unknown / blank / junk → first registered.
+  expect(normalizeActiveView("search", ["explorer", "scm"])).toBe("explorer");
+  expect(normalizeActiveView("", ["explorer", "scm"])).toBe("explorer");
+  expect(normalizeActiveView(null, ["explorer", "scm"])).toBe("explorer");
+  // Empty registry falls back to the default [explorer, scm].
+  expect(normalizeActiveView("scm", [])).toBe("scm");
+});
+
+test("loadActiveView reads the persisted view, defaulting to explorer", () => {
+  expect(loadActiveView(makeFakeStore())).toBe("explorer");
+  expect(loadActiveView(makeFakeStore({ "layout.activeView": "scm" }))).toBe(
+    "scm",
+  );
+  // A stale/unknown persisted id is coerced to the first registered view.
+  expect(loadActiveView(makeFakeStore({ "layout.activeView": "tasks" }))).toBe(
+    "explorer",
+  );
+});
+
+test("reduceActivityClick switches view + opens sidebar on a different icon", () => {
+  const next = reduceActivityClick(
+    { activeView: "explorer", collapsed: false },
+    "scm",
+    ["explorer", "scm"],
+  );
+  expect(next).toEqual({ activeView: "scm", collapsed: false });
+});
+
+test("reduceActivityClick switching also re-opens a collapsed sidebar", () => {
+  const next = reduceActivityClick(
+    { activeView: "explorer", collapsed: true },
+    "scm",
+    ["explorer", "scm"],
+  );
+  expect(next).toEqual({ activeView: "scm", collapsed: false });
+});
+
+test("reduceActivityClick toggles collapse when clicking the active view", () => {
+  const ids = ["explorer", "scm"];
+  const open = reduceActivityClick(
+    { activeView: "scm", collapsed: false },
+    "scm",
+    ids,
+  );
+  expect(open).toEqual({ activeView: "scm", collapsed: true });
+  const reopen = reduceActivityClick(
+    { activeView: "scm", collapsed: true },
+    "scm",
+    ids,
+  );
+  expect(reopen).toEqual({ activeView: "scm", collapsed: false });
+});
+
+test("reduceActivityClick is pure (never mutates its input) + tolerates junk", () => {
+  const state = { activeView: "explorer", collapsed: false };
+  const next = reduceActivityClick(state, "scm", ["explorer", "scm"]);
+  expect(state).toEqual({ activeView: "explorer", collapsed: false });
+  expect(next).not.toBe(state);
+  // Junk clicked-view coerces to the first registered, which equals the active
+  // explorer here → toggles collapse.
+  const junk = reduceActivityClick(state, "junk", ["explorer", "scm"]);
+  expect(junk).toEqual({ activeView: "explorer", collapsed: true });
 });
 
 test("migrateLayoutState v1 store → current stamps version, never clobbers keys", () => {
@@ -369,6 +462,11 @@ function makeFakeEl(id = null) {
     },
     insertBefore(node /*, ref */) {
       return el.appendChild(node);
+    },
+    replaceChildren(...nodes) {
+      for (const child of el.children) child.parentElement = null;
+      el.children = [];
+      for (const node of nodes) el.appendChild(node);
     },
     querySelector() {
       return null;
