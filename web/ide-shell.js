@@ -64,6 +64,7 @@ const LAYOUT_MODE_TERMINAL = "terminal";
 const VIEW_EXPLORER = "explorer";
 const VIEW_SCM = "scm";
 const VIEW_TASKS = "tasks";
+const VIEW_SEARCH = "search";
 
 // The default active sidebar view when nothing is persisted.
 const DEFAULT_ACTIVE_VIEW = VIEW_EXPLORER;
@@ -215,7 +216,7 @@ function normalizeActiveView(viewId, viewIds) {
   const ids =
     Array.isArray(viewIds) && viewIds.length
       ? viewIds
-      : [VIEW_EXPLORER, VIEW_SCM, VIEW_TASKS];
+      : [VIEW_EXPLORER, VIEW_SCM, VIEW_TASKS, VIEW_SEARCH];
   const v = typeof viewId === "string" ? viewId.trim() : "";
   return ids.includes(v) ? v : ids[0];
 }
@@ -1124,6 +1125,7 @@ const IdeShell = {
   VIEW_EXPLORER,
   VIEW_SCM,
   VIEW_TASKS,
+  VIEW_SEARCH,
   DEFAULT_ACTIVE_VIEW,
   EXPLORER_HOST_SIDEBAR,
   EXPLORER_HOST_DETACHED,
@@ -1166,6 +1168,7 @@ if (typeof exports !== "undefined") {
   exports.VIEW_EXPLORER = VIEW_EXPLORER;
   exports.VIEW_SCM = VIEW_SCM;
   exports.VIEW_TASKS = VIEW_TASKS;
+  exports.VIEW_SEARCH = VIEW_SEARCH;
   exports.DEFAULT_ACTIVE_VIEW = DEFAULT_ACTIVE_VIEW;
   exports.EXPLORER_HOST_SIDEBAR = EXPLORER_HOST_SIDEBAR;
   exports.EXPLORER_HOST_DETACHED = EXPLORER_HOST_DETACHED;

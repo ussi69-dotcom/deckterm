@@ -425,10 +425,19 @@ class EditorTabsController {
         ? options.labelForTab
         : (tab) => defaultLabel(tab);
 
+    // Reveal-at-line hook: (key, target:{line,col}) => void. The controller
+    // doesn't own CodeMirror handles (the app does), so it delegates the actual
+    // scroll/cursor placement. Optional — open-at-line is a no-op without it.
+    this.onRevealLine =
+      typeof options.onRevealLine === "function" ? options.onRevealLine : null;
+
     this.tabBarEl = null;
     this.bodyHostEl = null;
     // Per-tab mounted body element cache (so switching tabs doesn't re-fetch).
     this.bodies = new Map();
+    // Per-tab one-shot reveal targets ({ line, col }) set by openFile and
+    // consumed once the body is live (search open-at-line).
+    this.pendingReveal = new Map();
     // The key whose body is currently shown.
     this.mountedKey = null;
     // Keys whose async body mount is still in flight. Guards a second
@@ -474,10 +483,37 @@ class EditorTabsController {
     this.bodyHostEl = host;
   }
 
-  // Public open: build a tab descriptor and route through the model.
-  openFile(path, { preview = true } = {}) {
+  // Public open: build a tab descriptor and route through the model. An
+  // optional { line, col } is a ONE-SHOT reveal target (not persisted tab
+  // state): a search result opens the file and scrolls/places the cursor at the
+  // line. It's recorded per tabKey and consumed by the body mount (and applied
+  // immediately when the tab is already mounted). Line is 1-based.
+  openFile(path, { preview = true, line, col } = {}) {
     this.ensureScaffold();
-    this.model.open(makeFileTab(path, { preview }));
+    const tab = makeFileTab(path, { preview });
+    const key = tabKey(tab);
+    if (Number.isFinite(line) && line > 0) {
+      this.pendingReveal.set(key, {
+        line,
+        col: Number.isFinite(col) ? col : 1,
+      });
+      // If this file tab is already the mounted, live body, apply the reveal
+      // now (no mount will fire to consume it). Otherwise the mount path picks
+      // it up via consumeReveal().
+      if (this.mountedKey === key && typeof this.applyReveal === "function") {
+        this.applyReveal(key);
+      }
+    }
+    this.model.open(tab);
+  }
+
+  // Consume (read + clear) a pending one-shot reveal target for a tab key. The
+  // body-mount path calls this after the editor view is live to scroll to the
+  // search-hit line exactly once.
+  consumeReveal(key) {
+    const target = this.pendingReveal.get(key) || null;
+    if (target) this.pendingReveal.delete(key);
+    return target;
   }
 
   openDiff(spec) {
@@ -641,6 +677,22 @@ class EditorTabsController {
     bodyEl.hidden = false;
     this.mountedKey = activeKey;
     this.measureActive();
+    // Apply a pending open-at-line reveal once the body is live + measured.
+    this.applyReveal(activeKey);
+  }
+
+  // Consume + apply a pending reveal target for a key, delegating the actual
+  // scroll/cursor placement to the app's onRevealLine hook (which owns the live
+  // CodeMirror handle). One-shot: consumeReveal clears it.
+  applyReveal(key) {
+    if (!key || !this.onRevealLine) return;
+    const target = this.consumeReveal(key);
+    if (!target) return;
+    try {
+      this.onRevealLine(key, target);
+    } catch {
+      // best-effort — a reveal failure never breaks the tab switch
+    }
   }
 
   measureActive() {

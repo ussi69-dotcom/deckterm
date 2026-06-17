@@ -288,10 +288,14 @@ test("loadActiveView reads the persisted view, defaulting to explorer", () => {
   expect(loadActiveView(makeFakeStore({ "layout.activeView": "tasks" }))).toBe(
     "tasks",
   );
-  // A stale/unknown persisted id is still coerced to the first registered view.
+  // The Search view (slice 7) is an accepted persisted id (built-in default set).
   expect(loadActiveView(makeFakeStore({ "layout.activeView": "search" }))).toBe(
-    "explorer",
+    "search",
   );
+  // A stale/unknown persisted id is still coerced to the first registered view.
+  expect(
+    loadActiveView(makeFakeStore({ "layout.activeView": "nope-gone" })),
+  ).toBe("explorer");
 });
 
 test("reduceActivityClick switches view + opens sidebar on a different icon", () => {

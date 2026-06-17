@@ -510,3 +510,53 @@ test("controller guards a concurrent same-key mount (only one body/handle, none 
   expect(handles.size).toBeLessThanOrEqual(1);
   expect(controller.pendingMounts.size).toBe(0);
 });
+
+// ── Open-at-line (slice 7: search result → editor) ───────────────────────────
+
+// openFile with { line } records a one-shot reveal target keyed by tabKey, and
+// the body-mount path consumes it via onRevealLine exactly once. A later mount
+// of the SAME file with no line must NOT re-fire a stale reveal.
+test("openFile { line } reveals the line once after the body mounts", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  const reveals = [];
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    onRevealLine: (key, target) => reveals.push({ key, ...target }),
+  });
+
+  controller.openFile("/file.js", { preview: true, line: 12, col: 4 });
+  const key = tabKey(makeFileTab("/file.js"));
+  // The reveal is pending until the body mounts.
+  expect(controller.pendingReveal.has(key)).toBe(true);
+
+  await controller.renderActiveBody();
+  expect(reveals).toEqual([{ key, line: 12, col: 4 }]);
+  // One-shot: consumed, so the pending entry is gone.
+  expect(controller.pendingReveal.has(key)).toBe(false);
+
+  // Re-activating the already-mounted body must NOT re-fire a reveal.
+  await controller.renderActiveBody();
+  expect(reveals).toHaveLength(1);
+});
+
+test("openFile without line never fires a reveal", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  const reveals = [];
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    onRevealLine: (key, target) => reveals.push({ key, ...target }),
+  });
+  controller.openFile("/plain.js", { preview: true });
+  await controller.renderActiveBody();
+  expect(reveals).toHaveLength(0);
+});

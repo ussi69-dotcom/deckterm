@@ -1051,6 +1051,207 @@ async function resolveAllowedPath(
   }
 }
 
+// ── Scoped content search (POST /api/files/search) bounds + impl ─────────────
+const SEARCH_MAX_QUERY_LEN = 1024; // reject queries longer than this (400)
+const SEARCH_DEFAULT_MAX_RESULTS = 500; // default cap on returned matches
+const SEARCH_MAX_RESULTS = 500; // hard ceiling; client maxResults clamped to this
+const SEARCH_MAX_PER_FILE = 50; // stop collecting from a single file past this
+const SEARCH_MAX_LINE_LEN = 500; // truncate each returned match line to this many chars
+const SEARCH_TIMEOUT_MS = 5000; // hard-kill grep after this
+const SEARCH_MAX_STDOUT_BYTES = 2 * 1024 * 1024; // stop reading stdout past 2 MB
+
+// Secret-shaped basenames excluded from search by DEFAULT. There is no client
+// flag to disable this — bypass would require a privileged capability that is
+// simply never granted. Matched by grep --exclude (basename globs).
+const SEARCH_SECRET_EXCLUDES = [
+  ".env",
+  ".env.*",
+  "*.pem",
+  "*.key",
+  "*.p12",
+  "*.pfx",
+  "*.keystore",
+  "id_rsa*",
+  "id_dsa*",
+  "id_ecdsa*",
+  "id_ed25519*",
+  "*.ppk",
+  ".netrc",
+  ".git-credentials",
+  "*_token*",
+  "*_secret*",
+  "*secret*",
+  "*credential*",
+];
+
+// Directories never recursed into (noise + perf).
+const SEARCH_EXCLUDE_DIRS = [
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  "out",
+  "target",
+  "coverage",
+  ".cache",
+];
+
+interface ScopedSearchMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+// Per-actor in-flight grep process. A new search for the same actor aborts the
+// prior one (server side of the client's request-id staleness model — keeps
+// per-actor grep concurrency at 1).
+const inFlightSearches = new Map<string, ReturnType<typeof Bun.spawn>>();
+
+function parseGrepLine(line: string): ScopedSearchMatch | null {
+  // grep -n output is `path:lineno:text`. The path itself can contain colons,
+  // but we control the start dir (no colon-bearing roots in practice) and the
+  // line number is the first all-digit field after a colon, so split on the
+  // first two colons that bracket the digit run.
+  const firstColon = line.indexOf(":");
+  if (firstColon < 0) return null;
+  const secondColon = line.indexOf(":", firstColon + 1);
+  if (secondColon < 0) return null;
+  const path = line.slice(0, firstColon);
+  const lineNoRaw = line.slice(firstColon + 1, secondColon);
+  if (!/^\d+$/.test(lineNoRaw)) return null;
+  const lineNo = parseInt(lineNoRaw, 10);
+  if (!Number.isFinite(lineNo) || lineNo <= 0) return null;
+  let text = line.slice(secondColon + 1);
+  if (text.length > SEARCH_MAX_LINE_LEN) {
+    text = text.slice(0, SEARCH_MAX_LINE_LEN);
+  }
+  return { path, line: lineNo, text };
+}
+
+async function runScopedSearch(opts: {
+  ownerId: string;
+  root: string;
+  query: string;
+  regex: boolean;
+  maxResults: number;
+}): Promise<{ matches: ScopedSearchMatch[]; truncated: boolean }> {
+  const { ownerId, root, query, regex, maxResults } = opts;
+
+  // Abort any prior in-flight grep for this actor (per-actor concurrency = 1).
+  const prior = inFlightSearches.get(ownerId);
+  if (prior) {
+    try {
+      prior.kill();
+    } catch {
+      // best-effort
+    }
+  }
+
+  const excludeArgs: string[] = [];
+  for (const glob of SEARCH_SECRET_EXCLUDES)
+    excludeArgs.push(`--exclude=${glob}`);
+  for (const dir of SEARCH_EXCLUDE_DIRS)
+    excludeArgs.push(`--exclude-dir=${dir}`);
+
+  // -r (lowercase) → recurse but do NOT follow symlinks found during recursion.
+  // -I skip binary files, -n line numbers, -F literal / -E regex, -e <query> so
+  // a leading-dash query can't be argv-flag-smuggled.
+  const args = [
+    "grep",
+    "-rInI",
+    regex ? "-E" : "-F",
+    ...excludeArgs,
+    "-e",
+    query,
+    root,
+  ];
+
+  const proc = Bun.spawn(args, {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "ignore",
+    env: { ...process.env, LC_ALL: "C" },
+  });
+  inFlightSearches.set(ownerId, proc);
+
+  let truncated = false;
+  const timeout = setTimeout(() => {
+    truncated = true;
+    try {
+      proc.kill();
+    } catch {
+      // best-effort
+    }
+  }, SEARCH_TIMEOUT_MS);
+
+  const matches: ScopedSearchMatch[] = [];
+  const perFile = new Map<string, number>();
+  let buffer = "";
+  let bytesRead = 0;
+
+  const consumeLine = (line: string) => {
+    if (matches.length >= maxResults) {
+      truncated = true;
+      return;
+    }
+    const parsed = parseGrepLine(line);
+    if (!parsed) return;
+    const seen = perFile.get(parsed.path) || 0;
+    if (seen >= SEARCH_MAX_PER_FILE) {
+      truncated = true;
+      return;
+    }
+    perFile.set(parsed.path, seen + 1);
+    matches.push(parsed);
+  };
+
+  try {
+    const decoder = new TextDecoder();
+    for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+      bytesRead += chunk.byteLength;
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (line) consumeLine(line);
+        if (matches.length >= maxResults) break;
+      }
+      if (matches.length >= maxResults) {
+        truncated = true;
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+      if (bytesRead > SEARCH_MAX_STDOUT_BYTES) {
+        truncated = true;
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+    }
+    // Trailing line (no terminating newline) within bounds.
+    if (buffer && matches.length < maxResults) consumeLine(buffer);
+  } catch {
+    // Stream torn down by kill() (timeout / abort / cap) — keep what we have.
+  } finally {
+    clearTimeout(timeout);
+    await proc.exited.catch(() => undefined);
+    if (inFlightSearches.get(ownerId) === proc) {
+      inFlightSearches.delete(ownerId);
+    }
+  }
+
+  return { matches, truncated };
+}
+
 function resolveFoundationRootIdForPath(
   state: FoundationState,
   pathValue: string,
@@ -2931,6 +3132,110 @@ export function createWebApp() {
       }
       return c.json({ error: "Cannot read directory" }, 400);
     }
+  });
+
+  // POST /api/files/search — bounded recursive content search (grep) scoped to
+  // an allowed root. The single most security-critical slice-7 surface; do NOT
+  // weaken the gating/bounds below without a security review.
+  //
+  // Threat model + DECISIONS (slice 7):
+  //  - cwd is realpath-resolved + allowed-root-gated (resolveAllowedPath); the
+  //    REALPATH is the grep start dir so a symlinked root can't escape.
+  //  - grep -r (lowercase) does NOT follow symlinks found during recursion, so a
+  //    symlink placed inside the root pointing outside is never traversed.
+  //  - secret-shaped files are excluded by default (server-fixed --exclude
+  //    globs, no client flag to disable).
+  //  - literal-by-default (-F); regex is opt-in (-E).
+  //  - query never reaches a shell (argv-style Bun.spawn) and is passed via -e so
+  //    a leading dash can't be argv-flag-smuggled.
+  //  - the raw query text is NEVER audited (it can contain secrets the user is
+  //    hunting); only queryLength/regex/matchCount/truncated are logged.
+  app.post("/api/files/search", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      cwd?: unknown;
+      query?: unknown;
+      regex?: unknown;
+      maxResults?: unknown;
+      requestId?: unknown;
+    };
+
+    const requestId = body.requestId;
+    const regex = Boolean(body.regex);
+    const rawQuery = typeof body.query === "string" ? body.query : "";
+
+    // ── Validation / bounds ──────────────────────────────────────────────────
+    const query = rawQuery.trim();
+    if (!query) {
+      return c.json({ error: "Empty query", requestId }, 400);
+    }
+    if (rawQuery.length > SEARCH_MAX_QUERY_LEN) {
+      return c.json({ error: "Query too long", requestId }, 400);
+    }
+
+    let maxResults = SEARCH_DEFAULT_MAX_RESULTS;
+    if (
+      typeof body.maxResults === "number" &&
+      Number.isFinite(body.maxResults)
+    ) {
+      maxResults = Math.max(
+        1,
+        Math.min(SEARCH_MAX_RESULTS, Math.floor(body.maxResults)),
+      );
+    }
+
+    const requestedCwd = typeof body.cwd === "string" ? body.cwd : "";
+
+    // ── Gating: realpath-resolve cwd to an allowed root ──────────────────────
+    const resolvedRoot = await resolveAllowedPath(requestedCwd);
+    if (!resolvedRoot) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.search",
+        resourceType: "root",
+        decision: "deny",
+        reason: "forbidden_root",
+        data: { cwd: requestedCwd },
+      });
+      return c.json({ error: "Forbidden search root", requestId }, 403);
+    }
+
+    const fileAccess = await requireFileAccess(c, resolvedRoot);
+    if (!fileAccess.ok) {
+      return c.json(
+        { ...fileAccess.body, requestId },
+        { status: fileAccess.status as any },
+      );
+    }
+
+    // ── Run the bounded grep (argv-style, no shell) ──────────────────────────
+    const { matches, truncated } = await runScopedSearch({
+      ownerId,
+      root: resolvedRoot,
+      query,
+      regex,
+      maxResults,
+    });
+
+    const state = await getFoundationState();
+    const rootId = resolveFoundationRootIdForPath(state, resolvedRoot);
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action: "files.search",
+      resourceType: "root",
+      resourceId: rootId || resolvedRoot,
+      decision: "allow",
+      // DECISION: never log the raw query (it can contain secrets being hunted).
+      data: {
+        queryLength: query.length,
+        regex,
+        matchCount: matches.length,
+        truncated,
+      },
+    });
+
+    return c.json({ matches, truncated, requestId });
   });
 
   // File download

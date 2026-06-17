@@ -6155,6 +6155,129 @@ body.ide-mode #workspace-area {
   background: var(--accent-blue-hover, #1177bb);
 }
 
+/* --- Search sidebar view (IDE shell, slice 7) --- */
+.ide-search-view {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  font-size: 13px;
+  color: var(--text-primary, #ddd);
+}
+
+.ide-search-header {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.ide-search-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  box-sizing: border-box;
+  background: var(--bg-input, #1e1e1e);
+  color: var(--text-primary, #ddd);
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  padding: 5px 8px;
+  font-family: inherit;
+  font-size: 13px;
+}
+
+.ide-search-regex {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  cursor: pointer;
+  user-select: none;
+}
+
+.ide-search-status {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  padding: 4px 8px;
+}
+
+.ide-search-status:empty {
+  display: none;
+}
+
+.ide-search-results {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 2px 0;
+}
+
+.ide-search-group {
+  margin-bottom: 2px;
+}
+
+.ide-search-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-weight: 600;
+  color: var(--text-primary, #ddd);
+  position: sticky;
+  top: 0;
+  background: var(--bg-sidebar, #181818);
+}
+
+.ide-search-group-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-search-group-count {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  padding: 0 6px;
+  min-width: 16px;
+  text-align: center;
+}
+
+.ide-search-match {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 2px 8px 2px 20px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ide-search-match:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.08));
+}
+
+.ide-search-match-loc {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-secondary, #888);
+}
+
+.ide-search-match-text {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-secondary, #bbb);
+}
+
 .ide-editor-area {
   grid-column: 3;
   grid-row: 1;

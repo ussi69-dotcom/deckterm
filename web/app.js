@@ -9079,6 +9079,7 @@ class TerminalManager {
     this.initEditorTabs();
     this.initScmView();
     this.initTasksView();
+    this.initSearchView();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -9130,6 +9131,10 @@ class TerminalManager {
         handle?.destroy?.();
         this.editorTabHandles?.delete(key);
       },
+      // Open-at-line: scroll a freshly-mounted file tab to a search-hit line +
+      // place the cursor there. The controller owns the reveal target; we own
+      // the live CodeMirror handle, so it delegates here.
+      onRevealLine: (key, target) => this.revealEditorTabLine(key, target),
       // Persist descriptors only (never content). Debounced via settingsStore.
       onChange: (state) =>
         this.settingsStore?.set(
@@ -9188,6 +9193,29 @@ class TerminalManager {
     });
   }
 
+  // --- IDE Search view (phase 5, slice 7) -----------------------------------
+
+  // Build the Search sidebar view + register it as the 4th activity-bar view
+  // (Explorer 1st, Source Control 2nd, Tasks 3rd, Search 4th). The view
+  // dispatches a debounced, request-id'd query to the gated + bounded backend
+  // POST /api/files/search; clicking a result opens the file at the line via
+  // the editor-tabs open-at-line path.
+  initSearchView() {
+    if (!window.SearchView?.SearchViewController || !this.ideShell) return;
+    this.searchView = new window.SearchView.SearchViewController({
+      document,
+      getTerminalManager: () => this,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_SEARCH,
+      icon: "search",
+      title: "Search",
+      mount: (container) => this.searchView.mount(container),
+      unmount: () => this.searchView.unmount(),
+      resize: () => this.searchView.resize(),
+    });
+  }
+
   // Explorer file open: route to an editor TAB in IDE mode, else the modal.
   // The explorer passes the click intent: a single open action previews; a
   // double-click pins (VS Code semantics). Terminal-mode modal is unchanged.
@@ -9232,6 +9260,41 @@ class TerminalManager {
       };
     }
     this.editorTabHandles?.set(key, handle);
+  }
+
+  // Open-at-line: scroll the live editor for a tab to a 1-based line + place the
+  // cursor there. Reuses the tab's CodeMirror EditorView handle (handle.view).
+  // Best-effort + total: a missing handle/view or out-of-range line is a no-op,
+  // so a search hit on a file that since shrank never throws.
+  async revealEditorTabLine(key, target) {
+    if (!key || !target) return;
+    const line = Number.isFinite(target.line) ? target.line : 1;
+    const col = Number.isFinite(target.col) ? target.col : 1;
+    const handle = this.editorTabHandles?.get(key);
+    const view = handle?.view;
+    if (!view?.state?.doc || typeof view.dispatch !== "function") return;
+    try {
+      const cm = await import("/vendor/codemirror.js");
+      const doc = view.state.doc;
+      const lineNo = Math.min(Math.max(1, line), doc.lines);
+      const lineInfo = doc.line(lineNo);
+      // Clamp the column to the line length; col is 1-based.
+      const anchor = Math.min(
+        lineInfo.from + Math.max(0, col - 1),
+        lineInfo.to,
+      );
+      view.dispatch({
+        selection: { anchor },
+        effects: cm.EditorView.scrollIntoView(anchor, { y: "center" }),
+      });
+      try {
+        view.focus();
+      } catch {
+        // best-effort focus
+      }
+    } catch {
+      // best-effort — never break the open on a reveal failure
+    }
   }
 
   // Mount a merge diff into a tab body, reusing the git panel's renderMergeDiff
