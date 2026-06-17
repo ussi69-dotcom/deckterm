@@ -4088,10 +4088,13 @@ export function createWebApp() {
       );
     }
 
-    // Allow hex hashes (4-40 chars), HEAD, HEAD~N, HEAD^N, and branch/tag names
+    // Allow hex hashes (4-40 chars), HEAD, INDEX, and branch/tag names, each
+    // with an optional ~N / ^N revision suffix (so a commit diff's "before"
+    // side `<sha>~1` resolves; git refnames can't contain ~/^ so this is safe,
+    // and the ref is passed argv-style to `git show <ref>:<path>` — no shell).
     if (
       !commit ||
-      !/^([a-f0-9]{4,40}|HEAD(~\d+|\^\d+)?|[\w\-\/\.]+)$/i.test(commit)
+      !/^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(commit)
     ) {
       return c.json({ error: "Invalid commit reference" }, 400);
     }

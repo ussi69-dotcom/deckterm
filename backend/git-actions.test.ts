@@ -323,3 +323,23 @@ test("show resolves INDEX (staged) content", async () => {
     confirm: true,
   });
 });
+
+test("show accepts a <sha>~N revision suffix (commit-diff before-side)", async () => {
+  // A hex `<sha>~1` was previously rejected by the commit regex (400), so a
+  // commit diff's "before" side rendered empty (clean add). It's now accepted
+  // as a valid git revision. Two commits on rev.txt → `<sha>~1` is the parent.
+  await writeFile(join(repo, "rev.txt"), "first\n");
+  await git(repo, "add", "rev.txt");
+  await git(repo, "commit", "-m", "rev first");
+  await writeFile(join(repo, "rev.txt"), "second\n");
+  await git(repo, "add", "rev.txt");
+  await git(repo, "commit", "-m", "rev second");
+  const sha = (await git(repo, "rev-parse", "HEAD")).trim();
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=${encodeURIComponent(`${sha}~1`)}&path=rev.txt`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  expect(((await res.json()) as any).content).toBe("first\n");
+});
