@@ -4092,8 +4092,12 @@ export function createWebApp() {
     // with an optional ~N / ^N revision suffix (so a commit diff's "before"
     // side `<sha>~1` resolves; git refnames can't contain ~/^ so this is safe,
     // and the ref is passed argv-style to `git show <ref>:<path>` — no shell).
+    // Reject leading-dash refs so an option-shaped ref (e.g. "--stat", "-C")
+    // can't be smuggled as a git argv flag even though the ref is spawned
+    // argv-style. `[\w\-\/.]+` permits an interior dash but never a leading one.
     if (
       !commit ||
+      commit.startsWith("-") ||
       !/^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(commit)
     ) {
       return c.json({ error: "Invalid commit reference" }, 400);

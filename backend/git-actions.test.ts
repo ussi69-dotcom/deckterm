@@ -278,6 +278,15 @@ test("refs starting with a dash are rejected (argv flag smuggling)", async () =>
       })
     ).status,
   ).toBe(400);
+  // /api/git/show: an option-shaped commit ref (even with a ~N suffix) is 400.
+  for (const ref of ["--stat", "-C~1", "--output=/tmp/x"]) {
+    const res = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=${encodeURIComponent(ref)}&path=a.txt`,
+      ),
+    );
+    expect(res.status).toBe(400);
+  }
 });
 
 test("branch rejects invalid names", async () => {
