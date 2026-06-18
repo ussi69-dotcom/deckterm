@@ -700,6 +700,12 @@ class FileExplorerController {
 
       this.setSelectedItem(snapshot.workspaceId, item);
       this.renderList();
+      // VS Code single-click → open the file as a PREVIEW immediately (when an
+      // editor target is wired); a double-click then pins it. Parent (..) rows
+      // never open.
+      if (!item.isParent && typeof this.onOpenFile === "function") {
+        this.onOpenFile(item.path, { pinned: false });
+      }
     });
 
     // Double-click a file row → open PINNED (VS Code: double-click pins).
