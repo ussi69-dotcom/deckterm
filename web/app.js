@@ -3198,12 +3198,23 @@ class GitManager {
   }
 
   // The diff editor (#git-diff) is a CodeMirror MergeView that needs a measure
-  // pass when its container resizes. Re-render the current diff if one is shown.
+  // pass when its container resizes. Trigger a cheap re-measure on the live
+  // view rather than re-fetching the whole diff over the network — the diff
+  // CONTENT does not change on a layout resize, only the rendered geometry.
+  // For a split MergeView the sub-editors are on .a/.b; for an inline
+  // EditorView requestMeasure() is directly on the view.
   resize() {
     if (this.panel?.classList.contains("hidden")) return;
-    if (this.state?.selectedPath && this.state?.rightView !== "timeline") {
-      void this.showDiff(this.state.selectedPath);
+    const mv = this._mergeView;
+    if (!mv) return;
+    // EditorView (inline unified mode) exposes requestMeasure() directly.
+    if (typeof mv.requestMeasure === "function") {
+      mv.requestMeasure();
+      return;
     }
+    // MergeView (split mode) exposes .a and .b EditorViews.
+    mv.a?.requestMeasure?.();
+    mv.b?.requestMeasure?.();
   }
 
   async refresh() {
