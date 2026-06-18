@@ -6123,6 +6123,13 @@ class TerminalManager {
 
   async openSettings() {
     this.closeToolsSheet();
+    // IDE mode: open as an editor tab (singleton, pinned). SurfaceWindow is NOT
+    // used — the tab IS the settings UI. (Codex fix 7: single UI per mode.)
+    if (this.isIdeModeActive() && this.editorTabs) {
+      this.editorTabs.openSettings();
+      return;
+    }
+    // Terminal mode: use the existing SurfaceWindow path.
     if (!this.settingsManager) {
       this.settingsManager = new SettingsManager({
         settingsStore: this.settingsStore,
@@ -9124,6 +9131,9 @@ class TerminalManager {
         null,
       mountFileBody: (hostEl, tab) => this.mountEditorFileTab(hostEl, tab),
       mountDiffBody: (hostEl, tab) => this.mountEditorDiffTab(hostEl, tab),
+      // Settings body: build the settings content element and render it into
+      // the tab body host. No teardown — settings state lives in settingsStore.
+      mountSettingsBody: (hostEl) => this.mountEditorSettingsTab(hostEl),
       onActiveBodyMeasure: () => this.refreshActiveEditorTab(),
       // Destroy the live CodeMirror view/handle when a tab body is torn down.
       onBodyTeardown: (key) => {
@@ -9135,6 +9145,12 @@ class TerminalManager {
       // place the cursor there. The controller owns the reveal target; we own
       // the live CodeMirror handle, so it delegates here.
       onRevealLine: (key, target) => this.revealEditorTabLine(key, target),
+      // Dirty-check for user-initiated file-tab close (Codex fix 3): ask the
+      // live handle whether the file has unsaved changes.
+      isDirtyImpl: (key) => {
+        const handle = this.editorTabHandles?.get(key);
+        return typeof handle?.isDirty === "function" ? handle.isDirty() : false;
+      },
       // Persist descriptors only (never content). Debounced via settingsStore.
       onChange: (state) =>
         this.settingsStore?.set(
@@ -9299,6 +9315,21 @@ class TerminalManager {
 
   // Mount a merge diff into a tab body, reusing the git panel's renderMergeDiff
   // machinery. The diff ref carries everything needed to re-fetch both sides.
+  // Mount the settings UI into a settings editor tab body. Builds the content
+  // element once (settingsManager.buildContent is idempotent) and appends it.
+  // No handle registration needed — settings has no CodeMirror view to destroy.
+  async mountEditorSettingsTab(hostEl) {
+    if (!this.settingsManager) {
+      this.settingsManager = new SettingsManager({
+        settingsStore: this.settingsStore,
+        runtime: this.settingsRuntime,
+      });
+    }
+    const content = this.settingsManager.buildContent();
+    hostEl.appendChild(content);
+    await this.settingsManager.render();
+  }
+
   async mountEditorDiffTab(hostEl, tab) {
     const r = tab.ref || {};
     const key = window.EditorTabs.tabKey(tab);
@@ -9421,6 +9452,9 @@ class TerminalManager {
   // as an empty diff). The probe never renders — it only validates access +
   // existence. A throw (network) drops; we never trust a cached/200-on-error.
   async canReopenTab(tab) {
+    // Settings tabs: always restorable — no network probe needed (Codex fix 1,
+    // type-scoped restore). filterRestoredTabs handles deduplication.
+    if (tab.type === window.EditorTabs.TAB_SETTINGS) return true;
     try {
       if (tab.type === window.EditorTabs.TAB_DIFF) {
         return await this.canReopenDiffTab(tab);
@@ -9516,12 +9550,16 @@ class TerminalManager {
 
   // Entering IDE mode (after reparent): the `body.ide-mode` class (set by the
   // controller) docks the terminal container to the bottom panel via CSS only —
-  // no PTY touch. No further bookkeeping needed here.
-  onEnterIdeMode() {}
+  // no PTY touch. Close the terminal-mode settings SurfaceWindow if open so
+  // there aren't two settings UIs simultaneously (Codex fix 7).
+  onEnterIdeMode() {
+    this.surfaceWindowManager?.close("settings");
+  }
 
   // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
   // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
   // element). The explorer's prior state is restored via restoreExplorerPresentation.
+  // We do NOT auto-spawn a SurfaceWindow for settings on exit (Codex fix 7).
   onExitIdeMode() {}
 
   // Snapshot the focus target before a mode switch. An active terminal wins (its

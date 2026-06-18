@@ -3,8 +3,10 @@ import {
   EDITOR_TABS_KEY,
   TAB_FILE,
   TAB_DIFF,
+  TAB_SETTINGS,
   makeFileTab,
   makeDiffTab,
+  makeSettingsTab,
   tabKey,
   findTabIndex,
   openTab,
@@ -559,4 +561,289 @@ test("openFile without line never fires a reveal", async () => {
   controller.openFile("/plain.js", { preview: true });
   await controller.renderActiveBody();
   expect(reveals).toHaveLength(0);
+});
+
+// ── Slice 8: Settings tab (Part A) ───────────────────────────────────────────
+
+// tabKey namespacing: settings key must NEVER collide with a file named "settings".
+test("tabKey for settings is namespaced and never collides with a file path", () => {
+  const settingsTab = makeSettingsTab();
+  const fileNamedSettings = makeFileTab("settings");
+  const fileAbsSettings = makeFileTab("/home/deploy/settings");
+  expect(tabKey(settingsTab)).toBe("settings:global");
+  expect(tabKey(settingsTab)).not.toBe(tabKey(fileNamedSettings));
+  expect(tabKey(settingsTab)).not.toBe(tabKey(fileAbsSettings));
+  expect(tabKey(fileNamedSettings)).toBe("file:settings");
+  expect(tabKey(fileAbsSettings)).toBe("file:/home/deploy/settings");
+});
+
+// makeSettingsTab builds a pinned, non-preview singleton.
+test("makeSettingsTab builds a pinned non-preview settings descriptor", () => {
+  const tab = makeSettingsTab();
+  expect(tab.type).toBe(TAB_SETTINGS);
+  expect(tab.pinned).toBe(true);
+  expect(tab.preview).toBe(false);
+  expect(tab.ref).toBe(null);
+});
+
+// EditorTabsModel.openSettings: second open focuses, doesn't duplicate.
+test("EditorTabsModel.openSettings opens a pinned settings tab (singleton)", () => {
+  const model = new EditorTabsModel();
+  model.openSettings();
+  expect(model.state.tabs).toHaveLength(1);
+  expect(model.state.tabs[0].type).toBe(TAB_SETTINGS);
+  expect(model.state.activeKey).toBe("settings:global");
+
+  // Second open: focuses, no duplicate.
+  model.open(makeFileTab("/a", { preview: false }));
+  expect(model.state.tabs).toHaveLength(2);
+  model.openSettings();
+  // Still exactly 1 settings tab.
+  expect(model.state.tabs.filter((t) => t.type === TAB_SETTINGS)).toHaveLength(
+    1,
+  );
+  expect(model.state.activeKey).toBe("settings:global");
+});
+
+// openSettings NEVER touches the previewKey (Codex fix 4).
+test("EditorTabsModel.openSettings never clears/replaces the existing preview slot", () => {
+  const model = new EditorTabsModel();
+  // Open a file as preview first.
+  model.open(makeFileTab("/preview.js", { preview: true }));
+  const previewKey = tabKey(makeFileTab("/preview.js"));
+  expect(model.state.tabs.find((t) => tabKey(t) === previewKey)?.preview).toBe(
+    true,
+  );
+
+  // Open settings: must not replace the preview slot.
+  model.openSettings();
+  // Preview tab still there and still preview.
+  const preview = model.state.tabs.find((t) => tabKey(t) === previewKey);
+  expect(preview).toBeTruthy();
+  expect(preview?.preview).toBe(true);
+  // Settings tab appended (not in the preview slot).
+  expect(model.state.tabs).toHaveLength(2);
+  expect(model.state.activeKey).toBe("settings:global");
+});
+
+// serialize emits {type:"settings"} with no extra fields.
+test("serializeTabs emits {type:'settings'} for a settings tab", () => {
+  const model = new EditorTabsModel();
+  model.openSettings();
+  const ser = serializeTabs(model.state);
+  expect(ser.tabs).toHaveLength(1);
+  expect(ser.tabs[0]).toEqual({ type: "settings" });
+  // Never embeds content or ref.
+  expect(JSON.stringify(ser.tabs[0])).not.toContain("content");
+  expect(JSON.stringify(ser.tabs[0])).not.toContain('"ref"');
+});
+
+// Restore filter is type-scoped: settings passes WITHOUT a probe (Codex fix 1).
+test("filterRestoredTabs restores a settings tab without calling canOpen probe", async () => {
+  const restored = {
+    tabs: [makeSettingsTab()],
+    activeKey: "settings:global",
+  };
+  let probeCallCount = 0;
+  // canOpen should NOT be called for settings tabs.
+  const canOpen = async () => {
+    probeCallCount += 1;
+    return true;
+  };
+  const survived = await filterRestoredTabs(restored, canOpen);
+  expect(probeCallCount).toBe(0); // no probe for settings
+  expect(survived.tabs).toHaveLength(1);
+  expect(survived.tabs[0].type).toBe(TAB_SETTINGS);
+  expect(survived.activeKey).toBe("settings:global");
+});
+
+// Unknown types are dropped (type-scoped restore, Codex fix 1).
+test("filterRestoredTabs drops unknown tab types silently", async () => {
+  const unknownTab = { type: "future-unknown-type", ref: "x", pinned: true };
+  // reviveDescriptor drops unknown types, so they should not survive deserialize.
+  const raw = {
+    schemaVersion: 3,
+    tabs: [
+      { type: "file", ref: "/ok", pinned: true, preview: false },
+      unknownTab,
+    ],
+    activeKey: "file:/ok",
+  };
+  const restored = deserializeTabs(raw);
+  // Unknown type dropped at revive time.
+  expect(restored.tabs.every((t) => t.type !== "future-unknown-type")).toBe(
+    true,
+  );
+  expect(restored.tabs).toHaveLength(1);
+  expect(restored.tabs[0].ref).toBe("/ok");
+});
+
+// At most ONE settings tab restored (de-dup, Codex fix 5).
+test("filterRestoredTabs accepts at most one settings tab (de-dup)", async () => {
+  const restored = {
+    tabs: [makeSettingsTab(), makeSettingsTab(), makeSettingsTab()],
+    activeKey: "settings:global",
+  };
+  const survived = await filterRestoredTabs(restored, async () => true);
+  const settingsTabs = survived.tabs.filter((t) => t.type === TAB_SETTINGS);
+  expect(settingsTabs).toHaveLength(1);
+});
+
+// ── Slice 8: Dirty-close guard (Part B) ──────────────────────────────────────
+
+// A dirty file tab close is aborted when confirm returns false (Codex fix 3).
+test("requestCloseKey aborts close of a dirty file tab when confirm declines", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let confirmed = false;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    isDirtyImpl: () => true, // always dirty
+    confirmImpl: () => {
+      confirmed = true;
+      return false; // decline → abort close
+    },
+  });
+
+  controller.openFile("/dirty.js", { preview: false });
+  const key = tabKey(makeFileTab("/dirty.js"));
+  expect(controller.model.state.tabs).toHaveLength(1);
+
+  controller.requestCloseKey(key);
+  expect(confirmed).toBe(true); // confirm was called
+  expect(controller.model.state.tabs).toHaveLength(1); // tab still present
+});
+
+// A non-dirty file tab closes without prompting.
+test("requestCloseKey closes a clean file tab without prompting", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let prompted = false;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    isDirtyImpl: () => false, // clean
+    confirmImpl: () => {
+      prompted = true;
+      return true;
+    },
+  });
+
+  controller.openFile("/clean.js", { preview: false });
+  const key = tabKey(makeFileTab("/clean.js"));
+  controller.requestCloseKey(key);
+  expect(prompted).toBe(false); // no prompt for clean tab
+  expect(controller.model.state.tabs).toHaveLength(0); // closed
+});
+
+// diff tab closes without prompting (no dirty state for diffs).
+test("requestCloseKey closes a diff tab without prompting", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let prompted = false;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountDiffBody: async () => {},
+    isDirtyImpl: () => true, // would be dirty if file, but diff ignores it
+    confirmImpl: () => {
+      prompted = true;
+      return false;
+    },
+  });
+
+  controller.openDiff({ relPath: "a.js", mode: "working", cwd: "/r" });
+  const diffTab = makeDiffTab({ relPath: "a.js", mode: "working", cwd: "/r" });
+  const key = tabKey(diffTab);
+  controller.requestCloseKey(key);
+  expect(prompted).toBe(false); // diff → no prompt
+  expect(controller.model.state.tabs).toHaveLength(0);
+});
+
+// Settings tab closes without prompting.
+test("requestCloseKey closes a settings tab without prompting", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let prompted = false;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountSettingsBody: async () => {},
+    isDirtyImpl: () => true,
+    confirmImpl: () => {
+      prompted = true;
+      return false;
+    },
+  });
+
+  controller.openSettings();
+  const key = "settings:global";
+  controller.requestCloseKey(key);
+  expect(prompted).toBe(false); // settings → no prompt
+  expect(controller.model.state.tabs).toHaveLength(0);
+});
+
+// Programmatic removal (closeKey) never prompts even for a dirty file tab.
+test("closeKey (programmatic) never prompts even for a dirty file tab", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let prompted = false;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountFileBody: async () => {},
+    isDirtyImpl: () => true, // dirty
+    confirmImpl: () => {
+      prompted = true;
+      return false;
+    },
+  });
+
+  controller.openFile("/dirty.js", { preview: false });
+  const key = tabKey(makeFileTab("/dirty.js"));
+  // Programmatic path: closeKey bypasses the confirm.
+  controller.closeKey(key);
+  expect(prompted).toBe(false); // no prompt for programmatic close
+  expect(controller.model.state.tabs).toHaveLength(0); // closed
+});
+
+// Settings tab singleton via EditorTabsController.openSettings().
+test("EditorTabsController.openSettings opens singleton, second call focuses not duplicates", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountSettingsBody: async () => {},
+  });
+
+  controller.openSettings();
+  expect(controller.model.state.tabs).toHaveLength(1);
+  expect(controller.model.state.tabs[0].type).toBe(TAB_SETTINGS);
+  expect(controller.model.state.activeKey).toBe("settings:global");
+
+  // Open a file, then open settings again — should focus, not duplicate.
+  controller.openFile("/x.js", { preview: false });
+  expect(controller.model.state.tabs).toHaveLength(2);
+  controller.openSettings();
+  const settingsTabs = controller.model.state.tabs.filter(
+    (t) => t.type === TAB_SETTINGS,
+  );
+  expect(settingsTabs).toHaveLength(1);
+  expect(controller.model.state.activeKey).toBe("settings:global");
 });

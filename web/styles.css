@@ -6412,6 +6412,60 @@ body.ide-mode .ide-editor-area.has-tabs {
   height: 100%;
 }
 
+/* ── VS Code polish — Part C (slice 8) ───────────────────────────────────── */
+
+/* Activity bar: tighter focus ring + transition for smooth hover/active */
+body.ide-mode .ide-activity-item {
+  transition:
+    color 0.12s,
+    background 0.12s;
+  outline: none;
+}
+
+body.ide-mode .ide-activity-item:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: -2px;
+  border-radius: 4px;
+}
+
+/* Sidebar header: subtle hover on action buttons */
+body.ide-mode .ide-sidebar-action {
+  transition:
+    color 0.1s,
+    background 0.1s;
+}
+
+/* Settings tab: gear indicator matching the diff indicator style */
+.ide-editor-tab.is-settings .ide-editor-tab-settings-indicator {
+  color: var(--text-secondary, #858585);
+  font-size: 12px;
+}
+
+/* Settings tab body: fill and scroll like a regular tab body */
+.ide-editor-body .settings-panel {
+  height: 100%;
+  overflow: auto;
+  display: flex;
+  flex-direction: row;
+}
+
+/* Consistent focus ring on tab close buttons */
+body.ide-mode .ide-editor-tab-close:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+/* Active tab: slightly more prominent top border for clarity */
+body.ide-mode .ide-editor-tab.active {
+  border-top-width: 2px;
+}
+
+/* Pinned settings tab matches normal pinned tab styling (no italic) */
+.ide-editor-tab.is-settings .ide-editor-tab-label {
+  font-style: normal;
+}
+
 /* In IDE mode the terminal area docks to the bottom-right (below the editor
    placeholder). Reuses the dock height variable so the bottom panel feels like
    the phase-1 sessions dock. Only repositions the container — terminals are

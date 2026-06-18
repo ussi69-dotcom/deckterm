@@ -27,6 +27,7 @@ const EDITOR_TABS_SCHEMA_VERSION = 3;
 
 const TAB_FILE = "file";
 const TAB_DIFF = "diff";
+const TAB_SETTINGS = "settings";
 
 // ── Pure tab model (DOM-free, unit-tested) ───────────────────────────────────
 
@@ -62,11 +63,26 @@ function makeDiffTab({ relPath, mode, cwd, commit, ref, title } = {}) {
   };
 }
 
+// A settings tab. SINGLETON, always pinned, no file ref. Descriptor: {type:"settings"}.
+// Never uses the preview slot — settings is a first-class pinned tab.
+function makeSettingsTab() {
+  return {
+    type: TAB_SETTINGS,
+    ref: null,
+    pinned: true,
+    preview: false,
+  };
+}
+
 // Stable identity for a tab. File tabs key on their absolute path; diff tabs key
 // on the (relPath, mode, cwd, commit) tuple so the same file's working vs staged
 // vs a specific commit are DISTINCT tabs.
 function tabKey(tab) {
   if (!tab || typeof tab !== "object") return "";
+  if (tab.type === TAB_SETTINGS) {
+    // Type-namespaced key so it can never collide with a file named "settings".
+    return "settings:global";
+  }
   if (tab.type === TAB_DIFF) {
     const r = tab.ref || {};
     return `diff:${r.cwd || ""}::${r.relPath || ""}::${r.mode || ""}::${r.commit || ""}`;
@@ -184,6 +200,9 @@ function serializeTabs(state) {
 
 // Reduce a tab to its persisted descriptor (drops any transient/content fields).
 function toDescriptor(tab) {
+  if (tab?.type === TAB_SETTINGS) {
+    return { type: TAB_SETTINGS };
+  }
   if (tab?.type === TAB_DIFF) {
     const r = tab.ref || {};
     return {
@@ -235,8 +254,13 @@ function deserializeTabs(value) {
 }
 
 // Revive one descriptor into a normalized tab (or null when unusable).
+// Type-scoped: settings → exact match, file/diff → existing paths, unknown → drop.
 function reviveDescriptor(raw) {
   if (!raw || typeof raw !== "object") return null;
+  if (raw.type === TAB_SETTINGS) {
+    // Settings tab: no probe needed, no file ref — just revive it.
+    return makeSettingsTab();
+  }
   if (raw.type === TAB_DIFF) {
     const r = raw.ref || {};
     if (!r.relPath && !r.cwd) return null;
@@ -253,11 +277,14 @@ function reviveDescriptor(raw) {
       preview: false,
     };
   }
-  // file (default)
-  const ref = typeof raw.ref === "string" ? raw.ref : "";
-  if (!ref) return null;
-  const preview = raw.preview === true;
-  return { type: TAB_FILE, ref, pinned: !preview, preview };
+  if (raw.type === TAB_FILE) {
+    const ref = typeof raw.ref === "string" ? raw.ref : "";
+    if (!ref) return null;
+    const preview = raw.preview === true;
+    return { type: TAB_FILE, ref, pinned: !preview, preview };
+  }
+  // Unknown type → silently drop (Codex fix 1: type-scoped restore).
+  return null;
 }
 
 // ── v3 migration (idempotent; never clobbers) ────────────────────────────────
@@ -294,7 +321,19 @@ function migrateEditorTabsState(store) {
 async function filterRestoredTabs(restored, canOpen) {
   const s = normalizeState(restored);
   const survivors = [];
+  // Deduplication guard for singleton settings tab (Codex fix 5: at most ONE).
+  let settingsRestored = false;
   for (const tab of s.tabs) {
+    // Settings tabs: type-scoped, no probe needed (Codex fix 1).
+    if (tab.type === TAB_SETTINGS) {
+      if (!settingsRestored) {
+        survivors.push(tab);
+        settingsRestored = true;
+      }
+      // Drop any duplicate settings descriptors silently.
+      continue;
+    }
+    // File/diff tabs: probe through the capability layer.
     let ok = false;
     try {
       ok = Boolean(await canOpen(tab));
@@ -353,6 +392,23 @@ class EditorTabsModel {
     return this.setState(closeTab(this.state, key));
   }
 
+  // Open (or focus) the singleton settings tab. NEVER reads or writes the
+  // preview slot — settings is always pinned (Codex fix 4).
+  openSettings() {
+    const key = "settings:global";
+    const existingIdx = findTabIndex(this.state.tabs, key);
+    if (existingIdx >= 0) {
+      // Already open: just focus it. No preview mutation, no duplicate.
+      return this.setState(activateTab(this.state, key));
+    }
+    // Not present: append a pinned settings tab (NEVER via the preview slot).
+    const tab = makeSettingsTab();
+    return this.setState({
+      tabs: [...this.state.tabs, tab],
+      activeKey: key,
+    });
+  }
+
   activeTab() {
     return (
       this.state.tabs.find((t) => tabKey(t) === this.state.activeKey) || null
@@ -380,10 +436,12 @@ class EditorTabsModel {
 //   model           an EditorTabsModel (created here if omitted)
 //   mountFileBody   async (hostEl, tab) => void — render a file editor into host
 //   mountDiffBody   async (hostEl, tab) => void — render a merge diff into host
+//   mountSettingsBody (hostEl) => void — render the settings UI into host
 //   onActiveBodyMeasure (hostEl, tab) => void — post-mount measure/refresh hook
 //                   (CodeMirror needs a requestMeasure after its container sizes)
 //   onChange        (state) => void — app persistence hook (serializeTabs)
 //   labelForTab     (tab) => string — display label (defaults to basename)
+//   confirmImpl     (msg) => bool — user-close dirty-confirm. Defaults to window.confirm.
 class EditorTabsController {
   constructor(options = {}) {
     this.doc =
@@ -408,6 +466,22 @@ class EditorTabsController {
       typeof options.mountDiffBody === "function"
         ? options.mountDiffBody
         : null;
+    this.mountSettingsBody =
+      typeof options.mountSettingsBody === "function"
+        ? options.mountSettingsBody
+        : null;
+    // Injected confirm for dirty-close (user-initiated close only). Defaults to
+    // window.confirm in a browser; tests inject a stub.
+    this.confirmImpl =
+      typeof options.confirmImpl === "function"
+        ? options.confirmImpl
+        : typeof window !== "undefined" && typeof window.confirm === "function"
+          ? (msg) => window.confirm(msg)
+          : () => true;
+    // Injected dirty-check: (key) => bool. App supplies this so the controller
+    // can ask the live handle whether the file has unsaved changes.
+    this.isDirtyImpl =
+      typeof options.isDirtyImpl === "function" ? options.isDirtyImpl : null;
     this.onActiveBodyMeasure =
       typeof options.onActiveBodyMeasure === "function"
         ? options.onActiveBodyMeasure
@@ -521,6 +595,13 @@ class EditorTabsController {
     this.model.open(makeDiffTab(spec));
   }
 
+  // Open (or focus) the singleton settings tab. Delegates to the model's
+  // openSettings() which NEVER touches the preview slot (Codex fix 4).
+  openSettings() {
+    this.ensureScaffold();
+    this.model.openSettings();
+  }
+
   // Restore a pre-filtered state (after revalidation) without firing the app
   // persistence hook in a loop — set directly then render.
   restoreState(state) {
@@ -578,6 +659,7 @@ class EditorTabsController {
       if (key === activeKey) el.classList.add("active");
       if (tab.preview) el.classList.add("preview");
       if (tab.type === TAB_DIFF) el.classList.add("is-diff");
+      if (tab.type === TAB_SETTINGS) el.classList.add("is-settings");
       el.setAttribute("aria-selected", key === activeKey ? "true" : "false");
 
       if (tab.type === TAB_DIFF) {
@@ -602,7 +684,8 @@ class EditorTabsController {
       close.textContent = "✕";
       close.addEventListener("click", (event) => {
         event.stopPropagation();
-        this.closeKey(key);
+        // Route through the user-close chokepoint (dirty-confirm for file tabs).
+        this.requestCloseKey(key);
       });
       el.appendChild(close);
 
@@ -642,7 +725,9 @@ class EditorTabsController {
       this.bodyHostEl.appendChild(bodyEl);
       this.bodies.set(activeKey, bodyEl);
       try {
-        if (tab.type === TAB_DIFF) {
+        if (tab.type === TAB_SETTINGS) {
+          if (this.mountSettingsBody) await this.mountSettingsBody(bodyEl);
+        } else if (tab.type === TAB_DIFF) {
           if (this.mountDiffBody) await this.mountDiffBody(bodyEl, tab);
         } else if (this.mountFileBody) {
           await this.mountFileBody(bodyEl, tab);
@@ -714,6 +799,24 @@ class EditorTabsController {
     if (key) this.model.pin(key);
   }
 
+  // Single user-close chokepoint (Codex fix 3). ALL user-initiated closes (tab
+  // "×" button, keyboard close, close-all) MUST go through this. For a FILE tab
+  // whose handle is dirty, prompt and abort when declined. diff/settings have no
+  // dirty state → never prompt. Programmatic removals (restore cleanup,
+  // pruneOrphanBodies, mode teardown) call closeKey directly — no prompt.
+  requestCloseKey(key) {
+    const tab = this.model.state.tabs.find((t) => tabKey(t) === key);
+    if (tab && tab.type === TAB_FILE) {
+      const dirty =
+        typeof this.isDirtyImpl === "function" && this.isDirtyImpl(key);
+      if (dirty) {
+        const ok = this.confirmImpl("Discard unsaved changes?");
+        if (!ok) return; // user declined → keep the tab
+      }
+    }
+    this.closeKey(key);
+  }
+
   closeKey(key) {
     // Drop the cached body for the closed tab + tear down its live view.
     const body = this.bodies.get(key);
@@ -750,8 +853,9 @@ class EditorTabsController {
   }
 }
 
-// Default tab label: file basename, or the diff's relPath basename.
+// Default tab label: file basename, or the diff's relPath basename, or "Settings".
 function defaultLabel(tab) {
+  if (tab?.type === TAB_SETTINGS) return "Settings";
   if (tab?.type === TAB_DIFF) {
     const rel = tab.ref?.relPath || "";
     return basename(rel) || "diff";
@@ -760,6 +864,7 @@ function defaultLabel(tab) {
 }
 
 function fullTitle(tab) {
+  if (tab?.type === TAB_SETTINGS) return "Settings";
   if (tab?.type === TAB_DIFF) {
     return tab.ref?.title || tab.ref?.relPath || "diff";
   }
@@ -779,8 +884,10 @@ const EditorTabs = {
   EDITOR_TABS_SCHEMA_VERSION,
   TAB_FILE,
   TAB_DIFF,
+  TAB_SETTINGS,
   makeFileTab,
   makeDiffTab,
+  makeSettingsTab,
   tabKey,
   findTabIndex,
   openTab,
@@ -808,8 +915,10 @@ if (typeof exports !== "undefined") {
   exports.EDITOR_TABS_SCHEMA_VERSION = EDITOR_TABS_SCHEMA_VERSION;
   exports.TAB_FILE = TAB_FILE;
   exports.TAB_DIFF = TAB_DIFF;
+  exports.TAB_SETTINGS = TAB_SETTINGS;
   exports.makeFileTab = makeFileTab;
   exports.makeDiffTab = makeDiffTab;
+  exports.makeSettingsTab = makeSettingsTab;
   exports.tabKey = tabKey;
   exports.findTabIndex = findTabIndex;
   exports.openTab = openTab;

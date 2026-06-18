@@ -360,6 +360,10 @@ class FileEditor {
     const handle = {
       view,
       path: payload.path,
+      // Returns true when the file has unsaved changes. Used by the tab
+      // controller's dirty-close guard (Codex fix 2: isDirty lives here, not
+      // in FileEditor.dispose; the modal's confirmImpl stays on close()).
+      isDirty: () => edited,
       // Atomic save through the gated PUT, mirroring the modal's save() (409 +
       // access-denied handling). Returns true on success.
       save: async () => {
