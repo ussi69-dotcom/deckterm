@@ -678,6 +678,22 @@ test("filterRestoredTabs drops unknown tab types silently", async () => {
   expect(restored.tabs[0].ref).toBe("/ok");
 });
 
+// Backward-compat: a LEGACY file descriptor with NO `type` field (older stores)
+// revives as a file (not dropped), while an explicit unknown type still drops.
+test("deserializeTabs revives a legacy type-less descriptor as a file", () => {
+  const restored = deserializeTabs({
+    schemaVersion: 3,
+    tabs: [
+      { ref: "/legacy.js", pinned: true }, // no `type` (old store)
+      { type: "future-unknown-type", ref: "/x" }, // explicit unknown → drop
+    ],
+    activeKey: "file:/legacy.js",
+  });
+  expect(restored.tabs).toHaveLength(1);
+  expect(restored.tabs[0].type).toBe("file");
+  expect(restored.tabs[0].ref).toBe("/legacy.js");
+});
+
 // At most ONE settings tab restored (de-dup, Codex fix 5).
 test("filterRestoredTabs accepts at most one settings tab (de-dup)", async () => {
   const restored = {

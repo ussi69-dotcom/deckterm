@@ -277,13 +277,17 @@ function reviveDescriptor(raw) {
       preview: false,
     };
   }
-  if (raw.type === TAB_FILE) {
+  // file (explicit type:"file" OR a legacy type-less descriptor — older stores
+  // persisted file tabs without a type field; treat those as files for
+  // backward-compat). The ref still goes through the gated canReopen probe, so
+  // this opens no access hole. An EXPLICIT unknown future type still drops below.
+  if (raw.type === TAB_FILE || raw.type == null) {
     const ref = typeof raw.ref === "string" ? raw.ref : "";
     if (!ref) return null;
     const preview = raw.preview === true;
     return { type: TAB_FILE, ref, pinned: !preview, preview };
   }
-  // Unknown type → silently drop (Codex fix 1: type-scoped restore).
+  // Explicit unknown type → silently drop (type-scoped restore).
   return null;
 }
 
@@ -817,6 +821,9 @@ class EditorTabsController {
     this.closeKey(key);
   }
 
+  // PROGRAMMATIC close (no dirty prompt). Use this ONLY for non-user-initiated
+  // removals (load-fail cleanup, orphan prune, mode teardown). Any USER-initiated
+  // close MUST go through requestCloseKey() so a dirty file tab prompts first.
   closeKey(key) {
     // Drop the cached body for the closed tab + tear down its live view.
     const body = this.bodies.get(key);
