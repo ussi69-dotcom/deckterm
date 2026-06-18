@@ -3256,6 +3256,21 @@ body.virtual-keyboard-open #terminal-container {
 body.virtual-keyboard-open .extra-keys {
   transition: bottom 0.15s ease-out;
   box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
+  /* Compact bar while virtual keyboard is open */
+  padding: 2px 8px;
+  padding-bottom: calc(2px + env(safe-area-inset-bottom, 0px));
+  padding-right: 40px;
+  gap: 2px;
+}
+
+body.virtual-keyboard-open .extra-keys .ek-btn {
+  height: 32px;
+  padding: 4px 8px;
+}
+
+/* Hide the secondary row while keyboard is open — single minimal strip */
+body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
+  display: none !important;
 }
 
 /* =============================================================================
@@ -6278,34 +6293,41 @@ body.ide-mode #workspace-area {
   color: var(--text-secondary, #bbb);
 }
 
-.ide-editor-area {
+/* The IDE main column (grid-column 3): a vertical flex stack of the editor area,
+   the terminal sash, and the docked #terminal-container (moved in on enter).
+   Hidden outside IDE mode (the terminal is moved back to its full-bleed home). */
+.ide-main-column {
+  display: none;
+}
+
+body.ide-mode .ide-main-column {
   grid-column: 3;
   grid-row: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.ide-editor-area {
   display: none;
   min-height: 0;
   background: var(--bg-primary);
 }
 
-body.ide-mode .ide-editor-area {
+/* With no editor tabs the editor area is hidden and the terminal fills the
+   column (VS Code "maximized panel"); with tabs it grows to fill the space
+   above the sash. The :has() parent state keeps the editor/sash/terminal in
+   sync from a single source of truth. */
+body.ide-mode .ide-main-column:has(.ide-editor-area.has-tabs) .ide-editor-area {
   display: flex;
-  align-items: center;
-  justify-content: center;
-  /* Reserve the bottom strip occupied by the docked terminal panel (same grid
-     cell, align-self:end, height:var(--dock-height)). The dock's height is a
-     PERCENTAGE of the row height, so reserve by HEIGHT (vertical padding %
-     resolves against WIDTH and would mismatch the dock). Occupy exactly the
-     space above the dock by topping out at 100% minus the dock height. */
-  align-self: start;
-  height: calc(100% - var(--dock-height, 35%));
-}
-
-/* Once tabs exist the area becomes a column: tab bar on top, body host below
-   (the placeholder is hidden). */
-body.ide-mode .ide-editor-area.has-tabs {
-  display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   align-items: stretch;
   justify-content: flex-start;
+  min-height: 0;
 }
 
 .ide-editor-placeholder {
@@ -6466,16 +6488,61 @@ body.ide-mode .ide-editor-tab.active {
   font-style: normal;
 }
 
-/* In IDE mode the terminal area docks to the bottom-right (below the editor
-   placeholder). Reuses the dock height variable so the bottom panel feels like
-   the phase-1 sessions dock. Only repositions the container — terminals are
-   never recreated. */
+/* In IDE mode the #terminal-container is MOVED into .ide-main-column (a flex
+   child, not a grid item / not absolutely positioned). With no editor tabs it
+   fills the column; with tabs the shared --dock-height var sets its height and
+   the sash splits it from the editor. These rules also NEUTRALIZE the
+   sessions-dock terminal positioning (position/inset) so the two docking modes
+   never fight — the IDE column owns the geometry. */
 body.ide-mode #terminal-container {
-  grid-column: 3;
-  grid-row: 1;
-  align-self: end;
-  height: var(--dock-height, 35%);
+  position: static;
+  inset: auto;
+  flex: 1 1 auto;
+  height: auto;
+  border-top: none;
+}
+
+body.ide-mode
+  .ide-main-column:has(.ide-editor-area.has-tabs)
+  #terminal-container {
+  flex: 0 0 auto;
+  height: var(--ide-terminal-height, 35%);
   border-top: 1px solid var(--border-primary);
+}
+
+/* Terminal sash — a 5px ns-resize handle between the editor and the terminal.
+   Only present (and interactive) once editor tabs exist; with no tabs the
+   terminal owns the whole column so there's nothing to split. Lives inside the
+   main column, so it spans grid-column 3 only and never crosses the sidebar. */
+.ide-terminal-sash {
+  display: none;
+}
+
+body.ide-mode
+  .ide-main-column:has(.ide-editor-area.has-tabs)
+  .ide-terminal-sash {
+  display: block;
+  flex: 0 0 5px;
+  height: 5px;
+  cursor: ns-resize;
+  background: var(--bg-tertiary);
+  touch-action: none;
+}
+
+body.ide-mode .ide-terminal-sash:hover,
+body.ide-mode .ide-terminal-sash.dragging {
+  background: var(--accent-blue);
+}
+
+/* In IDE mode the old full-width sessions-dock sash is hidden (the in-column
+   terminal sash replaces it) and the surface-windows layer must not be offset
+   by the sessions-dock bottom inset. */
+body.ide-mode .dock-sash {
+  display: none;
+}
+
+body.ide-mode #surface-windows-layer {
+  bottom: 0;
 }
 
 /* Floating surface windows float ABOVE the whole shell in IDE mode (matching

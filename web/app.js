@@ -1955,8 +1955,7 @@ class ExtraKeysManager {
         e.stopImmediatePropagation();
         if (touchedKey) {
           if (touchedKey === "TOGGLE") {
-            row2.classList.toggle("hidden");
-            toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
+            this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
           } else {
             this.handleKey(touchedKey);
           }
@@ -1981,8 +1980,7 @@ class ExtraKeysManager {
         this.handleKey(btn.dataset.key);
       } else if (tog && row2 && toggle) {
         e.preventDefault();
-        row2.classList.toggle("hidden");
-        toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
+        this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
       }
     });
 
@@ -1993,6 +1991,14 @@ class ExtraKeysManager {
     // On desktop: load from localStorage (default: hidden)
     // On mobile: always visible
     this.updateVisibility();
+
+    // Restore the persisted secondary-row collapsed state (default: expanded).
+    this.setExtraKeysRow2Collapsed(
+      Boolean(
+        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+      ),
+      { persist: false },
+    );
 
     // Setup toggle button handler
     document
@@ -2042,6 +2048,15 @@ class ExtraKeysManager {
 
     active.ws.send(JSON.stringify({ type: "input", data: sequence }));
     this.resetModifiers();
+    // Snap the view back to the prompt on synthetic key input, except for
+    // scrollback-navigation keys (PgUp/PgDn). Single source of truth lives in
+    // extra-keys-scroll.js; if it somehow isn't loaded, fall back to a
+    // conservative inline denylist so PgUp/PgDn still never snap.
+    const scrollPred = window.ExtraKeysScroll?.shouldScrollToPromptForKey;
+    const shouldScroll = scrollPred
+      ? scrollPred(key)
+      : key !== "PGUP" && key !== "PGDN";
+    if (shouldScroll) this.tm.scrollActiveTerminalToPrompt();
   }
 
   toggleModifier(mod) {
@@ -2145,6 +2160,23 @@ class ExtraKeysManager {
     } else {
       this.extraKeysEl.classList.add("hidden");
       toggleBtn?.classList.remove("active");
+    }
+  }
+
+  // Collapse/expand the secondary extra-keys row + sync the toggle glyph, and
+  // persist the choice (per-actor) so it survives reloads. The compact
+  // keyboard-open CSS hides the row independently; this governs the resting state.
+  setExtraKeysRow2Collapsed(collapsed, { persist = true } = {}) {
+    const row2 = document.querySelector(".extra-keys-row-2");
+    const toggle = document.getElementById("extra-keys-toggle");
+    if (!row2) return;
+    row2.classList.toggle("hidden", Boolean(collapsed));
+    if (toggle) toggle.textContent = collapsed ? "⋯" : "⋮";
+    if (persist) {
+      this.tm?.settingsStore?.set(
+        "terminal.extraKeysRow2Collapsed",
+        Boolean(collapsed),
+      );
     }
   }
 
@@ -9016,6 +9048,11 @@ class TerminalManager {
 
   initSessionsDock() {
     this.dockState = { enabled: false, heightPct: 35 };
+    // The IDE terminal-panel split height is persisted independently of the
+    // sessions dock (its own --ide-terminal-height var + dock.ide key) so the two
+    // docking modes never overwrite each other.
+    this.ideDockHeightPct =
+      window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
     this.dockSash = document.getElementById("dock-sash");
     this.dockSash?.addEventListener("pointerdown", (e) =>
       this.startDockSashDrag(e),
@@ -9031,7 +9068,32 @@ class TerminalManager {
         this.dockState = stored;
         this.applyDockState({ persist: false });
       }
+      const ideStored = this.settingsStore?.get("dock.ide", null);
+      if (ideStored && Number.isFinite(Number(ideStored.heightPct))) {
+        this.ideDockHeightPct =
+          window.SurfaceWindows?.clampDockHeight?.(ideStored.heightPct) ??
+          this.ideDockHeightPct;
+      }
+      this.applyIdeDockHeight();
     });
+  }
+
+  // Push the persisted IDE terminal-panel height into its CSS var (read by the
+  // has-tabs split rule). Independent of the sessions dock's --dock-height.
+  applyIdeDockHeight() {
+    document
+      .getElementById("workspace-area")
+      ?.style.setProperty("--ide-terminal-height", `${this.ideDockHeightPct}%`);
+  }
+
+  // Reset the IDE terminal-panel split to the default height (double-click the
+  // sash), mirroring the sessions-dock double-click-to-reset affordance.
+  resetIdeTerminalSash() {
+    this.ideDockHeightPct =
+      window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
+    this.applyIdeDockHeight();
+    window.dispatchEvent(new Event("resize"));
+    this.settingsStore?.set("dock.ide", { heightPct: this.ideDockHeightPct });
   }
 
   applyDockState({ persist = true } = {}) {
@@ -9078,7 +9140,17 @@ class TerminalManager {
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));
         this.fileExplorer?.resize?.();
+        this.ensureIdeExplorerLoaded();
         this.syncSurfaceButtonState();
+        // Deferred refit after the terminal reparent + layout settle: fit the
+        // active terminal once its container has a nonzero rect (fitting
+        // immediately after a reparent can compute bad dimensions).
+        requestAnimationFrame(() => {
+          if (!this.activeId) return;
+          if ((this.container?.clientHeight || 0) <= 0) return;
+          this.fitTerminal(this.activeId);
+          this.syncTerminalSize(this.activeId);
+        });
       },
       // Focus preservation across the switch (contract: active focus is kept).
       captureFocus: () => this.captureIdeFocusTarget(),
@@ -9093,6 +9165,10 @@ class TerminalManager {
       // the reparent + ViewHost rebind — these hooks only own window plumbing).
       detachExplorerWindow: (el) => this.detachIdeExplorerWindow(el),
       dockExplorerWindow: () => this.dockIdeExplorerWindow(),
+      // Resize the IDE terminal panel by dragging the in-column sash; double-click
+      // resets it to the default height.
+      startTerminalSashDrag: (e) => this.startIdeTerminalSashDrag(e),
+      resetTerminalSash: () => this.resetIdeTerminalSash(),
     });
     this.initEditorTabs();
     this.initScmView();
@@ -9565,6 +9641,8 @@ class TerminalManager {
   // there aren't two settings UIs simultaneously (Codex fix 7).
   onEnterIdeMode() {
     this.surfaceWindowManager?.close("settings");
+    this.applyIdeDockHeight();
+    this.ensureIdeExplorerLoaded();
   }
 
   // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
@@ -9572,6 +9650,23 @@ class TerminalManager {
   // element). The explorer's prior state is restored via restoreExplorerPresentation.
   // We do NOT auto-spawn a SurfaceWindow for settings on exit (Codex fix 7).
   onExitIdeMode() {}
+
+  // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
+  // active workspace's directory itself (the legacy Files surface is what loads it
+  // in terminal mode). No-op once the active workspace's tree is loaded — so the
+  // frequent afterRender/workspace-sync calls never re-open or reset a browsed
+  // subdirectory. Only acts on first load or when the active workspace changed.
+  ensureIdeExplorerLoaded() {
+    if (!this.fileExplorer || !this.isIdeModeActive()) return;
+    const { workspaceId, cwd } = this.getActiveWorkspaceContext();
+    if (!workspaceId) return;
+    const sameWorkspace = this.fileExplorer.currentWorkspaceId === workspaceId;
+    const hasItems =
+      this.fileExplorer.getWorkspaceItems(workspaceId).length > 0;
+    if (sameWorkspace && hasItems) return;
+    const targetPath = this.fileExplorer.openForWorkspace(workspaceId, cwd);
+    if (targetPath) void this.fileExplorer.loadDir(targetPath, workspaceId);
+  }
 
   // Snapshot the focus target before a mode switch. An active terminal wins (its
   // xterm is the natural focus); else, if the explorer holds focus, remember it.
@@ -9699,6 +9794,38 @@ class TerminalManager {
     this.dockState.heightPct =
       window.SurfaceWindows?.clampDockHeight?.(pct) ?? this.dockState.heightPct;
     this.applyDockState();
+  }
+
+  // Drag the IDE terminal-panel sash. Measures the IDE main column so the split
+  // is scoped to grid-column 3 and never reaches the sidebar. Persists to its own
+  // --ide-terminal-height var + dock.ide key, independent of the sessions dock.
+  startIdeTerminalSashDrag(e) {
+    e.preventDefault();
+    const col = this.ideShell?.mainColumnEl;
+    if (!col) return;
+    const rect = col.getBoundingClientRect();
+    const sash = this.ideShell?.terminalSashEl;
+    sash?.classList.add("dragging");
+    const apply = (clientY) => {
+      const pct = ((rect.bottom - clientY) / Math.max(rect.height, 1)) * 100;
+      this.ideDockHeightPct =
+        window.SurfaceWindows?.clampDockHeight?.(pct) ?? this.ideDockHeightPct;
+      this.applyIdeDockHeight();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientY);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("dock.ide", {
+        heightPct: this.ideDockHeightPct,
+      });
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
   }
 
   startDockSashDrag(e) {
@@ -9855,6 +9982,7 @@ class TerminalManager {
   }
 
   async syncRightSurfaceForWorkspace() {
+    if (this.isIdeModeActive()) this.ensureIdeExplorerLoaded();
     const surface = this.getRightSurface();
     const { workspaceId, cwd } = this.getActiveWorkspaceContext();
     if (!workspaceId) return;
@@ -11937,6 +12065,15 @@ class TerminalManager {
         },
         isKeyboardOpen ? 50 : 0,
       );
+    }
+  }
+
+  scrollActiveTerminalToPrompt() {
+    const active = this.terminals.get(this.activeId);
+    try {
+      active?.terminal?.scrollToBottom?.();
+    } catch {
+      /* best-effort */
     }
   }
 

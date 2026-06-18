@@ -398,9 +398,25 @@ class IdeShellController {
       typeof options.dockExplorerWindow === "function"
         ? options.dockExplorerWindow
         : null;
+    // The app owns the IDE terminal-sash drag math (it shares the dock-height var
+    // + persistence). The shell only creates the sash element and binds this
+    // handler once in ensureShell, so the geometry stays scoped to the column.
+    this.startTerminalSashDragFn =
+      typeof options.startTerminalSashDrag === "function"
+        ? options.startTerminalSashDrag
+        : null;
+    // Double-click the terminal sash to reset the split to the default height.
+    this.resetTerminalSashFn =
+      typeof options.resetTerminalSash === "function"
+        ? options.resetTerminalSash
+        : null;
 
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
+    // #terminal-container's home (parent + sibling anchor) captured BEFORE it is
+    // moved into the IDE main column, so exit restores its EXACT prior position
+    // (mode-transition contract: the same DOM node is moved, never recreated).
+    this.terminalHome = null;
 
     // ── Activity-bar view registry (slice 5) ────────────────────────────────
     // An ordered list of sidebar views, each a thin ViewHost adapter:
@@ -444,6 +460,11 @@ class IdeShellController {
     this.sidebarTitleEl = null;
     this.editorAreaEl = null;
     this.popOutBtnEl = null;
+    // The IDE main column (editor-area + sash + docked terminal) — a vertical flex
+    // stack in grid-column 3, so the terminal sash geometry is automatic and can
+    // never overlap the activity bar / sidebar.
+    this.mainColumnEl = null;
+    this.terminalSashEl = null;
 
     // True while the shell is actually rendered (IDE presentation active).
     this.rendered = false;
@@ -744,6 +765,11 @@ class IdeShellController {
     if (body) body.classList.add("ide-mode");
     if (this.shellEl) this.shellEl.hidden = false;
 
+    // Move the SAME #terminal-container element into the IDE main column (DOM move
+    // only — no PTY/WebSocket touch, mirrors the explorer reparent). Its prior
+    // home is captured so exit restores the exact position.
+    this.moveTerminalIntoColumn();
+
     // Release-before-reparent: if the Files surface-window currently HOSTS the
     // #file-explorer element, release it FIRST so reparenting into the sidebar
     // doesn't race stale surface-window state / no-op against a moved node.
@@ -807,6 +833,11 @@ class IdeShellController {
     const body = this.doc.body;
     if (body) body.classList.remove("ide-mode");
     if (this.shellEl) this.shellEl.hidden = true;
+
+    // Return the #terminal-container element to its captured terminal-mode home
+    // (same node — never recreated). Done after the ide-mode class is removed so
+    // it lands in the terminal-mode layout context.
+    this.restoreTerminalHome();
 
     this.rendered = false;
 
@@ -881,15 +912,40 @@ class IdeShellController {
     placeholder.textContent = "Open a file from the Explorer to edit it.";
     editorArea.appendChild(placeholder);
 
+    // Main column (grid-column 3): a vertical flex stack of the editor area, a
+    // resize sash, and (moved in on enter) the #terminal-container. With no editor
+    // tabs the terminal fills the column; with tabs the sash splits editor/terminal
+    // and the terminal height comes from the shared --dock-height var. The sash
+    // lives INSIDE this column so its geometry never crosses the sidebar.
+    const mainColumn = this.doc.createElement("div");
+    mainColumn.className = "ide-main-column";
+    const terminalSash = this.doc.createElement("div");
+    terminalSash.className = "ide-terminal-sash";
+    terminalSash.setAttribute("role", "separator");
+    terminalSash.setAttribute("aria-orientation", "horizontal");
+    terminalSash.title = "Drag to resize the terminal panel";
+    if (this.startTerminalSashDragFn) {
+      terminalSash.addEventListener("pointerdown", (e) =>
+        this.startTerminalSashDragFn(e),
+      );
+    }
+    if (this.resetTerminalSashFn) {
+      terminalSash.addEventListener("dblclick", () =>
+        this.resetTerminalSashFn(),
+      );
+    }
+    mainColumn.appendChild(editorArea);
+    mainColumn.appendChild(terminalSash);
+
     shell.appendChild(activityBar);
     shell.appendChild(sidebar);
 
     // Insert the activity-bar + sidebar shell as the first child of the
-    // workspace so fl/grid layout places it to the left; the editor-area
-    // placeholder lives in the workspace too (above the docked terminals).
+    // workspace so grid layout places it to the left; the main column takes
+    // grid-column 3 (the #terminal-container is moved into it on enter).
     workspace.insertBefore(shell, workspace.firstChild);
     workspace.insertBefore(
-      editorArea,
+      mainColumn,
       this.doc.getElementById("terminal-container"),
     );
 
@@ -898,6 +954,8 @@ class IdeShellController {
     this.sidebarEl = sidebar;
     this.sidebarBodyEl = sidebarBody;
     this.editorAreaEl = editorArea;
+    this.mainColumnEl = mainColumn;
+    this.terminalSashEl = terminalSash;
 
     // Render the activity-bar icons from the registry (also runs lucide).
     this.renderActivityBar();
@@ -1098,6 +1156,48 @@ class IdeShellController {
       this.restoreFocusFn(resolved);
     } catch {
       // Focus restoration is best-effort; never break the mode switch.
+    }
+  }
+
+  // Move #terminal-container into the IDE main column. Captures its prior home
+  // (parent + next-sibling anchor) BEFORE the first move so exit can restore the
+  // exact position. Idempotent: a no-op if it's already in the column (so a
+  // repeated enter never overwrites the home with the column itself).
+  moveTerminalIntoColumn() {
+    if (!this.doc || !this.mainColumnEl) return;
+    const tc = this.doc.getElementById("terminal-container");
+    if (!tc) return;
+    if (tc.parentElement === this.mainColumnEl) return;
+    this.terminalHome = {
+      parent: tc.parentElement || null,
+      nextSibling: tc.nextSibling || null,
+    };
+    // Appended last → sits below the editor area + sash in the flex column.
+    this.mainColumnEl.appendChild(tc);
+  }
+
+  // Return #terminal-container to its captured terminal-mode home. Falls back to
+  // the workspace area (before the surface-windows layer) if no home was captured
+  // — the element must always end attached to a visible parent.
+  restoreTerminalHome() {
+    if (!this.doc) return;
+    const tc = this.doc.getElementById("terminal-container");
+    if (!tc) return;
+    const home = this.terminalHome;
+    this.terminalHome = null;
+    if (home && home.parent) {
+      // Only honor the captured sibling if it's still a child of the home parent;
+      // otherwise insertBefore would throw NotFoundError (the sibling moved).
+      const anchor =
+        home.nextSibling && home.nextSibling.parentNode === home.parent
+          ? home.nextSibling
+          : null;
+      home.parent.insertBefore(tc, anchor);
+      return;
+    }
+    const ws = this.doc.getElementById("workspace-area");
+    if (ws && tc.parentElement !== ws) {
+      ws.insertBefore(tc, this.doc.getElementById("surface-windows-layer"));
     }
   }
 

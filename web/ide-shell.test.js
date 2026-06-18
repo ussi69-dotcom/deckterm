@@ -854,3 +854,72 @@ test("unmountSecondaryView is idempotent + a no-op when nothing is mounted", () 
   h.controller.unmountSecondaryView();
   expect(h.controller.mountedSecondaryViewId).toBe(null);
 });
+
+// ── (7) Slice-2: terminal reparent into the IDE main column (mode contract) ───
+// The terminal panel docks into .ide-main-column in IDE mode. The mode-transition
+// contract requires the SAME #terminal-container node to be MOVED (never cloned /
+// recreated) and restored to its exact prior home on exit.
+
+test("enter moves the SAME terminal-container element into the IDE main column", () => {
+  const h = makeController();
+  const tc = h.doc.getElementById("terminal-container");
+  h.controller.applyMode(); // enter IDE
+  // Same node, now parented under the main column the shell built.
+  expect(h.controller.mainColumnEl).toBeTruthy();
+  expect(tc.parentElement).toBe(h.controller.mainColumnEl);
+  // The shell also built a terminal sash inside the same column.
+  expect(h.controller.terminalSashEl).toBeTruthy();
+});
+
+test("exit restores the terminal-container to its captured home (same node)", () => {
+  const h = makeController();
+  const ws = h.doc.getElementById("workspace-area");
+  const tc = h.doc.getElementById("terminal-container");
+  // Seed a realistic home: terminal-container lives in workspace-area.
+  ws.appendChild(tc);
+
+  h.controller.applyMode(); // enter → captures home + moves into the column
+  expect(tc.parentElement).toBe(h.controller.mainColumnEl);
+
+  h.controller.exitIde(); // exit → restore home
+  expect(tc.parentElement).toBe(ws); // SAME node back in its captured parent
+  expect(h.controller.terminalHome).toBe(null); // capture cleared
+});
+
+test("repeated enter is idempotent: home is captured once, never the column", () => {
+  const h = makeController();
+  const ws = h.doc.getElementById("workspace-area");
+  const tc = h.doc.getElementById("terminal-container");
+  ws.appendChild(tc);
+
+  h.controller.moveTerminalIntoColumn(); // build nothing yet → no-op (no column)
+  h.controller.applyMode(); // enter (builds shell + moves)
+  const capturedParent = h.controller.terminalHome?.parent;
+  // A second move (e.g. a redundant enter path) must NOT overwrite the home with
+  // the column itself — the guard returns early when already in the column.
+  h.controller.moveTerminalIntoColumn();
+  expect(h.controller.terminalHome?.parent).toBe(capturedParent);
+  expect(tc.parentElement).toBe(h.controller.mainColumnEl);
+
+  h.controller.exitIde();
+  expect(tc.parentElement).toBe(ws); // restored to the real home, not the column
+});
+
+test("enter/exit fire the app dock hooks and never recreate the terminal node", () => {
+  const enters = [];
+  const exits = [];
+  const h = makeController({
+    extraOptions: {
+      onEnterIde: () => enters.push(1),
+      onExitIde: () => exits.push(1),
+    },
+  });
+  const tc = h.doc.getElementById("terminal-container");
+  h.controller.applyMode(); // enter
+  h.controller.exitIde(); // exit
+  expect(enters).toHaveLength(1);
+  expect(exits).toHaveLength(1);
+  // The identity of the terminal node is preserved across the round-trip — the
+  // contract is "move the node", not "rebuild the terminal area".
+  expect(h.doc.getElementById("terminal-container")).toBe(tc);
+});
