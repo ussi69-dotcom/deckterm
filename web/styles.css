@@ -6317,17 +6317,22 @@ body.ide-mode .ide-main-column {
   background: var(--bg-primary);
 }
 
-/* With no editor tabs the editor area is hidden and the terminal fills the
-   column (VS Code "maximized panel"); with tabs it grows to fill the space
-   above the sash. The :has() parent state keeps the editor/sash/terminal in
-   sync from a single source of truth. */
-body.ide-mode .ide-main-column:has(.ide-editor-area.has-tabs) .ide-editor-area {
+/* In IDE mode the editor/file view ALWAYS occupies the top of the column and the
+   terminal is a resizable bottom panel below it (VS Code layout) — even with no
+   file open (the placeholder shows). The terminal never takes the whole column. */
+body.ide-mode .ide-editor-area {
   display: flex;
   flex: 1 1 auto;
   flex-direction: column;
   align-items: stretch;
   justify-content: flex-start;
   min-height: 0;
+}
+
+/* With no open tabs, center the "Open a file…" placeholder. */
+body.ide-mode .ide-editor-area:not(.has-tabs) {
+  align-items: center;
+  justify-content: center;
 }
 
 .ide-editor-placeholder {
@@ -6488,39 +6493,30 @@ body.ide-mode .ide-editor-tab.active {
   font-style: normal;
 }
 
-/* In IDE mode the #terminal-container is MOVED into .ide-main-column (a flex
-   child, not a grid item / not absolutely positioned). With no editor tabs it
-   fills the column; with tabs the shared --dock-height var sets its height and
-   the sash splits it from the editor. These rules also NEUTRALIZE the
-   sessions-dock terminal positioning (position/inset) so the two docking modes
-   never fight — the IDE column owns the geometry. */
+/* In IDE mode the #terminal-container is MOVED into .ide-main-column as a flex
+   child and docked as the resizable BOTTOM panel below the editor (its height is
+   the shared --ide-terminal-height var). It keeps `position: relative` so it
+   stays the containing block for its absolutely-positioned terminal tiles (a
+   `static` here would let a tile resolve against #workspace-area and slide under
+   the sidebar). `inset: auto` neutralizes the sessions-dock absolute insets so
+   the two docking modes never fight — the IDE column owns the geometry. */
 body.ide-mode #terminal-container {
-  position: static;
+  position: relative;
   inset: auto;
-  flex: 1 1 auto;
-  height: auto;
-  border-top: none;
-}
-
-body.ide-mode
-  .ide-main-column:has(.ide-editor-area.has-tabs)
-  #terminal-container {
   flex: 0 0 auto;
   height: var(--ide-terminal-height, 35%);
   border-top: 1px solid var(--border-primary);
 }
 
-/* Terminal sash — a 5px ns-resize handle between the editor and the terminal.
-   Only present (and interactive) once editor tabs exist; with no tabs the
-   terminal owns the whole column so there's nothing to split. Lives inside the
-   main column, so it spans grid-column 3 only and never crosses the sidebar. */
+/* Terminal sash — a 5px ns-resize handle between the editor and the terminal
+   panel. Always present in IDE mode so the panel is resizable even with no file
+   open. Lives inside the main column, so it spans grid-column 3 only and never
+   crosses the sidebar. */
 .ide-terminal-sash {
   display: none;
 }
 
-body.ide-mode
-  .ide-main-column:has(.ide-editor-area.has-tabs)
-  .ide-terminal-sash {
+body.ide-mode .ide-terminal-sash {
   display: block;
   flex: 0 0 5px;
   height: 5px;
