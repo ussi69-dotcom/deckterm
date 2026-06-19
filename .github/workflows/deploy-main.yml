@@ -64,14 +64,8 @@ jobs:
       - name: Wait for health check
         run: ./scripts/wait_for_health.sh http://127.0.0.1:4174/api/health 45
 
-      # TEMPORARY: smoke E2E harness is broken in CI (terminals barely get created
-      # in the headless runner; passes on clean local dev, unit gate covers
-      # correctness). Non-blocking so the deploy isn't gated on it; the unit tests
-      # + health check above still gate. Re-enable once the harness is fixed.
-      # Follow-up tracked in Notion Backlog.
       - name: Run smoke E2E suite
         run: bun run test:e2e:smoke
-        continue-on-error: true
 
       - name: Capture release metadata
         id: release
