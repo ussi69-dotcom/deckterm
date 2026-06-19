@@ -1051,6 +1051,38 @@ async function resolveAllowedPath(
   }
 }
 
+// Resolve a requested terminal cwd to a usable start directory.
+//   - Path outside the allowed roots            → null  (caller denies: 403).
+//   - Path within roots and existing            → its real path.
+//   - Path within roots but missing (ENOENT)    → nearest EXISTING ancestor
+//     that is still within roots (so a stale/deleted saved cwd — e.g. a
+//     files.defaultCwd whose directory was later removed — falls back to a
+//     valid root instead of hard-failing terminal creation).
+// Security is preserved: the first existing ancestor is realpath-resolved and
+// checked against the roots, so a missing path whose nearest real ancestor is
+// out of bounds (e.g. /tmp/gone → /tmp) still returns null. Unlike
+// resolveAllowedPath this never returns a non-existent path — the result is
+// always a directory the PTY can actually start in.
+async function resolveTerminalStartDir(
+  inputPath: string,
+): Promise<string | null> {
+  if (!inputPath) return null;
+  const fs = await import("fs/promises");
+  const roots = await getAllowedRealRoots();
+  let candidate = resolve(inputPath);
+  while (true) {
+    try {
+      const realPath = await fs.realpath(candidate);
+      return isWithinAllowedRoots(realPath, roots) ? realPath : null;
+    } catch (err: unknown) {
+      if ((err as { code?: string }).code !== "ENOENT") return null;
+      const parent = dirname(candidate);
+      if (parent === candidate) return null; // reached filesystem root
+      candidate = parent;
+    }
+  }
+}
+
 // ── Scoped content search (POST /api/files/search) bounds + impl ─────────────
 const SEARCH_MAX_QUERY_LEN = 1024; // reject queries longer than this (400)
 const SEARCH_DEFAULT_MAX_RESULTS = 500; // default cap on returned matches
@@ -2911,7 +2943,9 @@ export function createWebApp() {
     }
 
     const requestedCwd = body.cwd || process.env.HOME || "/";
-    const resolvedCwd = await resolveAllowedPath(requestedCwd);
+    // Falls back to an allowed root when the requested cwd is within roots but
+    // deleted; only a genuinely out-of-roots path returns null (→ 403).
+    const resolvedCwd = await resolveTerminalStartDir(requestedCwd);
     if (!resolvedCwd) {
       const state = await getFoundationState();
       writeAuditEvent(state.db, {
