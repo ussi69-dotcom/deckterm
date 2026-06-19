@@ -112,6 +112,9 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// SurfaceWindow id for the IDE Explorer pop-out (slice 3). Distinct from the
+// terminal-mode "files" window so their persisted geometries don't collide.
+const IDE_EXPLORER_WINDOW_ID = "ide-explorer";
 const APP_DEFAULT_TERMINAL_COLS =
   window.TerminalSizing?.DEFAULT_TERMINAL_COLS || 120;
 const APP_DEFAULT_TERMINAL_ROWS =
@@ -369,6 +372,13 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-setup",
     desktopTone: "secondary",
   }),
+  settings: Object.freeze({
+    label: "Settings",
+    icon: "settings",
+    action: "settings",
+    toolsId: "tools-sheet-settings",
+    desktopTone: "secondary",
+  }),
   clipboard: Object.freeze({
     label: "Clipboard",
     icon: "clipboard",
@@ -388,6 +398,13 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     icon: "wrap-text",
     action: "wrap-lines",
     toolsId: "tools-sheet-wrap",
+    desktopTone: "secondary",
+  }),
+  "dock-sessions": Object.freeze({
+    label: "Dock",
+    icon: "panel-bottom",
+    action: "dock-sessions",
+    toolsId: "tools-sheet-dock-sessions",
     desktopTone: "secondary",
   }),
   fullscreen: Object.freeze({
@@ -1938,8 +1955,7 @@ class ExtraKeysManager {
         e.stopImmediatePropagation();
         if (touchedKey) {
           if (touchedKey === "TOGGLE") {
-            row2.classList.toggle("hidden");
-            toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
+            this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
           } else {
             this.handleKey(touchedKey);
           }
@@ -1964,8 +1980,7 @@ class ExtraKeysManager {
         this.handleKey(btn.dataset.key);
       } else if (tog && row2 && toggle) {
         e.preventDefault();
-        row2.classList.toggle("hidden");
-        toggle.textContent = row2.classList.contains("hidden") ? "⋯" : "⋮";
+        this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
       }
     });
 
@@ -1976,6 +1991,14 @@ class ExtraKeysManager {
     // On desktop: load from localStorage (default: hidden)
     // On mobile: always visible
     this.updateVisibility();
+
+    // Restore the persisted secondary-row collapsed state (default: expanded).
+    this.setExtraKeysRow2Collapsed(
+      Boolean(
+        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+      ),
+      { persist: false },
+    );
 
     // Setup toggle button handler
     document
@@ -2025,6 +2048,15 @@ class ExtraKeysManager {
 
     active.ws.send(JSON.stringify({ type: "input", data: sequence }));
     this.resetModifiers();
+    // Snap the view back to the prompt on synthetic key input, except for
+    // scrollback-navigation keys (PgUp/PgDn). Single source of truth lives in
+    // extra-keys-scroll.js; if it somehow isn't loaded, fall back to a
+    // conservative inline denylist so PgUp/PgDn still never snap.
+    const scrollPred = window.ExtraKeysScroll?.shouldScrollToPromptForKey;
+    const shouldScroll = scrollPred
+      ? scrollPred(key)
+      : key !== "PGUP" && key !== "PGDN";
+    if (shouldScroll) this.tm.scrollActiveTerminalToPrompt();
   }
 
   toggleModifier(mod) {
@@ -2079,20 +2111,37 @@ class ExtraKeysManager {
     // On mobile, always start visible (managed by keyboard)
     if (platformDetector.isMobile) return true;
 
-    // On desktop, load from localStorage (default: hidden)
-    const saved = localStorage.getItem("extraKeysVisible");
-    return saved === "true";
+    // On desktop, read the canonical terminal.extraKeysVisible from the store
+    // (schema default: hidden). No legacy localStorage read — migration owns it.
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    const fallback = Boolean(defaults["terminal.extraKeysVisible"]);
+    return Boolean(
+      this.tm?.settingsStore?.get("terminal.extraKeysVisible", fallback) ??
+      fallback,
+    );
   }
 
-  saveVisibilityState() {
-    localStorage.setItem("extraKeysVisible", String(this.visible));
+  // Apply visibility WITHOUT persisting (the runtime side effect entry point).
+  applyVisibility(visible) {
+    this.visible = Boolean(visible);
+    this.updateVisibility();
   }
 
   setVisible(visible) {
-    this.visible = visible;
-    this.updateVisibility();
+    // Persist through the settings runtime/store; the side effect applies it.
+    if (platformDetector.isDesktop && this.tm?.settingsRuntime) {
+      this.tm.settingsRuntime.apply(
+        "terminal.extraKeysVisible",
+        Boolean(visible),
+      );
+      return;
+    }
+    this.applyVisibility(visible);
     if (platformDetector.isDesktop) {
-      this.saveVisibilityState();
+      this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
     }
   }
 
@@ -2111,6 +2160,23 @@ class ExtraKeysManager {
     } else {
       this.extraKeysEl.classList.add("hidden");
       toggleBtn?.classList.remove("active");
+    }
+  }
+
+  // Collapse/expand the secondary extra-keys row + sync the toggle glyph, and
+  // persist the choice (per-actor) so it survives reloads. The compact
+  // keyboard-open CSS hides the row independently; this governs the resting state.
+  setExtraKeysRow2Collapsed(collapsed, { persist = true } = {}) {
+    const row2 = document.querySelector(".extra-keys-row-2");
+    const toggle = document.getElementById("extra-keys-toggle");
+    if (!row2) return;
+    row2.classList.toggle("hidden", Boolean(collapsed));
+    if (toggle) toggle.textContent = collapsed ? "⋯" : "⋮";
+    if (persist) {
+      this.tm?.settingsStore?.set(
+        "terminal.extraKeysRow2Collapsed",
+        Boolean(collapsed),
+      );
     }
   }
 
@@ -2195,7 +2261,8 @@ class StatsManager {
 // =============================================================================
 
 class ClipboardManager {
-  constructor() {
+  constructor(manager = null) {
+    this.manager = manager;
     this.history = [];
     this.maxHistory = 20;
     this.maxItemSize = 200 * 1024; // 200KB
@@ -2204,10 +2271,14 @@ class ClipboardManager {
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
-    // Auto-copy enabled by default - user can disable in clipboard panel
-    const savedAutoCopy = localStorage.getItem("autoCopyEnabled");
-    this.autoCopyEnabled =
-      savedAutoCopy === null ? true : savedAutoCopy === "true";
+    // Seed with the schema default for terminal.autoCopy; the settings runtime
+    // applies the canonical (and migrated) value once the store resolves. No
+    // legacy localStorage read here — the migration owns that.
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    this.autoCopyEnabled = Boolean(defaults["terminal.autoCopy"]);
     this.selectionDebounceTimer = null;
     this.init();
   }
@@ -2448,8 +2519,25 @@ class ClipboardManager {
   }
 
   setAutoCopyEnabled(enabled) {
-    this.autoCopyEnabled = enabled;
-    localStorage.setItem("autoCopyEnabled", String(enabled));
+    // Persist through the settings runtime/store; the terminal.autoCopy side
+    // effect (applyAutoCopy) updates local state + the checkbox.
+    const runtime = this.manager?.settingsRuntime;
+    if (runtime) {
+      runtime.apply("terminal.autoCopy", Boolean(enabled));
+    } else {
+      this.applyAutoCopy(Boolean(enabled));
+      this.manager?.settingsStore?.set(
+        "terminal.autoCopy",
+        this.autoCopyEnabled,
+      );
+    }
+  }
+
+  // Side effect for terminal.autoCopy. `enabled` is already coerced to bool.
+  applyAutoCopy(enabled) {
+    this.autoCopyEnabled = Boolean(enabled);
+    const checkbox = document.getElementById("auto-copy-toggle");
+    if (checkbox) checkbox.checked = this.autoCopyEnabled;
   }
 
   // Called when terminal selection changes
@@ -2658,9 +2746,20 @@ class ClipboardManager {
   }
 
   escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    // Delegate to the shared escaper (escapes & < > " ' — safe for the quoted
+    // attribute interpolation sites in the legacy git panel: data-branch,
+    // data-path, data-folder-key, title="${message}", etc.). The old
+    // textContent→innerHTML round-trip left " and ' intact → attribute-breakout
+    // stored XSS when a branch/file/commit/stash value contained a quote.
+    if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+      return window.HtmlEscape.escapeHtml(text);
+    }
+    return String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   formatTime(timestamp) {
@@ -2684,11 +2783,15 @@ class GitManager {
       files: { staged: [], changes: [] },
       branches: { current: "", list: [] },
       commits: [],
+      stashes: [],
       selectedIndex: 0,
       selectedPath: null,
       activePanel: "files", // 'files' | 'history' | 'branches'
       diff: null,
       diffMode: "working", // 'working' | 'staged' | 'commit'
+      rightView: "diff", // 'diff' | 'timeline'
+      timelineEntries: [],
+      timelinePath: null,
       selectedCommit: null,
       collapsedFolders: new Set(),
       loading: false,
@@ -2714,21 +2817,33 @@ class GitManager {
           <div class="panel-header">
             <h3>Git</h3>
             <span id="git-branch" class="git-branch clickable" title="Click to switch branch"></span>
+            <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
+            <button id="git-pull-btn" class="panel-refresh git-sync-btn" title="Pull">↓</button>
+            <button id="git-push-btn" class="panel-refresh git-sync-btn" title="Push">↑</button>
+            <button id="git-fetch-btn" class="panel-refresh git-sync-btn" title="Fetch">⇣</button>
+            <button id="git-stash-btn" class="panel-refresh git-sync-btn" title="Stash changes">≡</button>
             <button class="panel-refresh" title="Refresh (r)">&#x21bb;</button>
             <button class="panel-close" title="Close (Esc)">&times;</button>
           </div>
           <div id="git-files" class="git-files"></div>
+          <div id="git-stashes" class="git-stashes"></div>
           <div id="git-branches" class="git-branches hidden"></div>
         </div>
         <div class="git-right-panel">
           <div class="git-diff-header">
             <span id="git-diff-title">Diff</span>
+            <div class="git-right-views">
+              <button class="git-right-view active" data-view="diff" title="Diff of the selected file">Diff</button>
+              <button class="git-right-view" data-view="timeline" title="Commit history of the selected file">Timeline</button>
+            </div>
             <div class="git-diff-modes">
               <button class="git-diff-mode active" data-mode="working">Working Tree</button>
               <button class="git-diff-mode" data-mode="staged">Staged</button>
               <button class="git-diff-mode" data-mode="commit">Commit</button>
+              <button id="git-diff-layout" class="git-diff-mode git-diff-layout" title="Toggle split / inline diff">⫿⫿</button>
             </div>
           </div>
+          <div id="git-timeline" class="git-timeline hidden"></div>
           <div id="git-diff" class="git-diff"></div>
           <div class="git-history-header">
             <span>History</span>
@@ -2739,6 +2854,7 @@ class GitManager {
       <div class="git-bottom-bar">
         <div class="git-commit-area">
           <textarea id="git-message" placeholder="Commit message..." rows="2"></textarea>
+          <label class="git-amend" title="Amend the last commit"><input type="checkbox" id="git-amend" /> Amend</label>
           <button id="git-commit-btn" class="btn btn-primary">Commit</button>
           <span id="git-commit-status" class="git-commit-status"></span>
         </div>
@@ -2766,9 +2882,77 @@ class GitManager {
     this.panel
       .querySelector("#git-branch")
       .addEventListener("click", () => this.toggleBranches());
-    this.panel.querySelectorAll(".git-diff-mode").forEach((btn) => {
-      btn.addEventListener("click", () => this.setDiffMode(btn.dataset.mode));
+    this.panel
+      .querySelector("#git-pull-btn")
+      .addEventListener("click", () => this.syncAction("pull"));
+    this.panel
+      .querySelector("#git-push-btn")
+      .addEventListener("click", () => this.syncAction("push"));
+    this.panel
+      .querySelector("#git-fetch-btn")
+      .addEventListener("click", () => this.syncAction("fetch"));
+    this.panel
+      .querySelector("#git-stash-btn")
+      .addEventListener("click", () => this.stashPush());
+    this.panel.querySelector("#git-amend").addEventListener("change", (e) => {
+      const messageEl = this.panel.querySelector("#git-message");
+      if (e.target.checked && !messageEl.value.trim()) {
+        messageEl.value = this.state.commits[0]?.message || "";
+      }
     });
+    this.panel
+      .querySelectorAll(".git-diff-mode:not(.git-diff-layout)")
+      .forEach((btn) => {
+        btn.addEventListener("click", () => this.setDiffMode(btn.dataset.mode));
+      });
+    this.panel
+      .querySelector("#git-diff-layout")
+      .addEventListener("click", () => {
+        const next = this.getDiffLayout() === "split" ? "inline" : "split";
+        window.terminalManager?.settingsStore?.set("git.diffLayout", next);
+        if (this.state.selectedPath) {
+          this.showDiff(this.state.selectedPath);
+        }
+      });
+    this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
+      btn.addEventListener("click", () => this.setRightView(btn.dataset.view));
+    });
+  }
+
+  // Switches the right pane between the Diff editor and the per-file Timeline.
+  setRightView(view) {
+    if (!view || view === this.state.rightView) {
+      if (view === "timeline") this.showTimeline(this.state.selectedPath);
+      return;
+    }
+    this.state.rightView = view;
+    this.updateRightViewUI();
+    if (view === "timeline") {
+      this.showTimeline(this.state.selectedPath);
+    } else if (this.state.selectedPath) {
+      this.showDiff(this.state.selectedPath);
+    }
+  }
+
+  updateRightViewUI() {
+    const view = this.state.rightView || "diff";
+    this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.view === view);
+    });
+    const isTimeline = view === "timeline";
+    const timelineEl = this.panel.querySelector("#git-timeline");
+    const diffEl = this.panel.querySelector("#git-diff");
+    const modesEl = this.panel.querySelector(".git-diff-modes");
+    if (timelineEl) timelineEl.classList.toggle("hidden", !isTimeline);
+    // Diff editor stays visible in timeline mode (a clicked commit renders into
+    // it); only the working/staged/commit mode buttons are hidden, since they
+    // do not apply to a historical revision.
+    if (modesEl) modesEl.classList.toggle("hidden", isTimeline);
+    if (diffEl && !this.state.selectedPath) {
+      diffEl.classList.toggle("hidden", isTimeline);
+    } else if (diffEl) {
+      diffEl.classList.remove("hidden");
+    }
   }
 
   setupKeyboardShortcuts() {
@@ -3009,10 +3193,60 @@ class GitManager {
 
   hide() {
     this.panel.classList.add("hidden");
+    // In windowed mode the panel lives inside a SurfaceWindow that must
+    // close with it (the in-panel × and Esc call hide() directly).
+    window.terminalManager?.surfaceWindowManager?.close("git");
+    window.terminalManager?.syncSurfaceButtonState?.();
   }
 
   toggle() {
     this.panel.classList.contains("hidden") ? this.show() : this.hide();
+  }
+
+  // ── ViewHost contract (IDE shell slice 5) ───────────────────────────────────
+  // GitManager conforms to the ViewHost lifecycle so the live instance can be
+  // re-hosted (its #git-panel moved into another container) without recreation.
+  // The IDE sidebar SCM presentation is a separate re-skin (git-scm-view.js) that
+  // reuses this instance's git OPERATIONS; these methods cover the legacy
+  // floating-window / terminal-mode panel re-host. mount(container) moves the
+  // panel element into the container + reveals it; unmount() returns it home +
+  // hides it (model state lives in this.state, so a re-mount restores from it).
+  mount(container) {
+    if (!container || !this.panel) return;
+    if (this.panel.parentElement !== container)
+      container.appendChild(this.panel);
+    this.panel.classList.remove("hidden");
+  }
+
+  unmount() {
+    if (!this.panel) return;
+    const home = document.getElementById("app");
+    if (home && this.panel.parentElement !== home) home.appendChild(this.panel);
+    this.panel.classList.add("hidden");
+  }
+
+  dispose() {
+    this.unmount();
+  }
+
+  // The diff editor (#git-diff) is a CodeMirror MergeView that needs a measure
+  // pass when its container resizes. Trigger a cheap re-measure on the live
+  // view rather than re-fetching the whole diff over the network — the diff
+  // CONTENT does not change on a layout resize, only the rendered geometry.
+  // For a split MergeView the sub-editors are on .a/.b; for an inline
+  // EditorView requestMeasure() is directly on the view.
+  resize() {
+    if (this.panel?.classList.contains("hidden")) return;
+    const mv = this._mergeView;
+    if (!mv) return;
+    // EditorView (inline unified mode) exposes requestMeasure() directly.
+    if (typeof mv.requestMeasure === "function") {
+      mv.requestMeasure();
+      return;
+    }
+    // MergeView (split mode) exposes .a and .b EditorViews.
+    mv.a?.requestMeasure?.();
+    mv.b?.requestMeasure?.();
   }
 
   async refresh() {
@@ -3037,33 +3271,18 @@ class GitManager {
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
 
-      this.state.files = {
-        staged: [],
-        changes: [],
+      // groupStatusFiles (git-scm.js) splits into staged/changes/untracked
+      // with VS Code semantics; sync state powers the push/pull header UI.
+      this.state.files = groupStatusFiles(statusData.files);
+      this.state.sync = {
+        upstream: statusData.upstream || null,
+        ahead: statusData.ahead || 0,
+        behind: statusData.behind || 0,
       };
       this.state.branches.current = statusData.branch;
 
-      statusData.files.forEach((f) => {
-        const stagedStatus = f.stagedStatus || "";
-        const unstagedStatus = f.unstagedStatus || "";
-        const isStaged = f.section === "staged" || !!stagedStatus;
-        const sectionKey = isStaged ? "staged" : "changes";
-        const displayStatus = stagedStatus || unstagedStatus || f.status || "?";
-        const file = {
-          path: f.path,
-          oldPath: f.oldPath || null,
-          status: f.status,
-          stagedStatus,
-          unstagedStatus,
-          isRenamed: !!f.isRenamed,
-          section: sectionKey,
-          staged: isStaged,
-          displayStatus,
-        };
-        this.state.files[sectionKey].push(file);
-      });
-
       this.panel.querySelector("#git-branch").textContent = statusData.branch;
+      this.renderSyncState();
       this.renderFiles();
 
       if (prevSelectedPath) {
@@ -3080,6 +3299,16 @@ class GitManager {
         }
       }
 
+      // Keep explorer git decorations + the IDE SCM view in sync with the panel:
+      // force-refresh the shared status cache (which EMITS onChange so the SCM
+      // view's subscriber re-renders), then re-derive explorer decorations. The
+      // force read repopulates the cache the decoration pass reuses.
+      const tm = window.terminalManager;
+      if (tm?.gitStatusStore) {
+        void tm.gitStatusStore.refreshStatus(cwd);
+        void tm.refreshExplorerDecorations();
+      }
+
       // Fetch commit history
       const logRes = await fetch(
         `/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=30`,
@@ -3089,6 +3318,16 @@ class GitManager {
       if (!logData.error) {
         this.state.commits = logData.commits || [];
         this.renderHistory();
+      }
+
+      // Fetch stash list (pop/apply/drop UI lives in #git-stashes)
+      const stashRes = await fetch(
+        `/api/git/stash?cwd=${encodeURIComponent(cwd)}`,
+      );
+      const stashData = await stashRes.json();
+      if (!stashData.error) {
+        this.state.stashes = stashData.stashes || [];
+        this.renderStashes();
       }
     } catch (err) {
       console.error("Git refresh error:", err);
@@ -3145,7 +3384,13 @@ class GitManager {
   }
 
   getAllFiles() {
-    return [...this.state.files.staged, ...this.state.files.changes];
+    // Order must match renderFiles() section order — row data-index points
+    // into this list.
+    return [
+      ...this.state.files.staged,
+      ...this.state.files.changes,
+      ...(this.state.files.untracked || []),
+    ];
   }
 
   renderFiles() {
@@ -3156,12 +3401,27 @@ class GitManager {
         label: "Staged Changes",
         icon: "\u2713",
         files: this.state.files.staged,
+        groupAction: "unstage-all",
+        groupActionGlyph: "\u2212",
+        groupActionTitle: "Unstage all",
       },
       {
         key: "changes",
         label: "Changes",
         icon: "\u2022",
         files: this.state.files.changes,
+        groupAction: "stage-all",
+        groupActionGlyph: "+",
+        groupActionTitle: "Stage all",
+      },
+      {
+        key: "untracked",
+        label: "Untracked",
+        icon: "\u25cb",
+        files: this.state.files.untracked || [],
+        groupAction: "stage-all",
+        groupActionGlyph: "+",
+        groupActionTitle: "Stage all",
       },
     ];
 
@@ -3183,6 +3443,11 @@ class GitManager {
             <span class="git-file-group-icon ${section.key}">${section.icon}</span>
             <span class="git-file-group-label">${section.label}</span>
             <span class="git-file-group-count">(${files.length})</span>
+            ${
+              files.length > 0
+                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+                : ""
+            }
           </div>
           <div class="git-file-group-items">
             ${treeHtml}
@@ -3222,24 +3487,240 @@ class GitManager {
     // Add event listeners
     container.querySelectorAll(".git-file").forEach((el) => {
       el.addEventListener("click", (e) => {
-        if (e.target.classList.contains("git-file-diff")) {
-          this.showDiff(el.dataset.path);
+        const files = this.getAllFiles();
+        const file = files[parseInt(el.dataset.index, 10)];
+
+        if (e.target.classList.contains("git-file-stage")) {
+          this.toggleStage(el.dataset.path, file?.staged);
           return;
         }
 
-        if (e.target.classList.contains("git-file-stage")) {
-          const files = this.getAllFiles();
-          const file = files[parseInt(el.dataset.index)];
-          this.toggleStage(el.dataset.path, file?.staged);
+        if (e.target.classList.contains("git-file-open")) {
+          const cwd = (this.state.cwd || this.currentCwd || "").replace(
+            /\/$/,
+            "",
+          );
+          window.terminalManager?.openFileInEditor?.(
+            `${cwd}/${el.dataset.path}`,
+          );
+          return;
+        }
+
+        if (e.target.classList.contains("git-file-discard")) {
+          this.discardFile(file || { path: el.dataset.path });
           return;
         }
 
         this.state.selectedIndex = parseInt(el.dataset.index, 10);
         this.state.selectedPath = el.dataset.path;
         this.highlightSelectedFile();
-        this.showDiff(el.dataset.path);
+        if (this.state.rightView === "timeline") {
+          this.showTimeline(el.dataset.path);
+        } else {
+          this.showDiff(el.dataset.path);
+        }
       });
     });
+
+    container.querySelectorAll(".git-group-action").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        const group = btn.dataset.group;
+        const action = btn.dataset.groupAction;
+        const files = this.state.files[group] || [];
+        if (files.length === 0) return;
+        this.stagePaths(
+          files.map((f) => f.path),
+          action === "unstage-all",
+        );
+      });
+    });
+  }
+
+  renderSyncState() {
+    const el = this.panel.querySelector("#git-sync-label");
+    if (!el) return;
+    const sync = this.state.sync || { ahead: 0, behind: 0, upstream: null };
+    el.textContent = syncLabel(sync.ahead, sync.behind);
+    // Pull only makes sense with an upstream; Push without one publishes the
+    // branch (-u origin <branch>), VS Code-style.
+    this.panel.querySelector("#git-pull-btn").disabled = !sync.upstream;
+    this.panel
+      .querySelector("#git-push-btn")
+      .setAttribute(
+        "title",
+        sync.upstream ? "Push" : "Publish branch (push -u origin)",
+      );
+  }
+
+  async syncAction(op) {
+    const btn = this.panel.querySelector(`#git-${op}-btn`);
+    if (btn?.disabled) return;
+    const cwd = this.state.cwd || this.currentCwd;
+    const body = { cwd };
+    if (op === "push" && !this.state.sync?.upstream) {
+      body.setUpstream = true;
+      body.remote = "origin";
+      body.branch = this.state.branches.current;
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(`/api/git/${op}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(
+          formatGitError(data, `${op[0].toUpperCase()}${op.slice(1)} failed`),
+          "error",
+        );
+        return;
+      }
+      this.showCommitStatus(
+        `${op[0].toUpperCase()}${op.slice(1)} done`,
+        "success",
+      );
+      await this.refresh();
+    } catch (err) {
+      console.error(`Git ${op} error:`, err);
+      this.showCommitStatus(`${op} failed: network error`, "error");
+    } finally {
+      if (btn) btn.disabled = false;
+      this.renderSyncState();
+    }
+  }
+
+  async stashPush() {
+    const message = window.prompt("Stash message (optional):");
+    if (message === null) return; // cancelled
+    const cwd = this.state.cwd || this.currentCwd;
+    try {
+      const res = await fetch("/api/git/stash", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          cwd,
+          action: "push",
+          message: message.trim() || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Stash failed"), "error");
+        return;
+      }
+      this.showCommitStatus("Stashed", "success");
+      await this.refresh();
+    } catch (err) {
+      console.error("Stash error:", err);
+    }
+  }
+
+  async stashAction(action, index) {
+    if (
+      action === "drop" &&
+      !window.confirm("Drop this stash? This cannot be undone.")
+    ) {
+      return;
+    }
+    const cwd = this.state.cwd || this.currentCwd;
+    try {
+      const res = await fetch("/api/git/stash", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, action, index }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Stash failed"), "error");
+        return;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Stash action error:", err);
+    }
+  }
+
+  renderStashes() {
+    const container = this.panel.querySelector("#git-stashes");
+    if (!container) return;
+    const stashes = this.state.stashes || [];
+    if (stashes.length === 0) {
+      container.innerHTML = "";
+      return;
+    }
+    const rows = stashes
+      .map(
+        (s) => `
+      <div class="git-stash-item" data-index="${s.index}">
+        <span class="git-stash-icon" title="Stash">${"≡"}</span>
+        <span class="git-stash-msg" title="${this.escapeHtml(s.message)}">${this.escapeHtml(s.message)}</span>
+        <button class="git-stash-action" data-action="apply" title="Apply (keep stash)">apply</button>
+        <button class="git-stash-action" data-action="pop" title="Pop (apply + drop)">pop</button>
+        <button class="git-stash-action git-stash-drop" data-action="drop" title="Drop">${"×"}</button>
+      </div>`,
+      )
+      .join("");
+    container.innerHTML = `<div class="git-stash-header">Stashes (${stashes.length})</div>${rows}`;
+
+    container.querySelectorAll(".git-stash-action").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        const item = e.target.closest(".git-stash-item");
+        const index = parseInt(item.dataset.index, 10);
+        this.stashAction(e.target.dataset.action, index);
+      });
+    });
+  }
+
+  async stagePaths(paths, unstage) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const res = await fetch(unstage ? "/api/git/unstage" : "/api/git/stage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(
+          formatGitError(data, unstage ? "Unstage failed" : "Stage failed"),
+          "error",
+        );
+        return;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Stage paths error:", err);
+    }
+  }
+
+  async discardFile(file) {
+    const untracked = statusLetter(file) === "U";
+    const question = untracked
+      ? `Delete untracked file ${file.path}?`
+      : `Discard changes to ${file.path}? This cannot be undone.`;
+    if (!window.confirm(question)) return;
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const res = await fetch("/api/git/discard", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths: [file.path], confirm: true }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        this.showCommitStatus(formatGitError(data, "Discard failed"), "error");
+        return;
+      }
+      if (this.state.selectedPath === file.path) {
+        this.state.selectedPath = null;
+      }
+      await this.refresh();
+    } catch (err) {
+      console.error("Discard error:", err);
+    }
   }
 
   renderSectionTree(files, section, startIndex) {
@@ -3319,14 +3800,19 @@ class GitManager {
         this.state.selectedPath === file.path ||
         index === this.state.selectedIndex;
       const fileName = file.path.split("/").pop() || file.path;
+      const letter = statusLetter(file);
+      const colorClass = statusClass(letter);
+      const discardTitle =
+        letter === "U" ? "Delete untracked file" : "Discard changes";
       html += `
         <div class="git-file ${isSelected ? "selected" : ""}" data-path="${this.escapeHtml(file.path)}" data-index="${index}" style="--tree-depth:${depth}">
-          <span class="git-file-status ${file.section}">${this.escapeHtml(this.getStatusGlyph(file))}</span>
-          <span class="git-file-path" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
+          <span class="git-file-path ${colorClass}" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
           <div class="git-file-actions">
-            <button class="git-file-diff" title="View diff">diff</button>
-            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "-" : "+"}</button>
+            <button class="git-file-open" title="Open file">⤢</button>
+            <button class="git-file-discard" title="${discardTitle}">⟲</button>
+            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "−" : "+"}</button>
           </div>
+          <span class="git-file-status ${colorClass}">${this.escapeHtml(letter)}</span>
         </div>
       `;
       index++;
@@ -3348,26 +3834,57 @@ class GitManager {
   }
 
   async showDiff(path) {
+    const mode = this.state.diffMode || "working";
+    this.state.selectedPath = path || this.state.selectedPath;
+    const resolvedPath = path || this.state.selectedPath;
+    const titlePath = resolvedPath || "Diff";
+    const modeLabel =
+      mode === "staged"
+        ? "Staged"
+        : mode === "commit"
+          ? "Commit"
+          : "Working Tree";
+    this.panel.querySelector("#git-diff-title").textContent =
+      `${titlePath} (${modeLabel})`;
+    this.panel.querySelector("#git-diff").innerHTML =
+      '<p class="muted">Loading...</p>';
+
+    // Whole-commit view (no file selected) stays a raw patch — the merge
+    // editor compares exactly one file.
+    if (!resolvedPath || (mode === "commit" && !this.state.selectedCommit)) {
+      await this.showPatchDiff(resolvedPath);
+      return;
+    }
+
+    try {
+      const file = this.getAllFiles().find((f) => f.path === resolvedPath) || {
+        path: resolvedPath,
+      };
+      const sources = diffSources(mode, file, this.state.selectedCommit);
+      const [original, modified] = await Promise.all([
+        this.fetchDiffSource(sources.original, resolvedPath),
+        this.fetchDiffSource(sources.modified, resolvedPath),
+      ]);
+      if (original === null || modified === null) {
+        // Binary/unreadable on either side — the unified patch still renders.
+        await this.showPatchDiff(resolvedPath);
+        return;
+      }
+      await this.renderMergeDiff(original, modified, resolvedPath);
+    } catch (err) {
+      console.warn("Merge diff failed, falling back to patch:", err);
+      await this.showPatchDiff(resolvedPath);
+    }
+  }
+
+  // Legacy unified-patch rendering (diff2html / plain text) — fallback path.
+  async showPatchDiff(path) {
     try {
       const cwd = this.state.cwd || this.currentCwd;
       const mode = this.state.diffMode || "working";
-      this.state.selectedPath = path || this.state.selectedPath;
-      const titlePath = path || this.state.selectedPath || "Diff";
-      const modeLabel =
-        mode === "staged"
-          ? "Staged"
-          : mode === "commit"
-            ? "Commit"
-            : "Working Tree";
-      this.panel.querySelector("#git-diff-title").textContent =
-        `${titlePath} (${modeLabel})`;
-      this.panel.querySelector("#git-diff").innerHTML =
-        '<p class="muted">Loading...</p>';
-
       const params = new URLSearchParams({ cwd });
-      const resolvedPath = path || this.state.selectedPath;
-      if (resolvedPath) {
-        params.set("path", resolvedPath);
+      if (path) {
+        params.set("path", path);
       }
       if (mode === "staged") {
         params.set("staged", "1");
@@ -3384,11 +3901,241 @@ class GitManager {
         return;
       }
 
-      this.showDiffContent(data.diff, resolvedPath || "");
+      this.showDiffContent(data.diff, path || "");
     } catch (err) {
       console.error("Diff error:", err);
       this.panel.querySelector("#git-diff").innerHTML =
         '<p class="error">Failed to load diff</p>';
+    }
+  }
+
+  // Resolves a diffSources() descriptor to document text. null = unreadable
+  // (binary, too large) → caller falls back to the patch view. A git-show 404
+  // means "file absent at that ref" (new file) and maps to "".
+  async fetchDiffSource(source, relPath) {
+    const cwd = this.state.cwd || this.currentCwd;
+    if (source.kind === "empty") return "";
+    if (source.kind === "worktree") {
+      const abs = `${cwd.replace(/\/$/, "")}/${relPath}`;
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      return typeof data.content === "string" ? data.content : null;
+    }
+    const params = new URLSearchParams({
+      cwd,
+      commit: source.ref,
+      path: relPath,
+    });
+    const res = await fetch(`/api/git/show?${params.toString()}`);
+    if (res.status === 404) return "";
+    if (!res.ok) return null;
+    const data = await res.json();
+    return typeof data.content === "string" ? data.content : "";
+  }
+
+  getDiffLayout() {
+    // Narrow screens always get the inline diff; otherwise the persisted
+    // preference (settings KV, phase 1) decides.
+    if (window.innerWidth < 768) return "inline";
+    return (
+      window.terminalManager?.settingsStore?.get("git.diffLayout", "split") ||
+      "split"
+    );
+  }
+
+  async renderMergeDiff(original, modified, relPath) {
+    const container = this.panel.querySelector("#git-diff");
+    this._mergeView?.destroy?.();
+    this._mergeView = null;
+    this._mergeView = await this.buildMergeView(
+      container,
+      original,
+      modified,
+      relPath,
+    );
+  }
+
+  // Render a merge diff into an editor TAB body (IDE slice 4). Returns the view
+  // so the tab controller can keep it; reuses the exact CodeMirror machinery as
+  // the git panel diff. Each call owns its own view (no shared _mergeView).
+  async renderMergeDiffInto(container, original, modified, relPath) {
+    return this.buildMergeView(container, original, modified, relPath);
+  }
+
+  // Shared merge-view builder (git panel + editor tab). Reads the diff-layout
+  // preference (split vs inline). Returns the live view/MergeView.
+  async buildMergeView(container, original, modified, relPath) {
+    this.cm ||= await import("/vendor/codemirror.js");
+    if (!container) return null;
+    container.innerHTML = "";
+
+    const langName = window.FileEditorModule?.detectEditorLanguage?.(relPath);
+    const langExt =
+      langName && typeof this.cm[langName] === "function"
+        ? [this.cm[langName]()]
+        : [];
+    const shared = [
+      this.cm.EditorView.editable.of(false),
+      this.cm.EditorState.readOnly.of(true),
+      this.cm.oneDark,
+      ...langExt,
+    ];
+
+    if (this.getDiffLayout() === "inline") {
+      return new this.cm.EditorView({
+        doc: modified,
+        extensions: [
+          ...shared,
+          this.cm.unifiedMergeView({
+            original,
+            mergeControls: false,
+            collapseUnchanged: { margin: 3, minSize: 4 },
+          }),
+        ],
+        parent: container,
+      });
+    }
+
+    return new this.cm.MergeView({
+      a: { doc: original, extensions: shared },
+      b: { doc: modified, extensions: shared },
+      parent: container,
+      collapseUnchanged: { margin: 3, minSize: 4 },
+    });
+  }
+
+  // Per-file timeline: lists the commit history of the selected file and lets
+  // the user diff any revision against its previous revision (root commit ->
+  // empty tree). Reuses renderMergeDiff for the diff itself.
+  async showTimeline(path) {
+    const container = this.panel.querySelector("#git-timeline");
+    if (!container) return;
+    const resolvedPath = path || this.state.selectedPath;
+
+    if (!resolvedPath) {
+      this.state.timelineEntries = [];
+      this.state.timelinePath = null;
+      container.innerHTML =
+        '<p class="muted centered">Select a file to see its history</p>';
+      return;
+    }
+
+    container.innerHTML = '<p class="muted centered">Loading history…</p>';
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const params = new URLSearchParams({ cwd, path: resolvedPath });
+      const res = await fetch(`/api/git/log?${params.toString()}`);
+      const data = await res.json();
+      if (data.error) {
+        container.innerHTML = `<p class="error">${this.escapeHtml(data.error)}</p>`;
+        return;
+      }
+      const entries = window.GitTimeline.buildTimelineEntries(data.commits);
+      this.state.timelineEntries = entries;
+      this.state.timelinePath = resolvedPath;
+      this.renderTimeline(resolvedPath);
+    } catch (err) {
+      console.error("Timeline error:", err);
+      container.innerHTML = '<p class="error">Failed to load history</p>';
+    }
+  }
+
+  renderTimeline(path) {
+    const container = this.panel.querySelector("#git-timeline");
+    if (!container) return;
+    const entries = this.state.timelineEntries || [];
+
+    if (entries.length === 0) {
+      container.innerHTML =
+        '<p class="muted centered">No commit history for this file</p>';
+      return;
+    }
+
+    const rows = entries
+      .map(
+        (e, i) => `
+      <div class="git-timeline-row" data-index="${i}" title="${this.escapeHtml(e.message)}">
+        <span class="git-timeline-hash">${this.escapeHtml(e.shortHash)}</span>
+        <span class="git-timeline-message">${this.escapeHtml(this.truncateMessage(e.message))}</span>
+        <span class="git-timeline-meta">${this.escapeHtml(e.author)} · ${this.escapeHtml(e.relativeDate)}</span>
+      </div>`,
+      )
+      .join("");
+    container.innerHTML = `<div class="git-timeline-path">${this.escapeHtml(path)}</div>${rows}`;
+
+    container.querySelectorAll(".git-timeline-row").forEach((el) => {
+      el.addEventListener("click", () => {
+        container
+          .querySelectorAll(".git-timeline-row")
+          .forEach((r) => r.classList.remove("selected"));
+        el.classList.add("selected");
+        this.showTimelineDiff(parseInt(el.dataset.index, 10));
+      });
+    });
+  }
+
+  async showTimelineDiff(index) {
+    const entries = this.state.timelineEntries || [];
+    const entry = entries[index];
+    const path = this.state.timelinePath || this.state.selectedPath;
+    if (!entry || !path) return;
+
+    // IDE mode (slice 5): open the revision diff as a commit-mode EDITOR TAB
+    // (keyed on the commit sha) instead of the legacy in-panel #git-diff pane.
+    const tm = window.terminalManager;
+    if (tm?.isIdeModeActive?.() && tm.openDiffTab) {
+      tm.openDiffTab({
+        relPath: path,
+        mode: "commit",
+        cwd: this.state.cwd || this.currentCwd,
+        commit: entry.hash || entry.shortHash,
+        title: `${path} @ ${entry.shortHash}`,
+      });
+      return;
+    }
+
+    const diffEl = this.panel.querySelector("#git-diff");
+    if (diffEl) diffEl.classList.remove("hidden");
+    diffEl.innerHTML = '<p class="muted">Loading…</p>';
+    this.panel.querySelector("#git-diff-title").textContent =
+      `${path} @ ${entry.shortHash}`;
+
+    // prevCommit = next-older revision of THIS file (or undefined at root).
+    const prevEntry = entries[index + 1];
+    const { ref, prevRef } = window.GitTimeline.revPairForCommit(
+      entry,
+      entry.isRoot,
+      prevEntry,
+    );
+
+    try {
+      const [original, modified] = await Promise.all([
+        this.fetchRevisionContent(prevRef, path),
+        this.fetchRevisionContent(ref, path),
+      ]);
+      await this.renderMergeDiff(original, modified, path);
+    } catch (err) {
+      console.error("Timeline diff error:", err);
+      diffEl.innerHTML = '<p class="error">Failed to load revision diff</p>';
+    }
+  }
+
+  // Fetches a file's content at a git ref via /api/git/show. A 404 (path absent
+  // at that ref — additions/deletions/empty-tree side) and any other failure
+  // map to "" so the diff renders as a clean add/delete instead of erroring.
+  async fetchRevisionContent(ref, relPath) {
+    try {
+      const cwd = this.state.cwd || this.currentCwd;
+      const params = new URLSearchParams({ cwd, commit: ref, path: relPath });
+      const res = await fetch(`/api/git/show?${params.toString()}`);
+      if (!res.ok) return "";
+      const data = await res.json();
+      return typeof data.content === "string" ? data.content : "";
+    } catch (err) {
+      return "";
     }
   }
 
@@ -3418,19 +4165,41 @@ class GitManager {
     }
   }
 
+  // Legacy panel commit: reads the hidden #git-message / #git-amend controls,
+  // then delegates to the parameterized commitWith() op. The IDE SCM view calls
+  // commitWith() directly (no hidden-DOM mirroring).
   async commit() {
     const message = this.panel.querySelector("#git-message").value.trim();
-    if (!message) {
+    const amendEl = this.panel.querySelector("#git-amend");
+    const amend = !!amendEl?.checked;
+    const result = await this.commitWith({ message, amend });
+    // On success the legacy panel clears its own controls (commitWith doesn't
+    // touch DOM, so the caller owns its inputs).
+    if (result?.ok) {
+      this.panel.querySelector("#git-message").value = "";
+      if (amendEl) amendEl.checked = false;
+    }
+    return result;
+  }
+
+  // Parameterized commit op (DOM-free): POST /api/git/commit with an explicit
+  // message + amend flag, surface status, refresh on success. Returns
+  // { ok: true } | { ok: false, error } so any caller (legacy panel OR the IDE
+  // SCM view) can reflect the outcome in its own UI without reading DOM nodes.
+  async commitWith({ message, amend } = {}) {
+    const trimmed = (message || "").trim();
+    if (!trimmed) {
       this.showCommitStatus("Commit message required", "error");
-      return;
+      return { ok: false, error: "Commit message required" };
     }
 
     const cwd = this.state.cwd || this.currentCwd;
+    const doAmend = Boolean(amend);
     try {
       const res = await fetch("/api/git/commit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, message }),
+        body: JSON.stringify({ cwd, message: trimmed, amend: doAmend }),
       });
 
       const data = await res.json();
@@ -3441,16 +4210,18 @@ class GitManager {
           typeof formatGitError === "function"
             ? formatGitError
             : (p) => (p && p.error) || "Commit failed";
-        this.showCommitStatus(formatGit(data, "Commit failed"), "error");
-        return;
+        const msg = formatGit(data, "Commit failed");
+        this.showCommitStatus(msg, "error");
+        return { ok: false, error: msg };
       }
 
-      this.panel.querySelector("#git-message").value = "";
-      this.showCommitStatus("Committed", "success");
+      this.showCommitStatus(doAmend ? "Amended" : "Committed", "success");
       await this.refresh();
+      return { ok: true };
     } catch (err) {
       console.error("Commit error:", err);
       this.showCommitStatus("Commit failed: network error", "error");
+      return { ok: false, error: "Commit failed: network error" };
     }
   }
 
@@ -3469,9 +4240,19 @@ class GitManager {
   }
 
   escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = text;
-    return div.innerHTML;
+    // Delegate to the shared escaper (escapes & < > " ' — safe in quoted
+    // attributes, e.g. the timeline/commit title="${message}" sites). See the
+    // matching note on the other escapeHtml: the old round-trip left quotes
+    // intact → attribute-breakout stored XSS.
+    if (typeof window !== "undefined" && window.HtmlEscape?.escapeHtml) {
+      return window.HtmlEscape.escapeHtml(text);
+    }
+    return String(text == null ? "" : text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
   }
 
   renderHistory() {
@@ -3485,9 +4266,9 @@ class GitManager {
     const html = this.state.commits
       .map(
         (commit) => `
-      <div class="git-commit-item" data-hash="${commit.hash}" title="${this.escapeHtml(commit.message)}">
+      <div class="git-commit-item" data-hash="${this.escapeHtml(commit.hash)}" title="${this.escapeHtml(commit.message)}">
         <span class="git-commit-graph">${this.escapeHtml(commit.graph)}</span>
-        <span class="git-commit-hash">${commit.hash}</span>
+        <span class="git-commit-hash">${this.escapeHtml(commit.hash)}</span>
         <span class="git-commit-message">${this.escapeHtml(this.truncateMessage(commit.message))}</span>
         <span class="git-commit-date">${this.formatDate(commit.date)}</span>
       </div>
@@ -3665,6 +4446,291 @@ class SessionRegistry {
 }
 
 // =============================================================================
+// SETTINGS MANAGER - VS Code-style two-pane settings window
+// =============================================================================
+
+// Renders the settings window content (category sidebar + search + a control
+// per setting + a read-only Server Config section). Reads/writes through the
+// shared settingsStore; live changes flow through the settings runtime so side
+// effects apply even when the window is closed. Pure render helpers live in
+// settings-ui.js; coercion + schema in settings-schema.js.
+class SettingsManager {
+  constructor({ settingsStore, runtime, fetchImpl } = {}) {
+    this.settingsStore = settingsStore || null;
+    this.runtime = runtime || null;
+    this.fetchImpl =
+      fetchImpl ||
+      (typeof fetch === "function" ? fetch.bind(globalThis) : null);
+    this.schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    this.ui = window.SettingsUI || null;
+    this.activeCategory = null;
+    this.query = "";
+    this.envLoaded = false;
+    this.envRows = [];
+    this.root = null;
+  }
+
+  // Build (once) the detached content element the SurfaceWindow will host.
+  buildContent() {
+    if (this.root) return this.root;
+    const root = document.createElement("div");
+    root.className = "settings-panel";
+    root.innerHTML = `
+      <aside class="settings-sidebar" role="tablist" aria-label="Settings categories"></aside>
+      <div class="settings-main">
+        <div class="settings-search">
+          <input type="search" class="settings-search-input"
+            placeholder="Search settings" aria-label="Search settings" />
+        </div>
+        <div class="settings-list" role="region" aria-label="Settings"></div>
+      </div>
+    `;
+    this.sidebarEl = root.querySelector(".settings-sidebar");
+    this.searchInputEl = root.querySelector(".settings-search-input");
+    this.listEl = root.querySelector(".settings-list");
+
+    this.searchInputEl.addEventListener("input", () => {
+      this.query = this.searchInputEl.value || "";
+      this.renderList();
+    });
+    this.sidebarEl.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-settings-category]");
+      if (!btn) return;
+      this.activeCategory = btn.dataset.settingsCategory;
+      this.query = "";
+      if (this.searchInputEl) this.searchInputEl.value = "";
+      this.renderSidebar();
+      this.renderList();
+    });
+    this.listEl.addEventListener("change", (e) => this.handleControlChange(e));
+
+    this.root = root;
+    return root;
+  }
+
+  renderSidebar() {
+    if (!this.sidebarEl) return;
+    const categories = window.SettingsSchema?.categoriesOf?.(this.schema) || [];
+    if (!this.activeCategory && categories.length) {
+      this.activeCategory = categories[0];
+    }
+    this.sidebarEl.replaceChildren();
+    for (const category of categories) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "settings-category-btn";
+      btn.dataset.settingsCategory = category;
+      btn.setAttribute("role", "tab");
+      const active = !this.query && category === this.activeCategory;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-selected", active ? "true" : "false");
+      btn.textContent = category;
+      this.sidebarEl.appendChild(btn);
+    }
+  }
+
+  // The list shows either the active category (no query) or the search results
+  // across all categories (with a query).
+  renderList() {
+    if (!this.listEl || !this.ui) return;
+    this.listEl.replaceChildren();
+
+    const trimmed = this.query.trim();
+    let groups;
+    if (trimmed) {
+      groups = this.ui.filterSchemaView(this.schema, trimmed);
+    } else {
+      groups = this.ui
+        .groupByCategory(this.schema)
+        .filter((g) => g.category === this.activeCategory);
+    }
+    this.renderSidebar();
+
+    if (!groups.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-empty";
+      empty.textContent = "No settings match your search.";
+      this.listEl.appendChild(empty);
+    }
+
+    for (const group of groups) {
+      if (trimmed) {
+        const heading = document.createElement("h3");
+        heading.className = "settings-group-heading";
+        heading.textContent = group.category;
+        this.listEl.appendChild(heading);
+      }
+      for (const def of group.entries) {
+        const stored = this.settingsStore?.get(def.key, def.default);
+        const descriptor = this.ui.buildControlDescriptor(def, stored);
+        if (descriptor)
+          this.listEl.appendChild(this.renderControlRow(descriptor));
+      }
+    }
+
+    this.listEl.appendChild(this.renderServerConfig());
+  }
+
+  renderControlRow(descriptor) {
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    row.dataset.settingKey = descriptor.key;
+
+    const labelWrap = document.createElement("div");
+    labelWrap.className = "settings-row-label";
+    const label = document.createElement("label");
+    label.className = "settings-row-title";
+    label.textContent = descriptor.label;
+    labelWrap.appendChild(label);
+    if (descriptor.description) {
+      const desc = document.createElement("p");
+      desc.className = "settings-row-desc";
+      desc.textContent = descriptor.description;
+      labelWrap.appendChild(desc);
+    }
+
+    const controlWrap = document.createElement("div");
+    controlWrap.className = "settings-row-control";
+    const control = this.buildControlElement(descriptor);
+    if (control.id) label.setAttribute("for", control.id);
+    controlWrap.appendChild(control);
+
+    row.appendChild(labelWrap);
+    row.appendChild(controlWrap);
+    return row;
+  }
+
+  buildControlElement(descriptor) {
+    const id = `setting-${descriptor.key.replace(/[^a-z0-9]+/gi, "-")}`;
+    let el;
+    switch (descriptor.type) {
+      case "toggle": {
+        el = document.createElement("input");
+        el.type = "checkbox";
+        el.className = "settings-control settings-toggle";
+        el.checked = Boolean(descriptor.value);
+        break;
+      }
+      case "number": {
+        el = document.createElement("input");
+        el.type = "number";
+        el.className = "settings-control settings-number";
+        if (typeof descriptor.min === "number") el.min = String(descriptor.min);
+        if (typeof descriptor.max === "number") el.max = String(descriptor.max);
+        el.value = String(descriptor.value);
+        break;
+      }
+      case "select": {
+        el = document.createElement("select");
+        el.className = "settings-control settings-select";
+        for (const opt of descriptor.options || []) {
+          const option = document.createElement("option");
+          option.value = opt.value;
+          option.textContent = opt.label || opt.value;
+          if (opt.value === descriptor.value) option.selected = true;
+          el.appendChild(option);
+        }
+        break;
+      }
+      case "text":
+      default: {
+        el = document.createElement("input");
+        el.type = "text";
+        el.className = "settings-control settings-text";
+        el.value = descriptor.value == null ? "" : String(descriptor.value);
+        break;
+      }
+    }
+    el.id = id;
+    el.dataset.settingKey = descriptor.key;
+    el.dataset.settingType = descriptor.type;
+    return el;
+  }
+
+  handleControlChange(e) {
+    const el = e.target.closest("[data-setting-key]");
+    if (!el) return;
+    const key = el.dataset.settingKey;
+    const raw = el.type === "checkbox" ? el.checked : el.value;
+    if (this.runtime) {
+      this.runtime.apply(key, raw);
+    } else if (this.settingsStore) {
+      const def = this.schema.find((d) => d.key === key);
+      const value = window.SettingsSchema?.coerceValue?.(def, raw) ?? raw;
+      this.settingsStore.set(key, value);
+    }
+  }
+
+  renderServerConfig() {
+    const section = document.createElement("section");
+    section.className = "settings-server-config";
+    const heading = document.createElement("h3");
+    heading.className = "settings-group-heading";
+    heading.textContent = "Server Config";
+    section.appendChild(heading);
+
+    const note = document.createElement("p");
+    note.className = "settings-server-note";
+    note.textContent = "Read-only server configuration.";
+    section.appendChild(note);
+
+    const table = document.createElement("div");
+    table.className = "settings-env-table";
+    if (!this.envRows.length) {
+      const empty = document.createElement("p");
+      empty.className = "settings-empty";
+      empty.textContent = this.envLoaded
+        ? "No server config available."
+        : "Loading server config…";
+      table.appendChild(empty);
+    }
+    for (const row of this.envRows) {
+      const envRow = document.createElement("div");
+      envRow.className = "settings-env-row";
+      const key = document.createElement("code");
+      key.className = "settings-env-key";
+      key.textContent = row.key;
+      const value = document.createElement("span");
+      value.className = "settings-env-value";
+      value.textContent = row.value;
+      const desc = document.createElement("p");
+      desc.className = "settings-env-desc";
+      desc.textContent = row.description || "";
+      envRow.appendChild(key);
+      envRow.appendChild(value);
+      envRow.appendChild(desc);
+      table.appendChild(envRow);
+    }
+    section.appendChild(table);
+    return section;
+  }
+
+  async loadServerConfig() {
+    if (this.envLoaded || !this.fetchImpl) return;
+    try {
+      const res = await this.fetchImpl("/api/settings/env-info");
+      if (res && res.ok) {
+        const body = await res.json();
+        if (Array.isArray(body?.env)) this.envRows = body.env;
+      }
+    } catch {
+      // Non-fatal — the section renders an empty/error state.
+    } finally {
+      this.envLoaded = true;
+    }
+  }
+
+  async render() {
+    this.buildContent();
+    this.renderSidebar();
+    this.renderList();
+    await this.loadServerConfig();
+    // Re-render the server-config section now that rows are loaded.
+    this.renderList();
+  }
+}
+
+// =============================================================================
 // TERMINAL MANAGER - Main orchestrator
 // =============================================================================
 
@@ -3674,9 +4740,19 @@ class TerminalManager {
     this.activeId = null;
     this.tabIndex = 0;
     this.workspaceIndex = 0;
-    this.fontSize = parseInt(localStorage.getItem("opencode-font-size")) || 14;
-    const storedWrap = localStorage.getItem("opencode-wrap-lines");
-    this.wrapLines = storedWrap ? storedWrap === "1" : false;
+    // Canonical settings (terminal.fontSize / terminal.wrapLines) are applied
+    // by the settings runtime once the store + legacy migration resolve; seed
+    // with the schema defaults here so terminals constructed before that have a
+    // sane value. No legacy localStorage read — the migration owns that.
+    const settingsDefaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    this.fontSize =
+      typeof settingsDefaults["terminal.fontSize"] === "number"
+        ? settingsDefaults["terminal.fontSize"]
+        : 14;
+    this.wrapLines = Boolean(settingsDefaults["terminal.wrapLines"]);
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
     this.workspaceLastActive = new Map(); // workspaceId -> terminalId
@@ -3729,7 +4805,24 @@ class TerminalManager {
     this.handleLayoutDragCancel = this.handleLayoutDragCancel.bind(this);
 
     this.tileManager = new TileManager(this.container);
-    this.clipboardManager = new ClipboardManager();
+    // Server-side actor-scoped settings (window layout, dock, prefs). The
+    // load races nothing: window/dock consumers await settingsReady first.
+    this.settingsStore = window.SettingsStore?.createSettingsStore?.() || null;
+    // Load server-side settings, then run the one-time legacy-localStorage
+    // migration BEFORE any consumer reads, so canonical keys are populated and
+    // consumers never need a legacy fallback. The migrated flag is only set
+    // after the flush resolves (so the debounced PUT can't be lost).
+    this.settingsReady = this.settingsStore
+      ? this.settingsStore
+          .load()
+          .catch(() => ({}))
+          .then(() => this.runSettingsMigration())
+          .catch(() => {})
+      : Promise.resolve({});
+    this.surfaceWindowManager = null;
+    this.settingsRuntime = null;
+    this.settingsManager = null;
+    this.clipboardManager = new ClipboardManager(this);
     this.commandPaletteRegistry = null;
     this.commandPalette = null;
 
@@ -3750,10 +4843,14 @@ class TerminalManager {
   }
 
   init() {
-    const lastDir = localStorage.getItem("opencode-web-dir");
-    if (lastDir) this.setDirectoryValue(lastDir);
+    // The last directory is restored from the canonical files.defaultCwd via the
+    // settings runtime (applyDefaultCwd) once the store + migration resolve — no
+    // synchronous legacy localStorage read here.
 
     this.initTaskSignalBadge();
+    this.initSessionsDock();
+    this.initSettingsRuntime();
+    this.initIdeShell();
 
     // Button handlers
     document
@@ -3869,9 +4966,29 @@ class TerminalManager {
     const FileExplorerCtor =
       window.FileExplorerController?.FileExplorerController;
     this.fileExplorer = FileExplorerCtor ? new FileExplorerCtor() : null;
+    // Shared git-status cache feeding the explorer's VS Code-style decorations
+    // (and reusable by the git panel). A git mutation can invalidate it later.
+    const GitStatusStoreCtor = window.GitStatusStore?.GitStatusStore;
+    this.gitStatusStore = GitStatusStoreCtor ? new GitStatusStoreCtor() : null;
+    if (this.fileExplorer) {
+      // Re-derive git decorations whenever the explorer navigates.
+      this.fileExplorer.onDirLoaded = () =>
+        void this.refreshExplorerDecorations();
+    }
+    // The controller's own close button only hides the explorer content; in
+    // windowed mode the hosting SurfaceWindow has to close with it.
+    document
+      .getElementById("file-explorer-close")
+      ?.addEventListener("click", () => {
+        this.surfaceWindowManager?.close("files");
+        this.syncSurfaceButtonState();
+      });
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
-      this.fileExplorer.onOpenFile = (path) => void this.fileEditor.open(path);
+      // In IDE mode an explorer file click opens a preview editor TAB; outside
+      // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
+      this.fileExplorer.onOpenFile = (path, intent) =>
+        this.handleExplorerOpenFile(path, intent);
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -4549,20 +5666,40 @@ class TerminalManager {
     );
     const paletteOpen = this.isCommandPaletteOpen();
 
+    // Windowed surfaces can be open simultaneously; the exclusive
+    // right-surface notion only applies to the mobile sheets.
+    const windowed = this.isWindowedSurfaces();
+    const filesOpen = windowed
+      ? Boolean(this.fileExplorer?.isOpen)
+      : surface === "files";
+    const gitOpen = windowed
+      ? Boolean(
+          window.gitManager &&
+          !window.gitManager.panel?.classList.contains("hidden"),
+        )
+      : surface === "git";
+
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
       if (actionId === "files") {
-        button.classList.toggle("active", surface === "files");
+        button.classList.toggle("active", filesOpen);
       } else if (actionId === "git") {
-        button.classList.toggle("active", surface === "git");
+        button.classList.toggle("active", gitOpen);
       } else if (actionId === "tasks") {
         button.classList.toggle("active", tasksOpen);
       } else if (actionId === "setup") {
         button.classList.toggle("active", setupOpen);
+      } else if (actionId === "settings") {
+        button.classList.toggle(
+          "active",
+          Boolean(this.surfaceWindowManager?.isOpen?.("settings")),
+        );
       } else if (actionId === "more") {
         button.classList.toggle("active", moreOpen);
       } else if (actionId === "palette") {
         button.classList.toggle("active", paletteOpen);
+      } else if (actionId === "dock-sessions") {
+        button.classList.toggle("active", Boolean(this.dockState?.enabled));
       }
     });
   }
@@ -4573,6 +5710,7 @@ class TerminalManager {
     else if (action === "git") await this.openGitPanel();
     else if (action === "tasks") await this.openTaskPanel();
     else if (action === "setup") await this.openSetupPanel();
+    else if (action === "settings") await this.openSettings();
     else if (action === "toggle-tools-sheet") this.toggleToolsSheet();
     else if (action === "open-dir-picker") this.openDirPicker();
     else if (action === "clipboard") this.clipboardManager.togglePanel();
@@ -4583,6 +5721,8 @@ class TerminalManager {
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
     else if (action === "fullscreen") this.toggleFullscreen();
     else if (action === "wrap-lines") this.toggleWrapLines();
+    else if (action === "dock-sessions") this.toggleSessionsDock();
+    else if (action === "toggle-ide") this.toggleIdeMode();
     else if (action === "help") this.openHelp();
     else if (action === "palette") this.toggleCommandPalette();
 
@@ -4659,7 +5799,12 @@ class TerminalManager {
     ) {
       this.toolsSheetDirectoryInput.value = next;
     }
-    localStorage.setItem("opencode-web-dir", next);
+    // Persist the last directory as the canonical files.defaultCwd. Write
+    // directly to the store (NOT via runtime.apply) to avoid re-dispatching the
+    // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
+    // recurse). The value is only a navigation default; the backend file gates
+    // remain the authorization boundary (Codex #4 — do not trust it).
+    this.settingsStore?.set("files.defaultCwd", next);
   }
 
   setupToolsSheet() {
@@ -4891,6 +6036,18 @@ class TerminalManager {
 
     this.closeToolsSheet();
     this.closeSetupPanel();
+    if (this.isWindowedSurfaces()) {
+      await this.openSurfaceWindow("tasks", {
+        title: "Tasks",
+        icon: "▦",
+        contentEl: panel,
+        bounds: { x: 20, y: 8, width: 60, height: 80 },
+        minWidthPx: 420,
+        onClose: () => this.closeTaskPanel(),
+      });
+    } else {
+      this.releaseSurfaceWindowContent("tasks", panel);
+    }
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     const rootInput = panel.querySelector("#task-project-root");
@@ -4909,6 +6066,132 @@ class TerminalManager {
     if (!panel) return;
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    this.surfaceWindowManager?.close("tasks");
+    this.syncSurfaceButtonState();
+  }
+
+  // --- Settings runtime + window ---------------------------------------------
+
+  // Construct the app-level settings runtime and apply every setting once on
+  // startup, so side effects (CSS vars, etc.) take hold even if the settings
+  // window is never opened. Real consumers are registered in Task 3; here we
+  // wire appearance.accent as a demo CSS-var side effect.
+  // One-time migration of the six legacy localStorage keys onto the canonical
+  // settings store. Flush-before-flag: only after the debounced PUT resolves do
+  // we record `settings.migratedV1`, so the migrated values can't be lost if the
+  // tab closes mid-flight. Idempotent (the migration helper no-ops when flagged).
+  async runSettingsMigration() {
+    if (
+      !this.settingsStore ||
+      !window.SettingsMigration?.migrateLegacySettings
+    ) {
+      return;
+    }
+    const storage = typeof localStorage !== "undefined" ? localStorage : null;
+    if (!storage) return;
+    const schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    const flagKey =
+      window.SettingsMigration.MIGRATED_FLAG_KEY || "settings.migratedV1";
+    const result = window.SettingsMigration.migrateLegacySettings(
+      storage,
+      this.settingsStore,
+      schema,
+    );
+    if (result.alreadyMigrated) return;
+    try {
+      // Flush whatever the migration enqueued, THEN mark the flag and flush it.
+      await this.settingsStore.flush();
+      this.settingsStore.set(flagKey, true);
+      await this.settingsStore.flush();
+    } catch {
+      // A failed flush leaves the flag unset; the next load+migration retries.
+    }
+  }
+
+  initSettingsRuntime() {
+    if (!window.SettingsRuntime?.createSettingsRuntime || !this.settingsStore) {
+      return;
+    }
+    this.settingsRuntime = window.SettingsRuntime.createSettingsRuntime({
+      store: this.settingsStore,
+      schema: window.SettingsSchema?.SETTINGS_SCHEMA || [],
+      sideEffects: {
+        "appearance.accent": (value) => this.applyAccentColor(value),
+        // The six migrated legacy settings — applied live when changed in the
+        // settings window AND once on startup via applyAll(). Each receives the
+        // already-coerced value (numbers clamped to the schema range).
+        "terminal.fontSize": (value) => this.applyFontSize(value),
+        "terminal.wrapLines": (value) => this.applyWrapLines(value),
+        "terminal.autoCopy": (value) =>
+          this.clipboardManager?.applyAutoCopy(value),
+        "terminal.extraKeysVisible": (value) =>
+          this.applyExtraKeysVisible(value),
+        "tasks.view": (value) => this.applyTaskView(value),
+        "files.defaultCwd": (value) => this.applyDefaultCwd(value),
+      },
+    });
+    // Settings load + migration are async; apply once they resolve so the store
+    // is populated with the canonical (and migrated) values.
+    void this.settingsReady.then(() => this.settingsRuntime?.applyAll());
+  }
+
+  applyAccentColor(name) {
+    const map = {
+      blue: "var(--accent-blue)",
+      green: "var(--accent-green)",
+      purple: "#a371f7",
+      orange: "var(--accent-orange)",
+      pink: "#f778ba",
+    };
+    const color = map[name] || map.blue;
+    document.documentElement.style.setProperty("--color-accent", color);
+  }
+
+  // Side effect for terminal.extraKeysVisible (value coerced to bool). Delegates
+  // to ExtraKeysManager without re-persisting. Mobile keeps its own always-on
+  // behavior, so this only re-applies desktop visibility.
+  applyExtraKeysVisible(visible) {
+    if (!this.extraKeys) return;
+    if (platformDetector.isMobile) return;
+    this.extraKeys.applyVisibility(Boolean(visible));
+  }
+
+  // Side effect for files.defaultCwd. A path value used purely as a navigation
+  // default — NOT trusted as authorized (Codex #4); the backend file gates still
+  // apply on the resulting loadDir. Only restores a non-empty stored value.
+  applyDefaultCwd(value) {
+    const dir = typeof value === "string" ? value : "";
+    if (dir) this.setDirectoryValue(dir, { force: true });
+  }
+
+  async openSettings() {
+    this.closeToolsSheet();
+    // IDE mode: open as an editor tab (singleton, pinned). SurfaceWindow is NOT
+    // used — the tab IS the settings UI. (Codex fix 7: single UI per mode.)
+    if (this.isIdeModeActive() && this.editorTabs) {
+      this.editorTabs.openSettings();
+      return;
+    }
+    // Terminal mode: use the existing SurfaceWindow path.
+    if (!this.settingsManager) {
+      this.settingsManager = new SettingsManager({
+        settingsStore: this.settingsStore,
+        runtime: this.settingsRuntime,
+      });
+    }
+    const content = this.settingsManager.buildContent();
+    if (this.isWindowedSurfaces()) {
+      await this.openSurfaceWindow("settings", {
+        title: "Settings",
+        icon: "⚙",
+        contentEl: content,
+        bounds: { x: 16, y: 8, width: 68, height: 82 },
+        minWidthPx: 520,
+        minHeightPx: 360,
+        onClose: () => this.surfaceWindowManager?.close("settings"),
+      });
+    }
+    await this.settingsManager.render();
     this.syncSurfaceButtonState();
   }
 
@@ -5414,14 +6697,30 @@ class TerminalManager {
   }
 
   getTaskViewMode() {
-    return localStorage.getItem("deckterm-task-view") === "board"
+    // Canonical tasks.view from the store (schema default "list").
+    const defaults =
+      window.SettingsSchema?.defaultsOf?.(
+        window.SettingsSchema.SETTINGS_SCHEMA,
+      ) || {};
+    const fallback = defaults["tasks.view"] || "list";
+    return this.settingsStore?.get("tasks.view", fallback) === "board"
       ? "board"
       : "list";
   }
 
   toggleTaskViewMode() {
     const next = this.getTaskViewMode() === "board" ? "list" : "board";
-    localStorage.setItem("deckterm-task-view", next);
+    // Persist + apply through the runtime; applyTaskView re-renders.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("tasks.view", next);
+    } else {
+      this.settingsStore?.set("tasks.view", next);
+      this.renderTasks();
+    }
+  }
+
+  // Side effect for tasks.view (value already coerced to a valid option).
+  applyTaskView() {
     this.renderTasks();
   }
 
@@ -6528,6 +7827,14 @@ class TerminalManager {
         run: () => this.clipboardManager.togglePanel(),
       },
       {
+        id: "open-settings",
+        title: "Open Settings",
+        group: "Actions",
+        keywords: ["settings", "preferences", "config", "options"],
+        priority: 35,
+        run: () => this.openSettings(),
+      },
+      {
         id: "search-terminal",
         title: "Search in Terminal",
         group: "Views",
@@ -6540,6 +7847,13 @@ class TerminalManager {
         group: "Views",
         keywords: ["wrap", "lines", "overflow"],
         run: () => this.toggleWrapLines(),
+      },
+      {
+        id: "toggle-sessions-dock",
+        title: "Dock Sessions to Bottom",
+        group: "Views",
+        keywords: ["dock", "panel", "bottom", "sessions", "terminal"],
+        run: () => this.toggleSessionsDock(),
       },
       {
         id: "toggle-fullscreen",
@@ -7570,8 +8884,19 @@ class TerminalManager {
   }
 
   toggleWrapLines() {
-    this.wrapLines = !this.wrapLines;
-    localStorage.setItem("opencode-wrap-lines", this.wrapLines ? "1" : "0");
+    const next = !this.wrapLines;
+    // Persist + apply through the runtime so the change is live everywhere.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("terminal.wrapLines", next);
+    } else {
+      this.applyWrapLines(next);
+      this.settingsStore?.set("terminal.wrapLines", this.wrapLines);
+    }
+  }
+
+  // Side effect for terminal.wrapLines. `enabled` is already coerced to bool.
+  applyWrapLines(enabled) {
+    this.wrapLines = Boolean(enabled);
     this.updateWrapButton();
     for (const [, t] of this.terminals) {
       t.preferredCols = 0;
@@ -7627,6 +8952,40 @@ class TerminalManager {
     };
   }
 
+  // Fetch git status for the explorer's current directory (via the shared
+  // store), build the decoration map (git-decorations.js), and set it on the
+  // explorer snapshot so rows render status badges/colors. Silently skips when
+  // the dir is not a git repo (status error) or the store/explorer is absent.
+  async refreshExplorerDecorations(options = {}) {
+    if (!this.fileExplorer || !this.gitStatusStore) return;
+    if (!window.GitDecorations?.buildDecorationMap) return;
+
+    const workspaceId = this.fileExplorer.currentWorkspaceId;
+    const cwd = this.fileExplorer.currentPath;
+    if (!workspaceId || !cwd) return;
+
+    let status;
+    try {
+      status = options.force
+        ? await this.gitStatusStore.refreshStatus(cwd)
+        : await this.gitStatusStore.getStatus(cwd);
+    } catch {
+      return;
+    }
+
+    // Not a git repo (or status failed) → clear decorations silently.
+    if (!status || status.error || !status.root) {
+      this.fileExplorer.setDecorations(workspaceId, {});
+      return;
+    }
+
+    const decorations = window.GitDecorations.buildDecorationMap(
+      status.files,
+      status.root,
+    );
+    this.fileExplorer.setDecorations(workspaceId, decorations);
+  }
+
   getRightSurface() {
     const filesOpen = Boolean(this.fileExplorer?.isOpen);
     const gitOpen = Boolean(
@@ -7638,17 +8997,918 @@ class TerminalManager {
     return nextSurface;
   }
 
+  // Desktop mounts Files/Git/Tasks/Editor into movable, snappable
+  // SurfaceWindows; mobile keeps the fullscreen sheets. The width check
+  // matches the file explorer's own sheet breakpoint so a narrow desktop
+  // window and the explorer agree on which mode is active.
+  isWindowedSurfaces() {
+    return (
+      !platformDetector.isMobile &&
+      window.innerWidth >= 768 &&
+      Boolean(window.SurfaceWindows?.SurfaceWindowManager)
+    );
+  }
+
+  async ensureSurfaceWindowManager() {
+    if (!this.isWindowedSurfaces()) return null;
+    if (this.surfaceWindowManager) return this.surfaceWindowManager;
+    // Saved geometry must be loaded before the manager reads it.
+    await this.settingsReady;
+    if (!this.surfaceWindowManager) {
+      const layer = document.getElementById("surface-windows-layer");
+      if (!layer) return null;
+      this.surfaceWindowManager =
+        new window.SurfaceWindows.SurfaceWindowManager({
+          container: layer,
+          settingsStore: this.settingsStore,
+        });
+    }
+    return this.surfaceWindowManager;
+  }
+
+  async openSurfaceWindow(id, config) {
+    const manager = await this.ensureSurfaceWindowManager();
+    if (!manager) return null;
+    if (!manager.get(id)) manager.register({ id, ...config });
+    const win = manager.get(id);
+    // The content element may have been reparented back to #app by a
+    // mode switch (viewport crossed the sheet breakpoint) — reclaim it.
+    if (
+      config?.contentEl &&
+      win?.bodyEl &&
+      config.contentEl.parentElement !== win.bodyEl
+    ) {
+      win.bodyEl.appendChild(config.contentEl);
+    }
+    manager.open(id);
+    return win;
+  }
+
+  // --- Sessions bottom dock (VS Code panel semantics) -----------------------
+
+  initSessionsDock() {
+    this.dockState = { enabled: false, heightPct: 35 };
+    // The IDE terminal-panel split height is persisted independently of the
+    // sessions dock (its own --ide-terminal-height var + dock.ide key) so the two
+    // docking modes never overwrite each other.
+    this.ideDockHeightPct =
+      window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
+    this.dockSash = document.getElementById("dock-sash");
+    this.dockSash?.addEventListener("pointerdown", (e) =>
+      this.startDockSashDrag(e),
+    );
+    this.dockSash?.addEventListener("dblclick", () =>
+      this.setDockHeight(window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35),
+    );
+    void this.settingsReady.then(() => {
+      const stored = window.SurfaceWindows?.dockStateFromSettings?.(
+        this.settingsStore?.get("dock.sessions", null),
+      );
+      if (stored?.enabled) {
+        this.dockState = stored;
+        this.applyDockState({ persist: false });
+      }
+      const ideStored = this.settingsStore?.get("dock.ide", null);
+      if (ideStored && Number.isFinite(Number(ideStored.heightPct))) {
+        this.ideDockHeightPct =
+          window.SurfaceWindows?.clampDockHeight?.(ideStored.heightPct) ??
+          this.ideDockHeightPct;
+      }
+      this.applyIdeDockHeight();
+    });
+  }
+
+  // Push the persisted IDE terminal-panel height into its CSS var (read by the
+  // has-tabs split rule). Independent of the sessions dock's --dock-height.
+  applyIdeDockHeight() {
+    document
+      .getElementById("workspace-area")
+      ?.style.setProperty("--ide-terminal-height", `${this.ideDockHeightPct}%`);
+  }
+
+  // Reset the IDE terminal-panel split to the default height (double-click the
+  // sash), mirroring the sessions-dock double-click-to-reset affordance.
+  resetIdeTerminalSash() {
+    this.ideDockHeightPct =
+      window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
+    this.applyIdeDockHeight();
+    window.dispatchEvent(new Event("resize"));
+    this.settingsStore?.set("dock.ide", { heightPct: this.ideDockHeightPct });
+  }
+
+  applyDockState({ persist = true } = {}) {
+    const enabled = this.dockState.enabled && this.isWindowedSurfaces();
+    document.body.classList.toggle("sessions-docked", enabled);
+    document
+      .getElementById("workspace-area")
+      ?.style.setProperty("--dock-height", `${this.dockState.heightPct}%`);
+    if (persist) {
+      this.settingsStore?.set("dock.sessions", {
+        enabled: this.dockState.enabled,
+        heightPct: this.dockState.heightPct,
+      });
+    }
+    // xterm instances must refit to the resized terminal area.
+    window.dispatchEvent(new Event("resize"));
+    this.syncSurfaceButtonState();
+  }
+
+  toggleSessionsDock() {
+    this.dockState.enabled = !this.dockState.enabled;
+    this.applyDockState();
+  }
+
+  // --- IDE shell (phase 5, slice 2) -----------------------------------------
+
+  // Build the IDE shell controller and apply the stored (viewport-gated) mode
+  // once settings resolve. The controller reparents the single #file-explorer
+  // element + toggles `body.ide-mode`; terminals are docked via CSS only (no
+  // PTY/WebSocket teardown — the mode-transition contract).
+  initIdeShell() {
+    if (!window.IdeShell?.IdeShellController) return;
+    this.ideShell = new window.IdeShell.IdeShellController({
+      document,
+      settingsStore: this.settingsStore,
+      isDesktop: () => this.isWindowedSurfaces(),
+      getExplorerView: () => this.fileExplorer,
+      // Release-before-reparent: free the Files surface-window BEFORE the shell
+      // moves #file-explorer into the sidebar (avoids racing stale window state).
+      beforeEnterIde: () => this.beforeEnterIdeMode(),
+      onEnterIde: () => this.onEnterIdeMode(),
+      onExitIde: () => this.onExitIdeMode(),
+      // Refit terminals + re-render the explorer after the container resizes.
+      afterRender: () => {
+        window.dispatchEvent(new Event("resize"));
+        this.fileExplorer?.resize?.();
+        this.ensureIdeExplorerLoaded();
+        this.syncSurfaceButtonState();
+        // Deferred refit after the terminal reparent + layout settle: fit the
+        // active terminal once its container has a nonzero rect (fitting
+        // immediately after a reparent can compute bad dimensions).
+        requestAnimationFrame(() => {
+          if (!this.activeId) return;
+          if ((this.container?.clientHeight || 0) <= 0) return;
+          this.fitTerminal(this.activeId);
+          this.syncTerminalSize(this.activeId);
+        });
+      },
+      // Focus preservation across the switch (contract: active focus is kept).
+      captureFocus: () => this.captureIdeFocusTarget(),
+      restoreFocus: (target) => this.restoreIdeFocusTarget(target),
+      terminalExists: (id) => this.terminals.has(id),
+      // Lossless explorer state: capture its prior presentation on enter and
+      // restore the EXACT same state on exit.
+      readExplorerState: () => this.readExplorerPresentation(),
+      restoreExplorerState: (state) => this.restoreExplorerPresentation(state),
+      // Slice-3 pop-out/dock: open/close a dedicated floating SurfaceWindow that
+      // hosts the SAME #file-explorer element while detached (the controller does
+      // the reparent + ViewHost rebind — these hooks only own window plumbing).
+      detachExplorerWindow: (el) => this.detachIdeExplorerWindow(el),
+      dockExplorerWindow: () => this.dockIdeExplorerWindow(),
+      // Resize the IDE terminal panel by dragging the in-column sash; double-click
+      // resets it to the default height.
+      startTerminalSashDrag: (e) => this.startIdeTerminalSashDrag(e),
+      resetTerminalSash: () => this.resetIdeTerminalSash(),
+    });
+    this.initEditorTabs();
+    this.initScmView();
+    this.initTasksView();
+    this.initSearchView();
+    // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
+    // breakpoint and re-apply the resolved mode (a narrow viewport renders
+    // terminal WITHOUT overwriting the stored desktop preference).
+    platformDetector.onChange(() => this.syncIdeAffordance());
+    void this.settingsReady.then(async () => {
+      window.IdeShell.migrateLayoutState(this.settingsStore);
+      // The Explorer can restore directly into a detached floating window on
+      // reload, so the surface-window manager must exist BEFORE applyMode() runs
+      // enterIde(). ensureSurfaceWindowManager no-ops off-desktop / when absent.
+      // try/finally so a manager failure still applies IDE mode — a detached
+      // restore just degrades to the docked sidebar (Codex slice-3 review #4).
+      try {
+        await this.ensureSurfaceWindowManager();
+      } finally {
+        this.syncIdeAffordance();
+        this.ideShell?.applyMode();
+        // Restore persisted editor tabs AFTER the shell is rendered (the editor
+        // area exists only once enterIde() ran). Revalidates each tab through the
+        // gated endpoints + silently drops dead ones.
+        void this.restoreEditorTabs();
+      }
+    });
+  }
+
+  // --- IDE editor tabs (phase 5, slice 4) -----------------------------------
+
+  // Build the editor-tabs controller that renders a tab bar + content host into
+  // the IDE editor area. File bodies reuse FileEditor's CodeMirror machinery
+  // (mountInto) + the phase-3 HEAD change-bar gutter; diff bodies reuse
+  // renderMergeDiff. The controller never imports CodeMirror itself.
+  initEditorTabs() {
+    if (!window.EditorTabs?.EditorTabsController) return;
+    // Per-tab live editor/diff handles, keyed by tabKey (for save/refresh/teardown).
+    this.editorTabHandles = new Map();
+    this.editorTabs = new window.EditorTabs.EditorTabsController({
+      document,
+      // The editor area + placeholder are created lazily on first enterIde, so
+      // resolve them through getters every render.
+      areaEl: () => this.ideShell?.editorAreaEl || null,
+      placeholderEl: () =>
+        this.ideShell?.editorAreaEl?.querySelector(".ide-editor-placeholder") ||
+        null,
+      mountFileBody: (hostEl, tab) => this.mountEditorFileTab(hostEl, tab),
+      mountDiffBody: (hostEl, tab) => this.mountEditorDiffTab(hostEl, tab),
+      // Settings body: build the settings content element and render it into
+      // the tab body host. No teardown — settings state lives in settingsStore.
+      mountSettingsBody: (hostEl) => this.mountEditorSettingsTab(hostEl),
+      onActiveBodyMeasure: () => this.refreshActiveEditorTab(),
+      // Destroy the live CodeMirror view/handle when a tab body is torn down.
+      onBodyTeardown: (key) => {
+        const handle = this.editorTabHandles?.get(key);
+        handle?.destroy?.();
+        this.editorTabHandles?.delete(key);
+      },
+      // Open-at-line: scroll a freshly-mounted file tab to a search-hit line +
+      // place the cursor there. The controller owns the reveal target; we own
+      // the live CodeMirror handle, so it delegates here.
+      onRevealLine: (key, target) => this.revealEditorTabLine(key, target),
+      // Dirty-check for user-initiated file-tab close (Codex fix 3): ask the
+      // live handle whether the file has unsaved changes.
+      isDirtyImpl: (key) => {
+        const handle = this.editorTabHandles?.get(key);
+        return typeof handle?.isDirty === "function" ? handle.isDirty() : false;
+      },
+      // Persist descriptors only (never content). Debounced via settingsStore.
+      onChange: (state) =>
+        this.settingsStore?.set(
+          window.EditorTabs.EDITOR_TABS_KEY,
+          window.EditorTabs.serializeTabs(state),
+        ),
+    });
+  }
+
+  // --- IDE Source Control view (phase 5, slice 5) ---------------------------
+
+  // Build the SCM sidebar view + register it as the second activity-bar view
+  // (Explorer first). The view re-skins the git panel into a VS Code SCM tree;
+  // it reuses the live GitManager's git OPERATIONS + the shared git-status-store
+  // (decoration sync), and opens diffs as editor tabs via openDiffTab.
+  initScmView() {
+    if (!window.GitScmView?.GitScmViewController || !this.ideShell) return;
+    this.scmView = new window.GitScmView.GitScmViewController({
+      document,
+      getGitManager: () => window.gitManager || null,
+      getTerminalManager: () => this,
+      getStatusStore: () => this.gitStatusStore || null,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_SCM,
+      icon: "git-branch",
+      title: "Source Control",
+      mount: (container) => this.scmView.mount(container),
+      unmount: () => this.scmView.unmount(),
+      resize: () => this.scmView.resize(),
+    });
+  }
+
+  // --- IDE Tasks view (phase 5, slice 6) ------------------------------------
+
+  // Build the Tasks sidebar view + register it as the third activity-bar view
+  // (Explorer 1st, Source Control 2nd, Tasks 3rd). The view re-skins the task
+  // panel into a sidebar list/board; it reuses the live task OPERATIONS on this
+  // TerminalManager (refreshTasks / handleTaskAction / selectTask /
+  // toggleTaskViewMode / openTaskPanel + the shared taskState model). The
+  // floating #task-panel keeps working (additive — the view subscribes via a
+  // poll on mount and tears it down on unmount).
+  initTasksView() {
+    if (!window.TasksView?.TasksViewController || !this.ideShell) return;
+    this.tasksView = new window.TasksView.TasksViewController({
+      document,
+      getTaskManager: () => this,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_TASKS,
+      icon: "list-checks",
+      title: "Tasks",
+      mount: (container) => this.tasksView.mount(container),
+      unmount: () => this.tasksView.unmount(),
+      resize: () => this.tasksView.resize(),
+    });
+  }
+
+  // --- IDE Search view (phase 5, slice 7) -----------------------------------
+
+  // Build the Search sidebar view + register it as the 4th activity-bar view
+  // (Explorer 1st, Source Control 2nd, Tasks 3rd, Search 4th). The view
+  // dispatches a debounced, request-id'd query to the gated + bounded backend
+  // POST /api/files/search; clicking a result opens the file at the line via
+  // the editor-tabs open-at-line path.
+  initSearchView() {
+    if (!window.SearchView?.SearchViewController || !this.ideShell) return;
+    this.searchView = new window.SearchView.SearchViewController({
+      document,
+      getTerminalManager: () => this,
+    });
+    this.ideShell.addView({
+      id: window.IdeShell.VIEW_SEARCH,
+      icon: "search",
+      title: "Search",
+      mount: (container) => this.searchView.mount(container),
+      unmount: () => this.searchView.unmount(),
+      resize: () => this.searchView.resize(),
+    });
+  }
+
+  // Explorer file open: route to an editor TAB in IDE mode, else the modal.
+  // The explorer passes the click intent: a single open action previews; a
+  // double-click pins (VS Code semantics). Terminal-mode modal is unchanged.
+  handleExplorerOpenFile(path, { pinned = false } = {}) {
+    if (this.isIdeModeActive() && this.editorTabs) {
+      this.editorTabs.openFile(path, { preview: !pinned });
+      return;
+    }
+    void this.openFileInEditor(path);
+  }
+
+  // Is the IDE editor area live (rendered IDE mode)? Tabs only make sense then.
+  isIdeModeActive() {
+    return this.ideShell?.renderedMode?.() === "ide" && this.ideShell?.rendered;
+  }
+
+  // Mount a file editor into a tab body via FileEditor.mountInto (reuses the
+  // gated load + the phase-3 gutter). Editing the file pins the preview tab
+  // (VS Code "edit promotes to pinned"). The returned handle drives refresh.
+  async mountEditorFileTab(hostEl, tab) {
+    if (!this.fileEditor?.mountInto) return;
+    const key = window.EditorTabs.tabKey(tab);
+    const handle = await this.fileEditor.mountInto(hostEl, tab.ref, {
+      onEdit: () => this.editorTabs?.model.pin(key),
+    });
+    if (!handle) {
+      // Load failed (binary / 403 / 404): drop the tab so we don't leave an
+      // empty body. Silent — matches the revalidation contract.
+      this.editorTabs?.closeKey(key);
+      return;
+    }
+    // Wrap save() with a minimal success toast (failures already surface their
+    // own alert from mountInto's save). The Mod-s keymap inside the editor view
+    // routes through this wrapped handle, so a successful Ctrl/Cmd+S flashes
+    // "Saved ✓" — keeping feedback cheap without a status bar.
+    const innerSave = handle.save;
+    if (typeof innerSave === "function") {
+      handle.save = async () => {
+        const ok = await innerSave();
+        if (ok) this.showToast?.("Saved ✓", "success");
+        return ok;
+      };
+    }
+    this.editorTabHandles?.set(key, handle);
+  }
+
+  // Open-at-line: scroll the live editor for a tab to a 1-based line + place the
+  // cursor there. Reuses the tab's CodeMirror EditorView handle (handle.view).
+  // Best-effort + total: a missing handle/view or out-of-range line is a no-op,
+  // so a search hit on a file that since shrank never throws.
+  async revealEditorTabLine(key, target) {
+    if (!key || !target) return;
+    const line = Number.isFinite(target.line) ? target.line : 1;
+    const col = Number.isFinite(target.col) ? target.col : 1;
+    const handle = this.editorTabHandles?.get(key);
+    const view = handle?.view;
+    if (!view?.state?.doc || typeof view.dispatch !== "function") return;
+    try {
+      const cm = await import("/vendor/codemirror.js");
+      const doc = view.state.doc;
+      const lineNo = Math.min(Math.max(1, line), doc.lines);
+      const lineInfo = doc.line(lineNo);
+      // Clamp the column to the line length; col is 1-based.
+      const anchor = Math.min(
+        lineInfo.from + Math.max(0, col - 1),
+        lineInfo.to,
+      );
+      view.dispatch({
+        selection: { anchor },
+        effects: cm.EditorView.scrollIntoView(anchor, { y: "center" }),
+      });
+      try {
+        view.focus();
+      } catch {
+        // best-effort focus
+      }
+    } catch {
+      // best-effort — never break the open on a reveal failure
+    }
+  }
+
+  // Mount a merge diff into a tab body, reusing the git panel's renderMergeDiff
+  // machinery. The diff ref carries everything needed to re-fetch both sides.
+  // Mount the settings UI into a settings editor tab body. Builds the content
+  // element once (settingsManager.buildContent is idempotent) and appends it.
+  // No handle registration needed — settings has no CodeMirror view to destroy.
+  async mountEditorSettingsTab(hostEl) {
+    if (!this.settingsManager) {
+      this.settingsManager = new SettingsManager({
+        settingsStore: this.settingsStore,
+        runtime: this.settingsRuntime,
+      });
+    }
+    const content = this.settingsManager.buildContent();
+    hostEl.appendChild(content);
+    await this.settingsManager.render();
+  }
+
+  async mountEditorDiffTab(hostEl, tab) {
+    const r = tab.ref || {};
+    const key = window.EditorTabs.tabKey(tab);
+    try {
+      const [original, modified] = await this.fetchDiffTabSources(r);
+      // Reuse the GitManager's CodeMirror merge-view machinery (split/inline per
+      // the diff-layout preference) — rendered into the tab body, not #git-diff.
+      if (window.gitManager?.renderMergeDiffInto) {
+        const view = await window.gitManager.renderMergeDiffInto(
+          hostEl,
+          original,
+          modified,
+          r.relPath,
+        );
+        // Register a teardown handle so closing/clearing the tab destroys the
+        // live CodeMirror EditorView/MergeView (symmetric with the file path);
+        // otherwise diff views leak listeners + state. The handle's no-op
+        // refresh keeps refreshActiveEditorTab() total across tab types.
+        if (view?.destroy) {
+          this.editorTabHandles?.set(key, {
+            destroy: () => view.destroy(),
+            refresh: () => {},
+          });
+        }
+      }
+    } catch {
+      hostEl.replaceChildren();
+      const err = document.createElement("p");
+      err.className = "muted";
+      err.textContent = "Failed to load diff.";
+      hostEl.appendChild(err);
+    }
+  }
+
+  // Resolve a diff tab's two document sides through the gated git/file endpoints.
+  async fetchDiffTabSources(ref) {
+    const cwd = ref.cwd || this.currentCwd || "";
+    const relPath = ref.relPath;
+    const mode = ref.mode || "working";
+    const showAt = async (commit) => {
+      const params = new URLSearchParams({ cwd, commit, path: relPath });
+      const res = await fetch(`/api/git/show?${params.toString()}`);
+      if (res.status === 404) return "";
+      if (!res.ok) return "";
+      const data = await res.json().catch(() => ({}));
+      return typeof data.content === "string" ? data.content : "";
+    };
+    const worktree = async () => {
+      const abs = `${cwd.replace(/\/$/, "")}/${relPath}`;
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      if (!res.ok) return "";
+      const data = await res.json().catch(() => ({}));
+      return typeof data.content === "string" ? data.content : "";
+    };
+    if (mode === "staged") {
+      // Staged side: the gated /api/git/show route maps "INDEX" → git's :0
+      // (server rejects a raw ":0" — its commit regex disallows the colon).
+      return Promise.all([showAt("HEAD"), showAt("INDEX")]);
+    }
+    if (mode === "commit" && ref.commit) {
+      return Promise.all([showAt(`${ref.commit}~1`), showAt(ref.commit)]);
+    }
+    // working tree (default): HEAD vs the on-disk file.
+    return Promise.all([showAt("HEAD"), worktree()]);
+  }
+
+  // Open a diff as an editor tab (the SCM list in slice 5 calls this). cwd
+  // defaults to the active git panel cwd so an explicit cwd is optional.
+  openDiffTab({ relPath, mode = "working", cwd, commit, title } = {}) {
+    if (!this.editorTabs || !relPath) return;
+    this.editorTabs.openDiff({
+      relPath,
+      mode,
+      cwd:
+        cwd ||
+        window.gitManager?.state?.cwd ||
+        window.gitManager?.currentCwd ||
+        this.currentCwd ||
+        "",
+      commit,
+      title:
+        title ||
+        `${relPath} (${mode === "staged" ? "Staged" : mode === "commit" ? "Commit" : "Working Tree"})`,
+    });
+  }
+
+  // Refresh (measure) the active editor-tab body after a resize / activation.
+  refreshActiveEditorTab() {
+    const tab = this.editorTabs?.model.activeTab?.();
+    if (!tab) return;
+    const key = window.EditorTabs.tabKey(tab);
+    this.editorTabHandles?.get(key)?.refresh?.();
+  }
+
+  // Persist + revalidated restore (Codex xhigh). Reads the v3 descriptors and
+  // re-opens each through the gated file/git endpoints; anything that fails
+  // (deleted / moved / unauthorized) is SILENTLY dropped. Only runs in IDE mode
+  // (the editor area must exist); terminal mode leaves the descriptors persisted.
+  async restoreEditorTabs() {
+    if (!this.editorTabs || !this.isIdeModeActive()) return;
+    const raw = this.settingsStore?.get(
+      window.EditorTabs.EDITOR_TABS_KEY,
+      null,
+    );
+    const restored = window.EditorTabs.deserializeTabs(raw);
+    if (!restored.tabs.length) return;
+    const survived = await window.EditorTabs.filterRestoredTabs(
+      restored,
+      (tab) => this.canReopenTab(tab),
+    );
+    this.editorTabs.restoreState(survived);
+  }
+
+  // Probe whether a persisted tab can still be opened through the capability
+  // layer. We attempt the SAME gated load(s) the body mount would do and DROP on
+  // access-denied / server-error / malformed / network failure (the spec
+  // requires silently dropping unauthorized or invalid tabs — not restoring them
+  // as an empty diff). The probe never renders — it only validates access +
+  // existence. A throw (network) drops; we never trust a cached/200-on-error.
+  async canReopenTab(tab) {
+    // Settings tabs: always restorable — no network probe needed (Codex fix 1,
+    // type-scoped restore). filterRestoredTabs handles deduplication.
+    if (tab.type === window.EditorTabs.TAB_SETTINGS) return true;
+    try {
+      if (tab.type === window.EditorTabs.TAB_DIFF) {
+        return await this.canReopenDiffTab(tab);
+      }
+      // File tab: must resolve OK (a 404/403/5xx all drop it).
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(tab.ref)}`,
+      );
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  // Diff-tab revalidation. A diff renders through one or two GATED endpoints
+  // depending on its mode; every probe it needs must be "renderable" or the tab
+  // is dropped. Renderable = HTTP 200 OR 404 (a 404 is a legitimate add/delete
+  // side of a diff — e.g. a tracked-but-deleted working file, or a file that
+  // doesn't exist on one of the two compared refs). NOT renderable = 401/403
+  // (access denied → root no longer authorized), 400 (malformed ref), 5xx
+  // (server error), or a network throw — all DROP. We require ALL probes to be
+  // renderable, so an access-denied git side drops even if the working file is
+  // still readable.
+  async canReopenDiffTab(tab) {
+    const r = tab.ref || {};
+    const cwd = (r.cwd || this.currentCwd || "").replace(/\/$/, "");
+    const mode = r.mode || "working";
+
+    // Probe a gated endpoint; resolve true when its status is renderable.
+    const probe = async (url) => {
+      const res = await fetch(url);
+      // 200 → fine; 404 → meaningful add/delete side; everything else drops.
+      return res.ok || res.status === 404;
+    };
+    const showProbe = (commit) =>
+      probe(
+        `/api/git/show?${new URLSearchParams({ cwd, commit, path: r.relPath }).toString()}`,
+      );
+    const fileProbe = () =>
+      probe(
+        `/api/files/content?path=${encodeURIComponent(`${cwd}/${r.relPath}`)}`,
+      );
+
+    // Map mode → the exact (endpoint, ref) probes the diff actually renders.
+    let probes;
+    if (mode === "staged") {
+      // HEAD vs the staged INDEX (the /api/git/show route maps "INDEX" → :0).
+      probes = [showProbe("HEAD"), showProbe("INDEX")];
+    } else if (mode === "commit" && r.commit) {
+      // commit~1 vs commit.
+      probes = [showProbe(`${r.commit}~1`), showProbe(r.commit)];
+    } else {
+      // working tree (default): HEAD vs the on-disk working file.
+      probes = [showProbe("HEAD"), fileProbe()];
+    }
+
+    const results = await Promise.all(probes);
+    return results.every(Boolean);
+  }
+
+  // Show the IDE toggle only on desktop; keep its pressed state in sync and let
+  // the controller reconcile the rendered mode to the current viewport.
+  syncIdeAffordance() {
+    const btn = document.getElementById("ide-toggle-btn");
+    const desktop = this.isWindowedSurfaces();
+    if (btn) {
+      btn.hidden = !desktop;
+      const ide = this.ideShell?.renderedMode?.() === "ide";
+      btn.classList.toggle("active", ide);
+      btn.setAttribute("aria-pressed", ide ? "true" : "false");
+    }
+    // Re-apply so a viewport crossing 768px docks/undocks correctly.
+    this.ideShell?.applyMode();
+  }
+
+  toggleIdeMode() {
+    if (!this.ideShell || !this.isWindowedSurfaces()) return;
+    this.ideShell.toggle();
+    this.syncIdeAffordance();
+  }
+
+  // Run BEFORE the shell reparents #file-explorer into the sidebar. If the Files
+  // surface-window currently HOSTS the explorer element, release it FIRST so the
+  // reparent doesn't race stale surface-window state / no-op against a moved node.
+  // Other floating windows are left as-is (they float above the shell — pop-out/
+  // dock is slice 3).
+  beforeEnterIdeMode() {
+    this.releaseSurfaceWindowContent(
+      "files",
+      document.getElementById("file-explorer"),
+    );
+  }
+
+  // Entering IDE mode (after reparent): the `body.ide-mode` class (set by the
+  // controller) docks the terminal container to the bottom panel via CSS only —
+  // no PTY touch. Close the terminal-mode settings SurfaceWindow if open so
+  // there aren't two settings UIs simultaneously (Codex fix 7).
+  onEnterIdeMode() {
+    this.surfaceWindowManager?.close("settings");
+    this.applyIdeDockHeight();
+    this.ensureIdeExplorerLoaded();
+  }
+
+  // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
+  // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
+  // element). The explorer's prior state is restored via restoreExplorerPresentation.
+  // We do NOT auto-spawn a SurfaceWindow for settings on exit (Codex fix 7).
+  onExitIdeMode() {}
+
+  // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
+  // active workspace's directory itself (the legacy Files surface is what loads it
+  // in terminal mode). No-op once the active workspace's tree is loaded — so the
+  // frequent afterRender/workspace-sync calls never re-open or reset a browsed
+  // subdirectory. Only acts on first load or when the active workspace changed.
+  ensureIdeExplorerLoaded() {
+    if (!this.fileExplorer || !this.isIdeModeActive()) return;
+    const { workspaceId, cwd } = this.getActiveWorkspaceContext();
+    if (!workspaceId) return;
+    const sameWorkspace = this.fileExplorer.currentWorkspaceId === workspaceId;
+    const hasItems =
+      this.fileExplorer.getWorkspaceItems(workspaceId).length > 0;
+    if (sameWorkspace && hasItems) return;
+    const targetPath = this.fileExplorer.openForWorkspace(workspaceId, cwd);
+    if (targetPath) void this.fileExplorer.loadDir(targetPath, workspaceId);
+  }
+
+  // Snapshot the focus target before a mode switch. An active terminal wins (its
+  // xterm is the natural focus); else, if the explorer holds focus, remember it.
+  captureIdeFocusTarget() {
+    const activeId = this.activeId || null;
+    const active = this.terminals.get(activeId);
+    if (active?.terminal) {
+      return window.IdeShell.captureFocusTarget({ activeTerminalId: activeId });
+    }
+    const explorerEl = document.getElementById("file-explorer");
+    const ae = document.activeElement;
+    const focusInExplorer = Boolean(
+      explorerEl && ae && explorerEl.contains(ae),
+    );
+    return window.IdeShell.captureFocusTarget({
+      activeControl: focusInExplorer ? "explorer" : null,
+    });
+  }
+
+  // Refocus the resolved target on the live DOM (the controller already checked
+  // the terminal still exists). Best-effort — never throws into the switch.
+  restoreIdeFocusTarget(target) {
+    if (!target) return;
+    if (target.kind === "terminal" && target.terminalId) {
+      this.focusTerminal(target.terminalId, { ensureVisible: true });
+      return;
+    }
+    if (target.kind === "control" && target.control === "explorer") {
+      const explorerEl = document.getElementById("file-explorer");
+      if (!explorerEl) return;
+      // Focus the first focusable explorer control, else the container itself.
+      const focusable = explorerEl.querySelector(
+        'button, [href], input, [tabindex]:not([tabindex="-1"])',
+      );
+      (focusable || explorerEl).focus?.({ preventScroll: true });
+    }
+  }
+
+  // Flat DOM read of the explorer's prior presentation (parent, open, surface
+  // window host) for a lossless restore on IDE exit.
+  readExplorerPresentation() {
+    const explorerEl = document.getElementById("file-explorer");
+    const parent = explorerEl?.parentElement || null;
+    const inSurfaceWindow = Boolean(
+      parent?.classList?.contains("surface-window-body"),
+    );
+    return {
+      parentId: parent?.id || null,
+      isOpen: Boolean(explorerEl && !explorerEl.classList.contains("hidden")),
+      surfaceWindow: inSurfaceWindow ? "files" : null,
+    };
+  }
+
+  // Restore the explorer to its captured prior presentation on IDE exit. If it
+  // was OPEN before, re-present it (in a surface window when that's where it was);
+  // if it was CLOSED, keep it closed in #app. Never force-hides an open explorer.
+  restoreExplorerPresentation(state) {
+    const explorerEl = document.getElementById("file-explorer");
+    if (!explorerEl) return;
+    const home = document.getElementById("app");
+    if (home && explorerEl.parentElement !== home) home.appendChild(explorerEl);
+
+    const wasOpen = Boolean(state?.isOpen);
+    if (!wasOpen) {
+      // Closed before IDE → keep closed. Rebind the view to the home skeleton.
+      explorerEl.classList.add("hidden");
+      const view = this.fileExplorer;
+      if (view) {
+        view.unmount?.();
+        view.mount?.(explorerEl);
+        view.isOpen = false;
+      }
+      return;
+    }
+
+    // Open before IDE → re-open via the normal path (this rebinds + re-presents,
+    // re-hosting in the Files surface-window on desktop just like the user left it).
+    explorerEl.classList.remove("hidden");
+    const view = this.fileExplorer;
+    if (view) {
+      view.unmount?.();
+      view.mount?.(explorerEl);
+    }
+    void this.openFileExplorer();
+  }
+
+  // --- IDE Explorer pop-out window (slice 3) --------------------------------
+
+  // Open (or reuse) the floating Explorer SurfaceWindow and host the given
+  // #file-explorer element in it. Returns the window body element so the IDE
+  // shell controller can run its ViewHost rebind against it (the SAME element +
+  // controller are reused — no recreation). Synchronous: by the time IDE mode is
+  // active the surface-window manager + settings are already resolved.
+  detachIdeExplorerWindow(explorerEl) {
+    const manager = this.surfaceWindowManager;
+    if (!manager || !explorerEl) return null;
+    if (!manager.get(IDE_EXPLORER_WINDOW_ID)) {
+      manager.register({
+        id: IDE_EXPLORER_WINDOW_ID,
+        title: "Explorer",
+        icon: "▤",
+        // Default bounds when no saved geometry exists; the manager prefers the
+        // persisted windows.layout entry for this id when present.
+        bounds: { x: 6, y: 6, width: 30, height: 80 },
+        // Closing via the window's × docks the Explorer back to the sidebar.
+        onClose: () => this.ideShell?.dockExplorer(),
+      });
+    }
+    const win = manager.get(IDE_EXPLORER_WINDOW_ID);
+    if (!win?.bodyEl) return null;
+    if (explorerEl.parentElement !== win.bodyEl) {
+      win.bodyEl.appendChild(explorerEl);
+    }
+    manager.open(IDE_EXPLORER_WINDOW_ID);
+    return win.bodyEl;
+  }
+
+  // Close the floating Explorer window (used when docking back to the sidebar or
+  // when leaving IDE mode). The controller reparents the element out separately.
+  dockIdeExplorerWindow() {
+    this.surfaceWindowManager?.close(IDE_EXPLORER_WINDOW_ID);
+  }
+
+  setDockHeight(pct) {
+    this.dockState.heightPct =
+      window.SurfaceWindows?.clampDockHeight?.(pct) ?? this.dockState.heightPct;
+    this.applyDockState();
+  }
+
+  // Drag the IDE terminal-panel sash. Measures the IDE main column so the split
+  // is scoped to grid-column 3 and never reaches the sidebar. Persists to its own
+  // --ide-terminal-height var + dock.ide key, independent of the sessions dock.
+  startIdeTerminalSashDrag(e) {
+    e.preventDefault();
+    const col = this.ideShell?.mainColumnEl;
+    if (!col) return;
+    const rect = col.getBoundingClientRect();
+    const sash = this.ideShell?.terminalSashEl;
+    sash?.classList.add("dragging");
+    const apply = (clientY) => {
+      const pct = ((rect.bottom - clientY) / Math.max(rect.height, 1)) * 100;
+      this.ideDockHeightPct =
+        window.SurfaceWindows?.clampDockHeight?.(pct) ?? this.ideDockHeightPct;
+      this.applyIdeDockHeight();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientY);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("dock.ide", {
+        heightPct: this.ideDockHeightPct,
+      });
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+  }
+
+  startDockSashDrag(e) {
+    e.preventDefault();
+    const area = document.getElementById("workspace-area");
+    if (!area) return;
+    const rect = area.getBoundingClientRect();
+    this.dockSash?.classList.add("dragging");
+    const onMove = (ev) => {
+      const pct = ((rect.bottom - ev.clientY) / Math.max(rect.height, 1)) * 100;
+      this.dockState.heightPct =
+        window.SurfaceWindows?.clampDockHeight?.(pct) ??
+        this.dockState.heightPct;
+      this.applyDockState({ persist: false });
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      this.dockSash?.classList.remove("dragging");
+      this.applyDockState();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp, { once: true });
+  }
+
+  async openFileInEditor(path) {
+    if (!this.fileEditor) return;
+    await this.fileEditor.open(path);
+    // open() bails on binary files and fetch errors — only window a visible
+    // editor.
+    const modal = document.getElementById("file-editor-modal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    if (this.isWindowedSurfaces()) {
+      const win = await this.openSurfaceWindow("editor", {
+        title: path,
+        icon: "✎",
+        contentEl: modal,
+        bounds: { x: 12, y: 6, width: 76, height: 86 },
+        minWidthPx: 480,
+        minHeightPx: 320,
+        onClose: () => this.fileEditor.close(),
+      });
+      win?.setTitle(path);
+    } else {
+      this.releaseSurfaceWindowContent("editor", modal);
+    }
+  }
+
+  // Panels originally live in #app; sheets expect them there. Used when a
+  // panel opens in sheet mode after having been mounted in a window.
+  releaseSurfaceWindowContent(id, contentEl) {
+    if (!contentEl) return;
+    this.surfaceWindowManager?.close(id);
+    if (contentEl.parentElement?.classList?.contains("surface-window-body")) {
+      document.getElementById("app")?.appendChild(contentEl);
+    }
+  }
+
   async openFileExplorer() {
     if (!this.fileExplorer) return null;
 
     const { workspaceId, cwd } = this.getActiveWorkspaceContext();
     if (!workspaceId) return null;
 
-    if (
-      window.gitManager &&
-      !window.gitManager.panel?.classList.contains("hidden")
-    ) {
-      window.gitManager.hide();
+    if (this.isWindowedSurfaces()) {
+      // Windows coexist — no mutual exclusion with the git panel.
+      await this.openSurfaceWindow("files", {
+        title: "Files",
+        icon: "▤",
+        contentEl: document.getElementById("file-explorer"),
+        bounds: { x: 64, y: 4, width: 34, height: 92 },
+        onClose: () => this.closeFileExplorer(),
+      });
+    } else {
+      this.releaseSurfaceWindowContent(
+        "files",
+        document.getElementById("file-explorer"),
+      );
+      if (
+        window.gitManager &&
+        !window.gitManager.panel?.classList.contains("hidden")
+      ) {
+        window.gitManager.hide();
+      }
     }
 
     const targetPath = this.fileExplorer.openForWorkspace(workspaceId, cwd);
@@ -7664,6 +9924,7 @@ class TerminalManager {
 
   closeFileExplorer() {
     this.fileExplorer?.close();
+    this.surfaceWindowManager?.close("files");
     this.getRightSurface();
     this.syncSurfaceButtonState();
   }
@@ -7680,8 +9941,23 @@ class TerminalManager {
     const { cwd } = this.getActiveWorkspaceContext();
     if (!cwd) return null;
 
-    if (this.fileExplorer?.isOpen) {
-      this.fileExplorer.close();
+    if (this.isWindowedSurfaces()) {
+      if (window.gitManager?.panel) {
+        await this.openSurfaceWindow("git", {
+          title: "Git",
+          icon: "⎇",
+          contentEl: window.gitManager.panel,
+          bounds: { x: 50, y: 0, width: 50, height: 100 },
+          minWidthPx: 480,
+          minHeightPx: 320,
+          onClose: () => this.closeGitPanel(),
+        });
+      }
+    } else {
+      this.releaseSurfaceWindowContent("git", window.gitManager?.panel);
+      if (this.fileExplorer?.isOpen) {
+        this.fileExplorer.close();
+      }
     }
 
     this.rightSurface = "git";
@@ -7692,6 +9968,7 @@ class TerminalManager {
 
   closeGitPanel() {
     window.gitManager?.hide();
+    this.surfaceWindowManager?.close("git");
     this.getRightSurface();
     this.syncSurfaceButtonState();
   }
@@ -7705,6 +9982,7 @@ class TerminalManager {
   }
 
   async syncRightSurfaceForWorkspace() {
+    if (this.isIdeModeActive()) this.ensureIdeExplorerLoaded();
     const surface = this.getRightSurface();
     const { workspaceId, cwd } = this.getActiveWorkspaceContext();
     if (!workspaceId) return;
@@ -9093,11 +11371,15 @@ class TerminalManager {
           const minRows = usesCompactLayout ? 12 : 16;
           const isTooSmall = cols < minCols || rows < minRows;
 
-          // Hide the warning for compact layouts where the bottom action bar is expected.
+          // Hide the warning for compact layouts where the bottom action bar
+          // is expected, and for the bottom dock where a short terminal strip
+          // is the whole point.
+          const sessionsDocked =
+            document.body.classList.contains("sessions-docked");
           if (t.sizeWarning) {
             t.sizeWarning.classList.toggle(
               "visible",
-              isTooSmall && !usesCompactLayout,
+              isTooSmall && !usesCompactLayout && !sessionsDocked,
             );
           }
 
@@ -9709,8 +11991,23 @@ class TerminalManager {
   }
 
   changeFontSize(delta) {
-    this.fontSize = Math.max(8, Math.min(24, this.fontSize + delta));
-    localStorage.setItem("opencode-font-size", this.fontSize.toString());
+    const next = this.fontSize + delta;
+    // Persist + clamp through the runtime (coerceValue clamps to the schema
+    // min/max); the terminal.fontSize side effect (applyFontSize) does the work.
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("terminal.fontSize", next);
+    } else {
+      this.applyFontSize(next);
+      this.settingsStore?.set("terminal.fontSize", this.fontSize);
+    }
+  }
+
+  // Side effect for terminal.fontSize. `value` is already coerced/clamped by the
+  // runtime; clamp defensively too (Codex #4 — clamp host-affecting numbers at
+  // the application site) before applying it to every terminal.
+  applyFontSize(value) {
+    const n = Number(value);
+    this.fontSize = Number.isFinite(n) ? Math.max(8, Math.min(32, n)) : 14;
     for (const [, t] of this.terminals) {
       t.terminal.options.fontSize = this.fontSize;
       t.preferredCols = 0;
@@ -9768,6 +12065,15 @@ class TerminalManager {
         },
         isKeyboardOpen ? 50 : 0,
       );
+    }
+  }
+
+  scrollActiveTerminalToPrompt() {
+    const active = this.terminals.get(this.activeId);
+    try {
+      active?.terminal?.scrollToBottom?.();
+    } catch {
+      /* best-effort */
     }
   }
 

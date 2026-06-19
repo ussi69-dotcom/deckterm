@@ -1,0 +1,9 @@
+# Vendored, pre-bundled assets — regenerated via scripts/build-codemirror-vendor.js
+# (minified). Prettier must never reformat these: it expands the minified
+# bundle to ~30k lines, bloating the served file and corrupting the vendor.
+web/vendor/
+
+# Dependencies & build output
+node_modules/
+dist/
+build/

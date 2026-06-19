@@ -1,6 +1,98 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-06-12 viz sekce 0**
+> **Datum:** 2026-05-29 · **Delta 2026-06-16 viz sekce 0z**
+
+## 0z. Delta 2026-06-16 — VS Code-grade workspace HOTOVÝ (fáze 2 + 3 + 4)
+
+**Fáze 2 — VS Code-grade git panel (na `dev`):** git-scm pure helpery, strom změn
+(staged/changes/untracked, status písmena+barvy, hover akce), `@codemirror/merge`
+split+inline diff editor, header sync akce (pull/push/fetch/stash) za capability
+gatem, stash list (apply/pop/drop), amend toggle. Side fix: přidán `.prettierignore`
+— quality-gate prettier hook expandoval minifikovaný `web/vendor/codemirror.js`
+(33 → ~30k řádků) při každém editu.
+
+**Fáze 3 — explorer⇄git dekorace + timeline + editor gutter (na `dev`,
+impl plán `docs/plans/2026-06-16-vscode-phase3-explorer-git-timeline.md`):**
+
+- **Backend `root` field** (`2ba8ead`): `GET /api/git/status` vrací absolutní git
+  toplevel, aby šly mapovat porcelain (repo-relativní) cesty na absolutní.
+- **Editor gutter** (`a7ebfce`): `@codemirror/merge` `unifiedMergeView`
+  (`mergeControls:false`, jen change-bary) vs HEAD; edit/save/undo/selection
+  ověřeny bez regrese; bez gutteru pro untracked/not-a-repo.
+- **Explorer dekorace** (`ca5fea4`): sdílený `web/git-status-store.js` (cache +
+  `refreshStatus` + listener) → `web/git-decorations.js` → status badge+barva na
+  řádcích exploreru; reuse `statusLetter`/`statusClass` z `git-scm.js`.
+- **Per-file timeline** (`8da0284`): „Timeline" tab v pravém panelu nad
+  `GET /api/git/log?path=`; klik na commit → diff revize přes existující
+  `renderMergeDiff`. Scope: current-path only; root/add diff fallbackuje na
+  prázdnou stranu (backend `show` regex odmítá `<sha>~1`/`^`, proto se jako prevRef
+  bere full hash předchozího log entry, root → empty-tree sha).
+- Testy: `git-status-store.test.js`, `git-decorations.test.js`, `git-timeline.test.js`,
+  `editor-git-gutter.test.js` (vše v `test:unit`), e2e `explorer-git-decorations.spec.ts`,
+  `git-timeline.spec.ts`, `editor-git-gutter.spec.ts`. Full unit + 19 e2e zelené na 4174.
+- **Orchestrace:** fáze 3 dělaná přes paralelní subagenty (Task 0‖C, pak A→B);
+  návrh prošel Codex (gpt-5.5) druhým názorem (chytil root/add diff + rename scope).
+  Pozn.: agent worktree izolace zde dala zastaralou bázi → tasky běžely v hlavním checkoutu.
+
+**Fáze 4 — settings UI (na `dev`, impl plán
+`docs/plans/2026-06-16-vscode-phase4-settings-ui.md`):**
+
+- **Schema registry** (`web/settings-schema.js`, `0f780c8`): deklarativní
+  `SETTINGS_SCHEMA` (13 nastavení, 7 kategorií) + pure helpery `searchSchema`/
+  `categoriesOf`/`defaultsOf`/`coerceValue` — single source of truth pro UI i klíče.
+- **env-info endpoint** (`3ecc556`): `GET /api/settings/env-info` — hardcoded
+  allowlist, secrets vyloučené, path-valued config (`ALLOWED_FILE_ROOTS`,
+  `DECKTERM_STATE_DIR`) coarsené (label+count) a přesné cesty jen za filesystem
+  capability (`actorHoldsFilesystemCapability`, read-only bez audit-deny).
+- **Settings okno + runtime** (`1ec1dd4`): VS Code two-pane SurfaceWindow (sidebar
+  - search + controls ze schématu, read-only Server Config sekce), centrální
+    `web/settings-runtime.js` aplikuje side-effecty i bez otevření okna; entry pointy
+    v command palette + toolbaru.
+- **Migrace** (`f1b7fb6`): 6 legacy localStorage klíčů → kanonické klíče přes
+  `web/settings-migration.js` (presence-test, flush-před-flagem `settings.migratedV1`,
+  žádný legacy fallback u konzumentů). Při tom opraven latentní bug: kolize
+  `const Schema` napříč `<script>` tagy tiše abortovala settings-runtime.
+  Pozn.: `terminal.autoCopy` default je teď `false` (schema = source of truth).
+- Testy: `settings-schema/-ui/-runtime/-migration.test.js`, `foundation-env-info.test.ts`
+  (vše v `test:unit`), e2e `settings-ui.spec.ts`, `settings-migration.spec.ts`.
+  Full unit (exit 0) + 13 e2e zelené na 4174.
+
+**→ Tím je celý VS Code-grade workspace (fáze 1–4) HOTOVÝ.** Orchestrace fází
+3 i 4 přes paralelní/serializované subagenty s Codex (gpt-5.5) druhým názorem na
+každý plán.
+
+---
+
+## 0a. Delta 2026-06-12 (večer) — VS Code-grade workspace, fáze 1
+
+Směr schválen uživatelem: UI dotáhnout na úroveň VS Code **uvnitř DeckTermu**
+(žádný embedovaný code-server — obcházel by foundation gates). Deštníkový design:
+`docs/plans/2026-06-12-vscode-grade-workspace-design.md` (4 fáze), impl plán fáze 1:
+`docs/plans/2026-06-12-workspace-windows.md`.
+
+**Fáze 1 hotová (vše na `dev`, ověřeno Playwrightem na 4174):**
+
+- **Surface windows** (`web/surface-windows.js`): Files/Git/Tasks/Editor jsou na
+  desktopu (≥768px) přesouvatelná, resizovatelná okna se snapem (poloviny/kvadranty/
+  maximalizace, Windows/VS Code styl) a z-orderem; mobil nechává fullscreen sheets.
+  Files+Git mohou být otevřené současně (padla vzájemná exkluzivita right-surface).
+- **Bottom dock**: akce „Dock" (overflow + palette) přepne terminálovou plochu do
+  spodního VS Code-style panelu se sashem (15–75 %, dblclick reset); size-warning
+  je v dock módu potlačen.
+- **Settings KV**: `user_settings` tabulka (migrace 4) + `GET/PUT /api/settings`
+  (actor-scoped, merge sémantika, null maže klíč) + `web/settings-store.js`
+  (debounced batch PUT, localStorage fallback). Geometrie oken a dock stav se
+  obnovují napříč zařízeními/prohlížeči.
+- Testy: `foundation-settings.test.ts` (samostatný chain link v `test:unit`),
+  `settings-store.test.js`, `surface-windows.test.js`, e2e `workspace-windows.spec.ts`;
+  upraven `file-explorer-surface.spec.ts` (koexistence oken je teď záměr).
+
+**Fáze 2–4 (plánované):** VS Code-grade git panel (strom změn, `@codemirror/merge`
+diffy, push/pull/fetch/discard/stash za capability gatem) → explorer⇄git dekorace +
+per-file timeline + editor gutter → settings UI (kategorie + search, migrace
+localStorage klíčů).
+
+---
 
 ## 0. Delta 2026-06-12 — noční QoL/direction session
 

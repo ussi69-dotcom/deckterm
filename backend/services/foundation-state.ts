@@ -43,6 +43,7 @@ export type InitializeFoundationStateOptions = {
 const INITIAL_MIGRATION = 1;
 const C1_AUTH_GRANTS_MIGRATION = 2;
 const C1B_TERMINAL_EVENTS_MIGRATION = 3;
+const C3_USER_SETTINGS_MIGRATION = 4;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -241,6 +242,25 @@ export function migrateFoundationDb(db: Database): void {
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(C1B_TERMINAL_EVENTS_MIGRATION, new Date().toISOString());
   }
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS user_settings (
+      user_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, key)
+    );
+  `);
+
+  const c3Existing = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(C3_USER_SETTINGS_MIGRATION);
+  if (!c3Existing) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(C3_USER_SETTINGS_MIGRATION, new Date().toISOString());
+  }
 }
 
 function isFilesystemRoot(pathValue: string): boolean {
@@ -339,9 +359,27 @@ async function ensureBootstrapToken({
   stateDir: string;
   env: FoundationEnv;
 }): Promise<FoundationBootstrapStatus> {
-  const adminCount = (
-    db.query("SELECT COUNT(*) AS count FROM users").get() as { count: number }
+  // The legacy/tunnel era created an implicit `anonymous` admin row without a
+  // real bootstrap; it must not make a fresh access-mode deployment look
+  // bootstrapped, or no real identity ever receives grants. An `anonymous`
+  // row still counts when a real bootstrap recorded it (legacy_dev token
+  // path) — bootstrapFirstAdmin always writes a bootstrap.admin.create audit
+  // row, the legacy-era row has none.
+  const realUserCount = (
+    db
+      .query("SELECT COUNT(*) AS count FROM users WHERE id != 'anonymous'")
+      .get() as { count: number }
   ).count;
+  const anonymousBootstrapMarker = db
+    .query(
+      `SELECT 1 FROM audit_events
+       WHERE action = 'bootstrap.admin.create'
+         AND decision = 'allow'
+         AND actor_user_id = 'anonymous'
+       LIMIT 1`,
+    )
+    .get();
+  const adminCount = realUserCount + (anonymousBootstrapMarker ? 1 : 0);
   const tokenPath = join(stateDir, "bootstrap-token");
 
   if (adminCount > 0) {
@@ -443,6 +481,47 @@ export function recordTerminalSession(
     session.status === "ended" ? timestamp : null,
     session.lastEventId || 0,
   );
+}
+
+export function getUserSettings(
+  db: Database,
+  userId: string,
+): Record<string, unknown> {
+  const rows = db
+    .query("SELECT key, value_json FROM user_settings WHERE user_id = ?")
+    .all(userId) as Array<{ key: string; value_json: string }>;
+  const settings: Record<string, unknown> = {};
+  for (const row of rows) {
+    try {
+      settings[row.key] = JSON.parse(row.value_json);
+    } catch {
+      // Skip unreadable rows instead of failing the whole read.
+    }
+  }
+  return settings;
+}
+
+export function setUserSettings(
+  db: Database,
+  userId: string,
+  entries: Record<string, unknown>,
+  now: Date = new Date(),
+): void {
+  const timestamp = isoDate(now);
+  const upsert = db.query(
+    `INSERT INTO user_settings (user_id, key, value_json, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(user_id, key) DO UPDATE SET
+       value_json = excluded.value_json,
+       updated_at = excluded.updated_at`,
+  );
+  const remove = db.query(
+    "DELETE FROM user_settings WHERE user_id = ? AND key = ?",
+  );
+  for (const [key, value] of Object.entries(entries)) {
+    if (value === null) remove.run(userId, key);
+    else upsert.run(userId, key, JSON.stringify(value), timestamp);
+  }
 }
 
 export function markTerminalSessionEnded(

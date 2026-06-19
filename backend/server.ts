@@ -8,7 +8,7 @@ import {
   type CloudflareAccessPayload,
 } from "@hono/cloudflare-access";
 import { mkdir, readdir, unlink, stat, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   classifyAgentOutputPhase,
@@ -46,6 +46,7 @@ import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
   getTerminalSession,
+  getUserSettings,
   hasScopedGrant,
   initializeFoundationState,
   isBootstrapComplete,
@@ -53,6 +54,7 @@ import {
   listTerminalSessionsForActor,
   markTerminalSessionEnded,
   recordTerminalSession,
+  setUserSettings,
   writeAuditEvent,
   type FoundationState,
   type RecordedTerminalSession,
@@ -266,6 +268,9 @@ const SCROLLBACK_MAX_BYTES = parseInt(
   process.env.SCROLLBACK_MAX_BYTES || String(1024 * 1024),
   10,
 ); // 1MB default
+const SETTINGS_MAX_KEYS = 200;
+const SETTINGS_MAX_KEY_LENGTH = 128;
+const SETTINGS_MAX_VALUE_BYTES = 16 * 1024;
 const TRUSTED_ORIGINS = (process.env.TRUSTED_ORIGINS || "")
   .split(",")
   .map((origin) => origin.trim())
@@ -1044,6 +1049,328 @@ async function resolveAllowedPath(
       return null;
     }
   }
+}
+
+// ── Scoped content search (POST /api/files/search) bounds + impl ─────────────
+const SEARCH_MAX_QUERY_LEN = 1024; // reject queries longer than this (400)
+const SEARCH_DEFAULT_MAX_RESULTS = 500; // default cap on returned matches
+const SEARCH_MAX_RESULTS = 500; // hard ceiling; client maxResults clamped to this
+const SEARCH_MAX_PER_FILE = 50; // stop collecting from a single file past this
+const SEARCH_MAX_LINE_LEN = 500; // truncate each returned match line to this many chars
+const SEARCH_TIMEOUT_MS = 5000; // hard-kill grep after this
+const SEARCH_MAX_STDOUT_BYTES = 2 * 1024 * 1024; // stop reading stdout past 2 MB
+
+// Secret-shaped basenames excluded from search by DEFAULT. These grep
+// --exclude globs are a FIRST-PASS PERF filter only — grep --exclude is
+// case-SENSITIVE, so the authoritative policy is the server-side
+// isSecretSearchMatch() check below (which lower-cases and broadens). There is
+// no client flag to disable this; a privileged bypass (if ever introduced)
+// would stay a server-side boolean that is OFF with no client input.
+const SEARCH_SECRET_EXCLUDES = [
+  ".env",
+  ".env.*",
+  "*.pem",
+  "*.key",
+  "*.p12",
+  "*.pfx",
+  "*.pkcs12",
+  "*.keystore",
+  "*.jks",
+  "id_rsa*",
+  "id_dsa*",
+  "id_ecdsa*",
+  "id_ed25519*",
+  "*.ppk",
+  ".netrc",
+  ".git-credentials",
+  ".npmrc",
+  ".pypirc",
+  ".htpasswd",
+  "*token*",
+  "*secret*",
+  "*credential*",
+  "*password*",
+  "*.kdbx",
+];
+
+// Directories never recursed into (noise + perf).
+const SEARCH_EXCLUDE_DIRS = [
+  ".git",
+  "node_modules",
+  "dist",
+  "build",
+  ".next",
+  "out",
+  "target",
+  "coverage",
+  ".cache",
+];
+
+// ── Authoritative server-side secret policy (case-insensitive) ───────────────
+// The grep --exclude globs above are a perf first-pass; THIS is the policy of
+// record. Every grep match is re-checked here (lower-cased) before being
+// surfaced. Predicates over a normalized (lower-cased) basename.
+const SECRET_BASENAME_PREDICATES: Array<(name: string) => boolean> = [
+  (n) => n === ".env" || n.startsWith(".env"), // .env and .env.*  (.env*)
+  (n) => n.endsWith(".pem"),
+  (n) => n.endsWith(".key"),
+  (n) => n.endsWith(".p12"),
+  (n) => n.endsWith(".pfx"),
+  (n) => n.endsWith(".pkcs12"),
+  (n) => n.endsWith(".keystore"),
+  (n) => n.endsWith(".jks"),
+  (n) => n.endsWith(".gpg"), // gpg-encrypted file (the .gpg DIR is covered too)
+  (n) => n.endsWith(".asc"), // PGP armored key/signature
+  (n) => n.endsWith(".p8"), // PKCS#8 / Apple auth key
+  (n) => n === ".pgpass",
+  (n) => n === ".boto",
+  (n) => n.startsWith("id_rsa"),
+  (n) => n.startsWith("id_dsa"),
+  (n) => n.startsWith("id_ecdsa"),
+  (n) => n.startsWith("id_ed25519"),
+  (n) => n.endsWith(".ppk"),
+  (n) => n === ".netrc",
+  (n) => n === ".git-credentials",
+  (n) => n === ".npmrc",
+  (n) => n === ".pypirc",
+  (n) => n === ".htpasswd",
+  (n) => n.includes("token"),
+  (n) => n.includes("secret"),
+  (n) => n.includes("credential"),
+  (n) => n.includes("password"),
+  (n) => n.endsWith(".kdbx"),
+];
+
+// Secret directory segments (lower-cased path-segment test). ".config/gcloud"
+// is a two-segment marker handled separately.
+const SECRET_DIR_SEGMENTS = new Set([
+  ".ssh",
+  ".aws",
+  ".gnupg",
+  ".gpg",
+  ".kube", // kube configs carry bearer tokens
+  ".docker", // config.json carries registry creds
+  "secrets",
+  ".secrets",
+]);
+
+// Returns true if the given absolute path is secret-shaped and must be dropped
+// from search results, regardless of grep's case-sensitive --exclude pass.
+function isSecretSearchMatch(absPath: string): boolean {
+  const lower = absPath.toLowerCase();
+  const base = basename(lower);
+  for (const pred of SECRET_BASENAME_PREDICATES) {
+    if (pred(base)) return true;
+  }
+  const segments = lower.split("/").filter(Boolean);
+  for (let i = 0; i < segments.length; i++) {
+    if (SECRET_DIR_SEGMENTS.has(segments[i])) return true;
+    if (segments[i] === ".config" && segments[i + 1] === "gcloud") return true;
+  }
+  return false;
+}
+
+// ── grep binary resolved ONCE from a trusted absolute location ───────────────
+// Bun.spawn resolves a bare "grep" via PATH while cwd is the user's search
+// root; a writable/relative PATH entry could run a planted grep. Resolve from a
+// fixed absolute path at module load and pass a sanitized PATH to the spawn.
+const SEARCH_SAFE_PATH = "/usr/bin:/bin";
+const GREP_BINARY: string = (() => {
+  for (const candidate of ["/usr/bin/grep", "/bin/grep"]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  console.warn(
+    "[search] neither /usr/bin/grep nor /bin/grep found; falling back to PATH-resolved 'grep'",
+  );
+  return "grep";
+})();
+
+interface ScopedSearchMatch {
+  path: string;
+  line: number;
+  text: string;
+}
+
+// Per-actor in-flight grep process. A new search for the same actor aborts the
+// prior one (server side of the client's request-id staleness model — keeps
+// per-actor grep concurrency at 1).
+const inFlightSearches = new Map<string, ReturnType<typeof Bun.spawn>>();
+
+function parseGrepLine(line: string): ScopedSearchMatch | null {
+  // With grep -Z/--null the filename is NUL-delimited: `path\0lineno:text`.
+  // Parsing the path on \0 (rather than ':') makes paths containing colons or
+  // newlines safe — a filename can no longer forge result framing, and a
+  // colon-bearing path parses correctly. (record framing is on \0; we split
+  // records on \0 before reaching here only for the filename portion.)
+  const nul = line.indexOf("\0");
+  if (nul < 0) return null;
+  const path = line.slice(0, nul);
+  if (!path) return null;
+  const rest = line.slice(nul + 1);
+  const colon = rest.indexOf(":");
+  if (colon < 0) return null;
+  const lineNoRaw = rest.slice(0, colon);
+  if (!/^\d+$/.test(lineNoRaw)) return null;
+  const lineNo = parseInt(lineNoRaw, 10);
+  if (!Number.isFinite(lineNo) || lineNo <= 0) return null;
+  let text = rest.slice(colon + 1);
+  if (text.length > SEARCH_MAX_LINE_LEN) {
+    text = text.slice(0, SEARCH_MAX_LINE_LEN);
+  }
+  return { path, line: lineNo, text };
+}
+
+async function runScopedSearch(opts: {
+  ownerId: string;
+  root: string;
+  query: string;
+  regex: boolean;
+  maxResults: number;
+}): Promise<{ matches: ScopedSearchMatch[]; truncated: boolean }> {
+  const { ownerId, root, query, regex, maxResults } = opts;
+
+  // Abort any prior in-flight grep for this actor (per-actor concurrency = 1).
+  const prior = inFlightSearches.get(ownerId);
+  if (prior) {
+    try {
+      prior.kill();
+    } catch {
+      // best-effort
+    }
+  }
+
+  const excludeArgs: string[] = [];
+  for (const glob of SEARCH_SECRET_EXCLUDES)
+    excludeArgs.push(`--exclude=${glob}`);
+  for (const dir of SEARCH_EXCLUDE_DIRS)
+    excludeArgs.push(`--exclude-dir=${dir}`);
+
+  // -r (lowercase) → recurse but do NOT follow symlinks found during recursion.
+  // -I skip binary files, -n line numbers, -Z/--null NUL-delimit the filename
+  // (newline-in-filename framing safety), -F literal / -E regex, -e <query> so
+  // a leading-dash query can't be argv-flag-smuggled. GREP_BINARY is an
+  // absolute path resolved at module load so a planted ./grep can't be run.
+  const args = [
+    GREP_BINARY,
+    "-rnIZ",
+    regex ? "-E" : "-F",
+    ...excludeArgs,
+    "-e",
+    query,
+    root,
+  ];
+
+  const proc = Bun.spawn(args, {
+    cwd: root,
+    stdout: "pipe",
+    stderr: "ignore",
+    // Sanitized PATH (not the possibly-poisoned process.env.PATH); the binary
+    // itself is absolute, this just hardens any grep-internal subprocess.
+    env: { ...process.env, PATH: SEARCH_SAFE_PATH, LC_ALL: "C" },
+  });
+  inFlightSearches.set(ownerId, proc);
+
+  let truncated = false;
+  const timeout = setTimeout(() => {
+    truncated = true;
+    try {
+      proc.kill();
+    } catch {
+      // best-effort
+    }
+  }, SEARCH_TIMEOUT_MS);
+
+  const matches: ScopedSearchMatch[] = [];
+  const perFile = new Map<string, number>();
+  let buffer = "";
+  let bytesRead = 0;
+
+  const consumeLine = (line: string) => {
+    if (matches.length >= maxResults) {
+      truncated = true;
+      return;
+    }
+    const parsed = parseGrepLine(line);
+    if (!parsed) return;
+    // Authoritative secret policy (case-insensitive) — grep --exclude is only a
+    // perf first-pass; this drops case/name variants it misses.
+    if (isSecretSearchMatch(parsed.path)) return;
+    const seen = perFile.get(parsed.path) || 0;
+    if (seen >= SEARCH_MAX_PER_FILE) {
+      truncated = true;
+      return;
+    }
+    perFile.set(parsed.path, seen + 1);
+    matches.push(parsed);
+  };
+
+  try {
+    const decoder = new TextDecoder();
+    for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+      bytesRead += chunk.byteLength;
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (line) consumeLine(line);
+        if (matches.length >= maxResults) break;
+      }
+      if (matches.length >= maxResults) {
+        truncated = true;
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+      if (bytesRead > SEARCH_MAX_STDOUT_BYTES) {
+        truncated = true;
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+    }
+    // Trailing line (no terminating newline) within bounds.
+    if (buffer && matches.length < maxResults) consumeLine(buffer);
+  } catch {
+    // Stream torn down by kill() (timeout / abort / cap) — keep what we have.
+  } finally {
+    clearTimeout(timeout);
+    await proc.exited.catch(() => undefined);
+    if (inFlightSearches.get(ownerId) === proc) {
+      inFlightSearches.delete(ownerId);
+    }
+  }
+
+  // ── Authoritative server-side post-filter (the SERVER is the authority on
+  // every returned match, not grep's flags) ─────────────────────────────────
+  // For each match path: (1) realpath it and require the canonical result to be
+  // inside an allowed root (closes TOCTOU/symlink-swap where a path leaked
+  // outside the roots — its realpath then falls outside and is dropped), and
+  // (2) re-apply the secret policy. Drop silently. realpath is cached per
+  // unique path so we pay it once per file, not per match line.
+  const realpathCache = new Map<string, string | null>();
+  const filtered: ScopedSearchMatch[] = [];
+  for (const m of matches) {
+    if (isSecretSearchMatch(m.path)) continue;
+    let canonical = realpathCache.get(m.path);
+    if (canonical === undefined) {
+      canonical = await resolveAllowedPath(m.path);
+      realpathCache.set(m.path, canonical);
+    }
+    if (!canonical) continue; // outside allowed roots → dropped
+    // Re-check the secret policy against the canonical path too (a symlinked
+    // name could disguise a secret target).
+    if (isSecretSearchMatch(canonical)) continue;
+    filtered.push(m);
+  }
+
+  return { matches: filtered, truncated };
 }
 
 function resolveFoundationRootIdForPath(
@@ -2928,6 +3255,149 @@ export function createWebApp() {
     }
   });
 
+  // POST /api/files/search — bounded recursive content search (grep) scoped to
+  // an allowed root. The single most security-critical slice-7 surface; do NOT
+  // weaken the gating/bounds below without a security review.
+  //
+  // Threat model + DECISIONS (slice 7):
+  //  - cwd is realpath-resolved + allowed-root-gated (resolveAllowedPath); the
+  //    REALPATH is the grep start dir so a symlinked root can't escape.
+  //  - grep -r (lowercase) does NOT follow symlinks found during recursion, so a
+  //    symlink placed inside the root pointing outside is never traversed.
+  //  - SERVER-AUTHORITATIVE post-filter: every returned match path is
+  //    realpath-resolved + allowed-root-gated again (closes TOCTOU/symlink-swap
+  //    surfacing a file outside the roots) and re-checked against the secret
+  //    policy in server code (grep --exclude is only a perf first-pass).
+  //  - secret-shaped files are excluded by default via a case-insensitive
+  //    server-side policy (isSecretSearchMatch), no client flag to disable.
+  //  - grep is invoked by ABSOLUTE path (resolved at module load) with a
+  //    sanitized PATH so a planted ./grep on the search root can't run.
+  //  - output is NUL-delimited (-Z) so a newline-in-filename can't forge result
+  //    framing; the path is parsed on \0, the line number on the first colon.
+  //  - literal-by-default (-F); regex is opt-in (-E).
+  //  - query never reaches a shell (argv-style Bun.spawn) and is passed via -e so
+  //    a leading dash can't be argv-flag-smuggled.
+  //  - the raw query text and cwd are NEVER audited (they can contain secrets);
+  //    only queryLength/regex/matchCount/truncated are logged on allow.
+  app.post("/api/files/search", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      cwd?: unknown;
+      query?: unknown;
+      regex?: unknown;
+      maxResults?: unknown;
+      requestId?: unknown;
+    };
+
+    // Normalize requestId: accept only a finite number or a short string
+    // (echoed back for client staleness matching); default to 0 otherwise so a
+    // hostile/oversized value can't bloat the response.
+    let requestId: number | string = 0;
+    if (typeof body.requestId === "number" && Number.isFinite(body.requestId)) {
+      requestId = body.requestId;
+    } else if (
+      typeof body.requestId === "string" &&
+      body.requestId.length <= 64
+    ) {
+      requestId = body.requestId;
+    }
+
+    const regex = Boolean(body.regex);
+    const rawQuery = typeof body.query === "string" ? body.query : "";
+    const requestedCwd = typeof body.cwd === "string" ? body.cwd : "";
+
+    // ── Validation / bounds ──────────────────────────────────────────────────
+    // Bound cwd before any work — it is unbounded user input and is written to
+    // the deny audit row, so cap it to avoid response/audit bloat on hostile
+    // requests.
+    const SEARCH_MAX_CWD_LEN = 4096;
+    if (requestedCwd.length > SEARCH_MAX_CWD_LEN) {
+      return c.json({ error: "cwd too long", requestId }, 400);
+    }
+
+    const query = rawQuery.trim();
+    if (!query) {
+      return c.json({ error: "Empty query", requestId }, 400);
+    }
+    if (rawQuery.length > SEARCH_MAX_QUERY_LEN) {
+      return c.json({ error: "Query too long", requestId }, 400);
+    }
+
+    let maxResults = SEARCH_DEFAULT_MAX_RESULTS;
+    if (
+      typeof body.maxResults === "number" &&
+      Number.isFinite(body.maxResults)
+    ) {
+      maxResults = Math.max(
+        1,
+        Math.min(SEARCH_MAX_RESULTS, Math.floor(body.maxResults)),
+      );
+    }
+
+    // ── Gating: realpath-resolve cwd to an allowed root ──────────────────────
+    const resolvedRoot = await resolveAllowedPath(requestedCwd);
+    if (!resolvedRoot) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.search",
+        resourceType: "root",
+        decision: "deny",
+        reason: "forbidden_root",
+        data: { cwd: requestedCwd },
+      });
+      return c.json({ error: "Forbidden search root", requestId }, 403);
+    }
+
+    const fileAccess = await requireFileAccess(c, resolvedRoot);
+    if (!fileAccess.ok) {
+      // Attribute the denial to THIS endpoint in the audit trail (in addition
+      // to whatever requireFileAccess logs internally). Never log the raw query
+      // or cwd here — reason only, empty data.
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.search",
+        resourceType: "root",
+        decision: "deny",
+        reason: "file_access_denied",
+        data: {},
+      });
+      return c.json(
+        { ...fileAccess.body, requestId },
+        { status: fileAccess.status as any },
+      );
+    }
+
+    // ── Run the bounded grep (argv-style, no shell) ──────────────────────────
+    const { matches, truncated } = await runScopedSearch({
+      ownerId,
+      root: resolvedRoot,
+      query,
+      regex,
+      maxResults,
+    });
+
+    const state = await getFoundationState();
+    const rootId = resolveFoundationRootIdForPath(state, resolvedRoot);
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action: "files.search",
+      resourceType: "root",
+      resourceId: rootId || resolvedRoot,
+      decision: "allow",
+      // DECISION: never log the raw query (it can contain secrets being hunted).
+      data: {
+        queryLength: query.length,
+        regex,
+        matchCount: matches.length,
+        truncated,
+      },
+    });
+
+    return c.json({ matches, truncated, requestId });
+  });
+
   // File download
   app.get("/api/files/download", async (c) => {
     const requestedPath = c.req.query("path");
@@ -3265,6 +3735,176 @@ export function createWebApp() {
     return fileAccess.ok;
   }
 
+  // Shared runner for git child processes. GIT_TERMINAL_PROMPT=0 makes
+  // credential prompts (e.g. push to an auth-requiring remote) fail fast
+  // instead of hanging the request until the timeout.
+  async function runGit(
+    cwd: string,
+    args: string[],
+    timeoutMs = 10000,
+  ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
+    const proc = Bun.spawn(["git", ...args], {
+      cwd,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
+    const [output, stderr, code] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    clearTimeout(timeoutId);
+    return { ok: code === 0, output, stderr, code };
+  }
+
+  // GET /api/settings — actor-scoped UI settings (windows layout, dock, prefs)
+  app.get("/api/settings", async (c) => {
+    const actor = getCurrentActor(c);
+    const state = await getFoundationState();
+    return c.json({ settings: getUserSettings(state.db, actor.id) });
+  });
+
+  // PUT /api/settings { settings: { key: value | null } } — merge semantics,
+  // null deletes a key. Values are opaque JSON owned by the frontend.
+  app.put("/api/settings", async (c) => {
+    const actor = getCurrentActor(c);
+    const body = await c.req.json().catch(() => null);
+    const entries = (body as { settings?: unknown } | null)?.settings;
+    if (!entries || typeof entries !== "object" || Array.isArray(entries)) {
+      return c.json({ error: "settings object required" }, 400);
+    }
+    const record = entries as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length > SETTINGS_MAX_KEYS) {
+      return c.json({ error: "too many settings keys" }, 400);
+    }
+    for (const key of keys) {
+      if (!key || key.length > SETTINGS_MAX_KEY_LENGTH) {
+        return c.json({ error: "invalid settings key" }, 400);
+      }
+      const value = record[key];
+      if (
+        value !== null &&
+        JSON.stringify(value).length > SETTINGS_MAX_VALUE_BYTES
+      ) {
+        return c.json({ error: `settings value too large: ${key}` }, 400);
+      }
+    }
+    const state = await getFoundationState();
+    setUserSettings(state.db, actor.id, record);
+    return c.json({ settings: getUserSettings(state.db, actor.id) });
+  });
+
+  // Does the resolved actor already hold a filesystem capability (i.e. is
+  // allowed to browse the registered roots)? Read-only: never writes an audit
+  // row (this is consulted on every settings-window open, and a deny here is
+  // an expected, benign state — not a host-access attempt). Mirrors the
+  // allow conditions of requireFoundationCapability("root.use", …) without the
+  // deny side effects.
+  async function actorHoldsFilesystemCapability(c: any): Promise<boolean> {
+    if (isFoundationLegacyBypassEnabled()) return true;
+    if (isEdgeProtectedTunnelMode(process.env)) return true;
+    const state = await getFoundationState();
+    if (!isBootstrapComplete(state)) return false;
+    const { ownerId } = getCurrentUser(c);
+    // Match the same shape requireFileAccess would check: root.use on any
+    // registered root (admins hold the "*"/"*" wildcard; per-root grants are
+    // matched by their rootId). hasScopedGrant treats "*" as a wildcard on
+    // both sides, so checking the first root's id also catches wildcard grants.
+    const firstRootId = state.roots[0]?.id;
+    return hasScopedGrant(state.db, {
+      userId: ownerId,
+      capability: "root.use",
+      resourceType: "root",
+      resourceId: firstRootId || "*",
+    });
+  }
+
+  // GET /api/settings/env-info — read-only, non-secret server config.
+  //
+  // Returns a HARDCODED allowlist of {key, value, description} rows. It NEVER
+  // echoes arbitrary process.env, and never includes secret-shaped vars
+  // (CF_ACCESS_*, *_TOKEN, *_SECRET, *_KEY). Path-valued config is COARSENED by
+  // default (label + count) because raw host paths reveal topology, usernames,
+  // and confinement boundaries — exact paths are revealed only to an actor that
+  // already holds the filesystem capability (the same gate that lets them
+  // browse those roots). Same actor gate as GET/PUT /api/settings; deliberately
+  // NOT behind requireFileAccess so any authenticated actor can read the
+  // non-path basics.
+  app.get("/api/settings/env-info", async (c) => {
+    // Resolve the actor (throws -> 401 for unauthenticated) just like
+    // GET/PUT /api/settings.
+    getCurrentActor(c);
+
+    const env: Array<{ key: string; value: string; description: string }> = [];
+
+    // --- Default (non-path) rows: shown to any authenticated actor. ---
+    env.push({
+      key: "PORT",
+      value: String(process.env.PORT || "4174"),
+      description: "HTTP port the server listens on.",
+    });
+    env.push({
+      key: "DECKTERM_RUNTIME_ENV",
+      value: String(
+        process.env.DECKTERM_RUNTIME_ENV ||
+          process.env.NODE_ENV ||
+          "production",
+      ),
+      description: "Runtime environment (development or production).",
+    });
+    env.push({
+      key: "TMUX_BACKEND",
+      value: getBackendMode() === "tmux" ? "enabled" : "disabled",
+      description:
+        "Terminal backend: tmux (persists across reconnects) or raw PTY.",
+    });
+    env.push({
+      key: "MAX_TERMINALS_PER_USER",
+      value: String(MAX_TERMINALS_PER_USER),
+      description: "Maximum concurrent terminals allowed per user.",
+    });
+    env.push({
+      key: "DECKTERM_PUBLISH_MODE",
+      value: String(process.env.DECKTERM_PUBLISH_MODE || "default"),
+      description: "How the server is published (e.g. cloudflare-tunnel).",
+    });
+
+    // --- Path-valued rows: coarsened by default, exact only with capability. ---
+    const canSeePaths = await actorHoldsFilesystemCapability(c);
+    const rootCount = ALLOWED_FILESYSTEM_ROOTS.length;
+
+    if (canSeePaths) {
+      env.push({
+        key: "ALLOWED_FILE_ROOTS",
+        value: ALLOWED_FILESYSTEM_ROOTS.join(", "),
+        description:
+          "Filesystem roots terminals and file/git access are scoped to.",
+      });
+      env.push({
+        key: "DECKTERM_STATE_DIR",
+        value: DECKTERM_STATE_DIR,
+        description: "Directory holding foundation state, sockets, and DB.",
+      });
+    } else {
+      env.push({
+        key: "ALLOWED_FILE_ROOTS",
+        value: `${rootCount} allowed root${rootCount === 1 ? "" : "s"} configured`,
+        description:
+          "Number of filesystem roots access is scoped to (exact paths hidden).",
+      });
+      env.push({
+        key: "DECKTERM_STATE_DIR",
+        value: "configured",
+        description: "Server state directory (exact path hidden).",
+      });
+    }
+
+    return c.json({ env });
+  });
+
   // GET /api/git/status?cwd=/path/to/repo
   app.get("/api/git/status", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
@@ -3301,7 +3941,15 @@ export function createWebApp() {
       }
 
       const lines = output.trim().split("\n");
-      const branch = lines[0]?.replace("## ", "").split("...")[0] || "unknown";
+      const headerLine = lines[0]?.replace("## ", "") || "";
+      // "main...origin/main [ahead 1, behind 2]" | "main" | "No commits yet on main"
+      const trackMatch = headerLine.match(
+        /^(.+?)(?:\.\.\.(\S+))?(?:\s+\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\])?$/,
+      );
+      const branch = trackMatch?.[1] || "unknown";
+      const upstream = trackMatch?.[2] || null;
+      const ahead = Number(trackMatch?.[3] || 0);
+      const behind = Number(trackMatch?.[4] || 0);
       const files = lines
         .slice(1)
         .filter((line) => line.length >= 3)
@@ -3335,7 +3983,28 @@ export function createWebApp() {
           };
         });
 
-      return c.json({ branch, files, cwd });
+      // Absolute repo toplevel — lets callers (e.g. the explorer decorations)
+      // map porcelain paths (repo-relative) to absolute paths. Best-effort:
+      // null if the lookup fails, never breaks the status response.
+      let root: string | null = null;
+      try {
+        const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
+          cwd,
+          stdout: "pipe",
+          stderr: "ignore",
+        });
+        const rootTimeout = setTimeout(() => rootProc.kill(), 10000);
+        const [rootOut, rootExit] = await Promise.all([
+          new Response(rootProc.stdout).text(),
+          rootProc.exited,
+        ]);
+        clearTimeout(rootTimeout);
+        if (rootExit === 0) root = rootOut.trim() || null;
+      } catch {
+        root = null;
+      }
+
+      return c.json({ branch, upstream, ahead, behind, files, cwd, root });
     } catch (err) {
       return c.json(
         { error: "Not a git repository", message: String(err) },
@@ -3491,7 +4160,7 @@ export function createWebApp() {
   // POST /api/git/commit { cwd, message }
   app.post("/api/git/commit", async (c) => {
     const body = await c.req.json().catch(() => ({}));
-    const { cwd, message } = body;
+    const { cwd, message, amend } = body;
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
       return c.json(
@@ -3505,29 +4174,21 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "commit", "-m", message], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      const args = amend
+        ? ["commit", "--amend", "-m", message]
+        : ["commit", "-m", message];
+      const result = await runGit(cwd, args);
 
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const [output, stderr, code] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      clearTimeout(timeoutId);
-
-      if (code !== 0) {
+      if (!result.ok) {
         // git reports the common failure ("nothing to commit") on stdout, not
         // stderr — fall back to stdout so the panel shows a real reason instead
         // of an empty "Commit failed:" line.
-        const reason = stderr.trim() || output.trim() || "git commit failed";
+        const reason =
+          result.stderr.trim() || result.output.trim() || "git commit failed";
         return c.json({ error: "Commit failed", message: reason }, 400);
       }
 
-      return c.json({ ok: true, output });
+      return c.json({ ok: true, output: result.output });
     } catch (err) {
       return c.json({ error: "Git commit failed", message: String(err) }, 400);
     }
@@ -3564,10 +4225,11 @@ export function createWebApp() {
     }
   });
 
-  // GET /api/git/log?cwd=...&limit=50
+  // GET /api/git/log?cwd=...&limit=50&path= (path = per-file history)
   app.get("/api/git/log", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
     const limit = parseInt(c.req.query("limit") || "50");
+    const path = c.req.query("path");
 
     if (!cwd || !(await validateGitCwd(c, cwd))) {
       return c.json(
@@ -3576,22 +4238,25 @@ export function createWebApp() {
       );
     }
 
+    if (path && (path.startsWith("/") || path.includes(".."))) {
+      return c.json({ error: "Invalid path" }, 400);
+    }
+
     try {
-      const proc = Bun.spawn(
-        [
-          "git",
-          "log",
-          `--max-count=${Math.min(limit, 200)}`,
-          "--format=%h|%H|%s|%an|%aI",
-          "--graph",
-          "--",
-        ],
-        {
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
+      const args = [
+        "git",
+        "log",
+        `--max-count=${Math.min(limit, 200)}`,
+        "--format=%h|%H|%s|%an|%aI",
+        "--graph",
+        "--",
+      ];
+      if (path) args.push(path);
+      const proc = Bun.spawn(args, {
+        cwd,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
 
       const timeoutId = setTimeout(() => proc.kill(), 10000);
       const output = await new Response(proc.stdout).text();
@@ -3673,6 +4338,208 @@ export function createWebApp() {
     }
   });
 
+  // POST /api/git/branch { cwd, action: "create"|"delete", name, checkout?, force? }
+  app.post("/api/git/branch", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, action, name, checkout, force } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (!["create", "delete"].includes(action)) {
+      return c.json({ error: "Invalid branch action" }, 400);
+    }
+    if (!name || typeof name !== "string" || !/^(?!-)[\w\-\/\.]+$/.test(name)) {
+      return c.json({ error: "Invalid branch name" }, 400);
+    }
+    const args =
+      action === "create"
+        ? checkout
+          ? ["checkout", "-b", name]
+          : ["branch", name]
+        : ["branch", force ? "-D" : "-d", name];
+    const result = await runGit(cwd, args);
+    if (!result.ok) {
+      const reason =
+        result.stderr.trim() || result.output.trim() || "git branch failed";
+      return c.json({ error: "Git branch failed", message: reason }, 400);
+    }
+    return c.json({ ok: true, name, action });
+  });
+
+  // GET /api/git/stash?cwd= — list stashes
+  app.get("/api/git/stash", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    const result = await runGit(cwd, ["stash", "list", "--format=%gd%x09%s"]);
+    if (!result.ok) {
+      return c.json(
+        { error: "Git stash failed", message: result.stderr.trim() },
+        400,
+      );
+    }
+    const stashes = result.output
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line, i) => {
+        const [ref, ...rest] = line.split("\t");
+        return { index: i, ref, message: rest.join("\t") };
+      });
+    return c.json({ stashes, cwd });
+  });
+
+  // POST /api/git/stash { cwd, action: "push"|"pop"|"apply"|"drop", message?, index? }
+  app.post("/api/git/stash", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, action, message, index } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (!["push", "pop", "apply", "drop"].includes(action)) {
+      return c.json({ error: "Invalid stash action" }, 400);
+    }
+    if (index !== undefined && (!Number.isInteger(index) || index < 0)) {
+      return c.json({ error: "Invalid stash index" }, 400);
+    }
+    const args = ["stash", action as string];
+    if (action === "push") {
+      args.push("--include-untracked");
+      if (typeof message === "string" && message.trim()) {
+        args.push("-m", message.trim());
+      }
+    } else if (index !== undefined) {
+      args.push(`stash@{${index}}`);
+    }
+    const result = await runGit(cwd, args);
+    if (!result.ok) {
+      const reason =
+        result.stderr.trim() || result.output.trim() || "git stash failed";
+      return c.json({ error: "Git stash failed", message: reason }, 400);
+    }
+    return c.json({ ok: true, output: result.output });
+  });
+
+  // POST /api/git/discard { cwd, paths: string[], confirm: true }
+  // Destructive: confirm is required by contract; untracked files are removed
+  // via `git clean` (restore can't touch them), tracked via `git restore`.
+  app.post("/api/git/discard", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths, confirm } = body;
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    if (
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      paths.some((p) => typeof p !== "string")
+    ) {
+      return c.json({ error: "Paths required" }, 400);
+    }
+    if (confirm !== true) {
+      return c.json(
+        { error: "Confirmation required", reason: "confirm_required" },
+        400,
+      );
+    }
+    const status = await runGit(cwd, ["status", "--porcelain", "--", ...paths]);
+    if (!status.ok) {
+      return c.json(
+        { error: "Git status failed", message: status.stderr.trim() },
+        400,
+      );
+    }
+    const untracked: string[] = [];
+    const tracked: string[] = [];
+    for (const line of status.output.split("\n")) {
+      if (line.length < 3) continue;
+      const path = line.substring(3).trim();
+      (line.startsWith("??") ? untracked : tracked).push(path);
+    }
+    if (tracked.length > 0) {
+      const res = await runGit(cwd, [
+        "restore",
+        "--worktree",
+        "--",
+        ...tracked,
+      ]);
+      if (!res.ok) {
+        return c.json(
+          { error: "Git restore failed", message: res.stderr.trim() },
+          400,
+        );
+      }
+    }
+    if (untracked.length > 0) {
+      const res = await runGit(cwd, ["clean", "-f", "--", ...untracked]);
+      if (!res.ok) {
+        return c.json(
+          { error: "Git clean failed", message: res.stderr.trim() },
+          400,
+        );
+      }
+    }
+    return c.json({ ok: true, discarded: { tracked, untracked } });
+  });
+
+  // POST /api/git/push { cwd, remote?, branch?, setUpstream? }
+  // POST /api/git/pull { cwd, remote?, branch? }
+  // POST /api/git/fetch { cwd, remote? }
+  // Network ops get a longer timeout; GIT_TERMINAL_PROMPT=0 (runGit) makes
+  // credential prompts fail fast instead of hanging the request. No --force
+  // and no --rebase by design — conflicts belong in the terminal.
+  // Leading dash is rejected so a ref can never be parsed as a git flag
+  // (argv smuggling, e.g. remote="--force").
+  const GIT_REF_RE = /^(?!-)[\w\-\/\.]+$/;
+  for (const op of ["push", "pull", "fetch"] as const) {
+    app.post(`/api/git/${op}`, async (c) => {
+      const body = await c.req.json().catch(() => ({}));
+      const { cwd, remote, branch, setUpstream } = body;
+      if (!cwd || !(await validateGitCwd(c, cwd))) {
+        return c.json(
+          { error: "Forbidden path", reason: "no_matching_root" },
+          403,
+        );
+      }
+      if (
+        remote !== undefined &&
+        (typeof remote !== "string" || !GIT_REF_RE.test(remote))
+      ) {
+        return c.json({ error: "Invalid remote" }, 400);
+      }
+      if (
+        branch !== undefined &&
+        (typeof branch !== "string" || !GIT_REF_RE.test(branch))
+      ) {
+        return c.json({ error: "Invalid branch" }, 400);
+      }
+      const args: string[] = [op];
+      if (op === "push" && setUpstream) args.push("-u");
+      if (remote) args.push(remote);
+      if (op !== "fetch" && branch) args.push(branch);
+      const result = await runGit(cwd, args, 30000);
+      if (!result.ok) {
+        const reason =
+          result.stderr.trim() || result.output.trim() || `git ${op} failed`;
+        return c.json({ error: `Git ${op} failed`, message: reason }, 400);
+      }
+      return c.json({ ok: true, output: result.output + result.stderr });
+    });
+  }
+
   // GET /api/git/show?cwd=...&commit=...&path=...
   app.get("/api/git/show", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
@@ -3686,10 +4553,17 @@ export function createWebApp() {
       );
     }
 
-    // Allow hex hashes (4-40 chars), HEAD, HEAD~N, HEAD^N, and branch/tag names
+    // Allow hex hashes (4-40 chars), HEAD, INDEX, and branch/tag names, each
+    // with an optional ~N / ^N revision suffix (so a commit diff's "before"
+    // side `<sha>~1` resolves; git refnames can't contain ~/^ so this is safe,
+    // and the ref is passed argv-style to `git show <ref>:<path>` — no shell).
+    // Reject leading-dash refs so an option-shaped ref (e.g. "--stat", "-C")
+    // can't be smuggled as a git argv flag even though the ref is spawned
+    // argv-style. `[\w\-\/.]+` permits an interior dash but never a leading one.
     if (
       !commit ||
-      !/^([a-f0-9]{4,40}|HEAD(~\d+|\^\d+)?|[\w\-\/\.]+)$/i.test(commit)
+      commit.startsWith("-") ||
+      !/^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(commit)
     ) {
       return c.json({ error: "Invalid commit reference" }, 400);
     }
@@ -3698,8 +4572,12 @@ export function createWebApp() {
       return c.json({ error: "Path required" }, 400);
     }
 
+    // "INDEX" maps to git's :0 (staged content) — used by the diff editor for
+    // working-tree/staged comparisons.
+    const ref = commit === "INDEX" ? ":0" : commit;
+
     try {
-      const proc = Bun.spawn(["git", "show", `${commit}:${path}`, "--"], {
+      const proc = Bun.spawn(["git", "show", `${ref}:${path}`, "--"], {
         cwd,
         stdout: "pipe",
         stderr: "pipe",

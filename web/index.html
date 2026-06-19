@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260611d" />
+    <link rel="stylesheet" href="/styles.css?v=20260618d" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -76,6 +76,19 @@
             disabled
           >
             <i data-lucide="copy-plus"></i>
+          </button>
+
+          <button
+            id="ide-toggle-btn"
+            class="btn btn-secondary"
+            data-action="toggle-ide"
+            data-action-id="ide"
+            title="Toggle IDE layout"
+            aria-pressed="false"
+            hidden
+          >
+            <i data-lucide="layout-panel-left"></i>
+            <span class="btn-label">IDE</span>
           </button>
 
           <div id="server-stats" class="server-stats">
@@ -469,9 +482,14 @@
         </section>
       </div>
 
-      <!-- Terminal container - tiles created dynamically by TileManager -->
-      <div id="terminal-container">
-        <!-- Tiles will be created dynamically -->
+      <!-- Workspace area: terminal tiles + floating surface windows layer -->
+      <div id="workspace-area">
+        <!-- Terminal container - tiles created dynamically by TileManager -->
+        <div id="terminal-container">
+          <!-- Tiles will be created dynamically -->
+        </div>
+        <div id="surface-windows-layer"></div>
+        <div id="dock-sash" class="dock-sash" title="Drag to resize, double-click to reset"></div>
       </div>
 
       <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
@@ -696,13 +714,21 @@
         document.head.appendChild(script);
       }
     </script>
+    <script src="/html-escape.js?v=20260617a"></script>
     <script src="/access-denied.js?v=20260611a"></script>
     <script src="/git-error.js?v=20260611a"></script>
+    <script src="/git-scm.js?v=20260612a"></script>
+    <script src="/git-timeline.js?v=20260616a"></script>
+    <script src="/git-status-store.js?v=20260616a"></script>
+    <script src="/git-decorations.js?v=20260616a"></script>
+    <script src="/git-scm-view.js?v=20260617b"></script>
     <script src="/session-actions.js?v=20260601b"></script>
     <script src="/reconnect-classify.js?v=20260601a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
     <script src="/task-board.js?v=20260611a"></script>
+    <script src="/tasks-view.js?v=20260617b"></script>
+    <script src="/search-view.js?v=20260617c"></script>
     <script src="/terminal-colors.js?v=20260112g"></script>
     <script src="/bootstrap-routing.js?v=20260401b"></script>
     <script src="/terminal-sizing.js?v=20260401a"></script>
@@ -710,10 +736,21 @@
     <script src="/palette-providers.js?v=20260611a"></script>
     <script src="/command-palette.js?v=20260403a"></script>
     <script src="/navigation-surface.js?v=20260403a"></script>
-    <script src="/file-explorer.js?v=20260611b"></script>
-    <script src="/file-editor.js?v=20260611a"></script>
+    <script src="/settings-schema.js?v=20260616a"></script>
+    <script src="/settings-ui.js?v=20260616a"></script>
+    <script src="/settings-runtime.js?v=20260616b"></script>
+    <script src="/settings-store.js?v=20260612a"></script>
+    <script src="/settings-migration.js?v=20260616a"></script>
+    <script src="/surface-windows.js?v=20260612a"></script>
+    <script src="/view-host.js?v=20260616a"></script>
+    <script src="/file-tree-store.js?v=20260616a"></script>
+    <script src="/ide-shell.js?v=20260618c"></script>
+    <script src="/file-explorer.js?v=20260618c"></script>
+    <script src="/file-editor.js?v=20260618a"></script>
+    <script src="/editor-tabs.js?v=20260618a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
+    <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260611h"></script>
+    <script src="/app.js?v=20260618c"></script>
   </body>
 </html>

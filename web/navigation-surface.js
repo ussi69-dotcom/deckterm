@@ -11,10 +11,12 @@ const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
   mobilePrimary: Object.freeze(["files", "git", "paste", "more"]),
   overflow: Object.freeze([
     "setup",
+    "settings",
     "tasks",
     "clipboard",
     "toggle-extra-keys",
     "wrap-lines",
+    "dock-sessions",
     "fullscreen",
     "font-decrease",
     "font-increase",

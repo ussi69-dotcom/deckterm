@@ -16,3 +16,9 @@ export { python } from "@codemirror/lang-python";
 export { html } from "@codemirror/lang-html";
 export { css } from "@codemirror/lang-css";
 export { oneDark } from "@codemirror/theme-one-dark";
+export {
+  MergeView,
+  unifiedMergeView,
+  goToNextChunk,
+  goToPreviousChunk,
+} from "@codemirror/merge";

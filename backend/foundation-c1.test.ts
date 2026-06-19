@@ -299,3 +299,52 @@ test("foundation C1 allows legacy bootstrap bypass only in CI/test/dev contexts"
   ).toBe(true);
   expect(isLegacyBootstrapBypassAllowed({ CI: "true" })).toBe(false);
 });
+
+test("foundation C1 ignores the legacy anonymous user when deciding bootstrap completion", async () => {
+  const stateDir = await createTempDir(".deckterm-c1-state-");
+
+  // Simulate a DB from the legacy/tunnel era: the only user row is the
+  // implicit `anonymous` admin, which was never created by a real bootstrap.
+  const seeded = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: {},
+    now: new Date("2026-05-12T21:00:00Z"),
+  });
+  seeded.db
+    .query(
+      `INSERT INTO users (id, email, display_name, role, created_at, updated_at)
+       VALUES ('anonymous', 'anonymous', 'anonymous', 'admin', ?, ?)`,
+    )
+    .run("2026-05-12T21:00:00Z", "2026-05-12T21:00:00Z");
+  seeded.db.close();
+
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: { DECKTERM_BOOTSTRAP_ADMIN_EMAIL: "owner@example.com" },
+    now: new Date("2026-06-12T19:00:00Z"),
+  });
+
+  expect(state.bootstrap.bootstrapped).toBe(false);
+  expect(state.bootstrap.mode).toBe("env_admin");
+
+  const result = await bootstrapFirstAdmin({
+    state,
+    stateDir,
+    actorUserId: "cf-sub-uuid",
+    actorEmail: "owner@example.com",
+    env: {},
+    now: new Date("2026-06-12T19:00:00Z"),
+  });
+  expect(result.ok).toBe(true);
+  expect(
+    hasScopedGrant(state.db, {
+      userId: "cf-sub-uuid",
+      capability: "terminal.create",
+      resourceType: "*",
+      resourceId: "*",
+    }),
+  ).toBe(true);
+  state.db.close();
+});

@@ -72,6 +72,18 @@ function isProbablyEditable(path) {
   return !BINARY_EXTENSIONS.has(fileExtension(path));
 }
 
+// Decides whether the editor should show a change gutter vs HEAD. Returns the
+// HEAD content string when the file is tracked and `git show` succeeded, else
+// null (untracked file, not-a-repo, show error, or a non-string body). null
+// means "do not add the merge/change-gutter extension" — the editor stays a
+// plain editor with no false change bars.
+function headOriginalFor(showResponse, isTracked) {
+  if (!isTracked) return null;
+  if (!showResponse || !showResponse.ok) return null;
+  if (typeof showResponse.content !== "string") return null;
+  return showResponse.content;
+}
+
 class FileEditor {
   constructor({ fetchImpl, alertImpl, confirmImpl } = {}) {
     this.fetchImpl = fetchImpl || ((...args) => fetch(...args));
@@ -89,6 +101,34 @@ class FileEditor {
       this.cm = await import("/vendor/codemirror.js");
     }
     return this.cm;
+  }
+
+  // Fetches HEAD content for the file via GET /api/git/show so the editor can
+  // render change bars vs the committed version. Returns the original string
+  // when meaningful (tracked + changed), or null. Any failure (not a repo,
+  // untracked, fetch error) silently yields null — never surfaced to the user.
+  async fetchHeadOriginal(absPath) {
+    try {
+      const slash = String(absPath || "").lastIndexOf("/");
+      if (slash <= 0) return null;
+      const cwd = absPath.slice(0, slash);
+      const base = absPath.slice(slash + 1);
+      // "./<base>" makes git resolve the path relative to cwd (the file's
+      // directory) instead of the repo root, so we don't need to know the
+      // toplevel here.
+      const params = new URLSearchParams({
+        cwd,
+        commit: "HEAD",
+        path: `./${base}`,
+      });
+      const res = await this.fetchImpl(`/api/git/show?${params.toString()}`);
+      const body = await res.json().catch(() => ({}));
+      // A 404 means the file is untracked / absent at HEAD — treat as untracked.
+      const isTracked = res.ok;
+      return headOriginalFor({ ok: res.ok, content: body.content }, isTracked);
+    } catch {
+      return null;
+    }
   }
 
   ensureModal() {
@@ -141,12 +181,17 @@ class FileEditor {
       ?.classList.toggle("visible", dirty);
   }
 
-  async open(path) {
+  // Load a file's content + HEAD-original through the GATED file/git endpoints.
+  // Returns { payload, headOriginal } on success, or null on any error (binary,
+  // 403/404, fetch failure). `silent` suppresses the user-facing alert — used by
+  // the IDE editor-tab path where a failed open SILENTLY drops the tab instead
+  // of popping an alert (the modal path keeps the alert for direct opens).
+  async loadFile(path, { silent = false } = {}) {
     if (!isProbablyEditable(path)) {
-      this.alertImpl("This looks like a binary file — download it instead.");
-      return;
+      if (!silent)
+        this.alertImpl("This looks like a binary file — download it instead.");
+      return null;
     }
-
     let payload;
     try {
       const res = await this.fetchImpl(
@@ -154,24 +199,41 @@ class FileEditor {
       );
       payload = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const denial = window.AccessDenied?.describeAccessDenied(payload);
-        this.alertImpl(
-          denial?.text || payload.error || "Cannot open file for editing",
-        );
-        return;
+        if (!silent) {
+          const denial = window.AccessDenied?.describeAccessDenied(payload);
+          this.alertImpl(
+            denial?.text || payload.error || "Cannot open file for editing",
+          );
+        }
+        return null;
       }
     } catch {
-      this.alertImpl("Cannot open file for editing");
-      return;
+      if (!silent) this.alertImpl("Cannot open file for editing");
+      return null;
     }
+    const headOriginal = await this.fetchHeadOriginal(payload.path);
+    return { payload, headOriginal };
+  }
 
-    const cm = await this.ensureModule();
-    const modal = this.ensureModal();
-
-    this.view?.destroy();
-    const mount = modal.querySelector(".file-editor-mount");
-    mount.replaceChildren();
-
+  // Build a CodeMirror EditorView for a loaded file into `mount`. Shared by the
+  // modal (open) and the IDE editor-tab body (mountInto) so the phase-3 HEAD
+  // change-bar gutter + language setup stay identical. `onDocChanged` fires on
+  // the first edit (the modal sets dirty; the tab path pins the preview tab).
+  // `extraKeymaps` is an optional array of CodeMirror key bindings the IDE tab
+  // path injects (e.g. a Mod-s save) — it's bound at HIGH precedence (before
+  // basicSetup) so it's naturally scoped to when THIS editor view has focus,
+  // and the modal path leaves it empty (the modal owns its own Ctrl+S on the
+  // modal element). Returning true from such a binding swallows the browser's
+  // "save page" default without a global document listener.
+  buildEditorView(
+    cm,
+    mount,
+    payload,
+    headOriginal,
+    path,
+    onDocChanged,
+    extraKeymaps = null,
+  ) {
     const language = detectEditorLanguage(path);
     const languageExtensions = {
       javascript: () => cm.javascript({ typescript: true, jsx: true }),
@@ -181,22 +243,58 @@ class FileEditor {
       html: () => cm.html(),
       css: () => cm.css(),
     };
-
-    this.view = new cm.EditorView({
+    return new cm.EditorView({
       state: cm.EditorState.create({
         doc: payload.content,
         extensions: [
+          ...(Array.isArray(extraKeymaps) && extraKeymaps.length
+            ? [cm.keymap.of(extraKeymaps)]
+            : []),
           cm.basicSetup,
           cm.keymap.of([cm.indentWithTab]),
           cm.oneDark,
           ...(language ? [languageExtensions[language]()] : []),
+          // Change bars vs HEAD (no accept/reject merge controls). Only added
+          // when the file is tracked and differs — otherwise no false markers.
+          ...(typeof headOriginal === "string"
+            ? [
+                cm.unifiedMergeView({
+                  original: headOriginal,
+                  mergeControls: false,
+                  gutter: true,
+                }),
+              ]
+            : []),
           cm.EditorView.updateListener.of((update) => {
-            if (update.docChanged) this.setDirty(true);
+            if (update.docChanged && typeof onDocChanged === "function")
+              onDocChanged(update);
           }),
         ],
       }),
       parent: mount,
     });
+  }
+
+  async open(path) {
+    const loaded = await this.loadFile(path);
+    if (!loaded) return;
+    const { payload, headOriginal } = loaded;
+
+    const cm = await this.ensureModule();
+    const modal = this.ensureModal();
+
+    this.view?.destroy();
+    const mount = modal.querySelector(".file-editor-mount");
+    mount.replaceChildren();
+
+    this.view = this.buildEditorView(
+      cm,
+      mount,
+      payload,
+      headOriginal,
+      path,
+      () => this.setDirty(true),
+    );
 
     this.current = { path: payload.path, mtimeMs: payload.mtimeMs };
     this.setDirty(false);
@@ -204,6 +302,122 @@ class FileEditor {
     modal.querySelector(".file-editor-title").textContent = payload.path;
     modal.classList.remove("hidden");
     this.view.focus();
+  }
+
+  // Mount a standalone CodeMirror editor for `path` into an arbitrary host (the
+  // IDE editor-tab body) — NO modal, NO SurfaceWindow. Reuses the exact gated
+  // load + the phase-3 HEAD change-bar gutter via buildEditorView. Returns a
+  // small handle the tab controller drives:
+  //   { view, save(), refresh(), destroy() }  (or null when the load failed —
+  //   the caller silently drops the tab).
+  // `onEdit` fires on the first edit so the tab controller can pin the preview.
+  // Each mounted tab owns its OWN view + current pointer (the modal's this.view
+  // / this.current stay reserved for the modal path).
+  async mountInto(hostEl, path, { onEdit } = {}) {
+    if (!hostEl) return null;
+    const loaded = await this.loadFile(path, { silent: true });
+    if (!loaded) return null;
+    const { payload, headOriginal } = loaded;
+    const cm = await this.ensureModule();
+
+    hostEl.replaceChildren();
+    let current = { path: payload.path, mtimeMs: payload.mtimeMs };
+    let edited = false;
+    // Forward reference so the Mod-s keymap (built before the handle) can route
+    // to the handle's CURRENT save(). It points at the handle object (not a
+    // captured function) so a caller that WRAPS handle.save (e.g. the app adding
+    // a success toast) is still invoked by the keybinding. The binding only
+    // fires when THIS view has DOM focus, so Ctrl/Cmd+S is naturally scoped to
+    // the focused editor tab and never steals the shortcut from a terminal, the
+    // modal, or the explorer.
+    const handleRef = { handle: null };
+    const view = this.buildEditorView(
+      cm,
+      hostEl,
+      payload,
+      headOriginal,
+      path,
+      () => {
+        if (!edited) {
+          edited = true;
+          if (typeof onEdit === "function") onEdit();
+        }
+      },
+      [
+        {
+          key: "Mod-s",
+          preventDefault: true,
+          run: () => {
+            void handleRef.handle?.save?.();
+            // Returning true marks the key as handled → CodeMirror swallows the
+            // browser "save page" default without a global document listener.
+            return true;
+          },
+        },
+      ],
+    );
+
+    const handle = {
+      view,
+      path: payload.path,
+      // Returns true when the file has unsaved changes. Used by the tab
+      // controller's dirty-close guard (Codex fix 2: isDirty lives here, not
+      // in FileEditor.dispose; the modal's confirmImpl stays on close()).
+      isDirty: () => edited,
+      // Atomic save through the gated PUT, mirroring the modal's save() (409 +
+      // access-denied handling). Returns true on success.
+      save: async () => {
+        try {
+          const res = await this.fetchImpl("/api/files/content", {
+            method: "PUT",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              path: current.path,
+              content: view.state.doc.toString(),
+              expectedMtimeMs: current.mtimeMs,
+            }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (res.status === 409) {
+            this.alertImpl(
+              "The file changed on disk since you opened it. Close the tab and reopen to pick up the new content (your version stays in this tab until then).",
+            );
+            return false;
+          }
+          if (!res.ok) {
+            const denial = window.AccessDenied?.describeAccessDenied(body);
+            this.alertImpl(denial?.text || body.error || "Save failed");
+            return false;
+          }
+          current.mtimeMs = body.mtimeMs;
+          edited = false;
+          return true;
+        } catch {
+          this.alertImpl("Save failed");
+          return false;
+        }
+      },
+      // CodeMirror needs a measure after its container resizes (mode switch,
+      // dock sash drag, tab activation).
+      refresh: () => {
+        try {
+          view.requestMeasure();
+        } catch {
+          // best-effort
+        }
+      },
+      destroy: () => {
+        try {
+          view.destroy();
+        } catch {
+          // best-effort
+        }
+      },
+    };
+    // Bind the forward reference so the Mod-s keymap routes to this handle's
+    // current save (including a wrapper a caller may install on handle.save).
+    handleRef.handle = handle;
+    return handle;
   }
 
   async save() {
@@ -252,12 +466,18 @@ class FileEditor {
     this.view = null;
     this.current = null;
     this.setDirty(false);
+    // In windowed mode the editor lives inside a SurfaceWindow that must
+    // close with it (Esc and the in-editor ✕ call close() directly).
+    if (typeof window !== "undefined") {
+      window.terminalManager?.surfaceWindowManager?.close("editor");
+    }
   }
 }
 
 const FileEditorModule = {
   detectEditorLanguage,
   isProbablyEditable,
+  headOriginalFor,
   FileEditor,
 };
 
@@ -272,5 +492,6 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.detectEditorLanguage = detectEditorLanguage;
   exports.isProbablyEditable = isProbablyEditable;
+  exports.headOriginalFor = headOriginalFor;
   exports.FileEditor = FileEditor;
 }
