@@ -3048,14 +3048,13 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .file-item .file-actions {
-  display: flex;
+  display: none;
   gap: 4px;
-  opacity: 0;
-  transition: opacity 0.15s;
+  flex: 0 0 auto;
 }
 
 .file-item:hover .file-actions {
-  opacity: 1;
+  display: flex;
 }
 
 .file-item .file-actions button {
