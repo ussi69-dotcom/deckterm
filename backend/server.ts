@@ -4398,6 +4398,59 @@ export function createWebApp() {
     }
   });
 
+  // GET /api/git/commit-files?cwd=...&commit=<sha> — the files changed in a
+  // single commit (vs its first parent; --root lets the initial commit list its
+  // files). Powers the SCM History repo-scope "expand a commit to its files"
+  // view, where each file opens a single-file commit diff. Returns
+  // { files: [{ status, path }], cwd, commit }.
+  app.get("/api/git/commit-files", async (c) => {
+    const cwd = c.req.query("cwd") || process.env.HOME;
+    const commit = c.req.query("commit");
+    if (!cwd || !(await validateGitCwd(c, cwd))) {
+      return c.json(
+        { error: "Forbidden path", reason: "no_matching_root" },
+        403,
+      );
+    }
+    // Same ref validation as /api/git/show: hex/HEAD/refname + optional ~N/^N,
+    // never a leading dash (argv-flag smuggling), passed argv-style (no shell).
+    if (
+      !commit ||
+      commit.startsWith("-") ||
+      !/^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(commit)
+    ) {
+      return c.json({ error: "Invalid commit reference" }, 400);
+    }
+    const res = await runGit(cwd, [
+      "diff-tree",
+      "--no-commit-id",
+      "--name-status",
+      "-r",
+      "--root",
+      commit,
+    ]);
+    if (!res.ok) {
+      return c.json(
+        { error: "Git diff-tree failed", message: res.stderr.trim() },
+        400,
+      );
+    }
+    // Lines are "<STATUS>\t<path>" (renames/copies: "R100\t<old>\t<new>").
+    const files = res.output
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const parts = line.split("\t");
+        const status = (parts[0] || "").charAt(0);
+        // For renames/copies the destination path is the LAST tab field.
+        const path = parts[parts.length - 1] || "";
+        return path ? { status, path } : null;
+      })
+      .filter(Boolean);
+    return c.json({ files, cwd, commit });
+  });
+
   // POST /api/git/checkout { cwd, branch }
   app.post("/api/git/checkout", async (c) => {
     const body = await c.req.json().catch(() => ({}));

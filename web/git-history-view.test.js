@@ -340,7 +340,7 @@ test("HTTP error response renders an error message", async () => {
 
 // ── row click → openDiffTab ───────────────────────────────────────────────────
 
-test("row click calls openDiffTab with mode:'commit' and the fullHash", async () => {
+test("file-scope commit click calls openDiffTab with mode:'commit' and the fullHash", async () => {
   const commits = [
     {
       hash: "abc1234",
@@ -354,6 +354,7 @@ test("row click calls openDiffTab with mode:'commit' and the fullHash", async ()
   const fetchStub = async () => ({ ok: true, json: async () => ({ commits }) });
   const { ctl, container, tmCalls } = makeController({
     fetchImpl: fetchStub,
+    path: "a.js",
     cwd: "/repo",
   });
   ctl.mount(container);
@@ -409,7 +410,59 @@ test("row click with path set passes relPath to openDiffTab (6b)", async () => {
   ctl.unmount();
 });
 
-test("row click with no path sets relPath to empty string (repo-wide 6a)", async () => {
+test("repo-scope commit click expands to its files (no openDiffTab) and fetches commit-files", async () => {
+  const hash = "cafecafecafecafecafecafecafecafecafecafe";
+  let lastUrl = null;
+  const fetchStub = async (url) => {
+    lastUrl = url;
+    if (String(url).includes("/api/git/commit-files")) {
+      return {
+        ok: true,
+        json: async () => ({
+          files: [
+            { status: "M", path: "src/app.js" },
+            { status: "A", path: "docs/new.md" },
+          ],
+        }),
+      };
+    }
+    return { ok: true, json: async () => ({ commits: [] }) };
+  };
+  const { ctl, container, tmCalls } = makeController({
+    fetchImpl: fetchStub,
+    path: null,
+    cwd: "/repo",
+  });
+  ctl.mount(container);
+  await new Promise((r) => setTimeout(r, 20));
+
+  const fakeRow = makeFakeEl();
+  fakeRow.dataset.fullHash = hash;
+  ctl._onClick({
+    target: {
+      closest(sel) {
+        return sel === ".ide-history-row" ? fakeRow : null;
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Repo-scope click expands, never opens a diff tab directly.
+  expect(tmCalls).toHaveLength(0);
+  expect(ctl._expanded.has(hash)).toBe(true);
+  expect(lastUrl).toContain("/api/git/commit-files");
+  expect(lastUrl).toContain(`commit=${hash}`);
+  expect(ctl._commitFiles.get(hash)).toHaveLength(2);
+
+  // A second click collapses it.
+  ctl._onClick({
+    target: { closest: (sel) => (sel === ".ide-history-row" ? fakeRow : null) },
+  });
+  expect(ctl._expanded.has(hash)).toBe(false);
+  ctl.unmount();
+});
+
+test("clicking a file inside an expanded commit opens its single-file commit diff", async () => {
   const fetchStub = async () => ({
     ok: true,
     json: async () => ({ commits: [] }),
@@ -422,17 +475,23 @@ test("row click with no path sets relPath to empty string (repo-wide 6a)", async
   ctl.mount(container);
   await new Promise((r) => setTimeout(r, 20));
 
-  const fakeRow = makeFakeEl();
-  fakeRow.dataset.fullHash = "cafecafecafecafecafecafecafecafecafecafe";
+  const fakeFile = makeFakeEl();
+  fakeFile.dataset.path = "src/app.js";
+  fakeFile.dataset.commit = "f00ff00ff00ff00ff00ff00ff00ff00ff00ff00f";
   ctl._onClick({
     target: {
       closest(sel) {
-        return sel === ".ide-history-row" ? fakeRow : null;
+        if (sel === ".ide-history-file") return fakeFile;
+        return null;
       },
     },
   });
 
-  expect(tmCalls[0].relPath).toBe("");
+  expect(tmCalls).toHaveLength(1);
+  expect(tmCalls[0].relPath).toBe("src/app.js");
+  expect(tmCalls[0].mode).toBe("commit");
+  expect(tmCalls[0].commit).toBe("f00ff00ff00ff00ff00ff00ff00ff00ff00ff00f");
+  expect(tmCalls[0].cwd).toBe("/repo");
   ctl.unmount();
 });
 

@@ -98,6 +98,11 @@ class GitHistoryViewController {
     this._loading = false;
     this._rows = []; // last-fetched historyRows
     this._error = null;
+    // Repo-scope expand state: a commit row expands to the files it changed
+    // (each opens a single-file commit diff). fullHash -> [{status, path}].
+    this._expanded = new Set();
+    this._commitFiles = new Map();
+    this._filesLoading = new Set();
   }
 
   get terminalManager() {
@@ -195,17 +200,50 @@ class GitHistoryViewController {
       return;
     }
     const rowsHtml = this._rows
-      .map(
-        (row) =>
-          `<div class="ide-history-row" data-full-hash="${_esc(row.fullHash)}" title="${_esc(row.subject)} — ${_esc(row.author)}">` +
+      .map((row) => {
+        // In repo scope a commit expands to its file list; a caret reflects it.
+        const expandable = !this.path;
+        const expanded = this._expanded.has(row.fullHash);
+        const caret = expandable ? (expanded ? "▾" : "▸") : "";
+        const head =
+          `<div class="ide-history-row${expandable ? " expandable" : ""}" data-full-hash="${_esc(row.fullHash)}" title="${_esc(row.subject)} — ${_esc(row.author)}">` +
+          `<span class="ide-history-caret">${caret}</span>` +
           `<span class="ide-history-graph">${_esc(row.graph)}</span>` +
           `<span class="ide-history-hash">${_esc(row.shortHash)}</span>` +
           `<span class="ide-history-subject">${_esc(row.subject)}</span>` +
           `<span class="ide-history-meta">${_esc(row.author)} · ${_esc(row.dateLabel)}</span>` +
-          `</div>`,
-      )
+          `</div>`;
+        if (!expandable || !expanded) return head;
+        return head + this._fileListHtml(row.fullHash);
+      })
       .join("");
     this.root.innerHTML = `<div class="ide-history-list">${rowsHtml}</div>`;
+  }
+
+  // The expanded file list for a commit (repo scope). Renders a loading/empty
+  // state until the commit-files fetch resolves; each file opens a single-file
+  // commit diff on click.
+  _fileListHtml(fullHash) {
+    if (this._filesLoading.has(fullHash)) {
+      return '<div class="ide-history-files"><p class="ide-scm-empty">Loading files…</p></div>';
+    }
+    const files = this._commitFiles.get(fullHash);
+    if (!files) return '<div class="ide-history-files"></div>';
+    if (files.length === 0) {
+      return '<div class="ide-history-files"><p class="ide-scm-empty">No files</p></div>';
+    }
+    const rows = files
+      .map((f) => {
+        const name = (f.path || "").split("/").pop() || f.path || "";
+        return (
+          `<div class="ide-history-file" data-path="${_esc(f.path)}" data-commit="${_esc(fullHash)}" title="${_esc(f.path)}">` +
+          `<span class="ide-history-file-status">${_esc(f.status || "")}</span>` +
+          `<span class="ide-history-file-name">${_esc(name)}</span>` +
+          `</div>`
+        );
+      })
+      .join("");
+    return `<div class="ide-history-files">${rows}</div>`;
   }
 
   // ── Events ────────────────────────────────────────────────────────────────
@@ -216,21 +254,75 @@ class GitHistoryViewController {
   }
 
   _onClick(e) {
+    const tm = this.terminalManager;
+    // A file inside an expanded commit → open that file's single-file diff at
+    // the commit (repo scope). This is the path the editor diff tab can render.
+    const fileEl = e.target.closest(".ide-history-file");
+    if (fileEl) {
+      if (!tm?.openDiffTab) return;
+      tm.openDiffTab({
+        relPath: fileEl.dataset.path,
+        mode: "commit",
+        commit: fileEl.dataset.commit,
+        cwd: this.cwd,
+      });
+      return;
+    }
+
     const row = e.target.closest(".ide-history-row");
     if (!row) return;
     const fullHash = row.dataset.fullHash;
     if (!fullHash) return;
-    const tm = this.terminalManager;
-    if (!tm?.openDiffTab) return;
-    // For a file-scoped view (6b), pass the path so the diff is scoped.
-    // For repo-wide (6a) relPath is empty string — openDiffTab shows a
-    // whole-commit diff via commit mode.
-    tm.openDiffTab({
-      relPath: this.path || "",
-      mode: "commit",
-      commit: fullHash,
-      cwd: this.cwd,
-    });
+
+    // File scope (6b): the commit click opens THIS file's diff at the commit —
+    // there's exactly one file to show, so go straight to the diff tab.
+    if (this.path) {
+      if (!tm?.openDiffTab) return;
+      tm.openDiffTab({
+        relPath: this.path,
+        mode: "commit",
+        commit: fullHash,
+        cwd: this.cwd,
+      });
+      return;
+    }
+
+    // Repo scope (6a): a whole commit has many files, which the single-file diff
+    // tab can't show at once. Expand the commit to its file list instead; each
+    // file opens its own commit diff. Toggle + lazy-fetch the file list.
+    if (this._expanded.has(fullHash)) {
+      this._expanded.delete(fullHash);
+      this._render();
+      return;
+    }
+    this._expanded.add(fullHash);
+    if (!this._commitFiles.has(fullHash)) void this._loadCommitFiles(fullHash);
+    this._render();
+  }
+
+  // Fetch the files changed in a commit (repo scope expand). Cached per commit.
+  async _loadCommitFiles(fullHash) {
+    if (this._filesLoading.has(fullHash)) return;
+    this._filesLoading.add(fullHash);
+    this._render();
+    try {
+      const fetchFn = this._fetchImpl;
+      const cwd = this.cwd;
+      if (!fetchFn || !cwd) throw new Error("no fetch/cwd");
+      const res = await fetchFn(
+        `/api/git/commit-files?cwd=${encodeURIComponent(cwd)}&commit=${encodeURIComponent(fullHash)}`,
+      );
+      const data = await res.json().catch(() => ({}));
+      this._commitFiles.set(
+        fullHash,
+        res.ok && Array.isArray(data.files) ? data.files : [],
+      );
+    } catch {
+      this._commitFiles.set(fullHash, []);
+    } finally {
+      this._filesLoading.delete(fullHash);
+      this._render();
+    }
   }
 }
 

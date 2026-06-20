@@ -406,3 +406,33 @@ test("content PUT creates a brand-new file (allowMissing)", async () => {
   expect(await readFile(target, "utf8")).toBe("");
   await rm(target, { force: true });
 });
+
+test("commit-files lists the files changed in a single commit", async () => {
+  // Make a commit that touches one tracked file in a subdir, then ask the route
+  // for that commit's changed files (powers the History repo-scope expand view).
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(repo, "sub"), { recursive: true });
+  await writeFile(join(repo, "sub", "thing.txt"), "hello\n");
+  await git(repo, "add", "sub/thing.txt");
+  await git(repo, "commit", "-m", "add sub/thing");
+  const sha = (await git(repo, "rev-parse", "HEAD")).trim();
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/commit-files?cwd=${encodeURIComponent(repo)}&commit=${sha}`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  const entry = (data.files as any[]).find((f) => f.path === "sub/thing.txt");
+  expect(entry).toBeTruthy();
+  expect(entry.status).toBe("A");
+});
+
+test("commit-files rejects a dash-led commit ref (argv flag smuggling)", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/commit-files?cwd=${encodeURIComponent(repo)}&commit=--stat`,
+    ),
+  );
+  expect(res.status).toBe(400);
+});

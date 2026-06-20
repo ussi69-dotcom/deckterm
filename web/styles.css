@@ -5996,6 +5996,49 @@ body.ide-mode #workspace-area {
   flex: 0 0 auto;
 }
 
+.ide-history-caret {
+  flex: 0 0 auto;
+  width: 10px;
+  color: var(--text-secondary, #999);
+  font-size: 9px;
+}
+
+/* Files changed in an expanded commit (History repo scope) */
+.ide-history-files {
+  display: flex;
+  flex-direction: column;
+}
+
+.ide-history-file {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 10px 2px 34px;
+  cursor: pointer;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ide-history-file:hover {
+  background: var(--bg-hover, rgba(255, 255, 255, 0.06));
+}
+
+.ide-history-file-status {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-secondary, #999);
+}
+
+.ide-history-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .ide-scm-branch-item:hover {
   background: var(--bg-hover, rgba(255, 255, 255, 0.06));
 }
