@@ -8983,7 +8983,17 @@ class TerminalManager {
       status.files,
       status.root,
     );
-    this.fileExplorer.setDecorations(workspaceId, decorations);
+    const folderDecorations = window.GitDecorations.buildFolderDecorationMap
+      ? window.GitDecorations.buildFolderDecorationMap(
+          status.files,
+          status.root,
+        )
+      : {};
+    this.fileExplorer.setDecorations(
+      workspaceId,
+      decorations,
+      folderDecorations,
+    );
   }
 
   getRightSurface() {

@@ -45,6 +45,7 @@ class FileTreeStore {
     this.selectedItemByWorkspace = new Map();
     this.itemsByWorkspace = new Map();
     this.decorationsByWorkspace = new Map();
+    this.folderDecorationsByWorkspace = new Map();
 
     this.listeners = new Set();
   }
@@ -149,12 +150,19 @@ class FileTreeStore {
     return cloneItemsValue(this.itemsByWorkspace.get(id));
   }
 
-  setDecorations(workspaceId, decorations) {
+  // decorations: file-keyed map { absPath: { letter, colorClass } }
+  // folderDecorations: optional folder-keyed rollup map { absDirPath: { count, colorClass } }
+  setDecorations(workspaceId, decorations, folderDecorations = {}) {
     const id = normalizeWorkspaceId(workspaceId);
     if (!id) return null;
     const next =
       decorations && typeof decorations === "object" ? { ...decorations } : {};
     this.decorationsByWorkspace.set(id, next);
+    const nextFolders =
+      folderDecorations && typeof folderDecorations === "object"
+        ? { ...folderDecorations }
+        : {};
+    this.folderDecorationsByWorkspace.set(id, nextFolders);
     this._emit();
     return next;
   }
@@ -163,6 +171,12 @@ class FileTreeStore {
     const id = normalizeWorkspaceId(workspaceId);
     if (!id) return {};
     return { ...(this.decorationsByWorkspace.get(id) || {}) };
+  }
+
+  getFolderDecorations(workspaceId) {
+    const id = normalizeWorkspaceId(workspaceId);
+    if (!id) return {};
+    return { ...(this.folderDecorationsByWorkspace.get(id) || {}) };
   }
 }
 

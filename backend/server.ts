@@ -3535,7 +3535,9 @@ export function createWebApp() {
         413,
       );
     }
-    const filePath = await resolveAllowedPath(requestedPath);
+    const filePath = await resolveAllowedPath(requestedPath, {
+      allowMissing: true,
+    });
     if (!filePath) {
       return c.json(
         { error: "Forbidden path", reason: "no_matching_root" },
@@ -3950,7 +3952,7 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "status", "--porcelain", "-b"], {
+      const proc = Bun.spawn(["git", "status", "--porcelain", "-uall", "-b"], {
         cwd,
         stdout: "pipe",
         stderr: "pipe",
@@ -4111,6 +4113,75 @@ export function createWebApp() {
           { error: "Git diff failed", message: stderr.trim() || "git failed" },
           400,
         );
+      }
+
+      // Untracked file fallback (working-tree, single-path, empty diff output):
+      // plain `git diff -- <path>` produces no output for untracked files. Check
+      // if the path is untracked (status "??") and, if so, re-run with
+      // --no-index against /dev/null so the whole file appears as an addition.
+      // NOTE: `git diff --no-index` exits with code 1 when files differ — treat
+      // exit code 1 + non-empty stdout as SUCCESS (not an error). Only 400 on
+      // exit code > 1.
+      if (!commit && !stagedEnabled && path && output.trim() === "") {
+        const statusProc = Bun.spawn(
+          ["git", "status", "--porcelain", "--", path],
+          { cwd, stdout: "pipe", stderr: "pipe" },
+        );
+        const statusTimeoutId = setTimeout(() => statusProc.kill(), 10000);
+        const [statusOut, , statusExit] = await Promise.all([
+          new Response(statusProc.stdout).text(),
+          new Response(statusProc.stderr).text(),
+          statusProc.exited,
+        ]);
+        clearTimeout(statusTimeoutId);
+
+        if (statusExit === 0 && statusOut.trimStart().startsWith("??")) {
+          // Resolve the absolute path for --no-index (git diff --no-index
+          // expects real filesystem paths, not relative-to-cwd)
+          const absPath = path.startsWith("/") ? path : `${cwd}/${path}`;
+          const noIndexProc = Bun.spawn(
+            [
+              "git",
+              "diff",
+              "--no-index",
+              "--color=never",
+              "--",
+              "/dev/null",
+              absPath,
+            ],
+            { cwd, stdout: "pipe", stderr: "pipe" },
+          );
+          const noIndexTimeoutId = setTimeout(() => noIndexProc.kill(), 10000);
+          const [noIndexOut, noIndexErr, noIndexExit] = await Promise.all([
+            new Response(noIndexProc.stdout).text(),
+            new Response(noIndexProc.stderr).text(),
+            noIndexProc.exited,
+          ]);
+          clearTimeout(noIndexTimeoutId);
+
+          // exit 1 + non-empty stdout = files differ (expected for untracked)
+          if (
+            noIndexExit === 0 ||
+            (noIndexExit === 1 && noIndexOut.length > 0)
+          ) {
+            return c.json({
+              diff: noIndexOut,
+              cwd,
+              path,
+              staged: 0,
+              commit: null,
+            });
+          }
+          if (noIndexExit > 1) {
+            return c.json(
+              {
+                error: "Git diff failed",
+                message: noIndexErr.trim() || "git diff --no-index failed",
+              },
+              400,
+            );
+          }
+        }
       }
 
       return c.json({

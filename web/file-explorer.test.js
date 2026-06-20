@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { FileExplorerController } from "./file-explorer";
+import { FileExplorerController, breadcrumbSegments } from "./file-explorer";
 import { FileTreeStore } from "./file-tree-store";
 import { isViewController } from "./view-host";
 
@@ -296,4 +296,160 @@ test("an injected store backs the controller's model surface", () => {
 
   controller.setWorkspacePath("ws-a", "/tmp/shared");
   expect(store.getWorkspacePath("ws-a")).toBe("/tmp/shared");
+});
+
+// --- breadcrumbSegments ---
+
+test("breadcrumbSegments: first crumb is root, no segments above it", () => {
+  const crumbs = breadcrumbSegments("/home/deploy/project/src", "/home/deploy");
+  // Should NOT have "/" or "home" crumbs — only root + below-root segments
+  const labels = crumbs.map((c) => c.label);
+  expect(labels).not.toContain("/");
+  expect(labels).not.toContain("home");
+  expect(labels[0]).toBe("deploy"); // basename of root
+  expect(labels).toEqual(["deploy", "project", "src"]);
+});
+
+test("breadcrumbSegments: each emitted path is within the root", () => {
+  const root = "/home/deploy";
+  const crumbs = breadcrumbSegments("/home/deploy/a/b/c", root);
+  for (const crumb of crumbs) {
+    expect(crumb.path.startsWith(root)).toBe(true);
+  }
+});
+
+test("breadcrumbSegments: path equal to root emits only the root crumb", () => {
+  const crumbs = breadcrumbSegments("/home/deploy", "/home/deploy");
+  expect(crumbs).toHaveLength(1);
+  expect(crumbs[0]).toEqual({ label: "deploy", path: "/home/deploy" });
+});
+
+test("breadcrumbSegments: returns [] when path is not under root", () => {
+  const crumbs = breadcrumbSegments("/other/path", "/home/deploy");
+  expect(crumbs).toEqual([]);
+});
+
+test("breadcrumbSegments: returns [] for empty path or root", () => {
+  expect(breadcrumbSegments("", "/home/deploy")).toEqual([]);
+  expect(breadcrumbSegments("/home/deploy/foo", "")).toEqual([]);
+});
+
+// --- createFile ---
+
+test("createFile PUTs /api/files/content with {path, content:''} and reloads", async () => {
+  const fetchCalls = [];
+  const fetchImpl = async (url, opts) => {
+    fetchCalls.push({ url, opts });
+    if (url.includes("/api/browse")) {
+      return {
+        ok: true,
+        json: async () => ({ path: "/home/deploy", dirs: [], files: [] }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const promptImpl = (msg) => (msg.includes("File") ? "hello.txt" : null);
+
+  const controller = new FileExplorerController({
+    viewport: { innerWidth: 1280 },
+    fetchImpl,
+    promptImpl,
+  });
+  controller.openForWorkspace("ws-a", "/home/deploy");
+  controller.store.setWorkspacePath("ws-a", "/home/deploy");
+
+  await controller.createFile(null, null, "ws-a");
+
+  const putCall = fetchCalls.find(
+    (c) => c.url === "/api/files/content" && c.opts?.method === "PUT",
+  );
+  expect(putCall).toBeDefined();
+  const body = JSON.parse(putCall.opts.body);
+  expect(body.path).toBe("/home/deploy/hello.txt");
+  expect(body.content).toBe("");
+
+  // A browse reload must have followed
+  const browseCall = fetchCalls.find((c) => c.url?.includes("/api/browse"));
+  expect(browseCall).toBeDefined();
+});
+
+test("createFile no-ops when this.disposed", async () => {
+  const fetchCalls = [];
+  const fetchImpl = async (url, opts) => {
+    fetchCalls.push({ url, opts });
+    return { ok: true, json: async () => ({}) };
+  };
+  const controller = new FileExplorerController({
+    viewport: { innerWidth: 1280 },
+    fetchImpl,
+    promptImpl: () => "file.txt",
+  });
+  controller.openForWorkspace("ws-a", "/home/deploy");
+  controller.store.setWorkspacePath("ws-a", "/home/deploy");
+  controller.dispose();
+
+  const result = await controller.createFile(null, null, "ws-a");
+  // fetchImpl may be called for the PUT but the reload must not happen because
+  // disposed is checked after the response
+  expect(result).toBe(false);
+});
+
+// --- renameItem ---
+
+test("renameItem POSTs /api/files/rename with {from, to} in same dir and reloads", async () => {
+  const fetchCalls = [];
+  const fetchImpl = async (url, opts) => {
+    fetchCalls.push({ url, opts });
+    if (url.includes("/api/browse")) {
+      return {
+        ok: true,
+        json: async () => ({ path: "/home/deploy", dirs: [], files: [] }),
+      };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  const promptImpl = () => "renamed.txt";
+
+  const controller = new FileExplorerController({
+    viewport: { innerWidth: 1280 },
+    fetchImpl,
+    promptImpl,
+  });
+  controller.openForWorkspace("ws-a", "/home/deploy");
+  controller.store.setWorkspacePath("ws-a", "/home/deploy");
+
+  const item = { path: "/home/deploy/old.txt", name: "old.txt", isDir: false };
+  await controller.renameItem(item, "ws-a");
+
+  const renameCall = fetchCalls.find(
+    (c) => c.url === "/api/files/rename" && c.opts?.method === "POST",
+  );
+  expect(renameCall).toBeDefined();
+  const body = JSON.parse(renameCall.opts.body);
+  expect(body.from).toBe("/home/deploy/old.txt");
+  expect(body.to).toBe("/home/deploy/renamed.txt");
+
+  // A browse reload must follow
+  const browseCall = fetchCalls.find((c) => c.url?.includes("/api/browse"));
+  expect(browseCall).toBeDefined();
+});
+
+test("renameItem no-ops when this.disposed", async () => {
+  const fetchCalls = [];
+  const fetchImpl = async (url, opts) => {
+    fetchCalls.push({ url, opts });
+    return { ok: true, json: async () => ({}) };
+  };
+  const controller = new FileExplorerController({
+    viewport: { innerWidth: 1280 },
+    fetchImpl,
+    promptImpl: () => "newname.txt",
+  });
+  controller.openForWorkspace("ws-a", "/home/deploy");
+  controller.store.setWorkspacePath("ws-a", "/home/deploy");
+  controller.dispose();
+
+  const item = { path: "/home/deploy/old.txt", name: "old.txt", isDir: false };
+  const result = await controller.renameItem(item, "ws-a");
+  expect(result).toBe(false);
 });

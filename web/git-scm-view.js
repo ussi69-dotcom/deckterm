@@ -69,6 +69,25 @@ function getScm() {
   return null;
 }
 
+// Resolve the GitHistoryView module (browser global OR CommonJS under bun).
+// Returns { GitHistoryViewController } or null when not available.
+function getGitHistoryView() {
+  if (
+    typeof window !== "undefined" &&
+    window.GitHistoryView?.GitHistoryViewController
+  ) {
+    return window.GitHistoryView;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./git-history-view");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 // ── Pure helpers (DOM-free, unit-tested) ─────────────────────────────────────
 
 // The three SCM group section descriptors, in render order, with the file list
@@ -142,8 +161,11 @@ class GitScmViewController {
 
     this.root = null; // the mounted skeleton element
     this.container = null; // the host slot
-    // In-section collapse + branches/stashes section collapse (UI-local).
-    this.collapsed = { branches: true, stashes: false };
+    // In-section collapse + branches/stashes/history section collapse (UI-local).
+    // History defaults to collapsed (lazy fetch on first expand).
+    this.collapsed = { branches: true, stashes: false, history: true };
+    // GitHistoryViewController instance; created lazily on first history expand.
+    this._historyCtl = null;
     // Subscriptions to tear down on unmount.
     this._unsubscribe = null;
   }
@@ -199,6 +221,10 @@ class GitScmViewController {
         // best-effort
       }
       this._unsubscribe = null;
+    }
+    if (this._historyCtl) {
+      this._historyCtl.unmount();
+      this._historyCtl = null;
     }
     if (this.root && this.root.parentElement) {
       this.root.parentElement.removeChild(this.root);
@@ -271,6 +297,13 @@ class GitScmViewController {
       </div>
       <div class="ide-scm-tree"></div>
       <div class="ide-scm-sections">
+        <div class="ide-scm-section ide-scm-history">
+          <div class="ide-scm-section-header" data-section="history">
+            <span class="ide-scm-section-chevron"></span>
+            <span class="ide-scm-section-label">History</span>
+          </div>
+          <div class="ide-scm-section-body ide-scm-history-body"></div>
+        </div>
         <div class="ide-scm-section ide-scm-branches">
           <div class="ide-scm-section-header" data-section="branches">
             <span class="ide-scm-section-chevron"></span>
@@ -338,6 +371,7 @@ class GitScmViewController {
     }
 
     this.renderTree(groups, scm);
+    this.renderHistory();
     this.renderBranches(gm);
     this.renderStashes(gm);
   }
@@ -367,6 +401,7 @@ class GitScmViewController {
         stashes: stashes.map((s) => `${s.index}:${s.message}`),
         collBranches: !!this.collapsed.branches,
         collStashes: !!this.collapsed.stashes,
+        collHistory: !!this.collapsed.history,
       });
     } catch {
       return null;
@@ -423,6 +458,48 @@ class GitScmViewController {
         </div>`;
     }
     tree.innerHTML = html;
+  }
+
+  renderHistory() {
+    const body = this.q(".ide-scm-history-body");
+    const section = this.q(".ide-scm-history");
+    if (!body || !section) return;
+    section.classList.toggle("collapsed", this.collapsed.history);
+    this.setChevron(
+      ".ide-scm-history .ide-scm-section-chevron",
+      this.collapsed.history,
+    );
+    if (this.collapsed.history) {
+      // Collapsed: unmount the history controller to free resources.
+      if (this._historyCtl) {
+        this._historyCtl.unmount();
+        this._historyCtl = null;
+      }
+      body.innerHTML = "";
+      return;
+    }
+    // Expanded: mount/refresh the history controller into the body.
+    const ghv = getGitHistoryView();
+    if (!ghv) {
+      body.innerHTML = '<p class="ide-scm-empty">History view unavailable</p>';
+      return;
+    }
+    if (!this._historyCtl) {
+      const gm = this.gitManager;
+      this._historyCtl = new ghv.GitHistoryViewController({
+        document: this.doc,
+        getTerminalManager: this.getTerminalManagerFn,
+        getCwd: () => this.cwd(),
+        // TODO(6b): pass path when an active file is tracked:
+        //   path: this.getTerminalManager()?.getActiveWorkspaceContext?.()?.relPath || null
+        // For now ship 6a (repo-wide history); per-file scoping is a follow-up.
+        path: null,
+      });
+      this._historyCtl.mount(body);
+    } else {
+      // Already mounted — refresh to pick up cwd changes.
+      void this._historyCtl.refresh();
+    }
   }
 
   renderBranches(gm) {
@@ -595,7 +672,11 @@ class GitScmViewController {
     const header = e.target.closest(".ide-scm-section-header");
     if (header) {
       const section = header.dataset.section;
-      if (section === "branches") {
+      if (section === "history") {
+        this.collapsed.history = !this.collapsed.history;
+        // renderHistory() mounts/unmounts the controller on expand/collapse.
+        this.render();
+      } else if (section === "branches") {
         this.collapsed.branches = !this.collapsed.branches;
         if (!this.collapsed.branches)
           void gm.loadBranches?.().then(() => this.render());

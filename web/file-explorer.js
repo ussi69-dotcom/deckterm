@@ -83,6 +83,63 @@ function joinExplorerPath(basePath, childName) {
   return `${base.replace(/\/+$/, "")}/${child}`;
 }
 
+// Pure helper: turns an absolute path + an allowed root path into an ordered
+// array of breadcrumb entries, each with { label, path }.
+//
+// The FIRST entry is the root itself (label = basename of root, e.g. "deploy"
+// for "/home/deploy", or "/" for a root of "/"). Subsequent entries are only
+// the path segments BELOW rootPath — each with an absolute path within the
+// root so loadDir() can navigate to it without hitting a 403.
+//
+// Segments above the root (e.g. "/" or "home" when root is "/home/deploy") are
+// NOT emitted. If path equals rootPath exactly, only the root crumb is emitted.
+//
+// Returns [] if path is null/empty or rootPath is null/empty.
+function breadcrumbSegments(path, rootPath) {
+  const normPath = String(path || "").trim();
+  // Reject empty rootPath before any normalisation — an empty string falling
+  // back to "/" would incorrectly match every absolute path.
+  const rawRoot = String(rootPath || "").trim();
+  if (!normPath || !rawRoot) return [];
+  const normRoot = rawRoot.replace(/\/+$/, "") || "/";
+
+  // Ensure root is a prefix of path (normalise trailing slashes).
+  const rootWithSlash = normRoot === "/" ? "/" : normRoot + "/";
+  const startsAtRoot =
+    normPath === normRoot ||
+    normPath.startsWith(rootWithSlash) ||
+    normRoot === "/";
+
+  if (!startsAtRoot) return [];
+
+  // Root crumb label: basename of the root, or "/" for a bare-root.
+  const rootLabel =
+    normRoot === "/"
+      ? "/"
+      : normRoot.split("/").filter(Boolean).pop() || normRoot;
+
+  const crumbs = [{ label: rootLabel, path: normRoot }];
+
+  // Sub-path: everything after the root prefix.
+  let remainder = "";
+  if (normRoot === "/") {
+    remainder = normPath.replace(/^\/+/, "");
+  } else {
+    remainder = normPath.slice(normRoot.length).replace(/^\/+/, "");
+  }
+
+  if (!remainder) return crumbs;
+
+  const parts = remainder.split("/").filter(Boolean);
+  let accumulated = normRoot === "/" ? "" : normRoot;
+  for (const part of parts) {
+    accumulated = accumulated === "/" ? `/${part}` : `${accumulated}/${part}`;
+    crumbs.push({ label: part, path: accumulated });
+  }
+
+  return crumbs;
+}
+
 function getDefaultAlertImpl() {
   return (...args) => {
     if (typeof alert === "function") {
@@ -194,6 +251,11 @@ class FileExplorerController {
     this.pendingLoadByWorkspace = new Map();
     this.loadSequence = 0;
 
+    // Per-workspace root path: set once when openForWorkspace() is first called
+    // for a workspace (from the cwd passed by the host). Used to scope the
+    // breadcrumb so only segments WITHIN the allowed root are rendered as links.
+    this.rootByWorkspace = new Map();
+
     // DOM handles — null until mount(container) binds a host element.
     this.root = null;
     this.shellEl = null;
@@ -204,11 +266,13 @@ class FileExplorerController {
     this.uploadInputEl = null;
     this.uploadBtnEl = null;
     this.mkdirBtnEl = null;
+    this.newFileBtnEl = null;
     this.refreshBtnEl = null;
     this.closeButtons = [];
     this.dropTargetEl = null;
     this._boundUploadClick = null;
     this._boundMkdirClick = null;
+    this._boundNewFileClick = null;
     this._boundRefreshClick = null;
 
     this.handleClose = this.close.bind(this);
@@ -337,6 +401,7 @@ class FileExplorerController {
     this.uploadInputEl = this.root.querySelector("#file-explorer-upload-input");
     this.uploadBtnEl = this.root.querySelector("#file-explorer-upload-btn");
     this.mkdirBtnEl = this.root.querySelector("#file-explorer-mkdir-btn");
+    this.newFileBtnEl = this.root.querySelector("#file-explorer-newfile-btn");
     this.refreshBtnEl = this.root.querySelector("#file-explorer-refresh-btn");
 
     const closeSelectors = [
@@ -356,6 +421,7 @@ class FileExplorerController {
     // Hold references to the per-mount closures so unmount() can detach them.
     this._boundUploadClick = () => this.uploadInputEl?.click();
     this._boundMkdirClick = () => void this.createFolder();
+    this._boundNewFileClick = () => void this.createFile();
     this._boundRefreshClick = () => {
       if (!this.currentPath) return;
       void this.loadDir(this.currentPath);
@@ -364,6 +430,7 @@ class FileExplorerController {
     this.uploadBtnEl?.addEventListener("click", this._boundUploadClick);
     this.uploadInputEl?.addEventListener("change", this.handleUpload);
     this.mkdirBtnEl?.addEventListener("click", this._boundMkdirClick);
+    this.newFileBtnEl?.addEventListener("click", this._boundNewFileClick);
     this.refreshBtnEl?.addEventListener("click", this._boundRefreshClick);
 
     this.dropTargetEl = this.shellEl || this.root;
@@ -385,6 +452,12 @@ class FileExplorerController {
     this.uploadInputEl?.removeEventListener?.("change", this.handleUpload);
     if (this._boundMkdirClick) {
       this.mkdirBtnEl?.removeEventListener?.("click", this._boundMkdirClick);
+    }
+    if (this._boundNewFileClick) {
+      this.newFileBtnEl?.removeEventListener?.(
+        "click",
+        this._boundNewFileClick,
+      );
     }
     if (this._boundRefreshClick) {
       this.refreshBtnEl?.removeEventListener?.(
@@ -409,11 +482,13 @@ class FileExplorerController {
     this.uploadInputEl = null;
     this.uploadBtnEl = null;
     this.mkdirBtnEl = null;
+    this.newFileBtnEl = null;
     this.refreshBtnEl = null;
     this.closeButtons = [];
     this.dropTargetEl = null;
     this._boundUploadClick = null;
     this._boundMkdirClick = null;
+    this._boundNewFileClick = null;
     this._boundRefreshClick = null;
   }
 
@@ -457,9 +532,17 @@ class FileExplorerController {
       mode: this.mode,
       workspaceId,
       path,
+      // The root path this workspace was opened with (first cwd). Used by
+      // renderBreadcrumb() to scope links to navigable paths only.
+      rootPath: workspaceId
+        ? this.rootByWorkspace.get(workspaceId) || null
+        : null,
       selectedItem: workspaceId ? this.getSelectedItem(workspaceId) : null,
       items: workspaceId ? this.getWorkspaceItems(workspaceId) : [],
       decorations: workspaceId ? this.store.getDecorations(workspaceId) : {},
+      folderDecorations: workspaceId
+        ? this.store.getFolderDecorations(workspaceId)
+        : {},
       loading: this.loading,
       error: this.error,
       dragActive: this.dragActive,
@@ -506,24 +589,22 @@ class FileExplorerController {
         placeholder.textContent = "Open Files to browse the current workspace.";
         this.breadcrumbEl.appendChild(placeholder);
       } else {
-        const parts = snapshot.path.split("/").filter(Boolean);
-        const rootLink = document.createElement("a");
-        rootLink.textContent = "/";
-        rootLink.dataset.path = "/";
-        rootLink.addEventListener("click", () => void this.loadDir("/"));
-        this.breadcrumbEl.appendChild(rootLink);
+        // Scope the breadcrumb to the workspace's allowed root so every link
+        // points to a navigable (in-root) path. breadcrumbSegments() emits only
+        // segments at or below the root — never "/" or "home" etc. above it.
+        const rootPath = snapshot.rootPath || snapshot.path;
+        const crumbs = breadcrumbSegments(snapshot.path, rootPath);
 
-        let currentPath = "";
-        parts.forEach((part) => {
-          currentPath += `/${part}`;
-
-          const separator = document.createTextNode(" / ");
+        crumbs.forEach((crumb, i) => {
+          if (i > 0) {
+            this.breadcrumbEl.appendChild(document.createTextNode(" / "));
+          }
           const link = document.createElement("a");
-          link.textContent = part;
-          link.dataset.path = currentPath;
-          link.addEventListener("click", () => void this.loadDir(currentPath));
-
-          this.breadcrumbEl.appendChild(separator);
+          link.textContent = crumb.label;
+          link.dataset.path = crumb.path;
+          // Capture crumb.path in a const so the closure captures the right value.
+          const crumbPath = crumb.path;
+          link.addEventListener("click", () => void this.loadDir(crumbPath));
           this.breadcrumbEl.appendChild(link);
         });
       }
@@ -633,6 +714,20 @@ class FileExplorerController {
       badgeEl.textContent = decoration.letter;
     }
 
+    // Folder rollup badge: shows how many changed files are inside a directory.
+    // Mirrors the VS Code Explorer "+N" cue beside changed folders.
+    let folderBadgeEl = null;
+    if (item.isDir && !item.isParent) {
+      const folderDec = snapshot.folderDecorations?.[item.path];
+      if (folderDec && folderDec.count > 0) {
+        folderBadgeEl = document.createElement("span");
+        folderBadgeEl.className = "file-git-folder-count";
+        if (folderDec.colorClass)
+          folderBadgeEl.classList.add(folderDec.colorClass);
+        folderBadgeEl.textContent = String(folderDec.count);
+      }
+    }
+
     const sizeEl = document.createElement("span");
     sizeEl.className = "file-size";
     sizeEl.textContent = item.isDir ? "" : formatFileSize(item.size);
@@ -672,6 +767,20 @@ class FileExplorerController {
       actionsEl.appendChild(downloadBtn);
     }
 
+    // Rename button for both files and folders (not the parent ".." entry).
+    if (!item.isParent) {
+      const renameBtn = document.createElement("button");
+      renameBtn.type = "button";
+      renameBtn.className = "rename";
+      renameBtn.title = "Rename";
+      renameBtn.textContent = "✏";
+      renameBtn.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void this.renameItem(item);
+      });
+      actionsEl.appendChild(renameBtn);
+    }
+
     if (!item.isParent) {
       const deleteBtn = document.createElement("button");
       deleteBtn.type = "button";
@@ -688,6 +797,7 @@ class FileExplorerController {
     el.appendChild(iconEl);
     el.appendChild(nameEl);
     if (badgeEl) el.appendChild(badgeEl);
+    if (folderBadgeEl) el.appendChild(folderBadgeEl);
     el.appendChild(sizeEl);
     el.appendChild(actionsEl);
 
@@ -736,6 +846,16 @@ class FileExplorerController {
       this.getWorkspacePath(normalizedWorkspaceId) ||
       normalizeExplorerPath(cwd) ||
       "/";
+
+    // Record the workspace root the FIRST time this workspace is opened (the
+    // cwd from the host is the best proxy for the allowed root). If there is
+    // already a remembered path the workspace was previously open — use the
+    // cwd arg as the root only when no root is recorded yet.
+    if (!this.rootByWorkspace.has(normalizedWorkspaceId)) {
+      const initialRoot = normalizeExplorerPath(cwd) || rememberedPath;
+      if (initialRoot)
+        this.rootByWorkspace.set(normalizedWorkspaceId, initialRoot);
+    }
 
     this.store.setWorkspacePath(normalizedWorkspaceId, rememberedPath);
     this.render();
@@ -802,18 +922,25 @@ class FileExplorerController {
     return this.store.getWorkspaceItems(workspaceId);
   }
 
-  // Git status decorations keyed by absolute item path. Re-renders the list
-  // when set for the active workspace so badges/colors appear immediately.
-  setDecorations(workspaceId, decorations) {
+  // Git status decorations keyed by absolute item path, plus an optional folder
+  // rollup map keyed by absolute dir path. Re-renders the list when set for the
+  // active workspace so badges/colors appear immediately.
+  // Signature: setDecorations(workspaceId, fileMap, folderMap?)
+  // Existing callers that pass only fileMap continue to work (folderMap → {}).
+  setDecorations(workspaceId, decorations, folderDecorations = {}) {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return null;
 
-    const next = this.store.setDecorations(normalizedWorkspaceId, decorations);
+    this.store.setDecorations(
+      normalizedWorkspaceId,
+      decorations,
+      folderDecorations,
+    );
 
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
       this.renderList();
     }
-    return next;
+    return this.store.getDecorations(normalizedWorkspaceId);
   }
 
   setLoading(loading) {
@@ -1095,12 +1222,96 @@ class FileExplorerController {
     await this.loadDir(basePath, normalizedWorkspaceId);
     return true;
   }
+
+  // Create a new empty file in the current directory. Mirrors createFolder().
+  async createFile(
+    path = null,
+    fileName = null,
+    workspaceId = this.currentWorkspaceId,
+  ) {
+    if (this.disposed) return false;
+    const normalizedWorkspaceId = String(workspaceId || "").trim();
+    const basePath =
+      normalizeExplorerPath(path) ||
+      this.getWorkspacePath(normalizedWorkspaceId);
+    if (!this.fetchImpl || !basePath) return false;
+
+    const nextFileName = typeof fileName === "string" ? fileName.trim() : "";
+    const resolvedFileName =
+      nextFileName || String(this.promptImpl("File name:") || "").trim();
+
+    if (!resolvedFileName) return false;
+
+    try {
+      const targetPath = joinExplorerPath(basePath, resolvedFileName);
+      const res = await this.fetchImpl("/api/files/content", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: targetPath, content: "" }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      // Disposed mid-create: skip the follow-up reload of the now-null store.
+      if (this.disposed) return false;
+      if (!res.ok) {
+        this.alertImpl(explainApiError(payload, "Failed to create file"));
+        return false;
+      }
+
+      if (normalizedWorkspaceId) {
+        await this.loadDir(basePath, normalizedWorkspaceId);
+      }
+      return true;
+    } catch (err) {
+      this.alertImpl(`Failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
+
+  // Rename/move a file or folder item within the same directory.
+  async renameItem(item, workspaceId = this.currentWorkspaceId) {
+    if (this.disposed) return false;
+    const normalizedWorkspaceId = String(workspaceId || "").trim();
+    if (!this.fetchImpl || !item?.path || !item?.name) return false;
+
+    const newName = String(
+      this.promptImpl("Rename to:", item.name) || "",
+    ).trim();
+    if (!newName || newName === item.name) return false;
+
+    // Build the target path in the same directory as the source.
+    const dirPath = item.path.split("/").slice(0, -1).join("/") || "/";
+    const toPath = joinExplorerPath(dirPath, newName);
+
+    try {
+      const res = await this.fetchImpl("/api/files/rename", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: item.path, to: toPath }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (this.disposed) return false;
+      if (!res.ok) {
+        this.alertImpl(explainApiError(payload, "Failed to rename"));
+        return false;
+      }
+
+      const basePath = this.getWorkspacePath(normalizedWorkspaceId) || dirPath;
+      if (normalizedWorkspaceId) {
+        await this.loadDir(basePath, normalizedWorkspaceId);
+      }
+      return true;
+    } catch (err) {
+      this.alertImpl(`Failed: ${err instanceof Error ? err.message : err}`);
+      return false;
+    }
+  }
 }
 
 const FileExplorerModule = {
   FILE_EXPLORER_MOBILE_BREAKPOINT,
   FileExplorerController,
   resolveFileExplorerMode,
+  breadcrumbSegments,
 };
 
 if (typeof window !== "undefined") {
@@ -1115,4 +1326,5 @@ if (typeof exports !== "undefined") {
   exports.FILE_EXPLORER_MOBILE_BREAKPOINT = FILE_EXPLORER_MOBILE_BREAKPOINT;
   exports.FileExplorerController = FileExplorerController;
   exports.resolveFileExplorerMode = resolveFileExplorerMode;
+  exports.breadcrumbSegments = breadcrumbSegments;
 }

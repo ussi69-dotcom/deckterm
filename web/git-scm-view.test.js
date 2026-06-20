@@ -359,3 +359,77 @@ test("commit() with empty/whitespace message does not call commitWith", async ()
   // Controller surfaces the "required" hint.
   expect(statusEl.textContent).toBe("Commit message required");
 });
+
+// ── (4) History section ───────────────────────────────────────────────────────
+
+test("skeletonHtml() contains the History section markup above Branches", () => {
+  const { ctl } = makeScmController();
+  const html = ctl.skeletonHtml();
+  // History section must be present
+  expect(html).toContain('data-section="history"');
+  expect(html).toContain("ide-scm-history-body");
+  // History must appear before Branches in the string
+  const historyPos = html.indexOf('data-section="history"');
+  const branchesPos = html.indexOf('data-section="branches"');
+  expect(historyPos).toBeLessThan(branchesPos);
+});
+
+test("collapsed.history starts as true (History section collapsed by default)", () => {
+  const { ctl } = makeScmController();
+  expect(ctl.collapsed.history).toBe(true);
+});
+
+test("renderSignature includes collHistory flag", () => {
+  const { ctl, container, gm } = makeScmController();
+  ctl.mount(container);
+  const scm = {
+    statusLetter: () => "M",
+    statusClass: () => "modified",
+    groupStatusFiles: () => ({}),
+  };
+
+  const sig1 = ctl.renderSignature(gm, gm.state.files, scm);
+  expect(sig1).toContain("collHistory");
+
+  // Toggling history changes the signature
+  ctl.collapsed.history = false;
+  const sig2 = ctl.renderSignature(gm, gm.state.files, scm);
+  expect(sig2).not.toBe(sig1);
+  expect(sig2).toContain("collHistory");
+});
+
+test("toggling history collapse changes the renderSignature (expand/collapse re-renders)", () => {
+  const { ctl, container, gm } = makeScmController();
+  ctl.mount(container);
+  const sig1 = ctl._renderSig;
+
+  // Toggle history open
+  ctl.collapsed.history = false;
+  ctl.render();
+  const sig2 = ctl._renderSig;
+  expect(sig2).not.toBe(sig1);
+
+  // Toggle history closed again
+  ctl.collapsed.history = true;
+  ctl.render();
+  const sig3 = ctl._renderSig;
+  expect(sig3).not.toBe(sig2);
+  expect(sig3).toBe(sig1); // back to original collapsed state
+});
+
+test("unmount() disposes the _historyCtl when it exists", () => {
+  const { ctl, container } = makeScmController();
+  ctl.mount(container);
+
+  // Inject a fake history controller
+  let disposed = false;
+  ctl._historyCtl = {
+    unmount() {
+      disposed = true;
+    },
+  };
+
+  ctl.unmount();
+  expect(disposed).toBe(true);
+  expect(ctl._historyCtl).toBeNull();
+});
