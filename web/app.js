@@ -9249,12 +9249,26 @@ class TerminalManager {
         return typeof handle?.isDirty === "function" ? handle.isDirty() : false;
       },
       // Persist descriptors only (never content). Debounced via settingsStore.
-      onChange: (state) =>
+      // Also notify the SCM History view so file-scoped (6b) history follows the
+      // active editor file when the active tab changes.
+      onChange: (state) => {
         this.settingsStore?.set(
           window.EditorTabs.EDITOR_TABS_KEY,
           window.EditorTabs.serializeTabs(state),
-        ),
+        );
+        this.scmView?.onActiveFileChanged?.();
+      },
     });
+  }
+
+  // Absolute path of the active editor FILE tab, or null. Used by the SCM
+  // History view's file scope (6b) to follow the active file. File tabs carry
+  // their absolute path as a string `ref`; diff/settings tabs return null.
+  getActiveEditorFilePath() {
+    const tab = this.editorTabs?.model?.activeTab?.();
+    if (!tab || tab.type !== window.EditorTabs?.TAB_FILE) return null;
+    const ref = tab.ref;
+    return typeof ref === "string" ? ref : ref?.relPath || null;
   }
 
   // --- IDE Source Control view (phase 5, slice 5) ---------------------------

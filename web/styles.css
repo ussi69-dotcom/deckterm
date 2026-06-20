@@ -5926,6 +5926,35 @@ body.ide-mode #workspace-area {
   overflow-y: auto;
 }
 
+/* Repo / File scope toggle in the History section header */
+.ide-scm-history-scope {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+}
+
+.ide-scm-history-scope-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary, #999);
+  cursor: pointer;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.ide-scm-history-scope-btn:hover {
+  color: var(--text-primary, #fff);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.12));
+}
+
+.ide-scm-history-scope-btn.active {
+  color: var(--text-primary, #fff);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.16));
+}
+
 .ide-history-row {
   display: flex;
   align-items: baseline;

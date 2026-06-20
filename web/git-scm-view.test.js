@@ -433,3 +433,85 @@ test("unmount() disposes the _historyCtl when it exists", () => {
   expect(disposed).toBe(true);
   expect(ctl._historyCtl).toBeNull();
 });
+
+// ── (4b) History per-file scope (6b) ─────────────────────────────────────────
+
+// Build a controller whose TerminalManager reports a given active-file abs path.
+function makeScmCtlWithActiveFile(activeFilePath, cwd = "/repo") {
+  const gm = makeFakeGm({ cwd });
+  return new GitScmViewController({
+    document: makeFakeDoc(),
+    getGitManager: () => gm,
+    getStatusStore: () => makeFakeStore(),
+    getTerminalManager: () => ({
+      getActiveEditorFilePath: () => activeFilePath,
+    }),
+  });
+}
+
+test("skeletonHtml() includes the Repo/File history scope toggle", () => {
+  const { ctl } = makeScmController();
+  const html = ctl.skeletonHtml();
+  expect(html).toContain('data-history-scope="repo"');
+  expect(html).toContain('data-history-scope="file"');
+});
+
+test("historyScope defaults to repo and renderSignature includes histScope", () => {
+  const { ctl, gm } = makeScmController();
+  expect(ctl.historyScope).toBe("repo");
+  const scm = require("./git-scm");
+  const sig1 = ctl.renderSignature(gm, gm.state.files, scm);
+  expect(sig1).toContain("histScope");
+  ctl.historyScope = "file";
+  const sig2 = ctl.renderSignature(gm, gm.state.files, scm);
+  expect(sig1).not.toBe(sig2);
+});
+
+test("activeFileRelPath() strips the repo cwd prefix from the active file path", () => {
+  const ctl = makeScmCtlWithActiveFile("/repo/src/app.js", "/repo");
+  expect(ctl.activeFileRelPath()).toBe("src/app.js");
+});
+
+test("activeFileRelPath() returns null when no file is active or it's outside the repo", () => {
+  expect(
+    makeScmCtlWithActiveFile(null, "/repo").activeFileRelPath(),
+  ).toBeNull();
+  expect(
+    makeScmCtlWithActiveFile("/elsewhere/x.js", "/repo").activeFileRelPath(),
+  ).toBeNull();
+});
+
+test("onActiveFileChanged() is a no-op in repo scope or when collapsed", () => {
+  const ctl = makeScmCtlWithActiveFile("/repo/a.js", "/repo");
+  let rendered = 0;
+  ctl.renderHistory = () => {
+    rendered += 1;
+  };
+  // repo scope + collapsed → no render
+  ctl.onActiveFileChanged();
+  expect(rendered).toBe(0);
+  // file scope but still collapsed → no render
+  ctl.historyScope = "file";
+  ctl.onActiveFileChanged();
+  expect(rendered).toBe(0);
+  // file scope + expanded → renders
+  ctl.collapsed.history = false;
+  ctl.onActiveFileChanged();
+  expect(rendered).toBe(1);
+});
+
+test("onSectionsClick switches history scope to file and expands the section", () => {
+  const { ctl } = makeScmController();
+  ctl.render = () => {}; // isolate from full render
+  const evt = {
+    target: {
+      closest: (sel) =>
+        sel === "[data-history-scope]"
+          ? { dataset: { historyScope: "file" } }
+          : null,
+    },
+  };
+  ctl.onSectionsClick(evt);
+  expect(ctl.historyScope).toBe("file");
+  expect(ctl.collapsed.history).toBe(false);
+});
