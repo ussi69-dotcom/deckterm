@@ -519,6 +519,10 @@ class GitScmViewController {
       this._historyCtl = null;
     }
     if (!this._historyCtl) {
+      // Clear any stale empty-hint/markup so it doesn't linger above the freshly
+      // mounted history list (the controller appends its own root, it doesn't
+      // own the whole body).
+      body.innerHTML = "";
       this._historyPath = desiredPath;
       this._historyCtl = new ghv.GitHistoryViewController({
         document: this.doc,
