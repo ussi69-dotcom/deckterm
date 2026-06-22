@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
 
@@ -36,7 +36,7 @@ jobs:
           bun-version: 1.3.5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -75,7 +75,7 @@ jobs:
         run: git archive --format=tar.gz --output "deckterm-${{ steps.release.outputs.release_id }}.tgz" HEAD
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deckterm-release-${{ steps.release.outputs.release_id }}
           path: deckterm-${{ steps.release.outputs.release_id }}.tgz
@@ -83,7 +83,7 @@ jobs:
 
       - name: Upload deploy diagnostics on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deploy-check-artifacts-${{ github.run_id }}
           if-no-files-found: ignore
@@ -108,7 +108,7 @@ jobs:
 
     steps:
       - name: Download release artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: deckterm-release-${{ needs.verify-and-package.outputs.release_id }}
 
