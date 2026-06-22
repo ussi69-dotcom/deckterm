@@ -1,6 +1,141 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-06-16 viz sekce 0z**
+> **Datum:** 2026-05-29 · **Aktuální delta: 2026-06-20 viz sekce 0zz–0zx**
+
+## 0zz. Delta 2026-06-20 — IDE SCM + Explorer parity + Git History view
+
+Uzavření uživatelem nahlášených mezer v IDE Source-Control a Exploreru (design
+`docs/plans/2026-06-20-ide-scm-explorer-gaps-design.md`); výsledek: 21/21 smoke E2E
+zelených, +35 unit testů.
+
+**Bugy:**
+- Untracked-file diff byl prázdný → `git diff --no-index /dev/null <path>` fallback
+  (path-traversal gatován git status check restriktivním na repo root — `3b89a7b`).
+- Explorer breadcrumb 403'd pro cesty nad allowed root → scoped na workspace root.
+- `git status -uall` přidáno, aby soubory v netrackovaných adresářích listovaly
+  individuálně.
+
+**Features:**
+- VS Code-style **folder rollup dekorace** — `+N` na složkách se změnami.
+- **New File + Rename** v Exploreru (`allowMissing` na `PUT /api/files/content`;
+  rename endpoint už existoval).
+- Nový **Git History view** (`web/git-history-view.js`, commit `3b89a7b`): repo-wide
+  commit list s ASCII-lane gutterem + per-file scope toggle sledující aktivní editor
+  soubor; klik → commit diff tab. Per-file Timeline nyní surfacovaná v IDE SCM panelu
+  (`6ce25a3`).
+- Nový backend route `GET /api/git/commit-files?cwd&commit` → `git diff-tree
+  --name-status -r --root` (stejná leading-dash validace jako `/api/git/show`); repo-scope
+  commit row se **rozbalí na seznam souborů**, klik souboru otevře single-file commit diff
+  (`a212382`).
+
+**Live-test follow-up fixes** (`f2b4159`, `6108c21`):
+- `web/git-history-view.js` neměl `<script>` tag v `index.html` → `window.GitHistoryView`
+  nikdy nenačten; přidán tag + regresní guard v `bootstrap-scripts.test.js`.
+- `.file-item .file-actions` používal `opacity:0` (ne `display:none`) → hover-action
+  tlačítka rezervovala šířku řádku permanentně → jméno souboru zmizelo v úzkém IDE
+  sidebaru. Přepnuto na `display:none → flex` při hoveru.
+- Stale hint „Open a file…" při přepnutí na file scope: body nyní vyčištěno před
+  mountem controlleru.
+
+**Klíčové commity:** `3b89a7b`, `6ce25a3`, `ed37b61` (design), `f2b4159`, `6108c21`,
+`a212382`.
+
+---
+
+## 0zy. Delta 2026-06-18 → 2026-06-19 — IDE polish + povýšení do prod (PR #12)
+
+**IDE polish — post-umbrella follow-ups (`bad0d9f`, `44e8224`, `4761a21`):**
+
+- **Explorer auto-load:** `ensureIdeExplorerLoaded()` načte strom aktivního workspace
+  při vstupu do IDE módu / render / session switch — idempotentně; bez auto-load
+  byl explorer prázdný dokud uživatel netoggel legacy Files surface.
+- **IDE split (editor/terminál):** `.ide-main-column` vertikální split — editor taby
+  nahoře, terminál vždy dole (in-column `ns-resize` sash scoped na editor column, nelze
+  překrýt activity bar/sidebar). `#terminal-container` se PŘESOUVÁ (stejný DOM node,
+  žádný PTY/WebSocket teardown — kontrakt mode transition). Bez editor tabů terminál
+  vyplní celý sloupec.
+- **Mobil UX:** kompaktní single-row safe-area-aware extra-keys bar, když je virtuální
+  klávesnice otevřená; synthetic extra-key input snapne pohled zpět na prompt (vyjma
+  PgUp/PgDn).
+- **Single-click souboru** = preview tab (VS Code), ne jen select-only.
+- QoL: výška IDE splitu v `--ide-terminal-height` + `dock.ide` key (nezávisle na
+  sessions dock), dblclick sash = reset, extra-keys sekce si pamatuje collapsed/expanded.
+- 369 web unit testů zelené; ověřeno Playwrightem (DOM/CSS/geometrie).
+- **IDE zůstává desktop-only (≥768 px)** — mobil drží sheet-based UX.
+
+**Post-merge opravy (`3c575c4`, `b415092`, `ce8fe50`, `22aa937`):**
+- `fix(terminal)`: fallback na first allowed root, když je požadované cwd smazáno.
+- `fix(test)`: reset server settings KV v `resetAppState` — re-enable smoke E2E gate.
+- `ci`: smoke E2E non-blocking (temporary — CI harness vytvoří jen ~2 WS connections
+  na celý headless run; unit gate pokrývá korektnost).
+- `fix(test)`: hardening CI Playwright proti chromium `/dev/shm` crashům.
+
+**Povýšení do prod (PR #12, merge `3f9777f`, 2026-06-19):** 65+ commitů `dev` → `main`:
+VS Code-grade workspace (fáze 1–4), IDE shell (fáze 5), IDE + mobil UX polish.
+`Deploy Main` CI zelené; prod ověřen živě (release symlink + `deploy_release.sh`
+potvrdil `3f9777f`). Smoke E2E dočasně `continue-on-error` v CI; pruning 261 stale
+terminal/session záznamů na devu trackován v Backlogu.
+
+---
+
+## 0zx. Delta 2026-06-16 → 2026-06-18 — IDE shell fáze 5 (activity bar + sidebary + editor taby + terminál dole)
+
+Největší UI sprint projektu: 8 iterativních řezů, 25+ commitů. Výsledek: přepínatelné
+plnohodnotné IDE prostředí v prohlížeči, postavené nad VS Code-grade workspace (fáze 1–4).
+
+**Design a plan:** `128d613` (`docs/plans/2026-06-16-vscode-ide-shell-design.md`) +
+`fc34fc5` (Codex xhigh review hardening — 5 reálných rizik zachyceno a opraveno).
+
+**Řez 1 — ViewHost + FileExplorer adaptér** (`d368ade`, `7f78d5e`):  
+`ViewHost` kontrakt (mount/unmount/dispose lifecycle), FileExplorer jako ViewHost adaptér.
+Opravy: dispose race, store null-safety, explicitní DOM-ownership.
+
+**Řez 2 — IDE shell scaffold + mode toggle** (`520c1d0`, `3d22a11`):  
+IDE shell layout (activity bar + sidebar + editor area + bottom terminal), mode toggle
+`terminal ↔ IDE`. Opravy: focus preservation, lossless explorer state, surface-window
+layer, CSS gating.
+
+**Řez 3 — IDE Explorer pop-out/dock + persistence** (`3f1072a`, `b477749`):  
+Explorer může být undocked do plné šířky (layout.detached persistence). Opravy:
+detach-fallback flag rollback, manager-failure degrade.
+
+**Řez 4 — IDE editor area: file + diff taby** (`de40ac0`, `6a63ccd`, `94d8980`):  
+FileTab + DiffTab v editor area, revalidated `layout.editorTabs` restore. Opravy: diff
+restore revalidation, body/view leaks, dock reservation, explorer pin. Wire save +
+guard concurrent tab-mount view leak.
+
+**Řez 5 — VS Code SCM sidebar + activity-bar view registry** (`0ac8dcf`, `8cb314a`,
+`e2de709`):  
+Activity-bar view registry (ikony + sidebar mount/unmount), VS Code Source Control
+sidebar (`web/git-scm.js`). Diffy se otvírají jako editor taby. Opravy: unmount IDE
+secondary view on switch/collapse, single SCM render, robust SCM commit op.  
+Git security: `908f195` (accept `<sha>~N/^N` revision suffix v `/api/git/show`),
+`7b60d4b` (odmítnutí leading-dash refs — argv flag smuggling).
+
+**Řez 6 — Tasks sidebar** (`9f64bfb`, `cba752c`, `be0237e`):  
+Tasks jako activity-bar view. Security: escape quotes v IDE view HTML (stored-XSS v
+SCM/Tasks atributech, tasks render-sig, status class allowlist — `cba752c`); escape
+`commit.hash` v legacy git history (`be0237e`).
+
+**Řez 7 — Search sidebar + `/api/files/search`** (`26845d4`, `d2449cf`, `7e1bcfa`):  
+Search sidebar (Ctrl+Shift+F), bounded `POST /api/files/search` + open-at-line.
+Security hardening (Codex security pass): realpath-filter výsledků, server-side secret
+policy, absolute grep, null-delimited parse, audit + bound cwd (`d2449cf`). Broadened
+secret policy — `.gpg`, `.asc`, `.p8`, `.pgpass`, `.boto`, `.kube/`, `.docker/` dirs
+(`7e1bcfa`).
+
+**Řez 8 — Settings-as-tab + dirty-close guard + VS Code polish (finální)** (`73dfec5`,
+`1fee9c2`, `0d36a6c`):  
+Settings okno jako editor tab, dirty-close guard (unsaved file → confirm), VS Code
+polish. Revive legacy type-less editor-tab descriptors jako files + lock closeKey
+contract (pre-finalization — `1fee9c2`). Controller-level testy pro SCM view
+(dedup/commit/unsubscribe) + drop diff re-fetch on `GitManager.resize` (`0d36a6c`).
+
+**Klíčová vlastnost mode-switch:** `#terminal-container` se PŘESOUVÁ (stejný DOM node,
+žádný PTY/WebSocket teardown). Prior home je zachycen a obnoven při exitu z IDE módu.
+IDE mode: desktop-only (≥768 px); mobil drží sheet UX — bez mobile IDE.
+
+---
 
 ## 0z. Delta 2026-06-16 — VS Code-grade workspace HOTOVÝ (fáze 2 + 3 + 4)
 
@@ -419,6 +554,12 @@ Po "push to main" vždy ověř, že workflow **Deploy Main** prošel, než prohl
 
 ## 9. Roadmapa / co dál (backlog)
 
+**Hotové milestony (2026-06-19, PR #12 na prod):**
+- ✅ VS Code-grade workspace (fáze 1–4): surface windows, bottom dock, git SCM panel, explorer⇄git dekorace, settings UI
+- ✅ IDE shell (fáze 5): activity bar, Explorer/SCM/Tasks/Search sidebary, editor taby, bottom terminal panel
+- ✅ Git History view (repo + per-file scope, commit expand na soubory)
+- ✅ Smoke E2E dočasně non-blocking v CI (harness issue trackován v Backlogu)
+
 Explicitně **odloženo** (z foundation rozhodnutí — nestaví se teď):
 
 - Permission editor UI (správa grantů z UI)
@@ -447,7 +588,15 @@ Nejbližší logické pokračování po C2: dotáhnout multisession backlog (sek
 - `backend/task-runner.ts` — supervizovaný task runner.
 - `backend/onboarding-doctor.ts` — setup wizard / autoconfig asistent.
 - `backend/telemetry.ts` — agent badge klasifikace.
-- `web/app.js` — ~280k řádků frontendu (TileManager, TerminalManager, ReconnectingWebSocket, SessionRegistry).
+- `web/app.js` — ~10k řádků, hlavní frontend monolit (TileManager, TerminalManager, ReconnectingWebSocket, SessionRegistry, ExtraKeysManager). Extrahované moduly s co-located `*.test.js`: viz seznam níže.
+- `web/surface-windows.js` — přesouvatelná/resizovatelná/snappovatelná okna (fáze 1).
+- `web/settings-store.js` — klient pro `/api/settings`, localStorage fallback; actor-scoped.
+- `web/settings-schema.js` — deklarativní schema 13 nastavení (single source of truth pro UI + klíče + defaults).
+- `web/settings-runtime.js` — aplikuje settings side-effecty i bez otevřeného settings okna.
+- `web/git-history-view.js` — Git History view (repo + per-file scope, ASCII-lane gutter, lazy `/api/git/log`, commit expand).
+- `web/git-status-store.js` — sdílená cache git status + listener pro explorer dekorace i editor gutter.
+- `web/session-actions.js` — `planSessionRowAction` (focus/attach/open-here); `web/reconnect-classify.js` — `classifyReconnectFailure` (gone/blocked/retry).
+- `web/access-denied.js` — vysvětlitelné 403 (structured deny payloads).
 
 **Dokumenty:**
 
