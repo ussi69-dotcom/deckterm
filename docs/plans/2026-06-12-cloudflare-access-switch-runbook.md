@@ -88,6 +88,9 @@ Tyto dvě věci jdou s nočními commity na `dev` a týkají se prodů při př�
    pak `systemctl --user daemon-reload`). Bez toho každý restart služby zabije tmux server
    (child bunu v cgroupě) a s ním všechny "perzistentní" sessions. Dev unit už to má,
    šablona v `docs/install-dedicated-server.md` taky.
+   **Hotovo (2026-06-20):** prod `deckterm.service` má `KillMode=process` ověřeno živě
+   (`systemctl --user cat deckterm.service`). Tento bod je tedy splněný, nechávám ho tu
+   jako historický záznam akce.
 2. **Migrace tmux socketu** (commit `2618203`): socket se přesouvá z
    `/tmp/deckterm/deckterm_deckterm.sock` (sdílený dev+prod!) na
    `$DECKTERM_STATE_DIR/tmux/deckterm_deckterm.sock`. **Jednorázový dopad:** první start prodů

@@ -439,7 +439,7 @@ Nejbližší logické pokračování po C2: dotáhnout multisession backlog (sek
 
 **Kód:**
 
-- `backend/server.ts` — ~3.5k řádků, celý HTTP/WS povrch. Seamy: `createWebApp()`, `startWebServer()`, `reconcileSessionsOnStartup()`.
+- `backend/server.ts` — ~5.3k řádků, celý HTTP/WS povrch. Seamy: `createWebApp()`, `startWebServer()`, `reconcileSessionsOnStartup()`.
 - `backend/services/foundation-state.ts` — DB, migrace, granty, sessions, audit.
 - `backend/services/foundation-authorization.ts` — autorizační rozhodnutí, route registry.
 - `backend/services/foundation-actors.ts` — Cloudflare Access → aktér.
@@ -447,7 +447,7 @@ Nejbližší logické pokračování po C2: dotáhnout multisession backlog (sek
 - `backend/task-runner.ts` — supervizovaný task runner.
 - `backend/onboarding-doctor.ts` — setup wizard / autoconfig asistent.
 - `backend/telemetry.ts` — agent badge klasifikace.
-- `web/app.js` — ~280k řádků frontendu (TileManager, TerminalManager, ReconnectingWebSocket, SessionRegistry).
+- `web/app.js` — ~12k řádků frontendu (TileManager, TerminalManager, ReconnectingWebSocket, SessionRegistry).
 
 **Dokumenty:**
 
