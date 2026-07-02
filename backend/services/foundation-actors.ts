@@ -4,10 +4,7 @@ export type DeckTermActor = {
   id: string;
   email: string;
   source:
-    | "cloudflare_access"
-    | "cloudflare_tunnel"
-    | "tunnel_default"
-    | "legacy_dev";
+    "cloudflare_access" | "cloudflare_tunnel" | "tunnel_default" | "legacy_dev";
 };
 
 export type ActorResolutionResult =
