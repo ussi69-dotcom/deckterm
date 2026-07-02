@@ -822,6 +822,16 @@ export function isBootstrapComplete(state: FoundationState): boolean {
   return state.bootstrap.bootstrapped;
 }
 
+export function getUserById(
+  db: Database,
+  userId: string,
+): { id: string; email: string | null; role: string } | null {
+  const row = db
+    .query("SELECT id, email, role FROM users WHERE id = ?")
+    .get(userId) as { id: string; email: string | null; role: string } | null;
+  return row || null;
+}
+
 export async function bootstrapFirstAdmin({
   state,
   stateDir,

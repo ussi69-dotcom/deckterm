@@ -46,6 +46,7 @@ import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
   getTerminalSession,
+  getUserById,
   getUserSettings,
   hasScopedGrant,
   initializeFoundationState,
@@ -927,6 +928,131 @@ function foundationGateJson(error: {
       "The current user is missing the required DeckTerm capability grant.",
     ...structured,
   };
+}
+
+// Onboarding apply/remediate rewrite the server's .env — gate them to
+// owner/admin actors and audit every attempt (allow and deny), mirroring
+// requireFoundationCapability's trust model (legacy bypass + edge-trusted
+// tunnel mode keep single-tenant installs working unchanged).
+async function requireOnboardingAdmin(
+  c: any,
+  action: "onboarding.apply" | "onboarding.remediate",
+  data: Record<string, unknown> = {},
+): Promise<{ ok: true } | { ok: false; status: 401 | 403; body: any }> {
+  const resourceId =
+    (data.remediationId as string | undefined) ||
+    (data.profile as string | undefined) ||
+    null;
+
+  let ownerId: string;
+  try {
+    ({ ownerId } = getCurrentUser(c));
+  } catch (err) {
+    if (err instanceof UnauthorizedRequestError) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: null,
+        action,
+        resourceType: "onboarding",
+        resourceId,
+        decision: "deny",
+        reason: "unauthenticated",
+        data,
+      });
+      return { ok: false, status: 401, body: { error: err.message } };
+    }
+    throw err;
+  }
+
+  if (isFoundationLegacyBypassEnabled()) {
+    const state = await getFoundationState();
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType: "onboarding",
+      resourceId,
+      decision: "allow",
+      reason: "legacy_bypass",
+      data,
+    });
+    return { ok: true };
+  }
+
+  if (isEdgeProtectedTunnelMode(process.env)) {
+    const state = await getFoundationState();
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType: "onboarding",
+      resourceId,
+      decision: "allow",
+      reason: "edge_trusted_tunnel",
+      data,
+    });
+    return { ok: true };
+  }
+
+  const state = await getFoundationState();
+
+  if (!isBootstrapComplete(state)) {
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType: "onboarding",
+      resourceId,
+      decision: "deny",
+      reason: "bootstrap_required",
+      data: {
+        ...data,
+        bootstrapMode: state.bootstrap.mode,
+        bootstrapTokenPath: state.bootstrap.tokenPath,
+      },
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm bootstrap required",
+        reason: "bootstrap_required",
+        resourceType: "onboarding",
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  const user = getUserById(state.db, ownerId);
+  if (!user || (user.role !== "owner" && user.role !== "admin")) {
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType: "onboarding",
+      resourceId,
+      decision: "deny",
+      reason: "missing_role",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm admin role required",
+        reason: "missing_role",
+        resourceType: "onboarding",
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  writeAuditEvent(state.db, {
+    actorUserId: ownerId,
+    action,
+    resourceType: "onboarding",
+    resourceId,
+    decision: "allow",
+    reason: "role_admin",
+    data,
+  });
+  return { ok: true };
 }
 
 function ensureTerminalSessionRecorded(state: FoundationState, term: Terminal) {
@@ -2732,6 +2858,13 @@ export function createWebApp() {
 
   app.post("/api/onboarding/apply", async (c) => {
     const body = await c.req.json().catch(() => ({}));
+    const gate = await requireOnboardingAdmin(c, "onboarding.apply", {
+      profile: body.profile,
+      publicOrigin: body.publicOrigin,
+    });
+    if (!gate.ok) {
+      return c.json(gate.body, gate.status as never);
+    }
     return c.json(
       await applyOnboardingProfile({
         profile: body.profile,
@@ -2748,6 +2881,14 @@ export function createWebApp() {
     const remediationId = String(body.remediationId || "").trim();
     if (!remediationId) {
       return c.json({ error: "remediationId is required" }, 400);
+    }
+    const gate = await requireOnboardingAdmin(c, "onboarding.remediate", {
+      remediationId,
+      profile: body.profile,
+      publicOrigin: body.publicOrigin,
+    });
+    if (!gate.ok) {
+      return c.json(gate.body, gate.status as never);
     }
     const result = await applyOnboardingRemediation(remediationId, {
       profile: body.profile,
