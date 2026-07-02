@@ -360,6 +360,36 @@ test("commit() with empty/whitespace message does not call commitWith", async ()
   expect(statusEl.textContent).toBe("Commit message required");
 });
 
+// ── (1b) refresh() re-resolves the live cwd every call (no more freeze) ─────
+
+test("refresh() re-resolves the live cwd on every call instead of freezing on the first value", async () => {
+  // gm.state.cwd starts pre-set to a STALE value (simulating a panel that
+  // already mounted once against the wrong directory) — the old guard
+  // (`if (!gm.state?.cwd && !gm.currentCwd)`) would never touch it again.
+  const gm = makeFakeGm({ cwd: "/home/deploy" });
+  gm.currentCwd = "/home/deploy";
+  let liveCwd = "/repo";
+  const ctl = new GitScmViewController({
+    document: makeFakeDoc(),
+    getGitManager: () => gm,
+    getStatusStore: () => makeFakeStore(),
+    getTerminalManager: () => ({ getGitCwd: () => liveCwd }),
+  });
+  const container = makeFakeEl();
+  ctl.mount(container);
+
+  await ctl.refresh();
+  expect(gm.state.cwd).toBe("/repo");
+  expect(gm.currentCwd).toBe("/repo");
+
+  // Explorer navigation moves the live cwd again — a second refresh() must
+  // pick it up (not stay frozen at "/repo").
+  liveCwd = "/repo2";
+  await ctl.refresh();
+  expect(gm.state.cwd).toBe("/repo2");
+  expect(gm.currentCwd).toBe("/repo2");
+});
+
 // ── (4) History section ───────────────────────────────────────────────────────
 
 test("skeletonHtml() contains the History section markup above Branches", () => {

@@ -2798,6 +2798,10 @@ class GitManager {
     };
     // Keep currentCwd for backward compatibility with existing methods
     this.currentCwd = null;
+    // Monotonic refresh() generation: a slow response from a superseded
+    // refresh() (stale cwd) must not clobber the state/DOM a newer refresh()
+    // already wrote. See refresh() below.
+    this._refreshGeneration = 0;
     this.init();
   }
 
@@ -3184,7 +3188,14 @@ class GitManager {
   }
 
   async show(cwd) {
-    this.state.cwd = cwd || document.getElementById("directory")?.value || "~";
+    // An explicit cwd arg still wins (existing call sites always pass the
+    // active workspace's cwd); otherwise resolve the canonical LIVE cwd
+    // (explorer path / active workspace) instead of trusting a stale DOM read.
+    this.state.cwd =
+      cwd ||
+      window.terminalManager?.getGitCwd?.() ||
+      document.getElementById("directory")?.value ||
+      "~";
     this.currentCwd = this.state.cwd; // Keep backward compatibility
     this.panel.classList.remove("hidden");
     this.state.selectedIndex = 0;
@@ -3250,23 +3261,46 @@ class GitManager {
   }
 
   async refresh() {
-    if (!this.state.cwd && !this.currentCwd) return;
-    const cwd = this.state.cwd || this.currentCwd;
+    // Resolve the cwd LIVE every call — explorer navigation / a committed
+    // working-dir field change moves the canonical cwd AFTER this panel first
+    // mounted, and trusting the cached state.cwd is exactly the stuck-cwd bug
+    // (the old set-once guard). Falls back to the cached field only when no
+    // live source is available (e.g. GitManager used standalone in a test).
+    const tm = window.terminalManager;
+    const liveCwd = tm?.getGitCwd?.();
+    const cwd = liveCwd || this.state.cwd || this.currentCwd;
+    if (!cwd) return;
+    this.state.cwd = cwd;
+    this.currentCwd = cwd;
     this.state.loading = true;
 
+    // Monotonic generation guard: if a NEWER refresh() starts before this one's
+    // network round trips land, this (now-stale) call must not clobber the
+    // newer state it would otherwise overwrite.
+    const generation = ++this._refreshGeneration;
+    const stale = () => generation !== this._refreshGeneration;
+
     try {
-      // Fetch status
-      const statusRes = await fetch(
-        `/api/git/status?cwd=${encodeURIComponent(cwd)}`,
-      );
-      const statusData = await statusRes.json();
+      // Fetch status through the shared, deduping GitStatusStore instead of a
+      // raw fetch. refreshStatus() force-refetches + repopulates the cache +
+      // EMITS onChange (the IDE SCM view's subscriber re-renders from it) — the
+      // same effect the old separate force-refresh call below used to produce
+      // as a SECOND, redundant fetch; that call is gone (see below).
+      const statusData = tm?.gitStatusStore
+        ? await tm.gitStatusStore.refreshStatus(cwd)
+        : await fetch(`/api/git/status?cwd=${encodeURIComponent(cwd)}`).then(
+            (r) => r.json(),
+          );
+      if (stale()) return;
 
       if (statusData.error) {
+        this.state.error = statusData.error;
         this.panel.querySelector("#git-branch").textContent = "not a repo";
         this.panel.querySelector("#git-files").innerHTML =
           `<p class="error">${this.escapeHtml(statusData.error)}</p>`;
         return;
       }
+      this.state.error = null;
 
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
@@ -3299,21 +3333,20 @@ class GitManager {
         }
       }
 
-      // Keep explorer git decorations + the IDE SCM view in sync with the panel:
-      // force-refresh the shared status cache (which EMITS onChange so the SCM
-      // view's subscriber re-renders), then re-derive explorer decorations. The
-      // force read repopulates the cache the decoration pass reuses.
-      const tm = window.terminalManager;
-      if (tm?.gitStatusStore) {
-        void tm.gitStatusStore.refreshStatus(cwd);
-        void tm.refreshExplorerDecorations();
-      }
+      // Keep explorer git decorations in sync with the panel. The store's
+      // refreshStatus() above already repopulated the cache + emitted
+      // onChange, so this just re-derives decorations from the now-fresh
+      // cache (no extra network call).
+      if (tm) void tm.refreshExplorerDecorations();
+
+      if (stale()) return;
 
       // Fetch commit history
       const logRes = await fetch(
         `/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=30`,
       );
       const logData = await logRes.json();
+      if (stale()) return;
 
       if (!logData.error) {
         this.state.commits = logData.commits || [];
@@ -3325,6 +3358,8 @@ class GitManager {
         `/api/git/stash?cwd=${encodeURIComponent(cwd)}`,
       );
       const stashData = await stashRes.json();
+      if (stale()) return;
+
       if (!stashData.error) {
         this.state.stashes = stashData.stashes || [];
         this.renderStashes();
@@ -3332,7 +3367,7 @@ class GitManager {
     } catch (err) {
       console.error("Git refresh error:", err);
     } finally {
-      this.state.loading = false;
+      if (!stale()) this.state.loading = false;
     }
   }
 
@@ -4880,6 +4915,9 @@ class TerminalManager {
         force: true,
         userDraft: true,
       });
+      // Committed value (change = blur/Enter commit for text inputs) — unlike
+      // the input-event draft handler above, this one navigates.
+      void this.commitWorkingDirectory(event.target.value);
     });
     this.toolsSheetDirectoryInput?.addEventListener("input", (event) => {
       this.setDirectoryValue(event.target.value, {
@@ -4892,6 +4930,7 @@ class TerminalManager {
         force: true,
         userDraft: true,
       });
+      void this.commitWorkingDirectory(event.target.value);
     });
 
     // Toolbar action buttons
@@ -8952,6 +8991,38 @@ class TerminalManager {
     };
   }
 
+  // Canonical LIVE cwd for the Git panel/SCM view — the single authoritative
+  // source both the classic Git window and the IDE SCM view must resolve on
+  // EVERY refresh (never cache once). Prefers the file explorer's live current
+  // path (the most specific, user-navigated location); falls back to the
+  // active workspace's terminal cwd when the explorer hasn't been opened yet.
+  getGitCwd() {
+    return (
+      this.fileExplorer?.currentPath || this.getActiveWorkspaceContext().cwd
+    );
+  }
+
+  // A COMMITTED working-dir value (change/Enter on the toolbar field, or a
+  // Browse-picker selection — never a raw keystroke draft) atomically drives
+  // explorer navigation + a git refresh, alongside the files.defaultCwd
+  // persistence the call sites already do via setDirectoryValue(). One
+  // authoritative cwd source driving explorer + git + new-terminal default,
+  // per the VS Code-grade workspace plan's cwd invariant.
+  async commitWorkingDirectory(value) {
+    const cwd = this.normalizeWorkspaceCwd(value);
+    if (!cwd) return;
+
+    const { workspaceId } = this.getActiveWorkspaceContext();
+    if (this.fileExplorer && workspaceId) {
+      if (this.fileExplorer.currentWorkspaceId !== workspaceId) {
+        this.fileExplorer.openForWorkspace(workspaceId, cwd);
+      }
+      await this.fileExplorer.loadDir(cwd, workspaceId);
+    }
+
+    await window.gitManager?.refresh();
+  }
+
   // Fetch git status for the explorer's current directory (via the shared
   // store), build the decoration map (git-decorations.js), and set it on the
   // explorer snapshot so rows render status badges/colors. Silently skips when
@@ -12223,6 +12294,7 @@ class TerminalManager {
     const dir = this.selectedDir || this.currentDirPath;
     if (dir) {
       this.setDirectoryValue(dir, { force: true });
+      void this.commitWorkingDirectory(dir);
     }
     this.closeDirPicker();
   }

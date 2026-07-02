@@ -254,14 +254,14 @@ class GitScmViewController {
   async refresh() {
     const gm = this.gitManager;
     if (!gm) return;
-    // Ensure the GitManager has a cwd to work with (the active workspace).
-    if (!gm.state?.cwd && !gm.currentCwd) {
-      const tm = this.terminalManager;
-      const cwd = tm?.getActiveWorkspaceContext?.()?.cwd;
-      if (cwd) {
-        gm.state.cwd = cwd;
-        gm.currentCwd = cwd;
-      }
+    // Re-resolve the LIVE cwd on EVERY refresh (not just when gm has none set)
+    // — this used to only fire once, so after the first (often wrong) value it
+    // never updated and the panel froze on the initial cwd. getGitCwd() is the
+    // canonical source (explorer path, falling back to the active workspace).
+    const cwd = this.terminalManager?.getGitCwd?.();
+    if (cwd) {
+      if (gm.state) gm.state.cwd = cwd;
+      gm.currentCwd = cwd;
     }
     try {
       await gm.refresh();
@@ -379,7 +379,7 @@ class GitScmViewController {
       syncEl.textContent = parts.join(" ");
     }
 
-    this.renderTree(groups, scm);
+    this.renderTree(groups, scm, gm.state?.error || null);
     this.renderHistory();
     this.renderBranches(gm);
     this.renderStashes(gm);
@@ -403,6 +403,7 @@ class GitScmViewController {
         branch: branches.current || "",
         ahead: sync.ahead || 0,
         behind: sync.behind || 0,
+        error: gm.state?.error || "",
         staged: fileSig(groups.staged),
         changes: fileSig(groups.changes),
         untracked: fileSig(groups.untracked),
@@ -418,9 +419,17 @@ class GitScmViewController {
     }
   }
 
-  renderTree(groups, scm) {
+  renderTree(groups, scm, errorMessage) {
     const tree = this.q(".ide-scm-tree");
     if (!tree) return;
+    // A status-fetch error (most commonly "Not a git repository") must show a
+    // distinct banner — NOT the silent "No changes" empty state the classic
+    // Git window would never show in this situation. Mirrors the classic
+    // window's `.error` red banner (reuses that existing shared class).
+    if (errorMessage) {
+      tree.innerHTML = `<p class="error">${this.esc(errorMessage)}</p>`;
+      return;
+    }
     const sections = scmSections(groups);
     const total = scmTotalCount(groups);
     if (total === 0) {
