@@ -5014,14 +5014,13 @@ class TerminalManager {
       this.fileExplorer.onDirLoaded = () =>
         void this.refreshExplorerDecorations();
     }
-    // The controller's own close button only hides the explorer content; in
-    // windowed mode the hosting SurfaceWindow has to close with it.
-    document
-      .getElementById("file-explorer-close")
-      ?.addEventListener("click", () => {
-        this.surfaceWindowManager?.close("files");
-        this.syncSurfaceButtonState();
-      });
+    // Both the header × and footer Close button route through the
+    // controller's onRequestClose hook so they both run the full
+    // closeFileExplorer() chokepoint (content + hosting SurfaceWindow +
+    // right-surface bookkeeping) instead of only hiding the panel content.
+    if (this.fileExplorer) {
+      this.fileExplorer.onRequestClose = () => this.closeFileExplorer();
+    }
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
@@ -5832,12 +5831,15 @@ class TerminalManager {
     if (this.directoryInput && this.directoryInput.value !== next) {
       this.directoryInput.value = next;
     }
+    if (this.directoryInput) this.directoryInput.title = next;
     if (
       this.toolsSheetDirectoryInput &&
       this.toolsSheetDirectoryInput.value !== next
     ) {
       this.toolsSheetDirectoryInput.value = next;
     }
+    if (this.toolsSheetDirectoryInput)
+      this.toolsSheetDirectoryInput.title = next;
     // Persist the last directory as the canonical files.defaultCwd. Write
     // directly to the store (NOT via runtime.apply) to avoid re-dispatching the
     // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
@@ -7878,7 +7880,7 @@ class TerminalManager {
         title: "Search in Terminal",
         group: "Views",
         keywords: ["find", "search", "terminal"],
-        run: () => this.toggleSearch(),
+        run: () => this.openTerminalSearch(),
       },
       {
         id: "toggle-line-wrap",
@@ -9085,9 +9087,27 @@ class TerminalManager {
   isWindowedSurfaces() {
     return (
       !platformDetector.isMobile &&
-      window.innerWidth >= 768 &&
+      (window.SurfaceWindows?.isDesktopSurfaceWidth?.(window.innerWidth) ??
+        window.innerWidth >= 768) &&
       Boolean(window.SurfaceWindows?.SurfaceWindowManager)
     );
+  }
+
+  // isWindowedSurfaces() is only consulted at window-OPEN time, but
+  // PlatformDetector fires on every resize. Without this, a floating
+  // SurfaceWindow opened on desktop stays open (and overflows the viewport,
+  // CSS min-width and all) after the viewport shrinks below the desktop
+  // breakpoint. Closing here reuses each surface's own close chokepoint so
+  // right-surface bookkeeping / aria / persisted layout all stay consistent.
+  // No-op on desktop (isWindowedSurfaces() true) and a no-op per surface that
+  // isn't open (each close path already tolerates being called when closed).
+  reconcileSurfaceWindowsForViewport() {
+    if (this.isWindowedSurfaces()) return;
+    this.closeFileExplorer?.();
+    this.closeGitPanel?.();
+    this.surfaceWindowManager?.close("tasks");
+    this.surfaceWindowManager?.close("settings");
+    this.fileEditor?.close();
   }
 
   async ensureSurfaceWindowManager() {
@@ -9159,12 +9179,44 @@ class TerminalManager {
     });
   }
 
+  // Pixel floor for the IDE terminal panel's height so it always fits the
+  // invariant minimum of 24 rows (bug A3c) — computed from live cell metrics
+  // when a terminal is mounted, falling back to a conservative estimate
+  // otherwise (see measureTerminalCellSize). `chrome` accounts for the
+  // panel's border-top plus the terminal's own vertical padding
+  // (TERMINAL_PADDING_Y), PLUS one extra cell of headroom: the renderer's
+  // row-fit floors against real tile chrome that measurement can't see
+  // (observed ~10px beyond padding+border), and without the margin the floor
+  // lands exactly one row short (23 rows, live-measured at 1440x900).
+  getIdeTerminalPanelMinHeightPx() {
+    const cellMetrics = this.measureTerminalCellSize();
+    const cellHeight = cellMetrics?.cellHeight || 0;
+    return (
+      window.TerminalSizing?.minPanelHeightPx?.({
+        cellHeight,
+        chrome: TERMINAL_PADDING_Y + 1 + Math.ceil(cellHeight || 20),
+      }) ?? 0
+    );
+  }
+
   // Push the persisted IDE terminal-panel height into its CSS var (read by the
   // has-tabs split rule). Independent of the sessions dock's --dock-height.
+  // The stored percentage is clamped against a live pixel floor here — not
+  // rewritten into this.ideDockHeightPct — so neither the 35% default nor a
+  // sash drag that lands below it can ever render fewer than 24 rows
+  // (bug A3c; this is the single choke point both paths go through).
   applyIdeDockHeight() {
-    document
-      .getElementById("workspace-area")
-      ?.style.setProperty("--ide-terminal-height", `${this.ideDockHeightPct}%`);
+    const area = document.getElementById("workspace-area");
+    if (!area) return;
+    const colHeightPx =
+      this.ideShell?.mainColumnEl?.getBoundingClientRect?.().height || 0;
+    const pct =
+      window.TerminalSizing?.clampPanelHeightPercent?.({
+        pct: this.ideDockHeightPct,
+        containerHeightPx: colHeightPx,
+        minHeightPx: this.getIdeTerminalPanelMinHeightPx(),
+      }) ?? this.ideDockHeightPct;
+    area.style.setProperty("--ide-terminal-height", `${pct}%`);
   }
 
   // Reset the IDE terminal-panel split to the default height (double-click the
@@ -9259,6 +9311,11 @@ class TerminalManager {
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
     platformDetector.onChange(() => this.syncIdeAffordance());
+    // A floating SurfaceWindow is only closed/converted at open time
+    // (isWindowedSurfaces()) — without this, one left open on desktop
+    // survives a resize below the 768px breakpoint and overflows the mobile
+    // viewport (A4a).
+    platformDetector.onChange(() => this.reconcileSurfaceWindowsForViewport());
     void this.settingsReady.then(async () => {
       window.IdeShell.migrateLayoutState(this.settingsStore);
       // The Explorer can restore directly into a detached floating window on
@@ -9736,6 +9793,10 @@ class TerminalManager {
   // there aren't two settings UIs simultaneously (Codex fix 7).
   onEnterIdeMode() {
     this.surfaceWindowManager?.close("settings");
+    // The scrollback-search overlay is positioned relative to the active
+    // terminal's tile, which the IDE reflow can detach/resize mid-session —
+    // close it rather than let it float over stale geometry (bug A2).
+    this.closeTerminalSearch();
     this.applyIdeDockHeight();
     this.ensureIdeExplorerLoaded();
   }
@@ -9744,7 +9805,12 @@ class TerminalManager {
   // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
   // element). The explorer's prior state is restored via restoreExplorerPresentation.
   // We do NOT auto-spawn a SurfaceWindow for settings on exit (Codex fix 7).
-  onExitIdeMode() {}
+  onExitIdeMode() {
+    // Same rationale as onEnterIdeMode: the terminal reparents back to the
+    // TileManager layout, so any open search overlay must be disposed rather
+    // than left bound to a container it's about to leave.
+    this.closeTerminalSearch();
+  }
 
   // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
   // active workspace's directory itself (the legacy Files surface is what loads it
@@ -9917,6 +9983,17 @@ class TerminalManager {
       this.settingsStore?.set("dock.ide", {
         heightPct: this.ideDockHeightPct,
       });
+      // Per-move work above only sets the CSS var + fires a debounced
+      // synthetic `resize` (window listener refits just the ACTIVE terminal,
+      // 150ms later, and never calls refresh()). That leaves a gap where a
+      // fast drag-and-release can settle on a stale/corrupted paint for any
+      // terminal that isn't the active one. Explicitly run the full
+      // fit -> resize(force) -> refresh sequence for every currently visible
+      // terminal right now instead of relying on that debounce (bug A3b).
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
     };
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onEnd);
@@ -10147,7 +10224,7 @@ class TerminalManager {
       }
       if (e.ctrlKey && e.key === "f") {
         e.preventDefault();
-        this.toggleSearch();
+        this.openTerminalSearch();
       }
       if (e.key === "F11") {
         e.preventDefault();
@@ -10343,7 +10420,7 @@ class TerminalManager {
 
     const sizeWarning = document.createElement("div");
     sizeWarning.className = "size-warning";
-    sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
+    sizeWarning.textContent = "Terminal too small. Minimum size: 60x16";
     element.parentElement.appendChild(sizeWarning);
 
     // Build debug overlay with DOM methods (safe, no innerHTML)
@@ -11455,6 +11532,14 @@ class TerminalManager {
         t.fitFrame = 0;
         try {
           this.fitTerminalState(t);
+          // fitTerminalState only recomputes cols/rows and tells the PTY —
+          // it does NOT repaint the buffer. Every other resize path in this
+          // file (performReconnectLayoutSync, scheduleTerminalMetricStabilization,
+          // toggleFullscreen) follows fit with an explicit refresh; this was the
+          // one ResizeObserver-driven path that skipped it, which let a resize
+          // mid-drag (IDE sash, dock sash) leave stale/corrupted glyph rows
+          // until something else happened to repaint (bug A3a).
+          t.terminal.refresh(0, Math.max(0, t.terminal.rows - 1));
 
           // Match compact chrome behavior to the same width-based breakpoint as CSS.
           // A narrow layout should not inherit desktop-only minimum-size warnings
@@ -11472,10 +11557,14 @@ class TerminalManager {
           const sessionsDocked =
             document.body.classList.contains("sessions-docked");
           if (t.sizeWarning) {
-            t.sizeWarning.classList.toggle(
-              "visible",
-              isTooSmall && !usesCompactLayout && !sessionsDocked,
-            );
+            const showWarning =
+              isTooSmall && !usesCompactLayout && !sessionsDocked;
+            t.sizeWarning.classList.toggle("visible", showWarning);
+            if (showWarning) {
+              // Keep the warning copy honest — render the ACTUAL thresholds
+              // used above instead of a hardcoded string that can drift.
+              t.sizeWarning.textContent = `Terminal too small. Minimum size: ${minCols}x${minRows}`;
+            }
           }
 
           // Always send resize - terminal will work even if small
@@ -11552,7 +11641,7 @@ class TerminalManager {
 
       const sizeWarning = document.createElement("div");
       sizeWarning.className = "size-warning";
-      sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
+      sizeWarning.textContent = "Terminal too small. Minimum size: 60x16";
       element.parentElement.appendChild(sizeWarning);
 
       // Build debug overlay with DOM methods (safe, no innerHTML)
@@ -12204,13 +12293,6 @@ class TerminalManager {
         this.fitTerminalState(active);
         this.syncTerminalSize(this.activeId);
       }, 100);
-  }
-
-  toggleSearch() {
-    const searchBar = document.getElementById("search-bar");
-    searchBar?.classList.toggle("hidden");
-    if (!searchBar?.classList.contains("hidden"))
-      document.getElementById("search-input")?.focus();
   }
 
   async openDirPicker() {

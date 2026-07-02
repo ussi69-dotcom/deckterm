@@ -1108,6 +1108,9 @@ body.touch-input-mode .xterm .composition-view.active {
   border-radius: 6px;
   color: var(--text-primary);
   font-size: 12px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .dir-input input:focus {
@@ -1212,6 +1215,9 @@ body.touch-input-mode .xterm .composition-view.active {
   background: rgba(255, 255, 255, 0.03);
   color: var(--text-primary);
   font-size: 13px;
+  text-overflow: ellipsis;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
 .tools-sheet-directory:focus {
@@ -2621,44 +2627,6 @@ body.touch-input-mode .xterm .composition-view.active {
   }
 }
 
-/* =============================================================================
-   SEARCH BAR
-   ============================================================================= */
-
-.search-bar {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  background: var(--bg-secondary);
-  border-top: 1px solid var(--border-primary);
-}
-
-.search-bar.hidden {
-  display: none;
-}
-
-.search-bar input {
-  flex: 1;
-  padding: 6px 10px;
-  background: var(--bg-primary);
-  border: 1px solid var(--border-primary);
-  border-radius: 6px;
-  color: var(--text-primary);
-  font-size: 13px;
-}
-
-.search-bar input:focus {
-  outline: none;
-  border-color: var(--accent-blue);
-}
-
-#search-count {
-  font-size: 12px;
-  color: var(--text-muted);
-  min-width: 60px;
-}
-
 .btn-icon-action-palette {
   border-color: rgba(88, 166, 255, 0.24);
   color: var(--accent-blue);
@@ -3011,6 +2979,7 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .file-item {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -3050,11 +3019,29 @@ body.touch-input-mode .xterm .composition-view.active {
 .file-item .file-actions {
   display: none;
   gap: 4px;
-  flex: 0 0 auto;
+  /* Overlay, not flex flow: 4 non-shrinking buttons in the row's flex flow
+     forced .file-name (flex:1, basis 0%) down to a sliver ("o.") once the
+     row got narrow. Positioning them out-of-flow means the name keeps the
+     row's full width and only visually cedes space on hover/focus. */
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-tertiary);
+  padding: 2px 4px;
+  border-radius: 4px;
 }
 
-.file-item:hover .file-actions {
+.file-item:hover .file-actions,
+.file-item:focus-within .file-actions {
   display: flex;
+}
+
+/* Actions overlay the size column too, so hide it out of the way rather than
+   let it collide with the buttons. */
+.file-item:hover .file-size,
+.file-item:focus-within .file-size {
+  display: none;
 }
 
 .file-item .file-actions button {
@@ -4250,10 +4237,13 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   opacity: 1;
 }
 
-/* Size warning for too-small containers */
+/* Size warning for too-small containers. Pinned to the TOP edge (not bottom):
+   the shell prompt lives on the terminal's last row, so a bottom-anchored
+   banner painted directly over it (bug A3d). pointer-events: none so it never
+   swallows clicks/drags meant for the terminal underneath. */
 .size-warning {
   position: absolute;
-  bottom: 8px;
+  top: 8px;
   left: 8px;
   right: 8px;
   padding: 8px 12px;
@@ -4264,6 +4254,7 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   color: var(--accent-red);
   z-index: 50;
   display: none;
+  pointer-events: none;
 }
 
 .size-warning.visible {
@@ -5212,6 +5203,17 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   inset: 0;
   pointer-events: none;
   z-index: 640;
+}
+
+/* Defense-in-depth for A4a: floating SurfaceWindows are desktop-only
+   (TerminalManager.reconcileSurfaceWindowsForViewport closes them on the JS
+   side when the viewport crosses below 768px). This backstops that with a
+   pure-CSS guarantee that no surface window can ever contribute to page
+   scrollWidth on a narrow viewport, even before/without the JS reconcile. */
+@media (max-width: 767px) {
+  #surface-windows-layer {
+    display: none;
+  }
 }
 
 .surface-window {

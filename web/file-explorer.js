@@ -275,7 +275,15 @@ class FileExplorerController {
     this._boundNewFileClick = null;
     this._boundRefreshClick = null;
 
-    this.handleClose = this.close.bind(this);
+    // Both close controls (header × and footer Close) route through this
+    // single handler. When the host (app.js) wires onRequestClose, that
+    // callback owns closing the surrounding chrome (e.g. the SurfaceWindow)
+    // in addition to the controller's own close(); otherwise this falls back
+    // to close() alone (e.g. mobile sheet mode has no host to notify).
+    this.handleClose = () =>
+      typeof this.onRequestClose === "function"
+        ? this.onRequestClose()
+        : this.close();
     this.handleBackdropClick = this.handleBackdropClick.bind(this);
     this.handleUpload = this.handleUpload.bind(this);
     this.handleDragOver = this.handleDragOver.bind(this);

@@ -100,12 +100,74 @@ function normalizeTerminalGrid({
   };
 }
 
+// Conservative cell-height estimate (px) used only when no terminal is
+// mounted yet and no live renderer metrics are available — deliberately a bit
+// generous so the resulting minimum height errs large rather than letting a
+// panel render under the row floor.
+const DEFAULT_MIN_PANEL_CELL_HEIGHT = 20;
+const DEFAULT_MIN_PANEL_ROWS = 24;
+
+// Pure pixel-height floor for a terminal panel that must fit at least
+// `minRows` rows at the given cell height, plus any non-terminal chrome
+// (borders, internal padding) the caller measured around it. Never throws on
+// bad input — falls back to a conservative cell-height estimate so callers
+// can use it unconditionally during a resize/drag without guarding first.
+function minPanelHeightPx({
+  cellHeight = 0,
+  minRows = DEFAULT_MIN_PANEL_ROWS,
+  chrome = 0,
+  fallbackCellHeight = DEFAULT_MIN_PANEL_CELL_HEIGHT,
+} = {}) {
+  const safeMinRows = Math.max(1, Number(minRows) || DEFAULT_MIN_PANEL_ROWS);
+  const safeChrome = Math.max(0, Number(chrome) || 0);
+  const numericCellHeight = Number(cellHeight);
+  const safeCellHeight =
+    Number.isFinite(numericCellHeight) && numericCellHeight > 0
+      ? numericCellHeight
+      : Math.max(
+          1,
+          Number(fallbackCellHeight) || DEFAULT_MIN_PANEL_CELL_HEIGHT,
+        );
+
+  return safeMinRows * safeCellHeight + safeChrome;
+}
+
+// Clamp a candidate panel-height percentage so it never resolves to fewer
+// pixels than `minHeightPx` against the given container height, without ever
+// exceeding `maxPct`. Pure — the caller supplies live geometry (container
+// height, computed pixel floor); this only does the percent arithmetic, which
+// is what makes both the default height and the sash-drag minimum go through
+// one testable code path (bug A3c).
+function clampPanelHeightPercent({
+  pct = 0,
+  containerHeightPx = 0,
+  minHeightPx = 0,
+  maxPct = 100,
+} = {}) {
+  const safeMaxPct = Math.max(0, Number(maxPct) || 100);
+  const safePct = Math.min(safeMaxPct, Math.max(0, Number(pct) || 0));
+  const safeContainerHeightPx = Math.max(0, Number(containerHeightPx) || 0);
+  const safeMinHeightPx = Math.max(0, Number(minHeightPx) || 0);
+
+  // No usable geometry (container not laid out yet, or no floor to enforce):
+  // fall back to just the plain clamped percentage.
+  if (safeContainerHeightPx <= 0 || safeMinHeightPx <= 0) {
+    return safePct;
+  }
+
+  const minPct = (safeMinHeightPx / safeContainerHeightPx) * 100;
+  return Math.min(safeMaxPct, Math.max(safePct, minPct));
+}
+
 const TerminalSizing = {
   DEFAULT_TERMINAL_COLS,
   DEFAULT_TERMINAL_ROWS,
+  DEFAULT_MIN_PANEL_ROWS,
   predictInitialTilePixels,
   estimateTerminalGrid,
   normalizeTerminalGrid,
+  minPanelHeightPx,
+  clampPanelHeightPercent,
 };
 
 if (typeof window !== "undefined") {
@@ -119,7 +181,10 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.DEFAULT_TERMINAL_COLS = DEFAULT_TERMINAL_COLS;
   exports.DEFAULT_TERMINAL_ROWS = DEFAULT_TERMINAL_ROWS;
+  exports.DEFAULT_MIN_PANEL_ROWS = DEFAULT_MIN_PANEL_ROWS;
   exports.predictInitialTilePixels = predictInitialTilePixels;
   exports.estimateTerminalGrid = estimateTerminalGrid;
   exports.normalizeTerminalGrid = normalizeTerminalGrid;
+  exports.minPanelHeightPx = minPanelHeightPx;
+  exports.clampPanelHeightPercent = clampPanelHeightPercent;
 }

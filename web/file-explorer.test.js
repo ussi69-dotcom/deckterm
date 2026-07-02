@@ -82,6 +82,24 @@ function makeSkeletonContainer() {
   return base;
 }
 
+// Same as makeSkeletonContainer, plus stand-ins for the header × and footer
+// Close buttons (A4b) — each a makeFakeElement() so a test can trigger its
+// bound click handler via _listeners.click.
+function makeCloseSkeletonContainer() {
+  const container = makeSkeletonContainer();
+  const closeBtn = makeFakeElement();
+  const mobileCloseBtn = makeFakeElement();
+  // container.nodes is the same object querySelector() closes over, so
+  // mutating it here is visible to the container's own querySelector.
+  container.nodes["#file-explorer-close"] = closeBtn;
+  container.nodes["#file-explorer-mobile-close"] = mobileCloseBtn;
+  return { container, closeBtn, mobileCloseBtn };
+}
+
+function clickButton(button) {
+  (button._listeners.click || []).forEach((fn) => fn());
+}
+
 // render() builds list/breadcrumb rows with document.createElement; bun:test has
 // no DOM, so install a minimal element factory for the duration of a callback.
 function withFakeDocument(run) {
@@ -452,4 +470,94 @@ test("renameItem no-ops when this.disposed", async () => {
   const item = { path: "/home/deploy/old.txt", name: "old.txt", isDir: false };
   const result = await controller.renameItem(item, "ws-a");
   expect(result).toBe(false);
+});
+
+// --- A4b: header × and footer Close both route through onRequestClose ---
+
+test("both close buttons invoke onRequestClose when the host wires it", () => {
+  withFakeDocument(() => {
+    const { container, closeBtn, mobileCloseBtn } =
+      makeCloseSkeletonContainer();
+    const controller = new FileExplorerController({
+      root: container,
+      viewport: { innerWidth: 1280 },
+    });
+    controller.openForWorkspace("ws-a", "/tmp/workspace-a");
+    expect(controller.isOpen).toBe(true);
+
+    const calls = [];
+    controller.onRequestClose = () => calls.push("requested");
+
+    clickButton(closeBtn);
+    clickButton(mobileCloseBtn);
+
+    expect(calls).toEqual(["requested", "requested"]);
+    // The chokepoint callback owns closing — the controller's own close()
+    // (isOpen = false) must NOT have run as a side effect of the callback path.
+    expect(controller.isOpen).toBe(true);
+  });
+});
+
+test("both close buttons fall back to close() when no onRequestClose is injected", () => {
+  withFakeDocument(() => {
+    const { container, closeBtn, mobileCloseBtn } =
+      makeCloseSkeletonContainer();
+    const controller = new FileExplorerController({
+      root: container,
+      viewport: { innerWidth: 1280 },
+    });
+    controller.openForWorkspace("ws-a", "/tmp/workspace-a");
+    expect(controller.isOpen).toBe(true);
+
+    clickButton(closeBtn);
+    expect(controller.isOpen).toBe(false);
+
+    controller.openForWorkspace("ws-a", "/tmp/workspace-a");
+    expect(controller.isOpen).toBe(true);
+
+    clickButton(mobileCloseBtn);
+    expect(controller.isOpen).toBe(false);
+  });
+});
+
+// --- A5a: action icons never crush the filename ---
+
+test("a file row has exactly one .file-actions with 4 buttons and an untruncated .file-name", () => {
+  withFakeDocument(() => {
+    const controller = new FileExplorerController({
+      viewport: { innerWidth: 1280 },
+    });
+    controller.onOpenFile = () => {};
+
+    const longName =
+      "a-very-long-filename-that-must-never-be-crushed-by-action-icons.txt";
+    const item = {
+      name: longName,
+      path: `/tmp/workspace-a/${longName}`,
+      isDir: false,
+      isParent: false,
+      size: 1234,
+    };
+    const snapshot = {
+      workspaceId: "ws-a",
+      selectedItem: null,
+      decorations: {},
+      folderDecorations: {},
+    };
+
+    const row = controller.createItemElement(item, snapshot);
+
+    expect(row.className).toBe("file-item");
+    const actionsChildren = row.children.filter(
+      (child) => child.className === "file-actions",
+    );
+    expect(actionsChildren.length).toBe(1);
+    // edit (onOpenFile wired), download, rename, delete.
+    expect(actionsChildren[0].children.length).toBe(4);
+
+    const nameChild = row.children.find(
+      (child) => child.className === "file-name",
+    );
+    expect(nameChild.textContent).toBe(longName);
+  });
 });

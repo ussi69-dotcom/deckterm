@@ -8,6 +8,7 @@ const {
   deserializeWindowLayout,
   clampDockHeight,
   dockStateFromSettings,
+  isDesktopSurfaceWidth,
   DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
@@ -133,4 +134,14 @@ test("dockStateFromSettings tolerates garbage and fills defaults", () => {
     enabled: false,
     heightPct: DOCK_DEFAULT_HEIGHT_PCT,
   });
+});
+
+test("isDesktopSurfaceWidth uses the 768px breakpoint (A4a)", () => {
+  expect(isDesktopSurfaceWidth(767)).toBe(false);
+  expect(isDesktopSurfaceWidth(768)).toBe(true);
+  expect(isDesktopSurfaceWidth(320)).toBe(false);
+  expect(isDesktopSurfaceWidth(1920)).toBe(true);
+  // non-finite / garbage input degrades to "not desktop" rather than throwing
+  expect(isDesktopSurfaceWidth(undefined)).toBe(false);
+  expect(isDesktopSurfaceWidth("nonsense")).toBe(false);
 });
