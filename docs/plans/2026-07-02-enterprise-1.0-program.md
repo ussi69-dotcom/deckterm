@@ -65,6 +65,14 @@ event writes, global rate limiter) were re-verified by hand in code.
 
 ## 2. Track A — Stabilization (M0)
 
+> **STATUS: COMPLETE 2026-07-02** (same-day as the plan). Commits on `dev`: `6e62a7b` (A7),
+> `1f48582` (A6a), `0b7c88d` (A1), `c58c95f` (A2–A5). A6b was a stale item (already fixed
+> 2026-06-19, `b415092`). All fixes live-verified via Playwright on 4174 (one search overlay +
+> Escape closes; 24-row clamp holds at a 10% drag; dense output clean after sash drag;
+> scrollWidth 390 at mobile viewport, was 530; hovered filename keeps 205px, was 2 chars;
+> git panel follows explorer/working-dir navigation with a distinct not-a-repo banner and a
+> single deduped status request). Unit suite at baseline, smoke e2e 21/21, `tsc` green + CI gate.
+
 Bugfix slices on the current product, each PR-sized with tests. Tiering: Sonnet codes, Opus
 reviews the diff; no Codex (nothing to design). **A6 starts first** (longest lead time), the rest
 can run as a parallel file-disjoint batch after it, same pattern as the 2026-06-20 build. Live
