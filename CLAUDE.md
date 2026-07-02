@@ -31,7 +31,7 @@ bun run test:e2e:smoke                               # Playwright; bun run test:
 cd tests && PW_BASE_URL=http://localhost:4174 npx playwright test some.spec.ts
 ```
 
-- `tsc --noEmit` currently **fails on clean HEAD** (pre-existing errors) — do not rely on it; tests are the gate.
+- `bun x tsc --noEmit` is **green and a hard CI gate** (since 2026-07-02, Track A6a) — keep it green; tests remain the primary correctness gate.
 - `test:unit` lists every unit-test file explicitly. New `*.test.ts`/`*.test.js` must be added to that script in `package.json` or CI skips it. Foundation-bearing API tests (`foundation-c2`, `foundation-bootstrap`, `foundation-tunnel`) run as **separate chained `bun test` invocations** in that script because of the foundation-state singleton — keep that structure when adding similar tests.
 
 ## Architecture
