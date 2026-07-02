@@ -807,7 +807,16 @@ async function requireFoundationCapability({
   resourceId?: string | null;
   data?: Record<string, unknown>;
 }): Promise<
-  { ok: true } | { ok: false; status: 403; message: string; reason: string }
+  | { ok: true }
+  | {
+      ok: false;
+      status: 403;
+      message: string;
+      reason: string;
+      capability: ScopedGrantCapability;
+      resourceType: string;
+      resourceId: string;
+    }
 > {
   if (isFoundationLegacyBypassEnabled()) {
     return { ok: true };
@@ -1513,7 +1522,13 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
     };
   }
 
-  let accessPayload: CloudflareAccessPayload | null = null;
+  // Holds the JWT payload in a mutable container rather than a captured
+  // `let` binding: TS control-flow analysis does not track reassignment of
+  // an outer `let` from inside a nested closure, so a direct `let` here
+  // still type-checks as `null` after the closure runs.
+  const accessPayloadHolder: { value: CloudflareAccessPayload | null } = {
+    value: null,
+  };
   if (jwt && CF_ACCESS_TEAM_NAME) {
     try {
       const { cloudflareAccess: verifyJWT } =
@@ -1522,13 +1537,18 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
         req: { header: (name: string) => req.headers.get(name) },
         set: (key: string, value: CloudflareAccessPayload) => {
           if (key === "accessPayload") {
-            accessPayload = value;
+            accessPayloadHolder.value = value;
           }
         },
       };
       const middleware = verifyJWT(CF_ACCESS_TEAM_NAME);
       await middleware(mockContext as never, async () => {});
-      if (!isCloudflareAudienceAllowed(accessPayload?.aud, CF_ACCESS_AUD)) {
+      if (
+        !isCloudflareAudienceAllowed(
+          accessPayloadHolder.value?.aud,
+          CF_ACCESS_AUD,
+        )
+      ) {
         return {
           ok: false,
           status: 401,
@@ -1550,7 +1570,7 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
   }
 
   const actorResult = resolveActorFromAccessPayload({
-    accessPayload,
+    accessPayload: accessPayloadHolder.value,
     tunnelUserEmail: req.headers.get("cf-access-authenticated-user-email"),
     env: process.env,
   });

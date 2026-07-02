@@ -366,7 +366,7 @@ export function createTaskRunner(options: TaskRunnerOptions) {
   const tasksDir = join(stateDir, "tasks");
   const worktreesDir = join(stateDir, "worktrees");
   const runCommand = options.runCommand || defaultRunCommand;
-  const allowedProviders = options.allowedProviders?.length
+  const allowedProviders: TaskProvider[] = options.allowedProviders?.length
     ? options.allowedProviders
     : ["codex", "claude"];
 
