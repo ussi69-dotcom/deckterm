@@ -134,6 +134,7 @@ function cfActor(sub: string, email = "u@example.com"): DeckTermActor {
 const eligibleFacts = (uid: number, gid: number): OsAccountFacts => ({
   exists: true,
   username: "alice",
+  home: "/home/alice",
   uid,
   gid,
   loginShell: "/bin/bash",

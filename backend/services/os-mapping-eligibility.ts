@@ -22,6 +22,8 @@ export type OsAccountFacts = {
   /** Primary gid. */
   gid: number;
   loginShell: string;
+  /** The account's passwd home directory (used by B4-S6 default-root provisioning). */
+  home: string;
   /** All group gids (primary + supplementary), numeric. */
   groupGids: number[];
   /**
@@ -205,6 +207,7 @@ export function gatherOsAccountFacts(
       uid: -1,
       gid: -1,
       loginShell: "",
+      home: "",
       groupGids: [],
       canWriteProtectedPath: true,
     };
@@ -219,6 +222,7 @@ export function gatherOsAccountFacts(
     uid: pw.uid,
     gid: pw.gid,
     loginShell: pw.shell,
+    home: pw.home,
     groupGids,
     canWriteProtectedPath,
   };

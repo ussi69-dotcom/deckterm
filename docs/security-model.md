@@ -140,3 +140,35 @@ export-before-prune.
   sensitive artifacts with their own retention policy.
 - Availability under multi-user sqlite write load is bounded by B6's hot-path fix; Postgres
   is the 1.1 escape hatch if soak tests still show contention.
+
+### 8.1 B4 fs/git/exec surface boundaries (1.0)
+
+Filesystem, editor, upload/download, browse, and **local** git all run as the mapped user under
+isolation (or deny). Specific 1.0 scoping:
+
+- **Filesystem containment is fd-based** in a root-installed helper: every op resolves beneath
+  the granted root with `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` (or
+  an `O_NOFOLLOW` component-walk fallback), writes are atomic and owner/nlink/mode-checked. The
+  app-side path check is lexical policy only, never the boundary.
+- **Git is a hardened, config-neutralized execution surface, and its guarantee is CROSS-UID
+  isolation, not intra-uid root containment.** The broker runs git with global/system config,
+  pager, fsmonitor, hooks, external-diff and textconv execution disabled and repo discovery
+  capped to the granted root's parent (`GIT_CEILING_DIRECTORIES`), and rebuilds every argv from a
+  fixed schema (no `-c`/`--exec`/`--no-index`/pathspec-magic). But `fchdir` is not a chroot: a
+  determined repo-local config could still reach paths the _mapped uid_ can read outside the
+  granted root. The hard boundary is that Alice's uid cannot reach Bob's files; a
+  mount-namespace/chroot boundary for intra-uid root scoping is 1.1 container work.
+- **Denied (not brokered) under isolation in 1.0**, returning `os_isolation_unsupported`:
+  the **task runner** (workspaces/worktrees live under the service-owned state dir) and
+  **network git** (`push`/`pull`/`fetch` — credential-helper + network execution the broker git
+  profile intentionally omits; remote/conflict work belongs in the terminal). Workspace search is
+  likewise not yet brokered (denies under isolation) pending a fast-follow.
+- **Untracked-file inline diff preview** uses `git diff --no-index` (an absolute-path escape the
+  broker schema refuses) and is therefore **legacy-only**; under isolation an untracked file
+  still shows in the tree, without an inline content preview.
+- **Brokered fs/git/search are concurrency-capped** per-uid and globally (→ `429`) so they cannot
+  fork-storm `sudo`/`systemd-run`.
+- A newly mapped user is auto-granted a default root over their **own home** (eligibility-checked:
+  a non-symlink directory they own, not a shared/system path). The auto-grant is not
+  auto-revoked on remap because uid isolation makes a stale home-root grant inert (a new uid
+  cannot read the old home) and the resolver denies any unmapped/suspended actor first.

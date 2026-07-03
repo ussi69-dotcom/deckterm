@@ -594,6 +594,48 @@ async function importProjectRoots({
   return roots;
 }
 
+/**
+ * B4-S6: provision (or find) a project root for a path and add it to the live
+ * in-memory `state.roots` so the brokered path policy (`matchGrantedRoot`) can
+ * see it immediately. Used when an OS mapping is created to give the mapped user
+ * a default root over their own home. Idempotent on `path`.
+ */
+export async function provisionProjectRoot(
+  state: FoundationState,
+  inputPath: string,
+  env: FoundationEnv = process.env,
+  now: Date = new Date(),
+): Promise<{ rootId: string; created: boolean }> {
+  const normalized = await normalizeAllowedRoot(inputPath, env);
+  const existing = state.db
+    .query("SELECT id FROM project_roots WHERE path = ?")
+    .get(normalized.path) as { id: string } | null;
+  if (existing) {
+    if (!state.roots.some((r) => r.id === existing.id)) {
+      state.roots.push({ id: existing.id, ...normalized });
+    }
+    return { rootId: existing.id, created: false };
+  }
+  const id = createId("root");
+  const timestamp = isoDate(now);
+  state.db
+    .query(
+      `INSERT INTO project_roots (id, name, path, status, warning, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      normalized.name,
+      normalized.path,
+      normalized.status,
+      normalized.warning,
+      timestamp,
+      timestamp,
+    );
+  state.roots.push({ id, ...normalized });
+  return { rootId: id, created: true };
+}
+
 async function ensureBootstrapToken({
   db,
   stateDir,

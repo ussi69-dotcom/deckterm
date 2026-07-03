@@ -8,7 +8,7 @@ import {
   type CloudflareAccessPayload,
 } from "@hono/cloudflare-access";
 import { mkdir, readdir, unlink, stat, writeFile } from "node:fs/promises";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, lstatSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   classifyAgentOutputPhase,
@@ -93,6 +93,7 @@ import {
   deleteOsMapping,
   getOsMapping,
   listOsMappings,
+  provisionProjectRoot,
   reactivateOsMapping,
   recordIsolationDeny,
   suspendOsMapping,
@@ -626,7 +627,9 @@ const rateLimitState = {
 // Ensure clipboard directory exists
 async function ensureClipboardDir() {
   try {
-    await mkdir(CLIPBOARD_IMAGES_DIR, { recursive: true });
+    // Service-owned, 0700 (B4-S6 / Codex #14): no other account can plant a
+    // symlink or read a pasted image in a shared world-accessible /tmp dir.
+    await mkdir(CLIPBOARD_IMAGES_DIR, { recursive: true, mode: 0o700 });
   } catch {
     // Directory exists
   }
@@ -3554,6 +3557,50 @@ async function denyIfOsIsolationPending(
   };
 }
 
+/**
+ * B4-S6: a PERMANENT isolation deny for surfaces that will not be brokered in
+ * 1.0 (task runner: workspaces/worktrees live under the service-owned state dir,
+ * which mapped users cannot write and B2 eligibility forbids accounts that can).
+ * Distinct from `os_isolation_pending` (which meant "brokered later"). Every deny
+ * is audited via the persisted aggregation counter so evidence survives probing.
+ */
+async function denyIfOsIsolationUnsupported(
+  c: Parameters<typeof getCurrentActor>[0],
+  surface: string,
+  requestId?: string | null,
+): Promise<{ ok: false; status: 403; body: Record<string, unknown> } | null> {
+  if (!isOsIsolationEnabled(process.env)) return null;
+  const actor = getCurrentActor(c);
+  const state = await getFoundationState();
+  const count = recordIsolationDeny(state.db, {
+    actorUserId: actor.id,
+    actorSource: actor.source,
+    surface,
+    reason: "os_isolation_unsupported",
+    requestId: requestId ?? null,
+  });
+  if (count === 1 || count % 100 === 0) {
+    writeAuditEvent(state.db, {
+      actorUserId: actor.id,
+      action: "surface.access",
+      resourceType: "surface",
+      resourceId: surface,
+      decision: "deny",
+      reason: "os_isolation_unsupported",
+      data: { surface, actorSource: actor.source, count },
+    });
+  }
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      error: "Surface unavailable under OS isolation",
+      reason: "os_isolation_unsupported",
+      surface,
+    },
+  };
+}
+
 /** Loopback bind targets (B2 §4.4.1): the tunnel fail-closed guard treats these
  *  as safe because only local processes can reach them. */
 function isLoopbackHost(host: string): boolean {
@@ -4399,7 +4446,78 @@ export function createWebApp() {
         decision: "allow",
         data: { osUsername, osUid: facts.uid, osGid: facts.gid },
       });
-      return c.json({ mapping });
+
+      // B4-S6: give the mapped user a default root over their OWN home so the
+      // brokered fs/git surfaces have a granted root to resolve against. The home
+      // is eligibility-checked first (Codex #7): absolute, not /, not a shared/
+      // system dir, a non-symlink directory owned by the mapped uid, not group/
+      // world-writable. On failure the mapping still stands but no auto-root is
+      // provisioned (owner grants one manually). Note: the grant is not auto-
+      // revoked on suspend/delete — uid isolation makes a stale home-root grant
+      // inert (a remapped account's uid cannot read the old home), and the
+      // resolver denies any unmapped/suspended actor before a grant is consulted.
+      let rootProvisioned: string | null = null;
+      const home = facts.home;
+      const homeEligible = (() => {
+        try {
+          if (!home || !home.startsWith("/") || home === "/") return false;
+          if (
+            osMappingProtectedPaths().some(
+              (p) =>
+                home === p ||
+                home.startsWith(p + "/") ||
+                p.startsWith(home + "/"),
+            )
+          )
+            return false;
+          if (home === "/tmp" || home.startsWith("/tmp/")) return false;
+          const st = lstatSync(home);
+          if (!st.isDirectory() || st.isSymbolicLink()) return false;
+          if (st.uid !== facts.uid) return false;
+          if (st.mode & 0o0022) return false; // group/world-writable
+          return true;
+        } catch {
+          return false;
+        }
+      })();
+      if (homeEligible) {
+        try {
+          const { rootId } = await provisionProjectRoot(
+            state,
+            home,
+            process.env,
+          );
+          grantScopedCapability(state.db, {
+            userId,
+            capability: "root.use",
+            resourceType: "root",
+            resourceId: rootId,
+          });
+          rootProvisioned = rootId;
+          writeAuditEvent(state.db, {
+            actorUserId: gate.ownerId,
+            action: "root.provision",
+            resourceType: "root",
+            resourceId: rootId,
+            decision: "allow",
+            data: { userId, home, osUsername },
+          });
+        } catch {
+          rootProvisioned = null;
+        }
+      }
+      if (!rootProvisioned) {
+        writeAuditEvent(state.db, {
+          actorUserId: gate.ownerId,
+          action: "root.provision_skipped",
+          resourceType: "user",
+          resourceId: userId,
+          decision: "deny",
+          reason: "home_ineligible",
+          data: { userId, home, osUsername },
+        });
+      }
+      return c.json({ mapping, rootProvisioned });
     } catch (err) {
       // The active-uid partial unique index rejects a second active mapping on
       // one uid (B1 Codex #2).
@@ -4707,6 +4825,11 @@ export function createWebApp() {
     const { ownerId } = getCurrentUser(c);
     const body = await c.req.json().catch(() => ({}));
 
+    // B4-S6: task workspaces/worktrees live under the service-owned state dir —
+    // permanently unsupported under isolation (deny BEFORE createTask touches it).
+    const createDeny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (createDeny) return c.json(createDeny.body, createDeny.status);
+
     // C2: route the task's project root through the same actor/root/grant
     // resolution as terminal/file/git so it is gated and audited consistently
     // (taskRunner only does a path-allowlist check, without bootstrap/grant).
@@ -4764,7 +4887,7 @@ export function createWebApp() {
     const { ownerId, ownerEmail } = getCurrentUser(c);
     // Task workspaces spawn agent PTYs as the service account — a B4 surface,
     // denied under isolation until B4 brokers them (§4.3, inv 17).
-    const taskDeny = await denyIfOsIsolationPending(c, "tasks");
+    const taskDeny = await denyIfOsIsolationUnsupported(c, "tasks");
     if (taskDeny) return c.json(taskDeny.body, taskDeny.status);
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
@@ -4796,7 +4919,7 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/run-checks", async (c) => {
     const { ownerId } = getCurrentUser(c);
-    const checkDeny = await denyIfOsIsolationPending(c, "tasks");
+    const checkDeny = await denyIfOsIsolationUnsupported(c, "tasks");
     if (checkDeny) return c.json(checkDeny.body, checkDeny.status);
     try {
       return c.json(await taskRunner.runChecks(c.req.param("id"), { ownerId }));
@@ -4807,7 +4930,7 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/judge", async (c) => {
     const { ownerId, ownerEmail } = getCurrentUser(c);
-    const judgeDeny = await denyIfOsIsolationPending(c, "tasks");
+    const judgeDeny = await denyIfOsIsolationUnsupported(c, "tasks");
     if (judgeDeny) return c.json(judgeDeny.body, judgeDeny.status);
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
@@ -6987,7 +7110,11 @@ export function createWebApp() {
       const filename = `clipboard-${timestamp}-${random}.${extension}`;
       const filePath = join(CLIPBOARD_IMAGES_DIR, filename);
 
-      await Bun.write(filePath, imageData);
+      // O_CREAT|O_EXCL|O_WRONLY ("wx") + 0600: never overwrite, and refuse a
+      // planted symlink at the path (O_EXCL fails on an existing symlink) — no
+      // Bun.write symlink-follow (B4-S6 / Codex #14). The server-generated random
+      // name makes a collision effectively impossible.
+      writeFileSync(filePath, imageData, { flag: "wx", mode: 0o600 });
 
       console.log(
         `[Clipboard] Image saved: ${filePath} (${imageData.length} bytes)`,

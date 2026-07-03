@@ -48,6 +48,7 @@ const BASE_POLICY: EligibilityPolicy = {
 const ELIGIBLE: OsAccountFacts = {
   exists: true,
   username: "alice",
+  home: "/home/alice",
   uid: 2000,
   gid: 2000,
   loginShell: "/bin/bash",
