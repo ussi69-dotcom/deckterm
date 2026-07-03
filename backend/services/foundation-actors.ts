@@ -89,3 +89,39 @@ export function resolveActorFromAccessPayload({
     },
   };
 }
+
+/**
+ * Maps an actor's source to its canonical (provider, issuer, subject)
+ * identity triple (B1 §1.1). Actor identity is always this triple — never
+ * email — used as the lookup/storage key for `auth_identities`.
+ */
+export function actorIdentityTriple(
+  actor: DeckTermActor,
+  env: Record<string, string | undefined>,
+): { provider: string; issuer: string; subject: string } {
+  switch (actor.source) {
+    case "cloudflare_access":
+      return {
+        provider: "cloudflare_access",
+        issuer: env.CF_ACCESS_TEAM_NAME?.trim() ?? "",
+        subject: actor.id,
+      };
+    case "cloudflare_tunnel":
+      return {
+        provider: "cloudflare_tunnel",
+        issuer: "",
+        subject: actor.email,
+      };
+    case "tunnel_default":
+      return { provider: "cloudflare_tunnel", issuer: "", subject: "tunnel" };
+    case "legacy_dev":
+      return { provider: "legacy", issuer: "", subject: "anonymous" };
+    default: {
+      // Exhaustiveness guard: DeckTermActor["source"] is a closed union — if
+      // a new source is ever added without updating this map, fail loudly
+      // instead of silently minting an unmapped identity triple.
+      const unreachable: never = actor.source;
+      throw new Error(`unmapped actor source: ${String(unreachable)}`);
+    }
+  }
+}

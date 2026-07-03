@@ -187,7 +187,7 @@ test("foundation C1 authorizes terminal session access by owner or scoped grant"
   state.db
     .query(
       `INSERT INTO users (id, email, display_name, role, created_at, updated_at)
-       VALUES (?, ?, ?, 'user', ?, ?)`,
+       VALUES (?, ?, ?, 'member', ?, ?)`,
     )
     .run(
       "user_other",
