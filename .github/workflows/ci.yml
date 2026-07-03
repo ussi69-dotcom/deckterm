@@ -100,3 +100,37 @@ jobs:
           if [ -f /tmp/deckterm-ci.pid ]; then
             kill "$(cat /tmp/deckterm-ci.pid)" || true
           fi
+
+  isolation-e2e:
+    needs: unit
+    # MUST be the GitHub-hosted VM runner (real systemd + passwordless sudo), not
+    # a job container — the broker needs `sudo systemd-run --scope`. run.sh
+    # preflights and FAILS LOUD (never skips) if the host can't support it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Run Alice/Bob adversarial isolation e2e
+        run: ./scripts/isolation-e2e/run.sh
+
+      - name: Upload isolation-e2e logs on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolation-e2e-logs-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: /tmp/deckterm-iso-e2e-*/sut-*.log
