@@ -114,9 +114,23 @@ export function matchGrantedRoot(
   grantedRoots: string[],
   absPath: string,
 ): ScopedPath | null {
+  return matchGrantedRootCandidates(grantedRoots, absPath)[0] ?? null;
+}
+
+/**
+ * All roots that contain `absPath` on segment boundaries, sorted LONGEST prefix
+ * first. Callers that must enforce a per-root capability try candidates in order
+ * until one is authorized — so an ungranted nested root cannot shadow a granted
+ * parent root (Codex integrated #4). Each element's `relPath` is `""` for the
+ * root itself.
+ */
+export function matchGrantedRootCandidates(
+  grantedRoots: string[],
+  absPath: string,
+): ScopedPath[] {
   const canonInput = canonicalizeLexical(absPath);
-  if (canonInput === null) return null;
-  let best: ScopedPath | null = null;
+  if (canonInput === null) return [];
+  const out: ScopedPath[] = [];
   for (const raw of grantedRoots) {
     const root = canonicalizeLexical(raw);
     if (root === null) continue;
@@ -126,11 +140,9 @@ export function matchGrantedRoot(
     } else if (canonInput.startsWith(root === "/" ? "/" : root + "/")) {
       rel = canonInput.slice(root.length).replace(/^\/+/, "");
     }
-    if (rel !== null && (best === null || root.length > best.root.length)) {
-      best = { root, relPath: rel };
-    }
+    if (rel !== null) out.push({ root, relPath: rel });
   }
-  return best;
+  return out.sort((a, b) => b.root.length - a.root.length);
 }
 
 // ---------------------------------------------------------------------------

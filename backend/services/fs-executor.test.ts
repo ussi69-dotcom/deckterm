@@ -11,6 +11,7 @@ import { join } from "node:path";
 import {
   canonicalizeLexical,
   matchGrantedRoot,
+  matchGrantedRootCandidates,
   getFsExecutor,
   FsExecError,
   acquireBrokerSlot,
@@ -63,6 +64,16 @@ describe("matchGrantedRoot (segment-boundary — Codex #9)", () => {
       root: "/home/alice/project",
       relPath: "",
     });
+  });
+
+  test("candidates return all containing roots, longest first (nested shadowing — Codex integrated #4)", () => {
+    const cands = matchGrantedRootCandidates(roots, "/home/alice/project/x.ts");
+    expect(cands.map((c) => c.root)).toEqual([
+      "/home/alice/project",
+      "/home/alice",
+    ]);
+    // The parent root is a valid fallback if the nested root is ungranted.
+    expect(cands[1]).toEqual({ root: "/home/alice", relPath: "project/x.ts" });
   });
 });
 

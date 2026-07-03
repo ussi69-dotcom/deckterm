@@ -1703,6 +1703,28 @@ export function disableOrphanGrantPrincipal(
 }
 
 /** Deletes a scoped grant by id. Returns whether a row was actually deleted. */
+/**
+ * B4 (Codex integrated #1): revoke a user's `root.use` grant on a specific root
+ * (used to tear down an auto-provisioned home-root grant when its OS mapping is
+ * deleted, so a later remap to a different unix account can't inherit it).
+ * Returns true if a grant was removed.
+ */
+export function revokeRootUseGrant(
+  db: Database,
+  userId: string,
+  rootId: string,
+): boolean {
+  const row = db
+    .query(
+      `SELECT id FROM scoped_grants
+       WHERE user_id = ? AND capability = 'root.use'
+         AND resource_type = 'root' AND resource_id = ?`,
+    )
+    .get(userId, rootId) as { id: string } | null;
+  if (!row) return false;
+  return revokeScopedCapability(db, row.id);
+}
+
 export function revokeScopedCapability(db: Database, grantId: string): boolean {
   const result = db
     .query("DELETE FROM scoped_grants WHERE id = ?")

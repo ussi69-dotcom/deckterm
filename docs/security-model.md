@@ -169,6 +169,9 @@ isolation (or deny). Specific 1.0 scoping:
 - **Brokered fs/git/search are concurrency-capped** per-uid and globally (→ `429`) so they cannot
   fork-storm `sudo`/`systemd-run`.
 - A newly mapped user is auto-granted a default root over their **own home** (eligibility-checked:
-  a non-symlink directory they own, not a shared/system path). The auto-grant is not
-  auto-revoked on remap because uid isolation makes a stale home-root grant inert (a new uid
-  cannot read the old home) and the resolver denies any unmapped/suspended actor first.
+  a non-symlink directory they own, not a shared/system path). The auto-grant is **revoked when
+  the mapping is deleted**, so a later remap to a different unix account cannot inherit `root.use`
+  over the old home. Residual edge: if an operator deletes the unix account (leaving its home
+  world-readable) _before_ deleting the DeckTerm mapping, the home lookup fails and the grant may
+  linger — mitigated by the resolver denying the now-unmapped/drifted actor. Suspension needs no
+  revoke: the resolver denies a suspended mapping before any grant is consulted.

@@ -8,7 +8,13 @@ import {
   type CloudflareAccessPayload,
 } from "@hono/cloudflare-access";
 import { mkdir, readdir, unlink, stat, writeFile } from "node:fs/promises";
-import { readFileSync, existsSync, lstatSync, writeFileSync } from "node:fs";
+import {
+  readFileSync,
+  existsSync,
+  lstatSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import {
   classifyAgentOutputPhase,
@@ -96,6 +102,7 @@ import {
   provisionProjectRoot,
   reactivateOsMapping,
   recordIsolationDeny,
+  revokeRootUseGrant,
   suspendOsMapping,
 } from "./services/foundation-state";
 import {
@@ -107,8 +114,11 @@ import { brokerCheck, brokerKill, brokerExec } from "./services/broker-client";
 import {
   getFsExecutor,
   matchGrantedRoot,
+  matchGrantedRootCandidates,
   canonicalizeLexical,
   FsExecError,
+  acquireBrokerSlot,
+  releaseBrokerSlot,
   type FsExecutorContext,
 } from "./services/fs-executor";
 import {
@@ -627,11 +637,25 @@ const rateLimitState = {
 // Ensure clipboard directory exists
 async function ensureClipboardDir() {
   try {
-    // Service-owned, 0700 (B4-S6 / Codex #14): no other account can plant a
-    // symlink or read a pasted image in a shared world-accessible /tmp dir.
+    // Service-owned, 0700 (B4 / Codex #14): no other account can plant a symlink
+    // or read a pasted image in a shared world-accessible /tmp dir.
     await mkdir(CLIPBOARD_IMAGES_DIR, { recursive: true, mode: 0o700 });
   } catch {
     // Directory exists
+  }
+  // mkdir's mode only applies on creation — a PRE-EXISTING path could be a
+  // symlink or an attacker-owned dir (Codex integrated #2). Verify + reharden;
+  // refuse to use an unsafe path so the write below never targets it.
+  const st = lstatSync(CLIPBOARD_IMAGES_DIR);
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error("clipboard dir is not a real directory");
+  }
+  const myUid = process.getuid?.() ?? -1;
+  if (st.uid !== myUid) {
+    throw new Error("clipboard dir is not owned by the service account");
+  }
+  if ((st.mode & 0o777) !== 0o700) {
+    chmodSync(CLIPBOARD_IMAGES_DIR, 0o700);
   }
 }
 
@@ -660,8 +684,9 @@ async function cleanupClipboardImages() {
 
 // Run cleanup every 15 minutes
 setInterval(cleanupClipboardImages, 15 * 60 * 1000);
-// Ensure directory exists on startup
-ensureClipboardDir();
+// Ensure directory exists on startup (best-effort; the upload route re-validates
+// and fails the request if the dir is unsafe, rather than crashing the server).
+ensureClipboardDir().catch(() => {});
 
 export async function reconcileSessionsOnStartup(
   db: Database,
@@ -2157,38 +2182,70 @@ async function resolveScopedFsPath(
     return { ok: true, root: rootPath, relPath: rel, rootId };
   }
 
-  // brokered — lexical, segment-boundary containment against granted roots.
-  const scoped = matchGrantedRoot(
+  // brokered — lexical, segment-boundary containment against granted roots. Try
+  // ALL containing roots longest-first until one passes root.use, so an ungranted
+  // NESTED root cannot shadow a granted parent (Codex integrated #4). Only the
+  // final "none authorized" outcome is a deny.
+  const candidates = matchGrantedRootCandidates(
     state.roots.map((r) => r.path),
     clientPath,
   );
-  if (!scoped) {
+  if (candidates.length === 0) {
     return {
       ok: false,
       status: 403,
       body: { error: "Forbidden path", reason: "no_matching_root" },
     };
   }
-  const rootRow = state.roots.find(
-    (r) => canonicalizeLexical(r.path) === scoped.root,
-  );
-  const rootId = rootRow?.id ?? "";
   const actor = getCurrentActor(c);
-  const rootAuth = await requireFoundationCapability({
-    actor,
-    capability: "root.use",
-    resourceType: "root",
-    resourceId: rootId,
-    data: { cwd: scoped.root, osIsolation: true },
-  });
-  if (!rootAuth.ok) {
-    return {
-      ok: false,
-      status: rootAuth.status,
-      body: foundationGateJson(rootAuth),
-    };
+  let lastDeny: { status: number; body: Record<string, unknown> } | null = null;
+  for (const scoped of candidates) {
+    const rootRow = state.roots.find(
+      (r) => canonicalizeLexical(r.path) === scoped.root,
+    );
+    const rootId = rootRow?.id ?? "";
+    const rootAuth = await requireFoundationCapability({
+      actor,
+      capability: "root.use",
+      resourceType: "root",
+      resourceId: rootId,
+      data: { cwd: scoped.root, osIsolation: true },
+    });
+    if (rootAuth.ok) {
+      return { ok: true, root: scoped.root, relPath: scoped.relPath, rootId };
+    }
+    lastDeny = { status: rootAuth.status, body: foundationGateJson(rootAuth) };
   }
-  return { ok: true, root: scoped.root, relPath: scoped.relPath, rootId };
+  return {
+    ok: false,
+    status: lastDeny?.status ?? 403,
+    body: lastDeny?.body ?? {
+      error: "Forbidden path",
+      reason: "no_matching_root",
+    },
+  };
+}
+
+/** B4 (Codex integrated #6): the default root for a brokered actor — their first
+ *  granted root (the S6 home-root provisioning makes this their own $HOME), NOT
+ *  the service account's HOME. Returns null if the actor holds no granted root. */
+async function brokeredDefaultRoot(c: any): Promise<string | null> {
+  const state = await getFoundationState();
+  const actor = getCurrentActor(c);
+  // Longest-first is arbitrary here; any granted root is a valid default. Prefer
+  // a non-nested (shortest) root so the default is the broadest the actor holds.
+  const roots = [...state.roots].sort((a, b) => a.path.length - b.path.length);
+  for (const r of roots) {
+    const auth = await requireFoundationCapability({
+      actor,
+      capability: "root.use",
+      resourceType: "root",
+      resourceId: r.id,
+      data: { osIsolation: true },
+    });
+    if (auth.ok) return r.path;
+  }
+  return null;
 }
 
 /** Map an `FsExecError` from the executor to the HTTP response shape B4 routes
@@ -4679,6 +4736,34 @@ export function createWebApp() {
       debug(`[os-mapping] brokerKill tmux-server failed for ${userId}`, err);
     }
     deleteOsMapping(state.db, userId);
+    // Revoke the auto-provisioned home-root grant (Codex integrated #1) so a later
+    // remap to a DIFFERENT unix account cannot inherit root.use over this account's
+    // home. Best-effort: resolve the account's home → its project root → revoke.
+    try {
+      const facts = gatherOsAccountFacts(
+        mapping.osUsername,
+        osMappingProtectedPaths(),
+      );
+      const homeCanon = facts.home ? canonicalizeLexical(facts.home) : null;
+      if (homeCanon) {
+        const rootRow = state.roots.find(
+          (r) => canonicalizeLexical(r.path) === homeCanon,
+        );
+        if (rootRow && revokeRootUseGrant(state.db, userId, rootRow.id)) {
+          writeAuditEvent(state.db, {
+            actorUserId: gate.ownerId,
+            action: "root.revoke",
+            resourceType: "root",
+            resourceId: rootRow.id,
+            decision: "allow",
+            reason: "os_mapping_deleted",
+            data: { userId, home: facts.home },
+          });
+        }
+      }
+    } catch (err) {
+      debug(`[os-mapping] home-root grant revoke failed for ${userId}`, err);
+    }
     writeAuditEvent(state.db, {
       actorUserId: gate.ownerId,
       action: "os_mapping.delete",
@@ -4968,6 +5053,8 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/pause", async (c) => {
     const { ownerId } = getCurrentUser(c);
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
     try {
       return c.json(
         await taskRunner.updateTask(
@@ -4983,6 +5070,8 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/reset", async (c) => {
     const { ownerId } = getCurrentUser(c);
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
     try {
       return c.json(
         await taskRunner.updateTask(
@@ -4998,6 +5087,10 @@ export function createWebApp() {
 
   app.delete("/api/tasks/:id", async (c) => {
     const { ownerId } = getCurrentUser(c);
+    // Deletes remove the service-owned workspace/worktree — deny under isolation
+    // before touching it (Codex integrated #9).
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
     try {
       return c.json(
         await taskRunner.deleteTask(c.req.param("id"), { ownerId }),
@@ -5485,18 +5578,23 @@ export function createWebApp() {
     }
     const fx = getFsExecutor(execCtx.ctx);
 
-    // Brokered actors default to their own $HOME root; legacy keeps the
+    // Default root: brokered actors default to their OWN granted (home) root, not
+    // the service account's HOME (Codex integrated #6); legacy keeps the
     // realpath'd allowlist fallback exactly as before.
     const fallbackPath =
       execCtx.ctx.kind === "brokered"
-        ? process.env.HOME || requestedPath
+        ? (await brokeredDefaultRoot(c)) || requestedPath
         : await getDefaultBrowseRoot();
 
     let scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
     let fellBack = false;
     if (!scoped.ok) {
-      // Fall back to the default root (legacy behavior: forbidden/OOB path →
-      // default browse root) rather than 403, matching the prior UX.
+      // Legacy fell back to the default browse root ONLY for an out-of-root /
+      // missing path (no_matching_root) — an actual capability/auth denial must
+      // propagate, not be masked by a fallback (Codex integrated #5).
+      if (scoped.body?.reason !== "no_matching_root") {
+        return c.json(scoped.body, { status: scoped.status as any });
+      }
       const fb = await resolveScopedFsPath(c, execCtx.ctx, fallbackPath);
       if (!fb.ok) return c.json(scoped.body, { status: scoped.status as any });
       scoped = fb;
@@ -5555,6 +5653,8 @@ export function createWebApp() {
           return c.json(await readDirectory(fb.root, fb.relPath, fbDisplay));
         }
       }
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Cannot read directory");
       return c.json({ error: "Cannot read directory" }, 400);
     }
   });
@@ -5737,9 +5837,8 @@ export function createWebApp() {
         },
       });
     } catch (err) {
-      if (err instanceof FsExecError && err.code === "too_large") {
-        return fsErrorResponse(c, err, "File too large to download");
-      }
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Cannot read file");
       return c.json({ error: "Cannot read file" }, 400);
     }
   });
@@ -5788,7 +5887,9 @@ export function createWebApp() {
         mtimeMs: fileStat.mtimeMs,
         size: fileStat.size,
       });
-    } catch {
+    } catch (err) {
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Cannot read file");
       return c.json({ error: "Cannot read file" }, 400);
     }
   });
@@ -5945,6 +6046,8 @@ export function createWebApp() {
       ) {
         return c.json({ error: "Directory already exists" }, 400);
       }
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Failed to create directory");
       return c.json({ error: "Failed to create directory" }, 500);
     }
   });
@@ -5983,7 +6086,9 @@ export function createWebApp() {
       const st = await fx.statPath(scoped.root, scoped.relPath);
       await fx.remove(scoped.root, scoped.relPath, st.kind === "dir");
       return c.json({ ok: true });
-    } catch {
+    } catch (err) {
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Failed to delete");
       return c.json({ error: "Failed to delete" }, 500);
     }
   });
@@ -6008,17 +6113,31 @@ export function createWebApp() {
     });
     if (!scopedTo.ok)
       return c.json(scopedTo.body, { status: scopedTo.status as any });
-    // The executor renames within ONE root (the helper resolves both endpoints
-    // beneath the same root fd); a cross-root move is refused.
-    if (scopedFrom.root !== scopedTo.root) {
+    // BROKERED only: the helper resolves both endpoints beneath ONE root fd, so a
+    // cross-root move is refused. LEGACY preserves the prior behavior (each
+    // endpoint access-checked independently, fs.rename across allowed roots works
+    // — Codex integrated #7).
+    if (execCtx.ctx.kind === "brokered" && scopedFrom.root !== scopedTo.root) {
       return c.json(
         { error: "Cannot rename across roots", reason: "cross_root" },
         400,
       );
     }
-    const fx = getFsExecutor(execCtx.ctx);
-
     try {
+      if (execCtx.ctx.kind === "legacy" && scopedFrom.root !== scopedTo.root) {
+        // Legacy cross-root move: both endpoints were access-checked; rename the
+        // two absolute paths directly (the executor's rename is single-root).
+        const fromAbs = scopedFrom.relPath
+          ? join(scopedFrom.root, scopedFrom.relPath)
+          : scopedFrom.root;
+        const toAbs = scopedTo.relPath
+          ? join(scopedTo.root, scopedTo.relPath)
+          : scopedTo.root;
+        const fsp = await import("node:fs/promises");
+        await fsp.rename(fromAbs, toAbs);
+        return c.json({ ok: true });
+      }
+      const fx = getFsExecutor(execCtx.ctx);
       await fx.rename(scopedFrom.root, scopedFrom.relPath, scopedTo.relPath);
       return c.json({ ok: true });
     } catch (err) {
@@ -6073,28 +6192,48 @@ export function createWebApp() {
     timeoutMs = 10000,
   ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
     if (git.ctx.kind === "brokered") {
-      const res = await brokerExec(
-        {
-          session:
-            "git" +
-            Math.random().toString(36).slice(2).padEnd(10, "0").slice(0, 12),
-          username: git.ctx.osUsername,
-          uid: git.ctx.uid,
-          gid: git.ctx.gid,
-          cwd: git.root,
-          reldir: git.reldir,
-          profile: "git",
-          profileArgs: args,
-        },
-        process.env,
-        timeoutMs,
-      );
-      return {
-        ok: res.code === 0,
-        output: res.stdout,
-        stderr: res.stderr,
-        code: res.code,
-      };
+      // Brokered git shares the per-uid/global broker concurrency cap so it can't
+      // fork-storm sudo/systemd-run (Codex integrated #3). Over the cap the call
+      // fails fast (surfaced as a normal git failure by the routes).
+      try {
+        acquireBrokerSlot(git.ctx.uid);
+      } catch (err) {
+        if (err instanceof FsExecError && err.code === "isolation_busy") {
+          return {
+            ok: false,
+            output: "",
+            stderr: "isolation_busy: too many concurrent isolated operations",
+            code: 429,
+          };
+        }
+        throw err;
+      }
+      try {
+        const res = await brokerExec(
+          {
+            session:
+              "git" +
+              Math.random().toString(36).slice(2).padEnd(10, "0").slice(0, 12),
+            username: git.ctx.osUsername,
+            uid: git.ctx.uid,
+            gid: git.ctx.gid,
+            cwd: git.root,
+            reldir: git.reldir,
+            profile: "git",
+            profileArgs: args,
+          },
+          process.env,
+          timeoutMs,
+        );
+        return {
+          ok: res.code === 0,
+          output: res.stdout,
+          stderr: res.stderr,
+          code: res.code,
+        };
+      } finally {
+        releaseBrokerSlot(git.ctx.uid);
+      }
     }
     const cwd = git.reldir ? join(git.root, git.reldir) : git.root;
     const proc = Bun.spawn(["git", ...args], {
@@ -7105,6 +7244,10 @@ export function createWebApp() {
         }
       }
 
+      // Re-validate the dir per request (a symlink/owner swap could have happened
+      // since startup) — throws → caught below → 500 (Codex integrated #2).
+      await ensureClipboardDir();
+
       const timestamp = Date.now();
       const random = Math.random().toString(36).slice(2, 8);
       const filename = `clipboard-${timestamp}-${random}.${extension}`;
@@ -7112,7 +7255,7 @@ export function createWebApp() {
 
       // O_CREAT|O_EXCL|O_WRONLY ("wx") + 0600: never overwrite, and refuse a
       // planted symlink at the path (O_EXCL fails on an existing symlink) — no
-      // Bun.write symlink-follow (B4-S6 / Codex #14). The server-generated random
+      // Bun.write symlink-follow (B4 / Codex #14). The server-generated random
       // name makes a collision effectively impossible.
       writeFileSync(filePath, imageData, { flag: "wx", mode: 0o600 });
 
