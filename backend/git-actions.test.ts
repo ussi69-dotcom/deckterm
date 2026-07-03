@@ -50,6 +50,7 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   // Same env isolation as foundation-c2.test.ts (Bun .env auto-load + service
   // env leak through DeckTerm terminals — see 5fcd118).
   delete process.env.DECKTERM_PUBLISH_MODE;

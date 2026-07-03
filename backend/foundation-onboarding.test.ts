@@ -22,6 +22,7 @@ const TOGGLE_ENV_KEYS = [
   "CF_ACCESS_REQUIRED",
   "DECKTERM_PUBLISH_MODE",
   "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "DECKTERM_RUNTIME_ENV",
 ] as const;
 
 beforeAll(async () => {
@@ -38,10 +39,14 @@ beforeAll(async () => {
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
   process.env.DECKTERM_DOCTOR_ENV = doctorEnvFile;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   // Same class of ambient-env leak as C2/tunnel: a shell inside a DeckTerm dev
   // terminal inherits the service's DECKTERM_PUBLISH_MODE / LEGACY_NO_BOOTSTRAP,
   // which would short-circuit the gate before it ever runs its real logic.
-  for (const key of TOGGLE_ENV_KEYS) delete process.env[key];
+  for (const key of TOGGLE_ENV_KEYS) {
+    if (key === "DECKTERM_RUNTIME_ENV") continue;
+    delete process.env[key];
+  }
 
   // Bootstrap the foundation with "anonymous" as the first admin — this is the
   // fixed actor id the legacy_dev actor source resolves to when there is no
@@ -84,7 +89,11 @@ afterAll(async () => {
 });
 
 afterEach(() => {
-  for (const key of TOGGLE_ENV_KEYS) delete process.env[key];
+  for (const key of TOGGLE_ENV_KEYS) {
+    if (key === "DECKTERM_RUNTIME_ENV") continue;
+    delete process.env[key];
+  }
+  process.env.DECKTERM_RUNTIME_ENV = "development";
 });
 
 function queryAudit(

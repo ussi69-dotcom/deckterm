@@ -11,9 +11,13 @@ const ISOLATED_ENV_KEYS = [
   "ALLOWED_FILE_ROOTS",
   "TMUX_BACKEND",
   "CF_ACCESS_REQUIRED",
+  "CF_ACCESS_TEAM_NAME",
+  "CF_ACCESS_AUD",
   "DECKTERM_RUNTIME_ENV",
   "DECKTERM_PUBLISH_MODE",
   "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "DECKTERM_BOOTSTRAP_ADMIN_EMAIL",
+  "PORT",
   "SHELL",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -85,7 +89,11 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   process.env.ALLOWED_FILE_ROOTS = projectRoot;
   process.env.TMUX_BACKEND = "0";
   process.env.CF_ACCESS_REQUIRED = "0";
+  delete process.env.CF_ACCESS_TEAM_NAME;
+  delete process.env.CF_ACCESS_AUD;
   process.env.DECKTERM_RUNTIME_ENV = "development";
+  process.env.PORT = "4174";
+  delete process.env.DECKTERM_BOOTSTRAP_ADMIN_EMAIL;
   // Pin non-tunnel mode so this test deterministically exercises the
   // bootstrap-required gate. In cloudflare-tunnel mode that gate is bypassed by
   // design (see foundation-tunnel.test.ts), and a local .env enabling tunnel

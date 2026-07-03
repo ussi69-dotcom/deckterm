@@ -8,8 +8,27 @@ import {
 } from "./services/foundation-state";
 
 const tempDirs: string[] = [];
+const ISOLATED_ENV_KEYS = [
+  "DECKTERM_STATE_DIR",
+  "ALLOWED_FILE_ROOTS",
+  "DECKTERM_RUNTIME_ENV",
+  "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "CF_ACCESS_REQUIRED",
+] as const;
+const previousEnv: Record<string, string | undefined> = {};
+for (const key of ISOLATED_ENV_KEYS) {
+  previousEnv[key] = process.env[key];
+}
 
 afterEach(async () => {
+  for (const key of ISOLATED_ENV_KEYS) {
+    if (previousEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousEnv[key];
+    }
+  }
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
@@ -53,6 +72,7 @@ test("settings API stores and merges per-actor settings", async () => {
   tempDirs.push(stateDir);
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = process.env.HOME || "/tmp";
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   process.env.DECKTERM_LEGACY_NO_BOOTSTRAP = "1";
   delete process.env.DECKTERM_PUBLISH_MODE;
   // The shell running tests can inherit the dev service's Cloudflare Access

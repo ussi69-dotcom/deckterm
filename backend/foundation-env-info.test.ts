@@ -7,8 +7,30 @@ import {
 } from "./services/foundation-state";
 
 const tempDirs: string[] = [];
+const ISOLATED_ENV_KEYS = [
+  "DECKTERM_STATE_DIR",
+  "ALLOWED_FILE_ROOTS",
+  "DECKTERM_RUNTIME_ENV",
+  "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "CF_ACCESS_REQUIRED",
+  "CF_ACCESS_SECRET",
+  "FOO_TOKEN",
+  "SOME_API_KEY",
+] as const;
+const previousEnv: Record<string, string | undefined> = {};
+for (const key of ISOLATED_ENV_KEYS) {
+  previousEnv[key] = process.env[key];
+}
 
 afterEach(async () => {
+  for (const key of ISOLATED_ENV_KEYS) {
+    if (previousEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousEnv[key];
+    }
+  }
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
@@ -27,6 +49,7 @@ test("GET /api/settings/env-info: allowlist only, no secrets, paths coarsened fo
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   // No bypass: we want real capability evaluation (anonymous lacks root.use).
   delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
   // Not tunnel/edge-trusted (which would auto-allow host access).
