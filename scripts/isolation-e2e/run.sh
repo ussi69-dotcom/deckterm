@@ -44,4 +44,6 @@ sudo -n bash "$REPO_ROOT/scripts/isolation-e2e/setup-accounts.sh" >/dev/null
 # ── Run the spec ───────────────────────────────────────────────────────────
 say "run spec"
 cd "$REPO_ROOT"
-exec bun test ./tests/isolation/alice-bob.e2e.test.ts
+# Co-located with the harness (outside tests/ so Playwright's testDir and the
+# explicit test:unit list never pick it up). Long timeout: live broker + PTYs.
+exec bun test --timeout 120000 ./scripts/isolation-e2e/alice-bob.e2e.test.ts

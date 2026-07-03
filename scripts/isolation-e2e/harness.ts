@@ -347,6 +347,137 @@ export class Harness {
     return fetch(`${this.baseUrl}${path}`, { ...init, headers });
   }
 
+  /**
+   * Attempt a terminal WS upgrade as a persona. Resolves `{ opened }` — true if
+   * the socket opened (attach allowed), false if it closed/errored before
+   * opening (attach denied at upgrade). Always closes.
+   */
+  async attachTerminal(
+    persona: Persona | null,
+    terminalId: string,
+    opts: { rawJwt?: string } = {},
+  ): Promise<{ opened: boolean; closeCode?: number }> {
+    const jwt = opts.rawJwt ?? (persona ? await this.mint(persona) : "");
+    const url = `${this.baseUrl.replace(/^http/, "ws")}/ws/terminals/${terminalId}`;
+    const headers: Record<string, string> = {};
+    if (jwt) headers["cf-access-jwt-assertion"] = jwt;
+    return await new Promise((resolve) => {
+      let settled = false;
+      const ws = new WebSocket(url, { headers } as never);
+      const done = (opened: boolean, closeCode?: number) => {
+        if (settled) return;
+        settled = true;
+        try {
+          ws.close();
+        } catch {
+          // already closing
+        }
+        resolve({ opened, closeCode });
+      };
+      ws.addEventListener("open", () => done(true));
+      ws.addEventListener("error", () => done(false));
+      ws.addEventListener("close", (e) => done(false, (e as CloseEvent).code));
+      setTimeout(() => done(false), 5000);
+    });
+  }
+
+  /**
+   * Open a terminal WS as a persona, send `cmd`, collect raw PTY output for
+   * `settleMs`, return the captured text. Throws if the upgrade is denied.
+   * (Legacy WS protocol — no `?protocol=v2` — so output frames are raw; JSON
+   * control frames like pong/exit are filtered out.)
+   */
+  async runInTerminal(
+    persona: Persona,
+    terminalId: string,
+    cmd: string,
+    opts: { settleMs?: number; primeMs?: number } = {},
+  ): Promise<string> {
+    const settleMs = opts.settleMs ?? 1200;
+    const primeMs = opts.primeMs ?? 700;
+    const jwt = await this.mint(persona);
+    const url = `${this.baseUrl.replace(/^http/, "ws")}/ws/terminals/${terminalId}`;
+    const out: string[] = [];
+    const decoder = new TextDecoder();
+    const appendFrame = (data: unknown) => {
+      let text: string;
+      if (typeof data === "string") text = data;
+      else if (data instanceof ArrayBuffer) text = decoder.decode(data);
+      else if (ArrayBuffer.isView(data))
+        text = decoder.decode(data as ArrayBufferView);
+      else return;
+      // Filter JSON control frames (pong/exit/terminal_state/…).
+      const trimmed = text.trimStart();
+      if (trimmed.startsWith("{")) {
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && typeof parsed.type === "string") {
+            if (parsed.type === "terminal_event" && parsed.kind === "output") {
+              out.push(String(parsed.data ?? ""));
+            }
+            return;
+          }
+        } catch {
+          // not JSON — fall through and treat as raw output
+        }
+      }
+      out.push(text);
+    };
+
+    return await new Promise((resolve, reject) => {
+      const ws = new WebSocket(url, {
+        headers: { "cf-access-jwt-assertion": jwt },
+      } as never);
+      let opened = false;
+      ws.addEventListener("open", () => {
+        opened = true;
+        setTimeout(() => {
+          ws.send(JSON.stringify({ type: "input", data: `${cmd}\n` }));
+          setTimeout(() => {
+            try {
+              ws.close();
+            } catch {
+              // already closing
+            }
+            resolve(out.join(""));
+          }, settleMs);
+        }, primeMs);
+      });
+      ws.addEventListener("message", (e) =>
+        appendFrame((e as MessageEvent).data),
+      );
+      ws.addEventListener("error", () => {
+        if (!opened) reject(new Error(`WS attach denied for ${terminalId}`));
+      });
+      ws.addEventListener("close", () => {
+        if (!opened) reject(new Error(`WS attach denied for ${terminalId}`));
+      });
+      setTimeout(() => {
+        if (!opened) reject(new Error(`WS attach timed out for ${terminalId}`));
+      }, 8000);
+    });
+  }
+
+  /** Read audit_events rows from the SUT's sqlite DB (read-only). */
+  readAudit(
+    where: string,
+    ...params: unknown[]
+  ): Array<Record<string, unknown>> {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
+    const db = new Database(join(this.stateDir, "deckterm.db"), {
+      readonly: true,
+    });
+    try {
+      return db
+        .query(
+          `SELECT * FROM audit_events WHERE ${where} ORDER BY created_at DESC`,
+        )
+        .all(...(params as never[])) as Array<Record<string, unknown>>;
+    } finally {
+      db.close();
+    }
+  }
+
   async stop(): Promise<void> {
     if (this.sut) {
       await this.sut.stop();

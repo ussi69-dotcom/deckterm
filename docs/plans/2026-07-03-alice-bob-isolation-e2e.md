@@ -12,6 +12,28 @@
 > **Status: rev 1 — Codex-validated 2026-07-03** (deep/xhigh; initial no-go, all findings
 > incorporated — see §8). Harness-vs-reconfig, S1 rootId keying, mock-CF-edge, two-phase boot,
 > and CI-on-VM all confirmed defensible after the matrix + harness hardening below.
+>
+> **Delivery status (2026-07-03) — S1–S3 landed on `dev`, 55/55 e2e green live:**
+>
+> - **S1** (`150df6d`): member-grantable terminal capability (rootId keying) + split-grant
+>   unit matrix + E1 doc.
+> - **S2** (`315fd8d`): harness (mock CF edge, offline owner seed, SUT child boot, accounts,
+>   run.sh) **+ brokered terminal start-dir fix** — the create route realpathed the cwd as the
+>   service account, which cannot traverse a mapped user's 0700 home, so a mapped user could
+>   never open a terminal in their own home under isolation; now resolved lexically for brokered
+>   contexts.
+> - **S3** (this commit): the 55-assert spec + WS/audit harness helpers, **plus two more product
+>   bugs the e2e surfaced and fixed** (both cross-slice, exactly what the integration net is
+>   for): (a) **search route lacked an explicit isolation deny** — it gated via
+>   `resolveAllowedPath` (realpath) and only incidentally denied because the service account
+>   can't traverse a 0700 home; on a world-traversable granted root grep would have run AS THE
+>   SERVICE ACCOUNT. Added `denyIfOsIsolationPending` at the top (fail closed regardless of fs
+>   perms). (b) **`GET /api/terminals` scoped by the raw actor id** while create/attach store the
+>   canonical owner id — an invited user (canonical id ≠ subject) never saw their own terminals;
+>   now scoped by the canonical id. The owner's id equals their subject, which is why neither was
+>   caught before a two-_invited_-user test existed.
+> - Live: 55/55 on the dev host (dtalice uid 1003 / dtbob uid 1004, real broker); full
+>   `test:unit` + `tsc` green. **Owed:** S4 (CI job) + the Codex integrated-diff pass.
 
 ## 0. Scope & the harness-vs-reconfig decision
 

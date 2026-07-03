@@ -5518,11 +5518,33 @@ export function createWebApp() {
 
   // List terminals
   app.get("/api/terminals", async (c) => {
-    const { ownerId } = getCurrentUser(c);
     const requestingClientId =
       c.req.header("x-deckterm-client-id")?.trim() || null;
     const backendMode = getBackendMode();
     const state = await getFoundationState();
+    // Scope by the CANONICAL owner id — the same id terminal.create/attach store
+    // and compare (invariant §9.9). getCurrentUser returns the raw actor id,
+    // which for an invited user (canonical id ≠ subject) does not match the
+    // stored session owner, so they would never see their own terminals. Legacy
+    // bypass still resolves to the raw actor id (no user rows), unchanged.
+    const actor = getCurrentActor(c);
+    let ownerId: string;
+    try {
+      ownerId = isFoundationLegacyBypassEnabled()
+        ? actor.id
+        : resolveCanonicalOwnerId(state, actor).ownerId;
+    } catch (err) {
+      if (err instanceof IdentityConflictError) {
+        return c.json(
+          {
+            error: "DeckTerm identity resolution conflict",
+            reason: "identity_conflict",
+          },
+          403,
+        );
+      }
+      throw err;
+    }
     const recordedSessions = listTerminalSessionsForActor(state.db, ownerId);
     const seenIds = new Set<string>();
 
@@ -5846,6 +5868,25 @@ export function createWebApp() {
       maxResults = Math.max(
         1,
         Math.min(SEARCH_MAX_RESULTS, Math.floor(body.maxResults)),
+      );
+    }
+
+    // ── Isolation gate FIRST (B4 deferred fast-follow) ───────────────────────
+    // Workspace search is not brokered in 1.0, so under isolation it must deny
+    // explicitly and BEFORE the realpath gate below. Otherwise the deny would
+    // depend on filesystem permissions: `resolveAllowedPath` realpaths as the
+    // service account and only incidentally fails on a mapped user's 0700 home
+    // — on a world-traversable granted root, grep would run AS THE SERVICE
+    // ACCOUNT and read files the mapped user cannot. Fail closed regardless.
+    const searchIsolationDeny = await denyIfOsIsolationPending(
+      c,
+      "search",
+      typeof requestId === "string" ? requestId : String(requestId),
+    );
+    if (searchIsolationDeny) {
+      return c.json(
+        { ...searchIsolationDeny.body, requestId },
+        { status: searchIsolationDeny.status as any },
       );
     }
 
