@@ -5109,29 +5109,58 @@ export function createWebApp() {
     if (!routeCapability) {
       return c.json({ error: "Missing route capability" }, 500);
     }
-    const foundationAuth = await requireFoundationCapability({
-      actor,
-      capability: routeCapability.capability,
-      resourceType: routeCapability.resourceType,
-      resourceId: routeCapability.resourceId,
-      data: { cwd: body.cwd || process.env.HOME || "/" },
-    });
-    if (!foundationAuth.ok) {
-      return c.json(foundationGateJson(foundationAuth), foundationAuth.status);
-    }
-    // Canonical ownerId (plan §2, invariant §9.9): every downstream seam in
-    // this handler — live-count checks, PTY spawn, session recording, audit
-    // — stores/compares this resolved id, not the raw actor id.
-    const ownerId = foundationAuth.ownerId;
-
     const requestedCwd = body.cwd || process.env.HOME || "/";
+    // Resolve the start dir first (side-effect-free) so BOTH capability checks
+    // key on the resolved root's id, mirroring requireFileAccess. Before S1
+    // (Alice/Bob e2e), terminal.create was checked on (terminal, "*") and
+    // root.use on the raw cwd path — neither is grantable to a member (wildcard
+    // grants are forbidden; the S6 auto-grant / scoped grants are keyed by
+    // rootId), so members could never create even in their own home. Owner/
+    // admin still pass via the check-time role bundle regardless of resource,
+    // and legacy bypass short-circuits inside requireFoundationCapability, so
+    // their outcomes are unchanged.
+    //
     // Falls back to an allowed root when the requested cwd is within roots but
     // deleted; only a genuinely out-of-roots path returns null (→ 403).
     const resolvedCwd = await resolveTerminalStartDir(requestedCwd);
-    if (!resolvedCwd) {
-      const state = await getFoundationState();
+    const state = await getFoundationState();
+    // Canonical audit actor id for the pre-capability denies below, preserving
+    // the identity-conflict fail-closed outcome requireFoundationCapability
+    // used to give here (it resolved identity before cwd resolution).
+    const resolveAuditOwnerId = (): string | { conflict: true } => {
+      try {
+        return resolveCanonicalOwnerId(state, actor).ownerId;
+      } catch (err) {
+        if (err instanceof IdentityConflictError) return { conflict: true };
+        throw err;
+      }
+    };
+    const identityConflictResponse = () => {
       writeAuditEvent(state.db, {
-        actorUserId: ownerId,
+        actorUserId: actor.id,
+        action: "terminal.create",
+        resourceType: "terminal",
+        resourceId: "*",
+        decision: "deny",
+        reason: "identity_conflict",
+        data: { cwd: requestedCwd },
+      });
+      return c.json(
+        foundationGateJson({
+          message: "DeckTerm identity resolution conflict",
+          reason: "identity_conflict",
+          capability: "terminal.create",
+          resourceType: "terminal",
+          resourceId: "*",
+        }),
+        403,
+      );
+    };
+    if (!resolvedCwd) {
+      const auditOwnerId = resolveAuditOwnerId();
+      if (typeof auditOwnerId !== "string") return identityConflictResponse();
+      writeAuditEvent(state.db, {
+        actorUserId: auditOwnerId,
         action: "terminal.create",
         resourceType: "root",
         decision: "deny",
@@ -5141,11 +5170,55 @@ export function createWebApp() {
       return c.json({ error: "Forbidden terminal root" }, 403);
     }
 
+    // Lexical (no realpath) root match, same helper requireFileAccess uses.
+    // resolveTerminalStartDir already kept the path within roots, so a null
+    // here is a defensive guard (root row removed mid-request) → deny like the
+    // fs surfaces do.
+    const cwdRootId = resolveFoundationRootIdForPath(state, resolvedCwd);
+    if (!cwdRootId) {
+      const auditOwnerId = resolveAuditOwnerId();
+      if (typeof auditOwnerId !== "string") return identityConflictResponse();
+      writeAuditEvent(state.db, {
+        actorUserId: auditOwnerId,
+        action: "terminal.create",
+        resourceType: "root",
+        decision: "deny",
+        reason: "no_matching_root",
+        data: { cwd: resolvedCwd },
+      });
+      return c.json(
+        {
+          error: "Forbidden path (no matching registered root)",
+          reason: "no_matching_root",
+        },
+        403,
+      );
+    }
+
+    // terminal.create keyed on the resolved root (was terminal/"*"). Owner/admin
+    // pass via the role bundle; a member needs a scoped (terminal.create, root,
+    // <rootId>) grant. This call also enforces disabled-wins / bootstrap /
+    // identity / tunnel gating (unchanged) and yields the canonical ownerId.
+    const foundationAuth = await requireFoundationCapability({
+      actor,
+      capability: routeCapability.capability,
+      resourceType: "root",
+      resourceId: cwdRootId,
+      data: { cwd: resolvedCwd },
+    });
+    if (!foundationAuth.ok) {
+      return c.json(foundationGateJson(foundationAuth), foundationAuth.status);
+    }
+    // Canonical ownerId (plan §2, invariant §9.9): every downstream seam in
+    // this handler — live-count checks, PTY spawn, session recording, audit
+    // — stores/compares this resolved id, not the raw actor id.
+    const ownerId = foundationAuth.ownerId;
+
     const rootAuth = await requireFoundationCapability({
       actor,
       capability: "root.use",
       resourceType: "root",
-      resourceId: resolvedCwd,
+      resourceId: cwdRootId,
       data: { cwd: resolvedCwd },
     });
     if (!rootAuth.ok) {
@@ -5159,8 +5232,7 @@ export function createWebApp() {
 
     // Pre-side-effect disabled re-check (invariant §9.2): closes the race
     // where a disable lands between the capability gate above and the PTY
-    // spawn below.
-    const state = await getFoundationState();
+    // spawn below. (`state` was resolved above for the cwd/root checks.)
     const recheckUser = getFoundationUserById(state.db, ownerId);
     if (recheckUser?.disabled) {
       writeAuditEvent(state.db, {
@@ -5207,11 +5279,10 @@ export function createWebApp() {
       exec,
     });
 
-    const rootId = resolveFoundationRootIdForPath(state, resolvedCwd);
     recordTerminalSession(state.db, {
       id: terminal.id,
       actorUserId: ownerId,
-      rootId,
+      rootId: cwdRootId,
       cwd: resolvedCwd,
       status: "active",
       // Persist the execution kind so the isolation reconcile refuses to

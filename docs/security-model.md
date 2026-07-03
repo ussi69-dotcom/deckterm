@@ -78,7 +78,12 @@ Out of scope in 1.0 (documented, not defended):
    (`owner`/`admin`/`member`), scoped capabilities (`terminal.*`, `root.use`), per-user
    allowed roots, deny-by-default route gates, audit rows on allow and deny. This layer
    decides _what the server agrees to do_; it is not, by itself, an isolation boundary —
-   which is exactly why 1.0 adds boundary #1.
+   which is exactly why 1.0 adds boundary #1. **Consequence for scoped terminal grants:** a
+   member holding scoped `terminal.create` + `root.use` grants on a root can open a shell in
+   that root. Under OS isolation that shell is the mapped unix account (a real boundary);
+   **outside** OS isolation there is no broker, so it runs as the DeckTerm **service account** —
+   grant scoped terminal access only to users you would trust with the service account, or
+   enable `DECKTERM_OS_ISOLATION=1`.
 3. **Root grants (the broker) — the privilege pinch point.** The only privileged component is
    the fixed-argv broker: root-owned, invoked via a sudoers entry pinned to its absolute
    path, accepting only server-generated session ids, numeric uid/gid above a floor,
