@@ -32,8 +32,19 @@
 >   canonical owner id — an invited user (canonical id ≠ subject) never saw their own terminals;
 >   now scoped by the canonical id. The owner's id equals their subject, which is why neither was
 >   caught before a two-_invited_-user test existed.
+> - **S4** (`45c0bab`): `isolation-e2e` CI job (VM runner, fail-loud preflight); run.sh green
+>   end-to-end locally.
+> - **Codex integrated-diff security pass** (2026-07-03, xhigh) — 3 mediums, all addressed:
+>   (1) terminal-create denied `forbidden_root`/`no_matching_root` on a bad cwd BEFORE the
+>   disabled/trust gate, masking those reasons → added `preflightTerminalActor` (identity/
+>   disabled/isolation-source-trust) ahead of cwd resolution; (2) the early-deny audit used
+>   canonical resolution even under legacy bypass → preflight returns the raw actor id under
+>   bypass; (3) the PTY start dir is symlink-followable (DAC-bound, not root-confined) →
+>   documented as the intended cross-uid-only containment scope (fs/git/search stay symlink-
+>   confined via the fs-helper). A bonus: the untrusted-source deny is now `actor_source_untrusted`
+>   on PTY create too (tightened in the spec).
 > - Live: 55/55 on the dev host (dtalice uid 1003 / dtbob uid 1004, real broker); full
->   `test:unit` + `tsc` green. **Owed:** S4 (CI job) + the Codex integrated-diff pass.
+>   `test:unit` + `tsc` green.
 
 ## 0. Scope & the harness-vs-reconfig decision
 

@@ -160,8 +160,10 @@ export function isOsIsolationEnabled(env: FoundationEnv): boolean {
 }
 
 /** Actor sources whose identity is NOT server-verified must never select a
- *  unix account in isolation mode (B1 §1.2, invariant §7.3). */
-function isTrustedActorSourceForIsolation(
+ *  unix account in isolation mode (B1 §1.2, invariant §7.3). Exported so
+ *  execution surfaces can deny untrusted sources BEFORE resolving a cwd/root
+ *  (so the deny is attributed to the trust boundary, not a path check). */
+export function isTrustedActorSourceForIsolation(
   source: DeckTermActor["source"],
 ): boolean {
   return source === "cloudflare_access";

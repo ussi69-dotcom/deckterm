@@ -652,10 +652,9 @@ describe("phase B: tunnel actors denied", () => {
     await h.boot("tunnel" satisfies BootMode);
   });
 
-  // PTY create: a tunnel actor holds no granted root, so the brokered start-dir
-  // resolution denies (forbidden_root) before the exec-context check would
-  // return actor_source_untrusted — either way the untrusted source is refused.
-  // Even owner@e2e.local via a tunnel header must NOT gain the owner's bundle
+  // PTY create: the early actor-validity gate denies an untrusted source
+  // (actor_source_untrusted) BEFORE any cwd/root resolution. Even
+  // owner@e2e.local via a tunnel header must NOT gain the owner's bundle
   // (Codex #4): identity from an unverified header must never select privilege.
   for (const email of [PERSONAS.alice.email, PERSONAS.owner.email, null]) {
     test(`tunnel actor (${email ?? "headerless"}) is denied on PTY create`, async () => {
@@ -667,6 +666,7 @@ describe("phase B: tunnel actors denied", () => {
       expect(res.status).toBe(403);
       const body = await res.text();
       expect(body).not.toContain(BOB_SECRET_MARKER);
+      expect(JSON.parse(body).reason).toBe("actor_source_untrusted");
     });
   }
 

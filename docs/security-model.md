@@ -73,7 +73,13 @@ Out of scope in 1.0 (documented, not defended):
    can touch. Mapping eligibility is strict: unique uid per user, membership in an explicit
    allowed group, use-time revalidation against uid reuse/drift, and **never the DeckTerm
    service account or any account that can reach DeckTerm state, config, or the broker** —
-   mapping management is owner-only in 1.0.
+   mapping management is owner-only in 1.0. **Containment scope:** the hard guarantee is
+   **cross-uid** isolation. File/git/search operations are additionally symlink-confined to the
+   granted root (the fs-helper resolves with `openat2(RESOLVE_NO_SYMLINKS)`); the **PTY start
+   directory is DAC-bound only** — a symlink the mapped user owns inside their root is followed
+   by the broker's post-drop `chdir`, so a user can start their own shell wherever their unix
+   account may `cd`. Intra-uid root confinement (mount-namespace/chroot) is deferred to the 1.1
+   container work.
 2. **App-level grants (foundation layer) — authorization and audit, inside the TCB.** Roles
    (`owner`/`admin`/`member`), scoped capabilities (`terminal.*`, `root.use`), per-user
    allowed roots, deny-by-default route gates, audit rows on allow and deny. This layer

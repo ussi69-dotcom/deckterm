@@ -90,6 +90,7 @@ import {
   getRouteCapability,
   isLegacyBootstrapBypassAllowed,
   isOsIsolationEnabled,
+  isTrustedActorSourceForIsolation,
   resolveExecutionContext,
   roleImpliesCapability,
   type ExecutionContext,
@@ -2279,7 +2280,77 @@ async function resolveBrokeredStartDir(
     canonical,
   );
   if (candidates.length === 0) return null;
+  // NOTE (Codex integrated #3): lexical matching proves the STRING is under a
+  // granted root, not that the resolved directory is. A symlink the mapped user
+  // owns inside their root can point elsewhere and the broker's post-drop chdir
+  // follows it — as the mapped uid, bound by DAC. This is intentional and
+  // consistent with the B4 containment scope (security-model.md): the hard
+  // guarantee is CROSS-UID isolation; intra-uid root confinement is best-effort
+  // (mount-namespace/chroot is 1.1 container work), and the user already has a
+  // shell they can `cd` from. fs/git/search ops ARE symlink-confined (fs-helper
+  // openat2 RESOLVE_NO_SYMLINKS); only the PTY start dir is DAC-bound.
   return canonical;
+}
+
+/**
+ * Early actor-validity gate for the terminal-create path (Codex integrated
+ * #1/#2). Enforces identity-conflict, disabled-wins, and — under isolation —
+ * actor-source trust BEFORE cwd/root resolution, so a disabled or untrusted
+ * actor is denied with the correct reason and audit attribution instead of
+ * being masked by a later `forbidden_root`/`no_matching_root` path deny. Legacy
+ * bypass short-circuits to the raw actor id with no DB gating (byte-identical to
+ * pre-isolation behavior). The subsequent capability checks still enforce the
+ * grant + bootstrap; this only fixes the precedence of the resource-independent
+ * denials.
+ */
+function preflightTerminalActor(
+  state: FoundationState,
+  actor: DeckTermActor,
+):
+  | { ok: true; ownerId: string }
+  | {
+      ok: false;
+      reason: "identity_conflict" | "user_disabled" | "actor_source_untrusted";
+      message: string;
+      auditOwnerId: string;
+    } {
+  if (isFoundationLegacyBypassEnabled()) {
+    return { ok: true, ownerId: actor.id };
+  }
+  let canonical: { ownerId: string; user: FoundationUser | null };
+  try {
+    canonical = resolveCanonicalOwnerId(state, actor);
+  } catch (err) {
+    if (err instanceof IdentityConflictError) {
+      return {
+        ok: false,
+        reason: "identity_conflict",
+        message: "DeckTerm identity resolution conflict",
+        auditOwnerId: actor.id,
+      };
+    }
+    throw err;
+  }
+  if (canonical.user?.disabled) {
+    return {
+      ok: false,
+      reason: "user_disabled",
+      message: "DeckTerm account disabled",
+      auditOwnerId: canonical.ownerId,
+    };
+  }
+  if (
+    isOsIsolationEnabled(process.env) &&
+    !isTrustedActorSourceForIsolation(actor.source)
+  ) {
+    return {
+      ok: false,
+      reason: "actor_source_untrusted",
+      message: "OS isolation denied",
+      auditOwnerId: canonical.ownerId,
+    };
+  }
+  return { ok: true, ownerId: canonical.ownerId };
 }
 
 /** Map an `FsExecError` from the executor to the HTTP response shape B4 routes
@@ -5160,47 +5231,44 @@ export function createWebApp() {
     // enforces the real traversal). Legacy keeps the realpath resolver, which
     // falls back to an allowed root when the requested cwd is within roots but
     // deleted; only a genuinely out-of-roots path returns null (→ 403).
-    const resolvedCwd = isOsIsolationEnabled(process.env)
-      ? await resolveBrokeredStartDir(c, body.cwd ? String(body.cwd) : null)
-      : await resolveTerminalStartDir(requestedCwd);
     const state = await getFoundationState();
-    // Canonical audit actor id for the pre-capability denies below, preserving
-    // the identity-conflict fail-closed outcome requireFoundationCapability
-    // used to give here (it resolved identity before cwd resolution).
-    const resolveAuditOwnerId = (): string | { conflict: true } => {
-      try {
-        return resolveCanonicalOwnerId(state, actor).ownerId;
-      } catch (err) {
-        if (err instanceof IdentityConflictError) return { conflict: true };
-        throw err;
-      }
-    };
-    const identityConflictResponse = () => {
+
+    // Early actor-validity gate (Codex integrated #1/#2): enforce identity-
+    // conflict / disabled-wins / isolation source-trust BEFORE resolving the
+    // cwd, so those resource-independent denials keep their precedence and audit
+    // attribution rather than being masked by a forbidden_root/no_matching_root
+    // path deny. Legacy bypass short-circuits to the raw actor id (byte-
+    // identical). The capability checks below still enforce the grant/bootstrap.
+    const pre = preflightTerminalActor(state, actor);
+    if (!pre.ok) {
       writeAuditEvent(state.db, {
-        actorUserId: actor.id,
+        actorUserId: pre.auditOwnerId,
         action: "terminal.create",
         resourceType: "terminal",
         resourceId: "*",
         decision: "deny",
-        reason: "identity_conflict",
-        data: { cwd: requestedCwd },
+        reason: pre.reason,
+        data: { cwd: body.cwd ?? null },
       });
       return c.json(
         foundationGateJson({
-          message: "DeckTerm identity resolution conflict",
-          reason: "identity_conflict",
+          message: pre.message,
+          reason: pre.reason,
           capability: "terminal.create",
           resourceType: "terminal",
           resourceId: "*",
         }),
         403,
       );
-    };
+    }
+    const actorOwnerId = pre.ownerId;
+
+    const resolvedCwd = isOsIsolationEnabled(process.env)
+      ? await resolveBrokeredStartDir(c, body.cwd ? String(body.cwd) : null)
+      : await resolveTerminalStartDir(requestedCwd);
     if (!resolvedCwd) {
-      const auditOwnerId = resolveAuditOwnerId();
-      if (typeof auditOwnerId !== "string") return identityConflictResponse();
       writeAuditEvent(state.db, {
-        actorUserId: auditOwnerId,
+        actorUserId: actorOwnerId,
         action: "terminal.create",
         resourceType: "root",
         decision: "deny",
@@ -5216,10 +5284,8 @@ export function createWebApp() {
     // fs surfaces do.
     const cwdRootId = resolveFoundationRootIdForPath(state, resolvedCwd);
     if (!cwdRootId) {
-      const auditOwnerId = resolveAuditOwnerId();
-      if (typeof auditOwnerId !== "string") return identityConflictResponse();
       writeAuditEvent(state.db, {
-        actorUserId: auditOwnerId,
+        actorUserId: actorOwnerId,
         action: "terminal.create",
         resourceType: "root",
         decision: "deny",
