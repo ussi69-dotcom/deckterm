@@ -46,6 +46,7 @@ const C1_AUTH_GRANTS_MIGRATION = 2;
 const C1B_TERMINAL_EVENTS_MIGRATION = 3;
 const C3_USER_SETTINGS_MIGRATION = 4;
 const B3_IDENTITY_ROLES_MIGRATION = 5;
+const B2_OS_MAPPINGS_MIGRATION = 6;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -161,6 +162,8 @@ export function migrateFoundationDb(db: Database): void {
       updated_at TEXT NOT NULL,
       ended_at TEXT,
       last_event_id INTEGER NOT NULL DEFAULT 0,
+      exec_kind TEXT,
+      os_uid INTEGER,
       FOREIGN KEY(root_id) REFERENCES project_roots(id)
     );
 
@@ -213,6 +216,21 @@ export function migrateFoundationDb(db: Database): void {
       UNIQUE(user_id, capability, resource_type, resource_id),
       FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS user_os_mappings (
+      user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      os_username TEXT NOT NULL,
+      os_uid INTEGER NOT NULL,
+      os_gid INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+      suspend_reason TEXT,
+      created_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_os_mappings_active_uid
+      ON user_os_mappings(os_uid) WHERE status = 'active';
   `);
 
   const existing = db
@@ -275,6 +293,28 @@ export function migrateFoundationDb(db: Database): void {
     db.query(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(B3_IDENTITY_ROLES_MIGRATION, new Date().toISOString());
+  }
+
+  // Migration 6 (B2): `user_os_mappings` (created by the boot DDL above) + two
+  // additive columns on `terminal_sessions` so the persisted execution kind /
+  // brokered uid survive restarts (Codex #8 — in-memory backend refs are lost
+  // on restart, so the isolation reconcile can't trust them). Additive
+  // ALTERs, guarded per-column, so a pre-B2 DB pays them exactly once and a
+  // fresh DB (born with the columns via the boot DDL) skips them.
+  if (!tableColumnExists(db, "terminal_sessions", "exec_kind")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN exec_kind TEXT");
+  }
+  if (!tableColumnExists(db, "terminal_sessions", "os_uid")) {
+    db.exec("ALTER TABLE terminal_sessions ADD COLUMN os_uid INTEGER");
+  }
+
+  const b2Existing = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(B2_OS_MAPPINGS_MIGRATION);
+  if (!b2Existing) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(B2_OS_MAPPINGS_MIGRATION, new Date().toISOString());
   }
 }
 
@@ -1310,6 +1350,158 @@ export function markUserReviewed(
   db.query(
     "UPDATE users SET multiuser_reviewed_at = ?, updated_at = ? WHERE id = ?",
   ).run(timestamp, timestamp, opts.userId);
+}
+
+// ---------------------------------------------------------------------------
+// B2 — OS account mappings (migration 6). Pure DB layer: eligibility is
+// validated by the caller (server API / resolver) via os-mapping-eligibility
+// BEFORE createOsMapping/reactivateOsMapping, and independently by the root
+// broker on every call (Codex #2). Suspending/deleting a mapping must be
+// composed with the B3 revocation kill path by the caller (Codex #6) — this
+// module never reaches into server-side live state.
+// ---------------------------------------------------------------------------
+
+export type OsMappingStatus = "active" | "suspended";
+
+export type OsMapping = {
+  userId: string;
+  osUsername: string;
+  osUid: number;
+  osGid: number;
+  status: OsMappingStatus;
+  suspendReason: string | null;
+  createdBy: string;
+};
+
+type OsMappingRowRaw = {
+  user_id: string;
+  os_username: string;
+  os_uid: number;
+  os_gid: number;
+  status: string;
+  suspend_reason: string | null;
+  created_by: string;
+};
+
+function mapOsMappingRow(row: OsMappingRowRaw): OsMapping {
+  return {
+    userId: row.user_id,
+    osUsername: row.os_username,
+    osUid: row.os_uid,
+    osGid: row.os_gid,
+    status: row.status as OsMappingStatus,
+    suspendReason: row.suspend_reason,
+    createdBy: row.created_by,
+  };
+}
+
+export function getOsMapping(db: Database, userId: string): OsMapping | null {
+  const row = db
+    .query(
+      `SELECT user_id, os_username, os_uid, os_gid, status, suspend_reason, created_by
+       FROM user_os_mappings WHERE user_id = ?`,
+    )
+    .get(userId) as OsMappingRowRaw | null;
+  return row ? mapOsMappingRow(row) : null;
+}
+
+export function listOsMappings(db: Database): OsMapping[] {
+  const rows = db
+    .query(
+      `SELECT user_id, os_username, os_uid, os_gid, status, suspend_reason, created_by
+       FROM user_os_mappings ORDER BY os_username`,
+    )
+    .all() as OsMappingRowRaw[];
+  return rows.map(mapOsMappingRow);
+}
+
+/**
+ * Create (or replace) a user's OS mapping as `active`. The caller MUST have run
+ * eligibility validation on `(osUsername, osUid, osGid)` first. The partial
+ * unique index on `os_uid WHERE status='active'` enforces that no two active
+ * DeckTerm users share a unix account (B1 §2.1 / Codex #2) — a collision throws
+ * a UNIQUE constraint error the caller surfaces as a conflict.
+ */
+export function createOsMapping(
+  db: Database,
+  opts: {
+    userId: string;
+    osUsername: string;
+    osUid: number;
+    osGid: number;
+    createdBy: string;
+    now?: Date;
+  },
+): OsMapping {
+  const timestamp = isoDate(opts.now || new Date());
+  if (!getFoundationUserById(db, opts.userId)) {
+    throw new Error(`user not found: ${opts.userId}`);
+  }
+  db.query(
+    `INSERT INTO user_os_mappings
+       (user_id, os_username, os_uid, os_gid, status, suspend_reason, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'active', NULL, ?, ?, ?)
+     ON CONFLICT(user_id) DO UPDATE SET
+       os_username = excluded.os_username,
+       os_uid = excluded.os_uid,
+       os_gid = excluded.os_gid,
+       status = 'active',
+       suspend_reason = NULL,
+       updated_at = excluded.updated_at`,
+  ).run(
+    opts.userId,
+    opts.osUsername,
+    opts.osUid,
+    opts.osGid,
+    opts.createdBy,
+    timestamp,
+    timestamp,
+  );
+  const created = getOsMapping(db, opts.userId);
+  if (!created) {
+    throw new Error(`os mapping not found after create: ${opts.userId}`);
+  }
+  return created;
+}
+
+/**
+ * Suspend a mapping (drift, manual, or eligibility loss). Returns the updated
+ * mapping (null if none) so the caller can run the revocation kill path for the
+ * user (Codex #6). Idempotent.
+ */
+export function suspendOsMapping(
+  db: Database,
+  opts: { userId: string; reason: string; now?: Date },
+): OsMapping | null {
+  const timestamp = isoDate(opts.now || new Date());
+  db.query(
+    `UPDATE user_os_mappings
+       SET status = 'suspended', suspend_reason = ?, updated_at = ?
+     WHERE user_id = ?`,
+  ).run(opts.reason, timestamp, opts.userId);
+  return getOsMapping(db, opts.userId);
+}
+
+/**
+ * Reactivate a suspended mapping. The caller MUST re-run eligibility validation
+ * first (suspension is never auto-reversed, B2 §2). The active-uid unique index
+ * still applies — reactivating onto a uid another active mapping holds throws.
+ */
+export function reactivateOsMapping(
+  db: Database,
+  opts: { userId: string; now?: Date },
+): OsMapping | null {
+  const timestamp = isoDate(opts.now || new Date());
+  db.query(
+    `UPDATE user_os_mappings
+       SET status = 'active', suspend_reason = NULL, updated_at = ?
+     WHERE user_id = ?`,
+  ).run(timestamp, opts.userId);
+  return getOsMapping(db, opts.userId);
+}
+
+export function deleteOsMapping(db: Database, userId: string): void {
+  db.query("DELETE FROM user_os_mappings WHERE user_id = ?").run(userId);
 }
 
 /** Looks up a single scoped grant row by id (for DELETE /api/grants/:id). */
