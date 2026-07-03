@@ -61,6 +61,7 @@ import {
   listScopedGrants,
   listTerminalEventsAfter,
   listTerminalSessionsForActor,
+  listWildcardGrantPrincipals,
   markTerminalSessionEnded,
   markUserReviewed,
   recordTerminalSession,
@@ -6065,6 +6066,93 @@ export async function startWebServer(host: string, port: number) {
     throw new Error(
       "CF_ACCESS_REQUIRED=1 but CF_ACCESS_AUD is empty. Server-side audience pinning cannot run; refusing to start in a silently-unprotected state. Set CF_ACCESS_AUD or unset CF_ACCESS_REQUIRED.",
     );
+  }
+
+  // B3 §1.6 multiuser enablement gate (fail-closed startup, plan
+  // docs/plans/2026-07-03-b3-user-provisioning-roles-revocation.md §6,
+  // invariant §9.8). DECKTERM_OS_ISOLATION is the only multiuser flag until
+  // C1 (OIDC/sessions) and does nothing else in B3 — B2 implements actual OS
+  // isolation. Guarded entirely behind the flag check so startups with the
+  // flag unset/anything-but-"1" are byte-identical to pre-gate behavior
+  // (invariant §9.10): no early foundation-state load, no audit row, no
+  // throw. getFoundationState() is a memoized singleton promise, so this
+  // hoist does not initialize foundation state twice even when the
+  // TMUX_BACKEND branch below also awaits it.
+  if (process.env.DECKTERM_OS_ISOLATION === "1") {
+    const state = await getFoundationState();
+
+    const users = listFoundationUsers(state.db);
+    const owner = users.find((user) => user.role === "owner") ?? null;
+    const unreviewedAdmins = users.filter(
+      (user) => user.role === "admin" && user.multiuserReviewedAt === null,
+    );
+    // Wildcard principals whose own role is not "owner" — the owner's
+    // implicit bundle is exempt; every other wildcard-bearing principal
+    // (admin, member, or orphan with no users row at all) must be reviewed.
+    const wildcardPrincipals = listWildcardGrantPrincipals(state.db).filter(
+      (principal) => principal.role !== "owner",
+    );
+
+    const violations: string[] = [];
+    if (!owner) violations.push("no_owner");
+    if (unreviewedAdmins.length > 0) violations.push("unreviewed_admin");
+    if (wildcardPrincipals.length > 0) {
+      violations.push("unreviewed_wildcard_grants");
+    }
+
+    if (violations.length > 0) {
+      writeAuditEvent(state.db, {
+        actorUserId: owner?.id ?? null,
+        action: "multiuser.gate",
+        resourceType: "system",
+        resourceId: null,
+        decision: "deny",
+        reason: violations.join(","),
+        data: {
+          violations,
+          unreviewedAdminIds: unreviewedAdmins.map((user) => user.id),
+          wildcardPrincipalIds: wildcardPrincipals.map(
+            (principal) => principal.userId,
+          ),
+        },
+      });
+
+      const details: string[] = [];
+      if (!owner) {
+        details.push(
+          "no_owner: no user with role 'owner' exists. DECKTERM_OS_ISOLATION=1 refuses to start until an owner is established via the manual owner-recovery repair procedure (plan §1.3/E3).",
+        );
+      }
+      if (unreviewedAdmins.length > 0) {
+        details.push(
+          `unreviewed_admin: admin user(s) not yet reviewed for multiuser enablement: ${unreviewedAdmins
+            .map((user) => user.id)
+            .join(", ")}. Review each via POST /api/users/:id/review.`,
+        );
+      }
+      if (wildcardPrincipals.length > 0) {
+        details.push(
+          `unreviewed_wildcard_grants: principal(s) still hold wildcard scoped_grants rows that have not been reviewed: ${wildcardPrincipals
+            .map((principal) => principal.userId)
+            .join(
+              ", ",
+            )}. Review each via POST /api/users/:id/review (existing user) or POST /api/grants/review (orphan principal with no users row).`,
+        );
+      }
+
+      throw new Error(
+        `DECKTERM_OS_ISOLATION=1 multiuser enablement gate refused startup:\n${details.join("\n")}`,
+      );
+    }
+
+    writeAuditEvent(state.db, {
+      actorUserId: owner?.id ?? null,
+      action: "multiuser.gate",
+      resourceType: "system",
+      resourceId: null,
+      decision: "allow",
+      reason: "clean",
+    });
   }
 
   // Recover existing tmux sessions before starting server

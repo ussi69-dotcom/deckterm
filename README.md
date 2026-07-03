@@ -119,29 +119,30 @@ Relevant variables include:
 
 Common runtime variables:
 
-| Variable                     | Default                      | Purpose                                                           |
-| ---------------------------- | ---------------------------- | ----------------------------------------------------------------- |
-| `PORT`                       | `4174`                       | HTTP server port                                                  |
-| `HOST`                       | `0.0.0.0`                    | Bind address                                                      |
-| `OPENCODE_WEB_DEBUG`         | `0`                          | Debug logging                                                     |
-| `OPENCODE_WEB_MAX_TERMINALS` | `10`                         | Global terminal cap                                               |
-| `MAX_TERMINALS_PER_USER`     | `10`                         | Per-user cap                                                      |
-| `TERMINAL_IDLE_TIMEOUT_MS`   | `7200000`                    | Idle terminal cleanup                                             |
-| `SCROLLBACK_MAX_LINES`       | `2000`                       | Reconnect replay line budget                                      |
-| `SCROLLBACK_MAX_BYTES`       | `1048576`                    | Reconnect replay byte budget                                      |
-| `AGENT_RESPONDING_IDLE_MS`   | `700`                        | Response-to-idle decay for agent badges                           |
-| `ALLOWED_FILE_ROOTS`         | `$HOME`                      | Allowed browse/upload/git roots                                   |
-| `TMUX_BACKEND`               | `1` in deployed environments | Persistent tmux sessions                                          |
-| `DECKTERM_STATE_DIR`         | `$HOME/.deckterm`            | Task Runner metadata, control files, and worktree root            |
-| `DECKTERM_TASK_MAX_ROUNDS`   | `5`                          | Reserved cap for supervised worker/judge rounds                   |
-| `DECKTERM_TASK_PROVIDERS`    | `codex,claude`               | Reserved provider allow-list for task workflows                   |
-| `DECKTERM_PUBLISH_MODE`      | `local`                      | Setup doctor profile: `local`, `cloudflare`, `nginx`, or `direct` |
-| `CF_ACCESS_REQUIRED`         | `0`                          | Require Cloudflare Access JWTs                                    |
-| `CF_ACCESS_TEAM_NAME`        | empty                        | Cloudflare Access team name                                       |
-| `CF_ACCESS_AUD`              | empty                        | Cloudflare Access application audience tag                        |
-| `TRUSTED_ORIGINS`            | empty                        | Comma-separated allowed browser origins                           |
-| `DECKTERM_DOCTOR_ENV`        | `.env`                       | Env file used by the Setup doctor endpoint                        |
-| `DECKTERM_DOCTOR_SCRIPT`     | `scripts/doctor.sh`          | Fixed local doctor script used by Setup                           |
+| Variable                     | Default                      | Purpose                                                                                                                                                          |
+| ---------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PORT`                       | `4174`                       | HTTP server port                                                                                                                                                 |
+| `HOST`                       | `0.0.0.0`                    | Bind address                                                                                                                                                     |
+| `OPENCODE_WEB_DEBUG`         | `0`                          | Debug logging                                                                                                                                                    |
+| `OPENCODE_WEB_MAX_TERMINALS` | `10`                         | Global terminal cap                                                                                                                                              |
+| `MAX_TERMINALS_PER_USER`     | `10`                         | Per-user cap                                                                                                                                                     |
+| `TERMINAL_IDLE_TIMEOUT_MS`   | `7200000`                    | Idle terminal cleanup                                                                                                                                            |
+| `SCROLLBACK_MAX_LINES`       | `2000`                       | Reconnect replay line budget                                                                                                                                     |
+| `SCROLLBACK_MAX_BYTES`       | `1048576`                    | Reconnect replay byte budget                                                                                                                                     |
+| `AGENT_RESPONDING_IDLE_MS`   | `700`                        | Response-to-idle decay for agent badges                                                                                                                          |
+| `ALLOWED_FILE_ROOTS`         | `$HOME`                      | Allowed browse/upload/git roots                                                                                                                                  |
+| `TMUX_BACKEND`               | `1` in deployed environments | Persistent tmux sessions                                                                                                                                         |
+| `DECKTERM_STATE_DIR`         | `$HOME/.deckterm`            | Task Runner metadata, control files, and worktree root                                                                                                           |
+| `DECKTERM_TASK_MAX_ROUNDS`   | `5`                          | Reserved cap for supervised worker/judge rounds                                                                                                                  |
+| `DECKTERM_TASK_PROVIDERS`    | `codex,claude`               | Reserved provider allow-list for task workflows                                                                                                                  |
+| `DECKTERM_PUBLISH_MODE`      | `local`                      | Setup doctor profile: `local`, `cloudflare`, `nginx`, or `direct`                                                                                                |
+| `CF_ACCESS_REQUIRED`         | `0`                          | Require Cloudflare Access JWTs                                                                                                                                   |
+| `CF_ACCESS_TEAM_NAME`        | empty                        | Cloudflare Access team name                                                                                                                                      |
+| `CF_ACCESS_AUD`              | empty                        | Cloudflare Access application audience tag                                                                                                                       |
+| `TRUSTED_ORIGINS`            | empty                        | Comma-separated allowed browser origins                                                                                                                          |
+| `DECKTERM_DOCTOR_ENV`        | `.env`                       | Env file used by the Setup doctor endpoint                                                                                                                       |
+| `DECKTERM_DOCTOR_SCRIPT`     | `scripts/doctor.sh`          | Fixed local doctor script used by Setup                                                                                                                          |
+| `DECKTERM_OS_ISOLATION`      | `0`                          | Multiuser enablement gate: startup refuses (fail-closed) on unreviewed legacy wildcard grants/admins or no owner when `1`; B2 will implement actual OS isolation |
 
 Legacy compatibility note:
 
