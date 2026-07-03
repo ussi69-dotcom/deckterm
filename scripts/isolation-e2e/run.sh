@@ -23,10 +23,12 @@ command -v openssl >/dev/null || die "openssl not found (mock-edge cert)"
 command -v tmux >/dev/null || die "tmux not found (TMUX_BACKEND)"
 sudo -n true 2>/dev/null || die "passwordless sudo unavailable — required for broker + accounts"
 command -v systemctl >/dev/null || die "systemd not present — the broker needs systemd-run"
-# Tolerant system-running check (a VM may report 'degraded').
-systemctl is-system-running 2>/dev/null | grep -Eq 'running|degrading|degraded' \
-  || die "systemd is not in a usable state (systemd-run --scope will fail)"
-sudo -n systemd-run --scope --quiet true 2>/dev/null || die "sudo systemd-run --scope is not functional on this host"
+# `is-system-running` is informational only — GH VM runners often report
+# 'starting'/'degraded' while systemd-run works fine. The authoritative check is
+# actually spawning a transient scope below.
+say "systemd state: $(systemctl is-system-running 2>/dev/null || echo unknown)"
+sudo -n systemd-run --scope --quiet true 2>/dev/null \
+  || die "sudo systemd-run --scope is not functional on this host (the broker needs it)"
 
 # ── Install/refresh broker + fs-helper, create accounts ────────────────────
 say "install/refresh broker (service-user=$SERVICE_USER)"
