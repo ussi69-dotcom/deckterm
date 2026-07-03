@@ -9,7 +9,7 @@ import {
   rename as fsRename,
   chmod,
 } from "node:fs/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { brokerExec } from "./broker-client";
 
 /**
@@ -234,9 +234,21 @@ class LegacyFsExecutor implements FsExecutor {
     content: Buffer,
     expectedMode?: number,
   ): Promise<void> {
+    // Atomic tmp-in-same-dir + rename (matches the editor-save route's prior
+    // behavior; the brokered helper does the same fd-safely).
     const p = this.abs(root, relPath);
-    await writeFile(p, content);
-    if (expectedMode != null) await chmod(p, expectedMode);
+    const tmp = join(
+      dirname(p),
+      `.deckterm-save-${process.pid}-${Math.random().toString(36).slice(2)}`,
+    );
+    await writeFile(tmp, content);
+    if (expectedMode != null) await chmod(tmp, expectedMode);
+    try {
+      await fsRename(tmp, p);
+    } catch (err) {
+      await rm(tmp, { force: true }).catch(() => {});
+      throw err;
+    }
   }
   async mkdir(root: string, relPath: string): Promise<void> {
     await fsMkdir(this.abs(root, relPath));

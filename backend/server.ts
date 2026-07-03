@@ -104,6 +104,13 @@ import {
 } from "./services/os-mapping-eligibility";
 import { brokerCheck, brokerKill } from "./services/broker-client";
 import {
+  getFsExecutor,
+  matchGrantedRoot,
+  canonicalizeLexical,
+  FsExecError,
+  type FsExecutorContext,
+} from "./services/fs-executor";
+import {
   BrokeredTmuxBackendCache,
   type BrokeredTmuxBackend,
 } from "./services/brokered-tmux-backend";
@@ -2055,6 +2062,154 @@ async function requireFileAccess(
   );
 
   return { ok: true };
+}
+
+/**
+ * B4 (§5.1/§5.3): resolve the execution context for a non-PTY fs/git/search
+ * surface. Legacy ⇒ `{kind:"legacy"}` (byte-identical service-account path).
+ * Isolation ⇒ brokered exec identity, or a 403 deny (mirrors
+ * `resolvePtyExecutionContext`: a drift/ineligibility deny already suspended the
+ * mapping in the resolver, so we run that user's revocation kill path here — Codex
+ * #6 — and audit every deny).
+ */
+async function resolveExecFsContext(
+  c: any,
+  surface: string,
+): Promise<
+  | { ok: true; ctx: FsExecutorContext }
+  | { ok: false; status: number; body: Record<string, unknown> }
+> {
+  const state = await getFoundationState();
+  const actor = getCurrentActor(c);
+  const ec = resolveExecutionContext(state.db, { actor, env: process.env });
+  if (ec.kind === "legacy") return { ok: true, ctx: { kind: "legacy" } };
+  if (ec.kind === "brokered") {
+    return {
+      ok: true,
+      ctx: {
+        kind: "brokered",
+        uid: ec.uid,
+        gid: ec.gid,
+        osUsername: ec.osUsername,
+      },
+    };
+  }
+  if (ec.suspendedUserId) {
+    await killUserSessions(ec.suspendedUserId, `os_mapping:${ec.reason}`);
+  }
+  writeAuditEvent(state.db, {
+    actorUserId: actor.id,
+    action: "surface.access",
+    resourceType: "surface",
+    resourceId: surface,
+    decision: "deny",
+    reason: ec.reason,
+    data: { surface, osIsolation: true, actorSource: actor.source },
+  });
+  return {
+    ok: false,
+    status: 403,
+    body: { error: "OS isolation denied", reason: ec.reason, surface },
+  };
+}
+
+/**
+ * B4 (§5.2): resolve a client path to `{root, relPath, rootId}` under the given
+ * execution context, enforcing the `root.use` capability. Legacy reuses today's
+ * `resolveAllowedPath` (realpath + env allowlist) + `requireFileAccess` so
+ * behavior is byte-identical; brokered uses the lexical segment-boundary policy
+ * (`matchGrantedRoot`, Codex #9) — no realpath, no fs touch — then the same
+ * capability check. The returned `root`+`relPath` feed `getFsExecutor(ctx)`.
+ */
+async function resolveScopedFsPath(
+  c: any,
+  ctx: FsExecutorContext,
+  clientPath: string,
+  opts: { allowMissing?: boolean } = {},
+): Promise<
+  | { ok: true; root: string; relPath: string; rootId: string }
+  | { ok: false; status: number; body: Record<string, unknown> }
+> {
+  const state = await getFoundationState();
+
+  if (ctx.kind === "legacy") {
+    const abs = await resolveAllowedPath(clientPath, opts);
+    if (!abs) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: "Forbidden path", reason: "no_matching_root" },
+      };
+    }
+    const access = await requireFileAccess(c, abs);
+    if (!access.ok)
+      return { ok: false, status: access.status, body: access.body };
+    const rootId = resolveFoundationRootIdForPath(state, abs);
+    // Legacy bypass short-circuits requireFileAccess without a rootId; fall back
+    // to the whole path as its own root so the executor still targets `abs`.
+    if (!rootId) return { ok: true, root: abs, relPath: "", rootId: "" };
+    const rootPath = state.roots.find((r) => r.id === rootId)?.path ?? abs;
+    const rel =
+      abs === rootPath ? "" : abs.slice(rootPath.length).replace(/^\/+/, "");
+    return { ok: true, root: rootPath, relPath: rel, rootId };
+  }
+
+  // brokered — lexical, segment-boundary containment against granted roots.
+  const scoped = matchGrantedRoot(
+    state.roots.map((r) => r.path),
+    clientPath,
+  );
+  if (!scoped) {
+    return {
+      ok: false,
+      status: 403,
+      body: { error: "Forbidden path", reason: "no_matching_root" },
+    };
+  }
+  const rootRow = state.roots.find(
+    (r) => canonicalizeLexical(r.path) === scoped.root,
+  );
+  const rootId = rootRow?.id ?? "";
+  const actor = getCurrentActor(c);
+  const rootAuth = await requireFoundationCapability({
+    actor,
+    capability: "root.use",
+    resourceType: "root",
+    resourceId: rootId,
+    data: { cwd: scoped.root, osIsolation: true },
+  });
+  if (!rootAuth.ok) {
+    return {
+      ok: false,
+      status: rootAuth.status,
+      body: foundationGateJson(rootAuth),
+    };
+  }
+  return { ok: true, root: scoped.root, relPath: scoped.relPath, rootId };
+}
+
+/** Map an `FsExecError` from the executor to the HTTP response shape B4 routes
+ *  return. Broker/transient failures are 503; a busy cap is 429; the rest map to
+ *  the closest 4xx. Kept centralized so every fs route is consistent. */
+function fsErrorResponse(c: any, err: unknown, fallbackMsg: string): Response {
+  if (err instanceof FsExecError) {
+    const map: Record<string, number> = {
+      not_found: 404,
+      too_large: 413,
+      not_regular: 400,
+      not_owner: 403,
+      escape_denied: 403,
+      exists: 409,
+      permission: 403,
+      bad_request: 400,
+      isolation_busy: 429,
+      broker_unavailable: 503,
+      io_error: 400,
+    };
+    const status = map[err.code] ?? 400;
+    return c.json({ error: fallbackMsg, reason: err.code }, status as any);
+  }
+  return c.json({ error: fallbackMsg }, 400);
 }
 
 async function getDefaultBrowseRoot(): Promise<string> {
@@ -5199,22 +5354,40 @@ export function createWebApp() {
   app.get("/api/browse", async (c) => {
     const requestedPath = c.req.query("path") || process.env.HOME || "/";
     const includeFiles = c.req.query("files") === "true";
-    const fs = await import("fs/promises");
-    const pathModule = await import("path");
-    const fallbackPath = await getDefaultBrowseRoot();
-    let path = (await resolveAllowedPath(requestedPath)) || fallbackPath;
 
-    const fileAccess = await requireFileAccess(c, path);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
+    // B4: resolve the execution context (legacy vs mapped-user broker vs deny).
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
+    }
+    const fx = getFsExecutor(execCtx.ctx);
+
+    // Brokered actors default to their own $HOME root; legacy keeps the
+    // realpath'd allowlist fallback exactly as before.
+    const fallbackPath =
+      execCtx.ctx.kind === "brokered"
+        ? process.env.HOME || requestedPath
+        : await getDefaultBrowseRoot();
+
+    let scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
+    let fellBack = false;
+    if (!scoped.ok) {
+      // Fall back to the default root (legacy behavior: forbidden/OOB path →
+      // default browse root) rather than 403, matching the prior UX.
+      const fb = await resolveScopedFsPath(c, execCtx.ctx, fallbackPath);
+      if (!fb.ok) return c.json(scoped.body, { status: scoped.status as any });
+      scoped = fb;
+      fellBack = requestedPath !== fallbackPath;
     }
 
-    let fellBack = path === fallbackPath && requestedPath !== fallbackPath;
-
-    const readDirectory = async (targetPath: string) => {
-      const entries = await fs.readdir(targetPath, { withFileTypes: true });
+    const readDirectory = async (
+      root: string,
+      relPath: string,
+      displayPath: string,
+    ) => {
+      const entries = await fx.list(root, relPath);
       const dirs = entries
-        .filter((e) => e.isDirectory() && !e.name.startsWith("."))
+        .filter((e) => e.kind === "dir" && !e.name.startsWith("."))
         .map((e) => e.name)
         .sort();
 
@@ -5223,23 +5396,13 @@ export function createWebApp() {
         dirs: string[];
         files?: { name: string; size: number }[];
         fallback?: boolean;
-      } = { path: targetPath, dirs };
+      } = { path: displayPath, dirs };
 
       if (includeFiles) {
-        const fileEntries = entries.filter(
-          (e) => e.isFile() && !e.name.startsWith("."),
-        );
-        const files = await Promise.all(
-          fileEntries.map(async (e) => {
-            try {
-              const stat = await fs.stat(pathModule.join(targetPath, e.name));
-              return { name: e.name, size: stat.size };
-            } catch {
-              return { name: e.name, size: 0 };
-            }
-          }),
-        );
-        result.files = files.sort((a, b) => a.name.localeCompare(b.name));
+        result.files = entries
+          .filter((e) => e.kind === "file" && !e.name.startsWith("."))
+          .map((e) => ({ name: e.name, size: e.size }))
+          .sort((a, b) => a.name.localeCompare(b.name));
       }
 
       if (fellBack) {
@@ -5249,14 +5412,25 @@ export function createWebApp() {
       return result;
     };
 
+    const displayPath = scoped.relPath
+      ? `${scoped.root}/${scoped.relPath}`
+      : scoped.root;
     try {
-      return c.json(await readDirectory(path));
+      return c.json(
+        await readDirectory(scoped.root, scoped.relPath, displayPath),
+      );
     } catch (err: unknown) {
       const error = err as { code?: string };
-      if (error.code === "ENOENT" && path !== fallbackPath) {
-        path = fallbackPath;
-        fellBack = true;
-        return c.json(await readDirectory(path));
+      const missing =
+        error.code === "ENOENT" ||
+        (err instanceof FsExecError && err.code === "not_found");
+      if (missing && !fellBack) {
+        const fb = await resolveScopedFsPath(c, execCtx.ctx, fallbackPath);
+        if (fb.ok) {
+          fellBack = true;
+          const fbDisplay = fb.relPath ? `${fb.root}/${fb.relPath}` : fb.root;
+          return c.json(await readDirectory(fb.root, fb.relPath, fbDisplay));
+        }
       }
       return c.json({ error: "Cannot read directory" }, 400);
     }
@@ -5411,37 +5585,38 @@ export function createWebApp() {
     if (!requestedPath) {
       return c.json({ error: "Path required" }, 400);
     }
-    const filePath = await resolveAllowedPath(requestedPath);
-    if (!filePath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
     }
-    const fileAccess = await requireFileAccess(c, filePath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
-
-    const fs = await import("fs/promises");
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
 
     try {
-      const stat = await fs.stat(filePath);
-      if (!stat.isFile()) {
+      const st = await fx.statPath(scoped.root, scoped.relPath);
+      if (st.kind !== "file") {
         return c.json({ error: "Not a file" }, 400);
       }
+      // Download reuses the editor byte cap under isolation (B4 §2.2 / Codex #12);
+      // legacy is uncapped so pass through the observed size.
+      const cap =
+        execCtx.ctx.kind === "brokered" ? EDITOR_MAX_FILE_BYTES : st.size + 1;
+      const { content } = await fx.read(scoped.root, scoped.relPath, cap);
+      const filename = basename(scoped.relPath || scoped.root);
 
-      const data = await fs.readFile(filePath);
-      const filename = basename(filePath);
-
-      return new Response(data, {
+      return new Response(new Uint8Array(content), {
         headers: {
           "Content-Type": "application/octet-stream",
           "Content-Disposition": `attachment; filename="${filename}"`,
-          "Content-Length": String(stat.size),
+          "Content-Length": String(content.length),
         },
       });
-    } catch {
+    } catch (err) {
+      if (err instanceof FsExecError && err.code === "too_large") {
+        return fsErrorResponse(c, err, "File too large to download");
+      }
       return c.json({ error: "Cannot read file" }, 400);
     }
   });
@@ -5456,22 +5631,18 @@ export function createWebApp() {
     if (!requestedPath) {
       return c.json({ error: "Path required" }, 400);
     }
-    const filePath = await resolveAllowedPath(requestedPath);
-    if (!filePath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
     }
-    const fileAccess = await requireFileAccess(c, filePath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
 
-    const fs = await import("fs/promises");
     try {
-      const fileStat = await fs.stat(filePath);
-      if (!fileStat.isFile()) {
+      const fileStat = await fx.statPath(scoped.root, scoped.relPath);
+      if (fileStat.kind !== "file") {
         return c.json({ error: "Not a file" }, 400);
       }
       if (fileStat.size > EDITOR_MAX_FILE_BYTES) {
@@ -5480,12 +5651,16 @@ export function createWebApp() {
           413,
         );
       }
-      const data = await fs.readFile(filePath);
+      const { content: data } = await fx.read(
+        scoped.root,
+        scoped.relPath,
+        EDITOR_MAX_FILE_BYTES,
+      );
       if (data.includes(0)) {
         return c.json({ error: "Binary file cannot be edited" }, 415);
       }
       return c.json({
-        path: filePath,
+        path: scoped.relPath ? `${scoped.root}/${scoped.relPath}` : scoped.root,
         content: data.toString("utf8"),
         mtimeMs: fileStat.mtimeMs,
         size: fileStat.size,
@@ -5508,26 +5683,25 @@ export function createWebApp() {
         413,
       );
     }
-    const filePath = await resolveAllowedPath(requestedPath, {
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
+    }
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath, {
       allowMissing: true,
     });
-    if (!filePath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
-    }
-    const fileAccess = await requireFileAccess(c, filePath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
+    const displayPath = scoped.relPath
+      ? `${scoped.root}/${scoped.relPath}`
+      : scoped.root;
 
-    const fs = await import("fs/promises");
     try {
       const expectedMtimeMs = Number(body.expectedMtimeMs);
       if (Number.isFinite(expectedMtimeMs)) {
         try {
-          const current = await fs.stat(filePath);
+          const current = await fx.statPath(scoped.root, scoped.relPath);
           if (current.mtimeMs !== expectedMtimeMs) {
             return c.json(
               {
@@ -5547,10 +5721,8 @@ export function createWebApp() {
         }
       }
 
-      const tmpPath = `${filePath}.deckterm-save-${process.pid}-${Date.now()}`;
-      await fs.writeFile(tmpPath, content, "utf8");
-      await fs.rename(tmpPath, filePath);
-      const saved = await fs.stat(filePath);
+      await fx.write(scoped.root, scoped.relPath, Buffer.from(content, "utf8"));
+      const saved = await fx.statPath(scoped.root, scoped.relPath);
 
       const state = await getFoundationState();
       writeAuditEvent(state.db, {
@@ -5559,11 +5731,13 @@ export function createWebApp() {
         resourceType: "root",
         decision: "allow",
         reason: "editor_save",
-        data: { path: filePath, bytes: saved.size },
+        data: { path: displayPath, bytes: saved.size, brokered: fx.brokered },
       });
 
-      return c.json({ ok: true, path: filePath, mtimeMs: saved.mtimeMs });
+      return c.json({ ok: true, path: displayPath, mtimeMs: saved.mtimeMs });
     } catch (err) {
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Cannot write file");
       return c.json({ error: "Cannot write file", message: String(err) }, 500);
     }
   });
@@ -5574,24 +5748,19 @@ export function createWebApp() {
     if (!requestedPath) {
       return c.json({ error: "Path required" }, 400);
     }
-    const targetPath = await resolveAllowedPath(requestedPath);
-    if (!targetPath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
     }
-    const fileAccess = await requireFileAccess(c, targetPath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
-
-    const fs = await import("fs/promises");
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
 
     try {
       // Check if target is a directory
-      const stat = await fs.stat(targetPath);
-      if (!stat.isDirectory()) {
+      const st = await fx.statPath(scoped.root, scoped.relPath);
+      if (st.kind !== "dir") {
         return c.json({ error: "Target must be a directory" }, 400);
       }
 
@@ -5604,23 +5773,20 @@ export function createWebApp() {
       }
 
       const fileName = basename(file.name);
-      const destPath = await resolveAllowedPath(join(targetPath, fileName), {
-        allowMissing: true,
-      });
-      if (!destPath) {
-        return c.json(
-          { error: "Forbidden path", reason: "no_matching_root" },
-          403,
-        );
-      }
+      const destRel = scoped.relPath
+        ? `${scoped.relPath}/${fileName}`
+        : fileName;
       const buffer = await file.arrayBuffer();
-      await fs.writeFile(destPath, Buffer.from(buffer));
+      await fx.write(scoped.root, destRel, Buffer.from(buffer));
 
-      debug(`File uploaded: ${destPath}`);
+      const destDisplay = `${scoped.root}/${destRel}`;
+      debug(`File uploaded: ${destDisplay}`);
 
-      return c.json({ ok: true, path: destPath });
+      return c.json({ ok: true, path: destDisplay });
     } catch (err) {
       debug(`Upload error:`, err);
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Failed to upload file");
       return c.json({ error: "Failed to upload file" }, 500);
     }
   });
@@ -5631,28 +5797,29 @@ export function createWebApp() {
     if (!requestedPath) {
       return c.json({ error: "Path required" }, 400);
     }
-    const dirPath = await resolveAllowedPath(requestedPath, {
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
+    }
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath, {
       allowMissing: true,
     });
-    if (!dirPath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
-    }
-    const fileAccess = await requireFileAccess(c, dirPath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
-
-    const fs = await import("fs/promises");
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
+    const dirDisplay = scoped.relPath
+      ? `${scoped.root}/${scoped.relPath}`
+      : scoped.root;
 
     try {
-      await fs.mkdir(dirPath, { recursive: false });
-      return c.json({ ok: true, path: dirPath });
+      await fx.mkdir(scoped.root, scoped.relPath);
+      return c.json({ ok: true, path: dirDisplay });
     } catch (err: unknown) {
       const error = err as { code?: string };
-      if (error.code === "EEXIST") {
+      if (
+        error.code === "EEXIST" ||
+        (err instanceof FsExecError && err.code === "exists")
+      ) {
         return c.json({ error: "Directory already exists" }, 400);
       }
       return c.json({ error: "Failed to create directory" }, 500);
@@ -5665,33 +5832,33 @@ export function createWebApp() {
     if (!requestedPath) {
       return c.json({ error: "Path required" }, 400);
     }
-    const filePath = await resolveAllowedPath(requestedPath);
-    if (!filePath) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
     }
-    const fileAccess = await requireFileAccess(c, filePath);
-    if (!fileAccess.ok) {
-      return c.json(fileAccess.body, { status: fileAccess.status as any });
-    }
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
+    if (!scoped.ok)
+      return c.json(scoped.body, { status: scoped.status as any });
+    const fx = getFsExecutor(execCtx.ctx);
 
-    // Security: don't allow deleting filesystem roots
+    // Security: never delete a root itself. The reconstructed abs path guards the
+    // legacy realpath'd roots; brokered additionally can never target the root
+    // (relPath === "" is refused by the helper) — belt and suspenders here.
+    const absPath = scoped.relPath
+      ? `${scoped.root}/${scoped.relPath}`
+      : scoped.root;
     const protectedRoots = await getAllowedRealRoots();
-    if (filePath === "/" || protectedRoots.includes(filePath)) {
+    if (
+      scoped.relPath === "" ||
+      absPath === "/" ||
+      protectedRoots.includes(absPath)
+    ) {
       return c.json({ error: "Cannot delete root or home directory" }, 403);
     }
 
-    const fs = await import("fs/promises");
-
     try {
-      const stat = await fs.stat(filePath);
-      if (stat.isDirectory()) {
-        await fs.rm(filePath, { recursive: true });
-      } else {
-        await fs.unlink(filePath);
-      }
+      const st = await fx.statPath(scoped.root, scoped.relPath);
+      await fx.remove(scoped.root, scoped.relPath, st.kind === "dir");
       return c.json({ ok: true });
     } catch {
       return c.json({ error: "Failed to delete" }, 500);
@@ -5706,29 +5873,34 @@ export function createWebApp() {
     if (!fromInput || !toInput) {
       return c.json({ error: "from and to paths required" }, 400);
     }
-    const from = await resolveAllowedPath(fromInput);
-    const to = await resolveAllowedPath(toInput, { allowMissing: true });
-    if (!from || !to) {
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
+    }
+    const scopedFrom = await resolveScopedFsPath(c, execCtx.ctx, fromInput);
+    if (!scopedFrom.ok)
+      return c.json(scopedFrom.body, { status: scopedFrom.status as any });
+    const scopedTo = await resolveScopedFsPath(c, execCtx.ctx, toInput, {
+      allowMissing: true,
+    });
+    if (!scopedTo.ok)
+      return c.json(scopedTo.body, { status: scopedTo.status as any });
+    // The executor renames within ONE root (the helper resolves both endpoints
+    // beneath the same root fd); a cross-root move is refused.
+    if (scopedFrom.root !== scopedTo.root) {
       return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
+        { error: "Cannot rename across roots", reason: "cross_root" },
+        400,
       );
     }
-    const fromAccess = await requireFileAccess(c, from);
-    if (!fromAccess.ok) {
-      return c.json(fromAccess.body, { status: fromAccess.status as any });
-    }
-    const toAccess = await requireFileAccess(c, to);
-    if (!toAccess.ok) {
-      return c.json(toAccess.body, { status: toAccess.status as any });
-    }
-
-    const fs = await import("fs/promises");
+    const fx = getFsExecutor(execCtx.ctx);
 
     try {
-      await fs.rename(from, to);
+      await fx.rename(scopedFrom.root, scopedFrom.relPath, scopedTo.relPath);
       return c.json({ ok: true });
-    } catch {
+    } catch (err) {
+      if (err instanceof FsExecError)
+        return fsErrorResponse(c, err, "Failed to rename");
       return c.json({ error: "Failed to rename" }, 500);
     }
   });

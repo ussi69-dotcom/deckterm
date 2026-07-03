@@ -195,7 +195,11 @@ test("isolation mode: surface denials + owner-gated /api/os-mappings", async () 
   const { app, ownerId } = await bootstrapOwnerApp(stateDir);
   process.env.DECKTERM_OS_ISOLATION = "1";
 
-  // (1) Not-yet-brokered filesystem surface denies os_isolation_pending.
+  // (1) Filesystem surface under isolation: B4-S4 lifted files from the blanket
+  // os_isolation_pending deny to the REAL broker-or-deny resolver. The request
+  // has no verified (cloudflare_access) identity and no OS mapping, so it is
+  // denied — never served as the service account. The exact reason depends on
+  // the resolved actor source (untrusted source vs unmapped user).
   const browseRes = await app.fetch(
     new Request(
       `http://deckterm.test/api/browse?path=${encodeURIComponent(process.env.HOME || "/tmp")}`,
@@ -203,7 +207,12 @@ test("isolation mode: surface denials + owner-gated /api/os-mappings", async () 
   );
   expect(browseRes.status).toBe(403);
   const browseBody = await browseRes.json();
-  expect(browseBody.reason).toBe("os_isolation_pending");
+  expect([
+    "actor_source_untrusted",
+    "os_mapping_required",
+    "os_mapping_suspended",
+    "user_disabled",
+  ]).toContain(browseBody.reason);
   expect(browseBody.surface).toBe("files");
 
   // (2) Mapping a privileged/service account is refused (uid 0 root).
