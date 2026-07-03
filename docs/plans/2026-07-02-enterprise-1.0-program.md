@@ -102,11 +102,19 @@ The architecture track. **B1 is the program's keystone design doc** and ships to
 > `2026-07-03-b3-user-provisioning-roles-revocation.md` — migration 5, roles/precedence,
 > `/api/users`+`/api/grants`, revocation kill primitive, §1.6 enablement gate, Users admin
 > UI; Codex-validated plan + Codex-reviewed integrated diff, 8 hardening findings fixed).
-> **Next: B2** (run-as-user broker).
-> Sequencing inside the track: **B5 → B1(+E1) → B3 → B2 → B4 → adversarial e2e → B6 → B7.**
-> (B5 is a standalone P0 fix needing nothing from the design; B3's user/role/revocation model must
-> exist before B2 hardens around it; the Alice/Bob e2e lands immediately after B2+B4, not as
-> exit-time theater.)
+> **B2 in progress 2026-07-03** (plan `2026-07-03-b2-run-as-user-broker.md`, Codex-validated,
+> 11 findings incorporated): **S1–S3a landed** (`bdba581`, `c3cee5e`, `1821671`) — migration 6
+> `user_os_mappings` + eligibility core, the root-owned launch broker (installed + proven live on
+> dev: PTY drop with no root/service supplementary-group leak, all refusals + kill + GC), broker
+> client + `resolveExecutionContext` chokepoint. **S3b (brokered backends + capture provisioning)
+>
+> - S4 (server wiring, os-mappings API, startup guards) remain.** Codex broker per-slice review
+>   deferred (sandbox down all session) — owed at the integrated-diff pass. Live tmux brokering on
+>   dev is blocked by the `DECKTERM_LEGACY_NO_BOOTSTRAP` × isolation gate conflict (decide at S4).
+>   Sequencing inside the track: **B5 → B1(+E1) → B3 → B2 → B4 → adversarial e2e → B6 → B7.**
+>   (B5 is a standalone P0 fix needing nothing from the design; B3's user/role/revocation model must
+>   exist before B2 hardens around it; the Alice/Bob e2e lands immediately after B2+B4, not as
+>   exit-time theater.)
 
 | #   | Slice                                             | What                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | Evidence / key files                                                                                                                                  | Tier                                                                                                                                   |
 | --- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |

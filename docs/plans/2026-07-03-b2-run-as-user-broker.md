@@ -3,9 +3,33 @@
 > Program: `2026-07-02-enterprise-1.0-program.md` Track B, slice B2. Design authority:
 > `2026-07-02-b1-identity-isolation-storage-design.md` §2 (OS isolation), §1.2 (trust
 > boundaries), §5 (fail-closed summary). Status: **rev 2 — Codex-validated 2026-07-03**
-> (11 findings, all incorporated; §9). Cleared to code.
+> (11 findings, all incorporated; §9). **S1–S3a landed on `dev`; S3b + S4 remain.**
 > Tiering: **Fable codes every slice on the main loop** (security-critical, program §7),
 > Codex reviews per-slice diffs; sequential Path A (shared files).
+>
+> **Delivery status (2026-07-03):**
+>
+> - **S1 done** (`bdba581`): migration 6 (`user_os_mappings` + active-uid index +
+>   `terminal_sessions.exec_kind/os_uid`), `os-mapping-eligibility.ts` pure matrix + probe,
+>   mapping CRUD. 10 tests.
+> - **S2 done** (`c3cee5e`): the broker (`scripts/broker/*`) + capture helper + installer +
+>   contract test. **Installed + proven live on the dev host** — PTY drop yields a shell as the
+>   mapped uid with NO root/service supplementary-group leak; all refusals fire; kill + GC work.
+>   Codex per-slice review **deferred** (codex sandbox returned empty/hung all session);
+>   substituted by live host testing + Fable adversarial review (one hardening applied: cgroup
+>   path-component match). A Codex integrated-diff pass is owed before the dev→main promotion.
+> - **S3a done** (`1821671`): `broker-client.ts` + `resolveExecutionContext` (the single
+>   chokepoint) + 12 tests.
+> - **S3b TODO**: `TerminalBackend.exec` plumbing, raw brokered spawn, `brokered-tmux-backend.ts`,
+>   per-uid backend cache, **broker capture-dir provisioning** (create
+>   `/var/lib/deckterm/capture/<session>` 2750 + precreate `pipe.log` on tmux `new-session`;
+>   fd-safe `readPipeDelta`).
+> - **S4 TODO**: server wiring (PTY-surface context+deny+audit, not-yet-brokered 403,
+>   `/api/os-mappings` owner API, tunnel + isolation + reconcile startup guards).
+> - **Blocker for live tmux verification:** dev runs `DECKTERM_LEGACY_NO_BOOTSTRAP=1`, so the B3
+>   gate refuses `DECKTERM_OS_ISOLATION=1` (`legacy_bypass_conflict`). End-to-end tmux brokering
+>   on the running dev service needs dev reconfigured (bootstrap a real owner, drop the bypass) or
+>   a dedicated isolation test harness — decide at S4.
 
 ## 0. Scope
 
