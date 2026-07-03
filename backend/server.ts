@@ -45,19 +45,23 @@ import {
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
+  getFoundationUserById,
   getTerminalSession,
   getUserById,
   getUserSettings,
   hasScopedGrant,
+  IdentityConflictError,
   initializeFoundationState,
   isBootstrapComplete,
   listTerminalEventsAfter,
   listTerminalSessionsForActor,
   markTerminalSessionEnded,
   recordTerminalSession,
+  resolveUserForActor,
   setUserSettings,
   writeAuditEvent,
   type FoundationState,
+  type FoundationUser,
   type RecordedTerminalSession,
   type ScopedGrantCapability,
 } from "./services/foundation-state";
@@ -67,6 +71,7 @@ import {
   authorizeTerminalWrite,
   getRouteCapability,
   isLegacyBootstrapBypassAllowed,
+  roleImpliesCapability,
 } from "./services/foundation-authorization";
 import {
   resolveActorFromAccessPayload,
@@ -784,6 +789,28 @@ function isFoundationLegacyBypassEnabled(): boolean {
   return isLegacyBootstrapBypassAllowed(process.env);
 }
 
+/**
+ * Canonical ownership (plan §2, invariant §9.9): terminal create, attach, WS
+ * upgrade, and live-count checks store/compare the resolved `users.id`, not
+ * the raw actor id. For every grandfathered row these are identical by
+ * construction (S1), so this is a no-op for existing single-tenant installs;
+ * for invited (`user_<hex>`) users it collapses attach/create/ownership onto
+ * one id space. Only unresolved actors (no user row at all) fall back to the
+ * raw actor id, exactly like today. Throws IdentityConflictError (never
+ * caught here) when resolution hits a self-heal collision — callers must
+ * fail closed (403, audit reason "identity_conflict") rather than swallow it.
+ */
+function resolveCanonicalOwnerId(
+  state: FoundationState,
+  actor: DeckTermActor,
+): { ownerId: string; user: FoundationUser | null } {
+  const resolved = resolveUserForActor(state.db, actor, process.env);
+  return {
+    ownerId: resolved?.user.id ?? actor.id,
+    user: resolved?.user ?? null,
+  };
+}
+
 async function getFoundationState(): Promise<FoundationState> {
   if (!foundationStatePromise) {
     foundationStatePromise = initializeFoundationState({
@@ -796,19 +823,19 @@ async function getFoundationState(): Promise<FoundationState> {
 }
 
 async function requireFoundationCapability({
-  actorUserId,
+  actor,
   capability,
   resourceType,
   resourceId = "*",
   data = {},
 }: {
-  actorUserId: string;
+  actor: DeckTermActor;
   capability: ScopedGrantCapability;
   resourceType: string;
   resourceId?: string | null;
   data?: Record<string, unknown>;
 }): Promise<
-  | { ok: true }
+  | { ok: true; ownerId: string }
   | {
       ok: false;
       status: 403;
@@ -819,8 +846,73 @@ async function requireFoundationCapability({
       resourceId: string;
     }
 > {
+  // Legacy bypass stays first and unchanged (CI/test/dev only): it never
+  // touches the DB, so no canonical resolution happens here either — the
+  // raw actor id is what pre-existing legacy-mode installs have always used.
   if (isFoundationLegacyBypassEnabled()) {
-    return { ok: true };
+    return { ok: true, ownerId: actor.id };
+  }
+
+  const state = await getFoundationState();
+
+  // Resolve the canonical user once (plan §2, invariant §9.9): drives the
+  // disabled check and the role bundle below, and — on every allow path —
+  // is the id downstream seams (terminal create/attach, session recording,
+  // live-terminal counts) store and compare. IdentityConflictError means a
+  // self-heal collision: fail closed rather than ever merge identity rows
+  // (invariant §9.1).
+  let canonical: { ownerId: string; user: FoundationUser | null };
+  try {
+    canonical = resolveCanonicalOwnerId(state, actor);
+  } catch (err) {
+    if (err instanceof IdentityConflictError) {
+      writeAuditEvent(state.db, {
+        actorUserId: actor.id,
+        action: capability,
+        resourceType,
+        resourceId,
+        decision: "deny",
+        reason: "identity_conflict",
+        data,
+      });
+      return {
+        ok: false,
+        status: 403,
+        message: "DeckTerm identity resolution conflict",
+        reason: "identity_conflict",
+        capability,
+        resourceType,
+        resourceId: resourceId || "*",
+      };
+    }
+    throw err;
+  }
+  const actorUserId = canonical.ownerId;
+  const user = canonical.user;
+
+  // Precedence (plan §3, invariant §9.2): disabled wins over every grant,
+  // role, and edge/tunnel allowance for known users — checked before the
+  // edge-tunnel allow just below. An unknown actor (`user === null`) can't
+  // be disabled, so this is a no-op for actors without a user row.
+  if (user?.disabled) {
+    writeAuditEvent(state.db, {
+      actorUserId,
+      action: capability,
+      resourceType,
+      resourceId,
+      decision: "deny",
+      reason: "user_disabled",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      message: "DeckTerm account disabled",
+      reason: "user_disabled",
+      capability,
+      resourceType,
+      resourceId: resourceId || "*",
+    };
   }
 
   // Edge-trusted cloudflare-tunnel mode: the Cloudflare Access edge already
@@ -829,7 +921,6 @@ async function requireFoundationCapability({
   // the real identity for accountability. Root mapping still happens upstream,
   // so this does not widen filesystem scope.
   if (isEdgeProtectedTunnelMode(process.env)) {
-    const state = await getFoundationState();
     writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
@@ -839,10 +930,9 @@ async function requireFoundationCapability({
       reason: "edge_trusted_tunnel",
       data,
     });
-    return { ok: true };
+    return { ok: true, ownerId: actorUserId };
   }
 
-  const state = await getFoundationState();
   if (!isBootstrapComplete(state)) {
     writeAuditEvent(state.db, {
       actorUserId,
@@ -867,6 +957,22 @@ async function requireFoundationCapability({
       resourceType,
       resourceId: resourceId || "*",
     };
+  }
+
+  // Role bundle, evaluated at check time — not materialized (invariant
+  // §9.3): owner/admin imply the five capabilities on any resource; member
+  // gets no wildcards, scoped grants only.
+  if (user && roleImpliesCapability(user.role, capability)) {
+    writeAuditEvent(state.db, {
+      actorUserId,
+      action: capability,
+      resourceType,
+      resourceId,
+      decision: "allow",
+      reason: "role_bundle",
+      data,
+    });
+    return { ok: true, ownerId: actorUserId };
   }
 
   if (
@@ -898,7 +1004,7 @@ async function requireFoundationCapability({
     };
   }
 
-  return { ok: true };
+  return { ok: true, ownerId: actorUserId };
 }
 
 function foundationGateJson(error: {
@@ -1067,19 +1173,20 @@ function ensureTerminalSessionRecorded(state: FoundationState, term: Terminal) {
 }
 
 async function requireTerminalSessionAccess({
-  actorUserId,
+  actor,
   term,
   capability,
 }: {
-  actorUserId: string;
+  actor: DeckTermActor;
   term: Terminal;
   capability: "terminal.attach" | "terminal.manage";
 }): Promise<
-  { ok: true } | { ok: false; status: 403; reason: string; message: string }
+  | { ok: true; ownerId: string }
+  | { ok: false; status: 403; reason: string; message: string }
 > {
   if (isFoundationLegacyBypassEnabled()) {
-    return term.ownerId === actorUserId
-      ? { ok: true }
+    return term.ownerId === actor.id
+      ? { ok: true, ownerId: actor.id }
       : {
           ok: false,
           status: 403,
@@ -1088,9 +1195,37 @@ async function requireTerminalSessionAccess({
         };
   }
   const state = await getFoundationState();
+
+  // Canonical ownerId (plan §2, invariant §9.9): the attach/write/manage
+  // authorization call below compares against this resolved id, the same
+  // id terminal creation stores as ownerId. IdentityConflictError means a
+  // self-heal collision: fail closed (invariant §9.1).
+  let ownerId: string;
+  try {
+    ({ ownerId } = resolveCanonicalOwnerId(state, actor));
+  } catch (err) {
+    if (err instanceof IdentityConflictError) {
+      writeAuditEvent(state.db, {
+        actorUserId: actor.id,
+        action: capability,
+        resourceType: "terminal",
+        resourceId: term.id,
+        decision: "deny",
+        reason: "identity_conflict",
+      });
+      return {
+        ok: false,
+        status: 403,
+        reason: "identity_conflict",
+        message: "DeckTerm identity resolution conflict",
+      };
+    }
+    throw err;
+  }
+
   if (!isBootstrapComplete(state)) {
     writeAuditEvent(state.db, {
-      actorUserId,
+      actorUserId: ownerId,
       action: capability,
       resourceType: "terminal",
       resourceId: term.id,
@@ -1107,12 +1242,12 @@ async function requireTerminalSessionAccess({
 
   ensureTerminalSessionRecorded(state, term);
   const decision = authorizeTerminalSessionAccess(state.db, {
-    actorUserId,
+    actorUserId: ownerId,
     terminalId: term.id,
     capability,
   });
   writeAuditEvent(state.db, {
-    actorUserId,
+    actorUserId: ownerId,
     action: capability,
     resourceType: "terminal",
     resourceId: term.id,
@@ -1127,7 +1262,7 @@ async function requireTerminalSessionAccess({
       message: "DeckTerm capability denied",
     };
   }
-  return { ok: true };
+  return { ok: true, ownerId };
 }
 
 async function getAllowedRealRoots(): Promise<string[]> {
@@ -1561,7 +1696,8 @@ async function requireFileAccess(
     return { ok: true };
   }
 
-  const { ownerId } = getCurrentUser(c);
+  const actor = getCurrentActor(c);
+  const ownerId = actor.id;
   const state = await getFoundationState();
   const rootId = resolveFoundationRootIdForPath(state, resolvedPath);
 
@@ -1586,7 +1722,7 @@ async function requireFileAccess(
   }
 
   const rootAuth = await requireFoundationCapability({
-    actorUserId: ownerId,
+    actor,
     capability: "root.use",
     resourceType: "root",
     resourceId: rootId,
@@ -3086,14 +3222,15 @@ export function createWebApp() {
 
   // Create new terminal running shell
   app.post("/api/terminals", async (c) => {
-    const { ownerId, ownerEmail } = getCurrentUser(c);
+    const actor = getCurrentActor(c);
+    const ownerEmail = actor.email;
     const body = await c.req.json().catch(() => ({}));
     const routeCapability = getRouteCapability(c.req.method, c.req.url);
     if (!routeCapability) {
       return c.json({ error: "Missing route capability" }, 500);
     }
     const foundationAuth = await requireFoundationCapability({
-      actorUserId: ownerId,
+      actor,
       capability: routeCapability.capability,
       resourceType: routeCapability.resourceType,
       resourceId: routeCapability.resourceId,
@@ -3102,6 +3239,10 @@ export function createWebApp() {
     if (!foundationAuth.ok) {
       return c.json(foundationGateJson(foundationAuth), foundationAuth.status);
     }
+    // Canonical ownerId (plan §2, invariant §9.9): every downstream seam in
+    // this handler — live-count checks, PTY spawn, session recording, audit
+    // — stores/compares this resolved id, not the raw actor id.
+    const ownerId = foundationAuth.ownerId;
 
     const requestedCwd = body.cwd || process.env.HOME || "/";
     // Falls back to an allowed root when the requested cwd is within roots but
@@ -3121,7 +3262,7 @@ export function createWebApp() {
     }
 
     const rootAuth = await requireFoundationCapability({
-      actorUserId: ownerId,
+      actor,
       capability: "root.use",
       resourceType: "root",
       resourceId: resolvedCwd,
@@ -3136,6 +3277,32 @@ export function createWebApp() {
       return c.json(creationError.body, creationError.status);
     }
 
+    // Pre-side-effect disabled re-check (invariant §9.2): closes the race
+    // where a disable lands between the capability gate above and the PTY
+    // spawn below.
+    const state = await getFoundationState();
+    const recheckUser = getFoundationUserById(state.db, ownerId);
+    if (recheckUser?.disabled) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.create",
+        resourceType: "terminal",
+        decision: "deny",
+        reason: "user_disabled",
+        data: { cwd: resolvedCwd },
+      });
+      return c.json(
+        foundationGateJson({
+          message: "DeckTerm account disabled",
+          reason: "user_disabled",
+          capability: "terminal.create",
+          resourceType: "terminal",
+          resourceId: "*",
+        }),
+        403,
+      );
+    }
+
     rateLimitState.record();
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
@@ -3145,7 +3312,6 @@ export function createWebApp() {
       ownerEmail,
     });
 
-    const state = await getFoundationState();
     const rootId = resolveFoundationRootIdForPath(state, resolvedCwd);
     recordTerminalSession(state.db, {
       id: terminal.id,
@@ -3167,7 +3333,8 @@ export function createWebApp() {
   });
 
   app.post("/api/terminals/:id/linked-view", async (c) => {
-    const { ownerId, ownerEmail } = getCurrentUser(c);
+    const actor = getCurrentActor(c);
+    const ownerEmail = actor.email;
     const sourceId = c.req.param("id");
     const sourceTerm = terminals.get(sourceId);
 
@@ -3175,13 +3342,16 @@ export function createWebApp() {
       return c.json({ error: "Terminal not found" }, 404);
     }
     const sourceAccess = await requireTerminalSessionAccess({
-      actorUserId: ownerId,
+      actor,
       term: sourceTerm,
       capability: "terminal.attach",
     });
     if (!sourceAccess.ok) {
       return c.json(foundationGateJson(sourceAccess), sourceAccess.status);
     }
+    // Canonical ownerId (plan §2, invariant §9.9), resolved once by the
+    // access check above — the same id primary terminal creation uses.
+    const ownerId = sourceAccess.ownerId;
     if (!TMUX_BACKEND) {
       return c.json({ error: "Linked view requires tmux backend" }, 400);
     }
@@ -3316,14 +3486,14 @@ export function createWebApp() {
 
   // Delete terminal
   app.delete("/api/terminals/:id", async (c) => {
-    const { ownerId } = getCurrentUser(c);
+    const actor = getCurrentActor(c);
     const id = c.req.param("id");
     const term = terminals.get(id);
     if (!term) {
       return c.json({ error: "Terminal not found" }, 404);
     }
     const access = await requireTerminalSessionAccess({
-      actorUserId: ownerId,
+      actor,
       term,
       capability: "terminal.manage",
     });
@@ -3344,14 +3514,14 @@ export function createWebApp() {
 
   // Resize terminal - now with proper PTY resize support via Bun.Terminal
   app.post("/api/terminals/:id/resize", async (c) => {
-    const { ownerId } = getCurrentUser(c);
+    const actor = getCurrentActor(c);
     const id = c.req.param("id");
     const term = terminals.get(id);
     if (!term) {
       return c.json({ error: "Terminal not found" }, 404);
     }
     const access = await requireTerminalSessionAccess({
-      actorUserId: ownerId,
+      actor,
       term,
       capability: "terminal.manage",
     });
@@ -5078,13 +5248,37 @@ export async function startWebServer(host: string, port: number) {
             status: auth.status || 401,
           });
         }
-        const ownerId = auth.ownerId;
         const routeCapability = getRouteCapability(req.method, url.pathname);
         if (!routeCapability) {
           return new Response("Missing route capability", { status: 500 });
         }
 
         const state = await getFoundationState();
+
+        // Canonical ownerId (plan §2, invariant §9.9): the attach/write
+        // authorization below and the socket's actorUserId compare against
+        // this resolved id — the same id terminal creation stores as
+        // ownerId. IdentityConflictError means a self-heal collision: fail
+        // closed (invariant §9.1). `auth.actor` is always set when
+        // `auth.ok`.
+        let ownerId: string;
+        try {
+          ({ ownerId } = resolveCanonicalOwnerId(state, auth.actor!));
+        } catch (err) {
+          if (err instanceof IdentityConflictError) {
+            writeAuditEvent(state.db, {
+              actorUserId: auth.ownerId,
+              action: routeCapability.capability,
+              resourceType: routeCapability.resourceType,
+              resourceId: id,
+              decision: "deny",
+              reason: "identity_conflict",
+            });
+            return new Response("Forbidden", { status: 403 });
+          }
+          throw err;
+        }
+
         if (!isFoundationLegacyBypassEnabled() && !isBootstrapComplete(state)) {
           writeAuditEvent(state.db, {
             actorUserId: ownerId,
@@ -5171,6 +5365,22 @@ export async function startWebServer(host: string, port: number) {
             terminalId: id,
           });
           mode = writeDecision.allow ? "write" : "read";
+        }
+
+        // Pre-side-effect disabled re-check (invariant §9.2): closes the
+        // race where a disable lands between the attach decision above and
+        // the socket accept below.
+        const recheckUser = getFoundationUserById(state.db, ownerId);
+        if (recheckUser?.disabled) {
+          writeAuditEvent(state.db, {
+            actorUserId: ownerId,
+            action: routeCapability.capability,
+            resourceType: routeCapability.resourceType,
+            resourceId: id,
+            decision: "deny",
+            reason: "user_disabled",
+          });
+          return new Response("Forbidden", { status: 403 });
         }
 
         const success = server.upgrade(req, {

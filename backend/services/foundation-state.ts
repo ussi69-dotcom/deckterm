@@ -579,7 +579,6 @@ export async function initializeFoundationState({
 
   const roots = await importProjectRoots({ db, allowedFileRoots, env, now });
   const bootstrap = await ensureBootstrapToken({ db, stateDir, env });
-  ensureExistingAdminGrants(db, now);
 
   return { db, bootstrap, roots };
 }
@@ -909,25 +908,6 @@ export function grantScopedCapability(
     timestamp,
   );
   return id;
-}
-
-function ensureDefaultAdminGrants(
-  db: Database,
-  userId: string,
-  now: Date = new Date(),
-): void {
-  for (const grant of ADMIN_DEFAULT_GRANTS) {
-    grantScopedCapability(db, { userId, ...grant, now });
-  }
-}
-
-function ensureExistingAdminGrants(db: Database, now: Date): void {
-  const admins = db
-    .query("SELECT id FROM users WHERE role = 'admin'")
-    .all() as Array<{ id: string }>;
-  for (const admin of admins) {
-    ensureDefaultAdminGrants(db, admin.id, now);
-  }
 }
 
 export function hasScopedGrant(
@@ -1611,8 +1591,10 @@ export async function bootstrapFirstAdmin({
       );
   }
 
-  ensureDefaultAdminGrants(state.db, actorUserId, now);
-
+  // No boot-time/bootstrap-time grant materialization (plan §3.3): the owner
+  // role granted above is covered by the check-time role bundle
+  // (roleImpliesCapability in foundation-authorization.ts), so a bootstrapped
+  // owner can act immediately without any scoped_grants rows.
   state.bootstrap = {
     bootstrapped: true,
     mode: "complete",
