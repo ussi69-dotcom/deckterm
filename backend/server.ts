@@ -2248,6 +2248,40 @@ async function brokeredDefaultRoot(c: any): Promise<string | null> {
   return null;
 }
 
+/**
+ * B2/B4 integration: resolve a PTY start dir for a BROKERED actor without
+ * realpath. `resolveTerminalStartDir` realpaths the cwd as the service account,
+ * which cannot traverse a mapped user's 0700 home — so under isolation the
+ * start dir must be resolved LEXICALLY against the actor's registered roots
+ * (same policy as `resolveScopedFsPath`'s brokered branch), and the broker's
+ * post-drop chdir enforces the real traversal as the mapped uid. Returns a
+ * canonical absolute path contained in some registered root, or null (forbidden
+ * / no default root). The caller still enforces `terminal.create` + `root.use`
+ * on the resolved root, so this is containment-and-canonicalization only.
+ */
+async function resolveBrokeredStartDir(
+  c: any,
+  inputCwd: string | null,
+): Promise<string | null> {
+  if (!inputCwd) {
+    // No explicit cwd ⇒ the actor's own default (home) root, never the service
+    // account's HOME (B4 Codex #6).
+    return brokeredDefaultRoot(c);
+  }
+  // Lexical canonicalization rejects any residual `..` segment / NUL and
+  // requires an absolute path — never node's `resolve`, which would collapse
+  // `/home/alice/../bob` into an escape.
+  const canonical = canonicalizeLexical(inputCwd);
+  if (!canonical) return null;
+  const state = await getFoundationState();
+  const candidates = matchGrantedRootCandidates(
+    state.roots.map((r) => r.path),
+    canonical,
+  );
+  if (candidates.length === 0) return null;
+  return canonical;
+}
+
 /** Map an `FsExecError` from the executor to the HTTP response shape B4 routes
  *  return. Broker/transient failures are 503; a busy cap is 429; the rest map to
  *  the closest 4xx. Kept centralized so every fs route is consistent. */
@@ -5120,9 +5154,15 @@ export function createWebApp() {
     // and legacy bypass short-circuits inside requireFoundationCapability, so
     // their outcomes are unchanged.
     //
-    // Falls back to an allowed root when the requested cwd is within roots but
+    // Isolation (brokered) vs legacy split: under isolation the cwd is resolved
+    // LEXICALLY against the actor's registered roots (the service account can't
+    // realpath-traverse a mapped user's 0700 home; the broker's post-drop chdir
+    // enforces the real traversal). Legacy keeps the realpath resolver, which
+    // falls back to an allowed root when the requested cwd is within roots but
     // deleted; only a genuinely out-of-roots path returns null (→ 403).
-    const resolvedCwd = await resolveTerminalStartDir(requestedCwd);
+    const resolvedCwd = isOsIsolationEnabled(process.env)
+      ? await resolveBrokeredStartDir(c, body.cwd ? String(body.cwd) : null)
+      : await resolveTerminalStartDir(requestedCwd);
     const state = await getFoundationState();
     // Canonical audit actor id for the pre-capability denies below, preserving
     // the identity-conflict fail-closed outcome requireFoundationCapability
