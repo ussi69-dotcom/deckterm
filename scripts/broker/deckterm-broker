@@ -1,0 +1,674 @@
+#!/usr/bin/python3
+# DeckTerm launch broker — the single root-owned privilege boundary for
+# OS-isolated PTYs (design: docs/plans/2026-07-03-b2-run-as-user-broker.md §3;
+# B1 §2.3). Reached only by the DeckTerm service account via a pinned NOPASSWD
+# sudoers line. Stdlib only, fixed absolute interpreter (root-owned).
+#
+# Verbs:
+#   spawn  --session <id> --username <name> --uid <n> --gid <n> --cwd <abs>
+#          --profile pty|tmux [--cols N --rows M] [-- <profile-args…>]
+#   exec   … (same, non-PTY; stdout/stderr piped to the caller)
+#   kill   --session <id> | --tmux-server --uid <n>
+#   check                       (health probe: perms/config/systemd, rc 0/1)
+#   __drop --token <key>        (internal re-exec stage; NOT for direct use)
+#
+# The broker NEVER trusts caller argv for the privileged action: spawn/exec
+# validate everything, write a single-use root-owned drop record, then re-exec
+# under a systemd scope into `__drop`, which reloads the parameters from that
+# record (not its argv) and performs the privilege drop with a post-drop
+# capability/identity assertion before execve.
+
+import argparse
+import ctypes
+import ctypes.util
+import fcntl
+import grp
+import json
+import os
+import pwd
+import re
+import resource
+import secrets
+import shutil
+import stat
+import struct
+import sys
+import termios
+import time
+
+SELF_PATH = "/usr/local/lib/deckterm/deckterm-broker"
+CONFIG_PATH = "/etc/deckterm/broker.json"
+
+SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,63}$")
+SESSION_NAME_RE = re.compile(r"^deckterm[a-z0-9_-]*$")
+
+# libc prctl constants
+PR_SET_KEEPCAPS = 8
+PR_SET_NO_NEW_PRIVS = 38
+
+# TIOCGSID ioctl (Linux, asm-generic) — get a tty's session id; errors ENOTTY
+# when the tty is nobody's controlling terminal. Not exposed by CPython termios.
+TIOCGSID = 0x5429
+
+
+def die(reason, code=71):
+    sys.stderr.write("deckterm-broker: %s\n" % reason)
+    _log(reason=reason, verdict="refuse")
+    sys.exit(code)
+
+
+def _log(**fields):
+    try:
+        cfg = _CONFIG or {}
+        path = cfg.get("log_path", "/var/log/deckterm-broker.log")
+        line = json.dumps({"ts": int(time.time()), **fields}, sort_keys=True)
+        # Append-only; best-effort (never let logging failure abort a decision).
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+_CONFIG = None
+
+
+def load_config():
+    global _CONFIG
+    st = _lstat_or_die(CONFIG_PATH, "config")
+    _assert_root_owned_safe(CONFIG_PATH, st, world_writable_ok=False)
+    with open(CONFIG_PATH, "r") as fh:
+        _CONFIG = json.load(fh)
+    return _CONFIG
+
+
+def _lstat_or_die(path, label):
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        die("%s missing/unreadable: %s (%s)" % (label, path, exc))
+
+
+def _assert_root_owned_safe(path, st, world_writable_ok):
+    # Root-owned, not group- or world-writable, and not a symlink.
+    if stat.S_ISLNK(st.st_mode):
+        die("refusing symlinked path: %s" % path)
+    if st.st_uid != 0 or st.st_gid != 0:
+        die("path not root:root: %s (uid=%d gid=%d)" % (path, st.st_uid, st.st_gid))
+    if st.st_mode & stat.S_IWGRP or st.st_mode & stat.S_IWOTH:
+        die("path group/world-writable: %s (mode=%o)" % (path, st.st_mode))
+
+
+def assert_packaging():
+    # Must run as root, from a root-owned non-writable binary + config, with
+    # every parent dir root-owned. Refuse otherwise (B1 §2.3, inv 9).
+    if os.geteuid() != 0:
+        die("must run as root (euid=%d)" % os.geteuid())
+    for path in (SELF_PATH,):
+        st = _lstat_or_die(path, "binary")
+        _assert_root_owned_safe(path, st, world_writable_ok=False)
+    # Walk parent dirs of the binary — none may be group/world-writable.
+    d = os.path.dirname(SELF_PATH)
+    while True:
+        st = _lstat_or_die(d, "parent dir")
+        if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            die("unsafe parent dir: %s (uid=%d mode=%o)" % (d, st.st_uid, st.st_mode))
+        if d == "/":
+            break
+        d = os.path.dirname(d)
+
+
+def sanitize_process():
+    os.umask(0o022)
+    # Close every fd above stderr except when we deliberately keep PTY stdio.
+    try:
+        max_fd = os.sysconf("SC_OPEN_MAX")
+    except (ValueError, OSError):
+        max_fd = 4096
+    os.closerange(3, max_fd)
+
+
+# --------------------------------------------------------------------------
+# Eligibility — the SAME policy as backend/services/os-mapping-eligibility.ts,
+# independently enforced here (Codex #2). Numeric gids only.
+# --------------------------------------------------------------------------
+
+
+def account_group_gids(username, primary_gid):
+    gids = {primary_gid}
+    for g in grp.getgrall():
+        if username in g.gr_mem:
+            gids.add(g.gr_gid)
+    return gids
+
+
+def privileged_gids(cfg):
+    gids = {0}
+    for name in cfg.get("privileged_groups", ["sudo", "wheel", "admin"]):
+        try:
+            gids.add(grp.getgrnam(name).gr_gid)
+        except KeyError:
+            pass
+    for g in cfg.get("privileged_gids_extra", []):
+        gids.add(int(g))
+    return gids
+
+
+def account_can_write_protected(cfg, uid, group_gids):
+    for path in cfg.get("protected_paths", []):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True  # cannot prove non-writable ⇒ fail closed
+        mode = st.st_mode
+        if mode & stat.S_IWOTH:
+            return True
+        if st.st_uid == uid and mode & stat.S_IWUSR:
+            return True
+        if st.st_gid in group_gids and mode & stat.S_IWGRP:
+            return True
+    return False
+
+
+def resolve_and_check_identity(cfg, username, want_uid, want_gid):
+    """getpwnam(username), assert the caller's uid/gid match exactly (drift),
+    then enforce the full eligibility policy. Returns the pwd record."""
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        die("identity_unknown: no such account %r" % username)
+
+    if pw.pw_uid != want_uid or pw.pw_gid != want_gid:
+        die(
+            "identity_drift: %s resolves to uid=%d gid=%d, caller passed uid=%d gid=%d"
+            % (username, pw.pw_uid, pw.pw_gid, want_uid, want_gid)
+        )
+
+    min_uid = int(cfg.get("min_uid", 1000))
+    service_uid = int(cfg.get("service_uid", 0))
+    if service_uid <= 0:
+        die("config service_uid not set — run install-broker.sh --service-user")
+    try:
+        service_primary_gid = pwd.getpwuid(service_uid).pw_gid
+    except KeyError:
+        service_primary_gid = int(cfg.get("service_gid", -1))
+
+    if pw.pw_uid == 0:
+        die("ineligible: uid_zero")
+    if pw.pw_uid < min_uid:
+        die("ineligible: uid_below_min (%d < %d)" % (pw.pw_uid, min_uid))
+    if pw.pw_gid == 0:
+        die("ineligible: gid_zero")
+    if pw.pw_uid == service_uid:
+        die("ineligible: is_service_account")
+
+    gids = account_group_gids(username, pw.pw_gid)
+    if service_primary_gid in gids:
+        die("ineligible: service_group_member")
+
+    required = cfg.get("required_group", "deckterm-users")
+    try:
+        required_gid = grp.getgrnam(required).gr_gid
+    except KeyError:
+        die("ineligible: required_group %r does not exist" % required)
+    if required_gid not in gids:
+        die("ineligible: missing_required_group (%s)" % required)
+
+    if gids & privileged_gids(cfg):
+        die("ineligible: privileged_group_member")
+
+    shell = (pw.pw_shell or "").strip()
+    nologin = ("/nologin", "nologin", "/false", "false")
+    if not shell or any(shell.endswith(s) for s in nologin):
+        die("ineligible: nologin_shell (%r)" % shell)
+
+    if account_can_write_protected(cfg, pw.pw_uid, gids):
+        die("ineligible: protected_path_writable")
+
+    return pw
+
+
+# --------------------------------------------------------------------------
+# Registry — root-owned single-use drop records + unit tracking.
+# --------------------------------------------------------------------------
+
+
+def registry_dir(cfg):
+    return cfg.get("registry_dir", "/run/deckterm-broker")
+
+
+def _registry_ready(cfg):
+    d = registry_dir(cfg)
+    st = _lstat_or_die(d, "registry dir")
+    _assert_root_owned_safe(d, st, world_writable_ok=False)
+    if not stat.S_ISDIR(st.st_mode):
+        die("registry dir is not a directory: %s" % d)
+    return d
+
+
+def write_drop_record(cfg, session, unit, pw, gid, cwd, argv, env):
+    d = _registry_ready(cfg)
+    token = secrets.token_hex(16)
+    record = {
+        "token": token,
+        "session": session,
+        "unit": unit,
+        "uid": pw.pw_uid,
+        "gid": gid,
+        "username": pw.pw_name,
+        "cwd": cwd,
+        "argv": argv,
+        "env": env,
+    }
+    path = os.path.join(d, token + ".json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(record, fh)
+    # Also track the unit for kill().
+    unit_path = os.path.join(d, "unit-" + session + ".json")
+    ufd = os.open(unit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(ufd, "w") as fh:
+        json.dump({"unit": unit, "session": session, "uid": pw.pw_uid}, fh)
+    return token
+
+
+def gc_stale_units(cfg):
+    # Prune unit-*.json records whose scope is no longer active. A session that
+    # exits on its own (rather than via `kill`) would otherwise leak its record
+    # until reboot; the server also calls `kill --session` on teardown, so this
+    # is a belt-and-braces sweep, kept cheap (only runs on spawn).
+    d = registry_dir(cfg)
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return
+    for name in entries:
+        if not (name.startswith("unit-") and name.endswith(".json")):
+            continue
+        path = os.path.join(d, name)
+        try:
+            with open(path, "r") as fh:
+                unit = json.load(fh).get("unit", "")
+        except (OSError, ValueError):
+            continue
+        if not unit:
+            continue
+        rc = os.spawnvp(
+            os.P_WAIT, "systemctl", ["systemctl", "is-active", "--quiet", unit]
+        )
+        if rc != 0:  # not active
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def read_consume_drop_record(cfg, token):
+    d = _registry_ready(cfg)
+    if not re.match(r"^[0-9a-f]{32}$", token or ""):
+        die("bad drop token")
+    path = os.path.join(d, token + ".json")
+    st = _lstat_or_die(path, "drop record")
+    _assert_root_owned_safe(path, st, world_writable_ok=False)
+    if not stat.S_ISREG(st.st_mode):
+        die("drop record not a regular file")
+    with open(path, "r") as fh:
+        record = json.load(fh)
+    os.unlink(path)  # single-use
+    return record
+
+
+# --------------------------------------------------------------------------
+# Profiles & argv assembly.
+# --------------------------------------------------------------------------
+
+
+def get_profile(cfg, name):
+    profiles = cfg.get("profiles", {})
+    if name not in profiles:
+        die("unknown profile: %r" % name)
+    return profiles[name]
+
+
+def build_child_env(cfg, pw, cols, rows):
+    return {
+        "HOME": pw.pw_dir,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "SHELL": pw.pw_shell,
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "TERM": "xterm-256color",
+        "COLORTERM": "truecolor",
+        "LANG": cfg.get("lang", "C.UTF-8"),
+        "COLUMNS": str(cols),
+        "LINES": str(rows),
+    }
+
+
+TMUX_SUBCMD_ALLOW = {
+    "new-session", "attach-session", "kill-session", "has-session",
+    "list-sessions", "capture-pane", "pipe-pane", "resize-window",
+    "resize-pane", "set-option", "display-message", "list-clients",
+    "resize-client", "start-server", "kill-server",
+}
+
+
+def user_socket_path(cfg, pw):
+    ns = cfg.get("namespace", "deckterm")
+    return os.path.join(pw.pw_dir, ".deckterm", "tmux", "deckterm_%s.sock" % ns)
+
+
+def assemble_argv(cfg, profile, pw, cwd, cols, rows, extra_args, session):
+    kind = profile.get("kind")
+    if kind == "pty":
+        if extra_args:
+            die("pty profile takes no profile args")
+        shell = pw.pw_shell or "/bin/bash"
+        return [shell, "-l"]
+    if kind == "tmux":
+        if not extra_args:
+            die("tmux profile requires a subcommand")
+        sub = extra_args[0]
+        if sub not in TMUX_SUBCMD_ALLOW:
+            die("tmux subcommand not allowed: %r" % sub)
+        # Every -t target must match the deckterm session-name pattern.
+        it = iter(extra_args)
+        for tok in it:
+            if tok == "-t":
+                target = next(it, "")
+                if not SESSION_NAME_RE.match(target):
+                    die("tmux -t target not allowed: %r" % target)
+        tmux = profile.get("tmux_path", "/usr/bin/tmux")
+        sock = user_socket_path(cfg, pw)
+        args = list(extra_args)
+        if sub == "pipe-pane":
+            # The broker OWNS the pipe command (Codex #9): the caller supplies
+            # no command string. tmux runs the pipe target via `sh -c`, but the
+            # helper path is fixed+absolute and the session id is regex-checked,
+            # so nothing caller-controlled reaches that shell. We rebuild the
+            # arg vector from scratch, keeping only the validated -t target.
+            helper = cfg.get(
+                "capture_helper", "/usr/local/lib/deckterm/deckterm-capture"
+            )
+            tgt = None
+            prev = None
+            for tok in extra_args:
+                if prev == "-t":
+                    tgt = tok
+                prev = tok
+            if not tgt or not SESSION_NAME_RE.match(tgt):
+                die("pipe-pane requires a valid -t target")
+            args = ["pipe-pane", "-o", "-t", tgt, "%s %s" % (helper, session)]
+        return [tmux, "-S", sock] + args
+    die("profile kind not supported: %r" % kind)
+
+
+# --------------------------------------------------------------------------
+# Verbs.
+# --------------------------------------------------------------------------
+
+
+def systemd_run_scope(cfg, unit, profile, token):
+    props = []
+    for key, val in profile.get("properties", {}).items():
+        props += ["--property=%s=%s" % (key, val)]
+    runtime_max = profile.get("runtime_max_sec")
+    if runtime_max:
+        props += ["--property=RuntimeMaxSec=%s" % runtime_max]
+    return [
+        "systemd-run", "--scope", "--collect", "--quiet",
+        "--unit=%s" % unit,
+    ] + props + ["--", SELF_PATH, "__drop", "--token", token]
+
+
+def do_spawn(cfg, args, is_exec):
+    if not SESSION_RE.match(args.session or ""):
+        die("bad --session")
+    gc_stale_units(cfg)
+    pw = resolve_and_check_identity(cfg, args.username, args.uid, args.gid)
+
+    cwd = os.path.realpath(args.cwd)
+    if not os.path.isabs(cwd):
+        die("--cwd must be absolute")
+
+    profile = get_profile(cfg, args.profile)
+    kind = profile.get("kind")
+
+    # tmux server scope uses a per-user unit; per-session scope otherwise.
+    if kind == "tmux" and args.profile_args and args.profile_args[0] in (
+        "new-session", "start-server",
+    ):
+        unit = "deckterm-tmuxsrv-%d.scope" % pw.pw_uid
+    else:
+        unit = "deckterm-%s.scope" % args.session
+
+    argv = assemble_argv(
+        cfg, profile, pw, cwd, args.cols, args.rows, args.profile_args, args.session
+    )
+    # For tmux ops that aren't the server-spawning ones, run in an anonymous
+    # per-invocation scope (no persistent unit) so they end with the client.
+    if kind == "tmux" and unit.startswith("deckterm-%s" % args.session):
+        unit = "deckterm-%s-%s.scope" % (args.session, secrets.token_hex(4))
+
+    child_env = build_child_env(cfg, pw, args.cols, args.rows)
+    token = write_drop_record(cfg, args.session, unit, pw, args.gid, cwd, argv, child_env)
+
+    _log(verb="exec" if is_exec else "spawn", session=args.session,
+         uid=pw.pw_uid, username=pw.pw_name, profile=args.profile,
+         unit=unit, verdict="allow")
+
+    cmd = systemd_run_scope(cfg, unit, profile, token)
+    os.execvp(cmd[0], cmd)  # replace self; scope runs on our (PTY) stdio
+
+
+def do_drop(cfg, token):
+    record = read_consume_drop_record(cfg, token)
+    uid = int(record["uid"])
+    gid = int(record["gid"])
+    cwd = record["cwd"]
+    argv = list(record["argv"])
+    env = dict(record["env"])
+    expected_unit = record["unit"]
+
+    # Prove we're inside the broker-created scope, not invoked standalone
+    # (Codex #3): the scope's unit name must be a PATH COMPONENT of our cgroup
+    # (a full "/<unit>" segment, not a loose substring) — a direct
+    # `sudo broker __drop` runs outside any deckterm scope and fails here.
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            cgroup = fh.read()
+    except OSError as exc:
+        die("cannot read cgroup: %s" % exc)
+    components = set()
+    for line in cgroup.strip().splitlines():
+        # format: hierarchy-id:controllers:/path
+        path = line.split(":", 2)[-1]
+        components.update(seg for seg in path.split("/") if seg)
+    if expected_unit not in components:
+        die("cgroup mismatch: %r not a component of %r" % (expected_unit, cgroup.strip()))
+
+    libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+    # Do not retain capabilities across setuid; forbid new privileges.
+    if libc.prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0:
+        die("prctl(KEEPCAPS,0) failed")
+
+    try:
+        os.initgroups(record["username"], gid)
+    except OSError as exc:
+        die("initgroups failed: %s" % exc)
+    try:
+        os.setgid(gid)
+        os.setuid(uid)
+    except OSError as exc:
+        die("setgid/setuid failed: %s" % exc)
+
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        die("prctl(NO_NEW_PRIVS,1) failed")
+
+    # Post-drop identity + capability assertion (Codex #4): getresuid==uid is
+    # necessary but not sufficient — a leftover cap set would allow re-escalation.
+    assert_dropped_identity(uid, gid)
+
+    # rlimits from the record's profile were applied via scope properties where
+    # possible; apply NOFILE here (scopes don't take Limit*).
+    nofile = record.get("nofile")
+    if nofile:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
+        except (ValueError, OSError):
+            pass
+
+    # Controlling terminal (fd 0 = PTY slave handed by the server). Only claim
+    # it when the slave has NO controlling session yet — probe with TIOCGSID,
+    # which errors (ENOTTY) precisely when the tty is nobody's controlling
+    # terminal. A fresh slave ⇒ we setsid + TIOCSCTTY so the shell gets full
+    # job control; a slave whose session an outer layer already established
+    # (e.g. the server/Bun PTY setup) ⇒ inherit it, since a post-drop
+    # unprivileged process cannot steal another session's ctty (Codex note:
+    # ioctl failure aborts — but only in the genuine fresh-slave case).
+    if os.isatty(0):
+        has_ctty = True
+        try:
+            fcntl.ioctl(0, TIOCGSID, struct.pack("i", 0))
+        except OSError:
+            has_ctty = False
+        if not has_ctty:
+            os.setsid()
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError as exc:
+                die("TIOCSCTTY failed: %s" % exc)
+
+    try:
+        os.chdir(cwd)
+    except OSError as exc:
+        die("chdir(%r) failed as user: %s" % (cwd, exc))
+
+    os.execve(argv[0], argv, env)
+
+
+def assert_dropped_identity(uid, gid):
+    ruid, euid, suid = os.getresuid()
+    rgid, egid, sgid = os.getresgid()
+    if not (ruid == euid == suid == uid):
+        die("uid not fully dropped: %r" % ((ruid, euid, suid),))
+    if not (rgid == egid == sgid == gid):
+        die("gid not fully dropped: %r" % ((rgid, egid, sgid),))
+    caps = {}
+    with open("/proc/self/status", "r") as fh:
+        for line in fh:
+            if line.startswith(("CapInh:", "CapPrm:", "CapEff:", "CapAmb:")):
+                key, val = line.split(":", 1)
+                caps[key] = int(val.strip(), 16)
+    for key in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        if caps.get(key, -1) != 0:
+            die("capability %s not zero: %x" % (key, caps.get(key, -1)))
+
+
+def do_kill(cfg, args):
+    d = _registry_ready(cfg)
+    if args.tmux_server:
+        if args.uid is None or int(args.uid) <= 0:
+            die("bad --uid for --tmux-server")
+        unit = "deckterm-tmuxsrv-%d.scope" % int(args.uid)
+    else:
+        if not SESSION_RE.match(args.session or ""):
+            die("bad --session")
+        unit_path = os.path.join(d, "unit-" + args.session + ".json")
+        try:
+            with open(unit_path, "r") as fh:
+                unit = json.load(fh)["unit"]
+        except (OSError, ValueError, KeyError):
+            # No registry entry — nothing to kill; treat as success (idempotent).
+            _log(verb="kill", session=args.session, verdict="noop")
+            return 0
+    if not unit.startswith("deckterm-") or not unit.endswith(".scope"):
+        die("refusing to stop non-deckterm unit: %r" % unit)
+    _log(verb="kill", unit=unit, verdict="allow")
+    rc = os.spawnvp(os.P_WAIT, "systemctl", ["systemctl", "stop", unit])
+    try:
+        if not args.tmux_server:
+            os.unlink(os.path.join(d, "unit-" + args.session + ".json"))
+    except OSError:
+        pass
+    return 0 if rc == 0 else 0  # stop of an already-gone unit is not an error
+
+
+def do_check(cfg):
+    # Packaging already asserted in main(); verify systemd + config reachability.
+    if not shutil.which("systemd-run"):
+        die("systemd-run not found", code=1)
+    if not shutil.which("systemctl"):
+        die("systemctl not found", code=1)
+    try:
+        int(cfg["service_uid"])
+    except (KeyError, ValueError):
+        die("config missing/invalid service_uid", code=1)
+    _registry_ready(cfg)
+    sys.stdout.write("ok\n")
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="deckterm-broker", add_help=False)
+    sub = p.add_subparsers(dest="verb", required=True)
+
+    for verb in ("spawn", "exec"):
+        s = sub.add_parser(verb, add_help=False)
+        s.add_argument("--session", required=True)
+        s.add_argument("--username", required=True)
+        s.add_argument("--uid", type=int, required=True)
+        s.add_argument("--gid", type=int, required=True)
+        s.add_argument("--cwd", required=True)
+        s.add_argument("--profile", required=True)
+        s.add_argument("--cols", type=int, default=120)
+        s.add_argument("--rows", type=int, default=30)
+        s.add_argument("profile_args", nargs="*")
+
+    k = sub.add_parser("kill", add_help=False)
+    k.add_argument("--session")
+    k.add_argument("--tmux-server", dest="tmux_server", action="store_true")
+    k.add_argument("--uid", type=int)
+
+    sub.add_parser("check", add_help=False)
+
+    dr = sub.add_parser("__drop", add_help=False)
+    dr.add_argument("--token", required=True)
+    return p
+
+
+def main(argv):
+    load_config()
+    # __drop runs INSIDE the scope (already re-execed); it still runs as root
+    # until it drops, and must pass packaging too.
+    assert_packaging()
+
+    args = build_parser().parse_args(argv)
+
+    if args.verb == "__drop":
+        # Keep stdio (PTY); only sanitize env, do not close fds 0-2.
+        os.umask(0o022)
+        do_drop(_CONFIG, args.token)
+        return 0  # unreachable (execve)
+
+    if args.verb in ("spawn", "exec"):
+        # spawn keeps stdio (PTY handed by server); close only >2.
+        sanitize_process()
+        do_spawn(_CONFIG, args, is_exec=(args.verb == "exec"))
+        return 0  # unreachable (execvp)
+
+    sanitize_process()
+    if args.verb == "kill":
+        return do_kill(_CONFIG, args)
+    if args.verb == "check":
+        return do_check(_CONFIG)
+    die("unknown verb")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

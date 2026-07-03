@@ -1,0 +1,39 @@
+{
+  "namespace": "deckterm",
+  "min_uid": 1000,
+  "required_group": "deckterm-users",
+  "privileged_groups": ["sudo", "wheel", "admin"],
+  "service_uid": 0,
+  "lang": "C.UTF-8",
+  "registry_dir": "/run/deckterm-broker",
+  "log_path": "/var/log/deckterm-broker.log",
+  "capture_root": "/var/lib/deckterm/capture",
+  "capture_helper": "/usr/local/lib/deckterm/deckterm-capture",
+  "protected_paths": [
+    "/usr/local/lib/deckterm/deckterm-broker",
+    "/etc/deckterm",
+    "/etc/deckterm/broker.json",
+    "/etc/sudoers.d/deckterm-broker"
+  ],
+  "profiles": {
+    "pty": {
+      "kind": "pty",
+      "properties": {
+        "MemoryMax": "2G",
+        "TasksMax": "512",
+        "CPUWeight": "100"
+      },
+      "nofile": 4096
+    },
+    "tmux": {
+      "kind": "tmux",
+      "tmux_path": "/usr/bin/tmux",
+      "properties": {
+        "MemoryMax": "4G",
+        "TasksMax": "1024",
+        "CPUWeight": "100"
+      },
+      "nofile": 8192
+    }
+  }
+}

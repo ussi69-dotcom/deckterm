@@ -1,0 +1,41 @@
+#!/usr/bin/python3
+# DeckTerm reconnect-spool capture helper (design §3.5, Codex #9). Invoked by
+# tmux `pipe-pane` running AS THE MAPPED USER — replaces the old `cat >> path`
+# shell string so no caller-controlled string or shell metacharacter can enter.
+# The only argument is a regex-validated session id; the spool path is fixed and
+# derived here. Root-owned but runs unprivileged (the user's tmux runs it); it
+# just copies stdin to the session's append-only pipe.log.
+
+import os
+import re
+import sys
+
+CAPTURE_ROOT = "/var/lib/deckterm/capture"
+SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,63}$")
+
+
+def main(argv):
+    if len(argv) != 1 or not SESSION_RE.match(argv[0]):
+        sys.stderr.write("deckterm-capture: bad session id\n")
+        return 2
+    session = argv[0]
+    path = os.path.join(CAPTURE_ROOT, session, "pipe.log")
+    # O_NOFOLLOW: never write through a symlink the (untrusted) user planted.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        sys.stderr.write("deckterm-capture: open failed: %s\n" % exc)
+        return 1
+    try:
+        while True:
+            chunk = os.read(0, 65536)
+            if not chunk:
+                break
+            os.write(fd, chunk)
+    finally:
+        os.close(fd)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
