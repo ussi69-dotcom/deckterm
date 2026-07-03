@@ -6,9 +6,35 @@
 > `denyIfOsIsolationPending`). Status: **rev 1 — Codex-validated 2026-07-03** (14 findings, all
 > incorporated; see §9). Initial verdict was no-go (git/search not fd-contained, git execution
 > model undecided, root/grant lifecycle loose); rev 1 closes all three.
-> Tiering (program §7 + B4 row): fs helper + broker profiles + shared broker-call layer on the
-> strong main loop; per-surface route wiring = Sonnet subagents with briefs; **Codex validates
-> this plan, per-slice review on the helper/profiles, and the integrated diff.**
+> Tiering (program §7 + B4 row): fs helper + broker profiles + shared broker-call layer + the
+> route wiring all landed on the strong main loop (the route wiring proved cross-cutting /
+> legacy-regression-risky — kept off Sonnet); Codex validated the plan, reviewed S1 + S2
+> per-slice, and reviews the integrated diff.
+>
+> **Delivery status (2026-07-03) — all six slices landed on `dev`:**
+>
+> - **S1** (`47315b4`): fs helper + broker `fs`/`exec_stdin` profile + client stdin. Codex
+>   per-slice: 7 findings fixed (recursive-delete mount crossing, write/rename replace TOCTOU →
+>   renameat2, root='//', FIFO/device pre-open, temp cleanup + fsync order, openat2/renameat2
+>   arch-gate). 23 contract tests.
+> - **S2** (`4e7e780`): broker `git` + `search` profiles (fd-cwd `--root`/`--reldir`, hardened
+>   env, schema for 14 subcommands). Codex per-slice: 4 findings + 1 note fixed (ceiling=parent,
+>   hooks/ext-diff/textconv neutralized, canonical root_abs, reject empty reldir segments). 40
+>   schema tests.
+> - **S3** (`f3490f5`): `fs-executor.ts` seam (legacy node:fs vs brokered fs-JSON) +
+>   `matchGrantedRoot` segment-boundary policy + per-uid/global concurrency cap. 19 tests.
+> - **S4** (`94fb6bc`): all 8 files/browse routes → the executor via `resolveExecFsContext` +
+>   `resolveScopedFsPath` + `fsErrorResponse`; legacy byte-identical. 10 regression tests.
+> - **S5** (`79efedd`): all 13 local git routes → context-aware `runGit` (`resolveGitCwd`);
+>   network git denies `os_isolation_unsupported`; untracked-diff preview legacy-only. git-actions
+>   (21) regression guard green.
+> - **S6** (`a7acab8`): per-user default home-root provisioning (eligibility-checked) +
+>   `denyIfOsIsolationUnsupported` on tasks + clipboard `O_EXCL` hardening + E1/README docs.
+>
+> Full `test:unit` (668 + chained foundation invocations) + `tsc` green. **Deferred to a
+> fast-follow:** workspace search brokering (still denies under isolation — safe); the
+> adversarial Alice/Bob e2e (needs the live broker + two throwaway accounts). Integrated-diff
+> Codex pass owed at finalization.
 
 ## 0. Scope
 
