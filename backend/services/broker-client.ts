@@ -37,11 +37,17 @@ export type BrokerExecContext = {
 };
 
 export type BrokerSpawnOptions = BrokerExecContext & {
-  profile: "pty" | "tmux";
+  profile: "pty" | "tmux" | "fs";
   cols?: number;
   rows?: number;
   /** Extra profile args (e.g. tmux subcommand argv). Never a shell string. */
   profileArgs?: string[];
+  /**
+   * For `exec_stdin` profiles (B4 `fs` helper): a single request payload written
+   * to the child's stdin. The whole request travels over stdin, so there is no
+   * argv attack surface. Ignored by `spawn` (which hands the child a PTY).
+   */
+  stdin?: string;
   /** The PTY handle to hand the child (Bun.Terminal). */
   terminal?: unknown;
   onExit?: (
@@ -139,7 +145,14 @@ export async function brokerExec(
   timeoutMs = 30_000,
 ): Promise<BrokerExecResult> {
   const argv = buildBrokerArgv(resolveBrokerPath(env), "exec", opts);
-  const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(argv, {
+    // A stdin payload (fs helper request) is handed as the child's stdin; the
+    // whole request travels over stdin so no request data reaches argv. When
+    // absent, close stdin so a control command (e.g. tmux) can't block on it.
+    stdin: opts.stdin != null ? Buffer.from(opts.stdin, "utf8") : "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const timer = setTimeout(() => {
     try {
       proc.kill();

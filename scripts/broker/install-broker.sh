@@ -41,6 +41,8 @@ getent group deckterm-users >/dev/null || groupadd --system deckterm-users
 install -d -o root -g root -m 0755 "$LIB_DIR"
 install -o root -g root -m 0755 "$SRC_DIR/deckterm-broker" "$LIB_DIR/deckterm-broker"
 install -o root -g root -m 0755 "$SRC_DIR/deckterm-capture" "$LIB_DIR/deckterm-capture"
+# B4 fs helper — the fd-based containment boundary for OS-isolated file ops.
+install -o root -g root -m 0755 "$SRC_DIR/deckterm-fs-helper" "$LIB_DIR/deckterm-fs-helper"
 
 # 3. Config → root:root 0644, with service_uid pinned to the real account.
 install -d -o root -g root -m 0755 "$ETC_DIR"

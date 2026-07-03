@@ -760,6 +760,22 @@ def assemble_argv(cfg, profile, pw, cwd, cols, rows, extra_args, session):
             die("pty profile takes no profile args")
         shell = pw.pw_shell or "/bin/bash"
         return [shell, "-l"]
+    if kind == "exec_stdin":
+        # A fixed root-owned helper that reads a single JSON request on stdin and
+        # writes a JSON response on stdout (B4 fs helper). NO caller argv is ever
+        # accepted — the request travels entirely over stdin, so there is no argv
+        # attack surface (design §2.1). The exec path must be absolute + root-safe.
+        if extra_args:
+            die("exec_stdin profile takes no profile args")
+        exec_path = profile.get("exec_path")
+        if not exec_path or not os.path.isabs(exec_path):
+            die("exec_stdin profile missing absolute exec_path")
+        _assert_parents_root_safe(exec_path)
+        est = _lstat_or_die(exec_path, "exec_stdin helper")
+        if stat.S_ISLNK(est.st_mode) or not stat.S_ISREG(est.st_mode):
+            die("exec_stdin helper not a regular file: %s" % exec_path)
+        _assert_root_owned_safe(exec_path, est, world_writable_ok=False)
+        return [exec_path]
     if kind == "tmux":
         if not extra_args:
             die("tmux profile requires a subcommand")

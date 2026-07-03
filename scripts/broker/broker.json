@@ -34,6 +34,17 @@
         "CPUWeight": "100"
       },
       "nofile": 8192
+    },
+    "fs": {
+      "kind": "exec_stdin",
+      "exec_path": "/usr/local/lib/deckterm/deckterm-fs-helper",
+      "properties": {
+        "MemoryMax": "512M",
+        "TasksMax": "16",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 256
     }
   }
 }
