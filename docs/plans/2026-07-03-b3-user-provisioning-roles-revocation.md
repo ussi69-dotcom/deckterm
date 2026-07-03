@@ -2,9 +2,12 @@
 
 > Program: `2026-07-02-enterprise-1.0-program.md` Track B, slice B3. Design authority:
 > `2026-07-02-b1-identity-isolation-storage-design.md` §1.1, §1.4, §1.5, §1.6, §5.
-> Status: **rev 1 — Codex-validated 2026-07-03** (15 findings, all incorporated; see §11).
-> Tiering: Sonnet codes sub-slices sequentially (shared files), Opus diff-reviews each against
-> §9 invariants, Codex reviews the integrated authz diff before commit.
+> Status: **COMPLETE 2026-07-03** — plan rev 1 Codex-validated (15 findings, §11), coded
+> S1–S5 same day, integrated diff Codex-reviewed (8 further findings, all fixed — §12).
+> Commits on `dev`: `5bb4ad8` (S1), `b2bf304` (S2), `e62a6a5` (S3), `2072de0` (S4),
+> `9bfb5c2` (S5), `2889e7f` (hardening). Live-verified on 4174; smoke e2e 21/21.
+> Tiering: Sonnet coded sub-slices sequentially (shared files), Opus diff-reviewed each against
+> §9 invariants, Codex reviewed the integrated authz diff before finalization.
 
 ## 0. Scope
 
@@ -266,3 +269,29 @@ and empty issuer/subject — §4; (12) review coarseness fixed structurally (dec
 wildcard rows; gate checks rows, not only timestamps) — §4/§6; (13) `revoke_wildcards` +
 orphan-principal decisions — §4; (14) transactional mutations + audit — §4; (15) UI gate
 includes `disabled === false` + owner-only affordances hidden — §7.
+
+## 12. Integrated-diff review record (Codex, 2026-07-03, deep — commit `2889e7f`)
+
+8 findings on the S1–S5 integrated diff, all fixed: (1) invites could shadow grandfathered
+`(provider,'')` identities or `users.id` fallbacks — a disable bypass; invite now rejects
+both, and exact-triple resolution fails closed on dual-identity ambiguity; (2+3) in-flight
+create/attach TOCTOU beyond the sweeps — post-registration re-validation added (terminal
+create rechecks disabled after registration and kills; WS `open()` runs unit-tested
+`validateLiveSocket`, closing on disable or lost foreign-attach grant); (4) revocation made
+best-effort per step, audit failures never abort enforcement; (5) migration-5 rebuild made
+atomic (BEGIN → rebuilds → `foreign_key_check` → COMMIT, ROLLBACK on error, FK enforcement
+restored in `finally`); (6) `/api/grants/review` now requires a real orphan wildcard
+principal (`not_wildcard_principal`); (7) owner-approved PATCH promotion to admin marks the
+user reviewed (no runtime path into the state the startup gate rejects); (8) startup gate
+refuses `DECKTERM_OS_ISOLATION=1` + legacy bypass (`legacy_bypass_conflict`).
+
+**Live verification (dev, 4174):** migration 5 applied cleanly to the real state dir
+(versions 1–5); un-bootstrapped admin routes 403 `bootstrap_required` (no bypass); after
+bootstrap the `tunnel` actor is `owner` with `auth.user` exposed; `owner_immutable`,
+`wildcard_forbidden` (even for owner) and `issuer_not_configured` verified over HTTP;
+terminal create/delete unchanged; smoke e2e 21/21 pre- and post-hardening.
+
+**Known limitation:** orphan-principal review (`POST /api/grants/review`) is API-only (no
+user row to render in the Users panel); the S4 gate error message points operators at it.
+Live <5 s PTY-kill proof for a _second_ real user lands with the adversarial Alice/Bob e2e
+(program plan, immediately after B2+B4).
