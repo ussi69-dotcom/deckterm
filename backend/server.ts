@@ -45,23 +45,34 @@ import {
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
+  createInvitedUser,
+  disableOrphanGrantPrincipal,
   getFoundationUserById,
+  getScopedGrantById,
   getTerminalSession,
   getUserById,
   getUserSettings,
+  grantScopedCapability,
   hasScopedGrant,
   IdentityConflictError,
   initializeFoundationState,
   isBootstrapComplete,
+  listFoundationUsers,
+  listScopedGrants,
   listTerminalEventsAfter,
   listTerminalSessionsForActor,
   markTerminalSessionEnded,
+  markUserReviewed,
   recordTerminalSession,
   resolveUserForActor,
+  revokeScopedCapability,
+  setUserDisabled,
+  setUserRole,
   setUserSettings,
   writeAuditEvent,
   type FoundationState,
   type FoundationUser,
+  type FoundationUserRole,
   type RecordedTerminalSession,
   type ScopedGrantCapability,
 } from "./services/foundation-state";
@@ -1161,6 +1172,182 @@ async function requireOnboardingAdmin(
   return { ok: true };
 }
 
+// B3-S3 admin surfaces (/api/users*, /api/grants*): new privileged routes,
+// strict from birth (invariant §9.5) — unlike requireFoundationCapability /
+// requireOnboardingAdmin, this gate has NO legacy-bypass and NO edge-tunnel
+// allow path. Order: 401 unauthenticated -> 403 bootstrap_required -> resolve
+// canonical user (403 identity_conflict on a self-heal collision, 403
+// missing_role when no user row exists) -> 403 user_disabled (checked before
+// the role check, matching the disabled-wins precedence everywhere else) ->
+// 403 missing_role (role not in `roles`) -> allow. Every attempt is audited;
+// `action` doubles as the audit_events.action value (e.g. "users.create",
+// "grants.revoke") and its "grants." prefix selects the audit resourceType.
+async function requireRole(
+  c: any,
+  roles: FoundationUserRole[],
+  action: string,
+  data: Record<string, unknown> = {},
+): Promise<
+  | { ok: true; user: FoundationUser; ownerId: string }
+  | { ok: false; status: 401 | 403; body: any }
+> {
+  const resourceType = action.startsWith("grants.") ? "grant" : "user";
+  const resourceId = (data.targetId as string | undefined) || null;
+
+  let actor: DeckTermActor;
+  try {
+    actor = getCurrentActor(c);
+  } catch (err) {
+    if (err instanceof UnauthorizedRequestError) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: null,
+        action,
+        resourceType,
+        resourceId,
+        decision: "deny",
+        reason: "unauthenticated",
+        data,
+      });
+      return { ok: false, status: 401, body: { error: err.message } };
+    }
+    throw err;
+  }
+
+  const state = await getFoundationState();
+
+  if (!isBootstrapComplete(state)) {
+    writeAuditEvent(state.db, {
+      actorUserId: actor.id,
+      action,
+      resourceType,
+      resourceId,
+      decision: "deny",
+      reason: "bootstrap_required",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm bootstrap required",
+        reason: "bootstrap_required",
+        resourceType,
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  let canonical: { ownerId: string; user: FoundationUser | null };
+  try {
+    canonical = resolveCanonicalOwnerId(state, actor);
+  } catch (err) {
+    if (err instanceof IdentityConflictError) {
+      writeAuditEvent(state.db, {
+        actorUserId: actor.id,
+        action,
+        resourceType,
+        resourceId,
+        decision: "deny",
+        reason: "identity_conflict",
+        data,
+      });
+      return {
+        ok: false,
+        status: 403,
+        body: foundationGateJson({
+          message: "DeckTerm identity resolution conflict",
+          reason: "identity_conflict",
+          resourceType,
+          resourceId: resourceId || "*",
+        }),
+      };
+    }
+    throw err;
+  }
+
+  const { ownerId, user } = canonical;
+
+  if (!user) {
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType,
+      resourceId,
+      decision: "deny",
+      reason: "missing_role",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm role required",
+        reason: "missing_role",
+        resourceType,
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  // Disabled wins (invariant §9.2), checked before the role check — mirrors
+  // requireFoundationCapability's precedence.
+  if (user.disabled) {
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType,
+      resourceId,
+      decision: "deny",
+      reason: "user_disabled",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm account disabled",
+        reason: "user_disabled",
+        resourceType,
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  if (!roles.includes(user.role)) {
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action,
+      resourceType,
+      resourceId,
+      decision: "deny",
+      reason: "missing_role",
+      data,
+    });
+    return {
+      ok: false,
+      status: 403,
+      body: foundationGateJson({
+        message: "DeckTerm admin role required",
+        reason: "missing_role",
+        resourceType,
+        resourceId: resourceId || "*",
+      }),
+    };
+  }
+
+  writeAuditEvent(state.db, {
+    actorUserId: ownerId,
+    action,
+    resourceType,
+    resourceId,
+    decision: "allow",
+    reason: `role_${user.role}`,
+    data,
+  });
+  return { ok: true, user, ownerId };
+}
+
 function ensureTerminalSessionRecorded(state: FoundationState, term: Terminal) {
   if (getTerminalSession(state.db, term.id)) return;
   recordTerminalSession(state.db, {
@@ -1926,6 +2113,25 @@ async function getFoundationStatus(c: {
 }) {
   const actor = getCurrentActor(c);
   const state = await getFoundationState();
+  // B3-S3: exposes the resolved canonical role/disabled state for the admin
+  // UI's gate (plan §7 Codex #15). Status is informational, so an
+  // IdentityConflictError (self-heal collision) reports null rather than
+  // failing the whole endpoint — the conflict itself is fail-closed on every
+  // capability-checking path, this is just "do we know who you are yet."
+  let user: { id: string; role: FoundationUserRole; disabled: boolean } | null =
+    null;
+  try {
+    const canonical = resolveCanonicalOwnerId(state, actor);
+    if (canonical.user) {
+      user = {
+        id: canonical.user.id,
+        role: canonical.user.role,
+        disabled: canonical.user.disabled,
+      };
+    }
+  } catch (err) {
+    if (!(err instanceof IdentityConflictError)) throw err;
+  }
   return {
     runtime: {
       environment:
@@ -1937,6 +2143,7 @@ async function getFoundationStatus(c: {
     },
     auth: {
       actor,
+      user,
       cloudflareAccessRequired: CF_ACCESS_REQUIRED,
       cloudflareAccessTeamConfigured: Boolean(CF_ACCESS_TEAM_NAME),
       cloudflareAccessAudienceConfigured: Boolean(CF_ACCESS_AUD),
@@ -2335,6 +2542,131 @@ async function killTmuxSessionIfLast(
     return false;
   }
   return true;
+}
+
+// -----------------------------------------------------------------------
+// B3-S3 revocation kill primitive (plan §5, invariant §9.7).
+// -----------------------------------------------------------------------
+
+/** Kills every live terminal owned by `userId`, running the same sequence as
+ * the canonical `DELETE /api/terminals/:id` handler above (server.ts
+ * `app.delete("/api/terminals/:id", ...)`. */
+async function killOwnedTerminalsFor(
+  state: FoundationState,
+  userId: string,
+  reason: string,
+): Promise<void> {
+  const owned = [...terminals.values()].filter(
+    (term) => term.ownerId === userId,
+  );
+  for (const term of owned) {
+    try {
+      markTerminalSessionEnded(state.db, term.id);
+      closeTerminalSockets(term.id, reason);
+      removeTerminalState(term.id);
+      await killTmuxSessionIfLast(term.sessionName);
+      term.proc.kill();
+      term.terminal.close();
+      writeAuditEvent(state.db, {
+        actorUserId: userId,
+        action: "terminal.revoked",
+        resourceType: "terminal",
+        resourceId: term.id,
+        decision: "allow",
+        reason,
+      });
+    } catch (err) {
+      debug(
+        `[revocation] failed to kill terminal ${term.id} owned by ${userId}`,
+        err,
+      );
+    }
+  }
+}
+
+/** Closes every live socket authenticated as `userId`, regardless of who owns
+ * the terminal it is attached to — the general sweep used by full
+ * revocation. `closeUserForeignAttachments` below is the conservative subset
+ * that skips the user's own owned terminals. */
+function closeAllSocketsFor(
+  state: FoundationState,
+  userId: string,
+  reason: string,
+): void {
+  for (const [terminalId, sockets] of terminalSockets.entries()) {
+    for (const ws of sockets) {
+      if (ws.data.actorUserId !== userId) continue;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      writeAuditEvent(state.db, {
+        actorUserId: userId,
+        action: "terminal.revoked",
+        resourceType: "terminal",
+        resourceId: terminalId,
+        decision: "allow",
+        reason,
+      });
+    }
+  }
+}
+
+/**
+ * The full revocation kill primitive (plan §5) — used when a user is
+ * disabled. Enumerates owned terminals and runs the canonical DELETE
+ * sequence on each, then sweeps every `terminalSockets` set closing any
+ * socket authenticated as this user (a disabled user attached to someone
+ * else's terminal). Runs the whole thing a **second time** (Codex #8,
+ * invariant §9.7): the disabling mutation already committed before this
+ * runs, but a terminal create/attach that raced the mutation could still be
+ * in flight — the pre-side-effect `disabled` re-check on create/attach/WS
+ * upgrade (S2) closes that race for new attempts, and this second sweep
+ * catches anything that slipped through between the mutation commit and the
+ * first sweep. Synchronous, in-process — well under the 5s target.
+ */
+async function killUserSessions(userId: string, reason: string): Promise<void> {
+  const state = await getFoundationState();
+  await killOwnedTerminalsFor(state, userId, reason);
+  closeAllSocketsFor(state, userId, reason);
+  await killOwnedTerminalsFor(state, userId, reason);
+  closeAllSocketsFor(state, userId, reason);
+}
+
+/**
+ * The conservative revocation subset (plan §5, Codex #6) — used for
+ * `DELETE /api/grants/:id` and admin->member demotion. Only closes this
+ * user's attachments to terminals owned by SOMEONE ELSE (those attachments
+ * were authorized by the grant/role bundle that just changed); terminals the
+ * user owns survive, since the owner short-circuit still authorizes them
+ * regardless of role/grants.
+ */
+async function closeUserForeignAttachments(
+  userId: string,
+  reason: string,
+): Promise<void> {
+  const state = await getFoundationState();
+  for (const [terminalId, sockets] of terminalSockets.entries()) {
+    const term = terminals.get(terminalId);
+    if (term && term.ownerId === userId) continue;
+    for (const ws of sockets) {
+      if (ws.data.actorUserId !== userId) continue;
+      try {
+        ws.close();
+      } catch {
+        // ignore
+      }
+      writeAuditEvent(state.db, {
+        actorUserId: userId,
+        action: "terminal.revoked",
+        resourceType: "terminal",
+        resourceId: terminalId,
+        decision: "allow",
+        reason,
+      });
+    }
+  }
 }
 
 async function getTmuxSessionInfo(sessionName: string): Promise<{
@@ -2913,6 +3245,532 @@ export function createWebApp() {
 
   app.get("/api/foundation/status", async (c) => {
     return c.json(await getFoundationStatus(c));
+  });
+
+  // ---------------------------------------------------------------------
+  // B3-S3 admin API: user provisioning, roles, revocation (plan §4).
+  // requireRole gates every route below — no legacy-bypass, no edge-tunnel
+  // allow path (invariant §9.5). Every attempt is audited by the gate; route
+  // bodies additionally audit business-validation denials and the mutation
+  // outcome under the same `action` name.
+  // ---------------------------------------------------------------------
+
+  app.get("/api/users", async (c) => {
+    const gate = await requireRole(c, ["owner", "admin"], "users.list");
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const terminalCounts = new Map<string, number>();
+    for (const term of terminals.values()) {
+      terminalCounts.set(
+        term.ownerId,
+        (terminalCounts.get(term.ownerId) || 0) + 1,
+      );
+    }
+    const users = listFoundationUsers(state.db).map((user) => ({
+      ...user,
+      liveTerminalCount: terminalCounts.get(user.id) || 0,
+    }));
+    return c.json({ users });
+  });
+
+  app.post("/api/users", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const requestedRole =
+      body.role === "admin"
+        ? "admin"
+        : body.role === "member"
+          ? "member"
+          : null;
+    // Creating an 'admin' requires owner (plan §4/invariant §9.4); an invalid
+    // role falls back to the looser owner|admin gate so business validation
+    // (not the gate) reports "invalid_role" for a garbage role value.
+    const gate = await requireRole(
+      c,
+      requestedRole === "admin" ? ["owner"] : ["owner", "admin"],
+      "users.create",
+      { role: body.role },
+    );
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const provider =
+      typeof body.provider === "string" ? body.provider.trim() : "";
+    const subject = typeof body.subject === "string" ? body.subject.trim() : "";
+    const issuer = typeof body.issuer === "string" ? body.issuer.trim() : "";
+    const email =
+      typeof body.email === "string" && body.email.trim()
+        ? body.email.trim()
+        : null;
+    const displayName =
+      typeof body.displayName === "string" && body.displayName.trim()
+        ? body.displayName.trim()
+        : null;
+
+    const deny = (reason: string, status: 400 | 409 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "users.create",
+        resourceType: "user",
+        resourceId: null,
+        decision: "deny",
+        reason,
+        data: { provider, issuer, subject, role: body.role },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    // Provider 'oidc' is rejected until C1 wires real OIDC identity
+    // resolution; any other non-cloudflare_access provider is rejected the
+    // same way (Codex #11).
+    if (provider !== "cloudflare_access") {
+      return deny("provider_not_supported");
+    }
+    if (!subject) {
+      return deny("subject_required");
+    }
+    const configuredIssuer = process.env.CF_ACCESS_TEAM_NAME?.trim() || "";
+    if (!configuredIssuer) {
+      return deny("issuer_not_configured");
+    }
+    if (!issuer || issuer !== configuredIssuer) {
+      return deny("issuer_mismatch");
+    }
+    if (!requestedRole) {
+      return deny("invalid_role");
+    }
+
+    try {
+      const created = state.db.transaction(() => {
+        const { user } = createInvitedUser(state.db, {
+          provider,
+          issuer,
+          subject,
+          email,
+          displayName,
+          role: requestedRole,
+        });
+        writeAuditEvent(state.db, {
+          actorUserId: gate.ownerId,
+          action: "users.create",
+          resourceType: "user",
+          resourceId: user.id,
+          decision: "allow",
+          reason: "ok",
+          data: { provider, issuer, subject, role: requestedRole },
+        });
+        return user;
+      })();
+      return c.json({ user: created });
+    } catch (err) {
+      if (err instanceof IdentityConflictError) {
+        return deny("identity_exists", 409);
+      }
+      throw err;
+    }
+  });
+
+  app.patch("/api/users/:id", async (c) => {
+    const targetId = c.req.param("id");
+    const body = await c.req.json().catch(() => ({}));
+    const gate = await requireRole(c, ["owner", "admin"], "users.update", {
+      targetId,
+      role: body.role,
+      disabled: body.disabled,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 403 | 404 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "users.update",
+        resourceType: "user",
+        resourceId: targetId,
+        decision: "deny",
+        reason,
+        data: { role: body.role, disabled: body.disabled },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    const target = getFoundationUserById(state.db, targetId);
+    if (!target) return deny("user_not_found", 404);
+
+    const wantsRole = typeof body.role === "string" ? body.role : null;
+    const wantsDisabled =
+      typeof body.disabled === "boolean" ? body.disabled : null;
+    if (wantsRole === null && wantsDisabled === null) {
+      return deny("no_changes");
+    }
+    if (
+      wantsRole !== null &&
+      !["owner", "admin", "member"].includes(wantsRole)
+    ) {
+      return deny("invalid_role");
+    }
+    if (wantsRole === "owner") {
+      // Owner cannot be created/assigned via the API (invariant §9.4) — not
+      // even by the owner themselves.
+      return deny("invalid_role");
+    }
+
+    // Owner immutable via API — for BOTH role and disabled changes, checked
+    // before the admin-surface check below (invariant §9.4).
+    if (target.role === "owner") {
+      return deny("owner_immutable", 403);
+    }
+
+    const touchesAdminSurface =
+      target.role === "admin" || wantsRole === "admin";
+    if (touchesAdminSurface && gate.user.role !== "owner") {
+      return deny("owner_required", 403);
+    }
+
+    const wasAdmin = target.role === "admin";
+
+    const updated = state.db.transaction(() => {
+      let next = target;
+      if (wantsRole !== null && wantsRole !== target.role) {
+        next = setUserRole(state.db, {
+          userId: targetId,
+          role: wantsRole as FoundationUserRole,
+        });
+      }
+      if (wantsDisabled !== null && wantsDisabled !== target.disabled) {
+        next = setUserDisabled(state.db, {
+          userId: targetId,
+          disabled: wantsDisabled,
+        });
+      }
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "users.update",
+        resourceType: "user",
+        resourceId: targetId,
+        decision: "allow",
+        reason: "ok",
+        data: { role: wantsRole, disabled: wantsDisabled },
+      });
+      return next;
+    })();
+
+    // The kill primitive runs AFTER the transaction commits (plan §5.1):
+    // state before kill.
+    if (wantsDisabled === true) {
+      await killUserSessions(targetId, "user_disabled");
+    } else if (wasAdmin && wantsRole === "member") {
+      await closeUserForeignAttachments(targetId, "role_demoted");
+    }
+
+    return c.json({ user: updated });
+  });
+
+  app.post("/api/users/:id/review", async (c) => {
+    const targetId = c.req.param("id");
+    const body = await c.req.json().catch(() => ({}));
+    const decision = typeof body.decision === "string" ? body.decision : "";
+    const gate = await requireRole(c, ["owner"], "users.review", {
+      targetId,
+      decision,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 403 | 404 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "users.review",
+        resourceType: "user",
+        resourceId: targetId,
+        decision: "deny",
+        reason,
+        data: { decision },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    const target = getFoundationUserById(state.db, targetId);
+    if (!target) return deny("user_not_found", 404);
+    if (target.role === "owner") {
+      return deny("owner_immutable", 403);
+    }
+
+    const VALID_DECISIONS = [
+      "keep_admin",
+      "make_member",
+      "disable",
+      "revoke_wildcards",
+    ] as const;
+    if (!(VALID_DECISIONS as readonly string[]).includes(decision)) {
+      return deny("invalid_decision");
+    }
+
+    // All four decisions delete the target's wildcard grant rows in the same
+    // transaction (plan §4 Codex #12/#13) — 'keep_admin' relies on the
+    // implicit role bundle from here on, not materialized wildcards.
+    const updated = state.db.transaction(() => {
+      state.db
+        .query(
+          `DELETE FROM scoped_grants
+           WHERE user_id = ? AND (resource_type = '*' OR resource_id = '*')`,
+        )
+        .run(targetId);
+
+      if (decision === "make_member") {
+        setUserRole(state.db, { userId: targetId, role: "member" });
+      } else if (decision === "disable") {
+        setUserDisabled(state.db, { userId: targetId, disabled: true });
+      }
+
+      markUserReviewed(state.db, { userId: targetId });
+
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "users.review",
+        resourceType: "user",
+        resourceId: targetId,
+        decision: "allow",
+        reason: decision,
+        data: { decision },
+      });
+
+      return getFoundationUserById(state.db, targetId);
+    })();
+
+    if (decision === "disable") {
+      await killUserSessions(targetId, "user_disabled");
+    } else if (decision === "make_member") {
+      await closeUserForeignAttachments(targetId, "role_demoted");
+    }
+
+    return c.json({ user: updated });
+  });
+
+  app.post("/api/grants/review", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const principalId =
+      typeof body.principalId === "string" ? body.principalId.trim() : "";
+    const decision = typeof body.decision === "string" ? body.decision : "";
+    const gate = await requireRole(c, ["owner"], "grants.review", {
+      targetId: principalId,
+      decision,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 403 | 404 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.review",
+        resourceType: "grant",
+        resourceId: principalId || null,
+        decision: "deny",
+        reason,
+        data: { principalId, decision },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    if (!principalId) return deny("principal_id_required");
+    if (!["revoke_wildcards", "disable"].includes(decision)) {
+      return deny("invalid_decision");
+    }
+
+    // Orphan principals only: a scoped_grants.user_id with wildcard rows but
+    // no users row. If a users row exists, /api/users/:id/review is the
+    // correct path (Codex #3/#13).
+    const existingUser = getFoundationUserById(state.db, principalId);
+    if (existingUser) {
+      return deny("not_orphan");
+    }
+
+    const updated = state.db.transaction(() => {
+      state.db
+        .query(
+          `DELETE FROM scoped_grants
+           WHERE user_id = ? AND (resource_type = '*' OR resource_id = '*')`,
+        )
+        .run(principalId);
+
+      let user: FoundationUser | null = null;
+      if (decision === "disable") {
+        user = disableOrphanGrantPrincipal(state.db, { userId: principalId });
+      }
+
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.review",
+        resourceType: "grant",
+        resourceId: principalId,
+        decision: "allow",
+        reason: decision,
+        data: { principalId, decision },
+      });
+
+      return user;
+    })();
+
+    if (decision === "disable") {
+      await killUserSessions(principalId, "user_disabled");
+    } else {
+      await closeUserForeignAttachments(principalId, "grant_revoked");
+    }
+
+    return c.json({ user: updated });
+  });
+
+  app.get("/api/grants", async (c) => {
+    const userId = c.req.query("userId") || undefined;
+    const gate = await requireRole(c, ["owner", "admin"], "grants.list", {
+      targetId: userId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const grants = listScopedGrants(state.db, userId ? { userId } : undefined);
+    return c.json({ grants });
+  });
+
+  app.post("/api/grants", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+    const capability =
+      typeof body.capability === "string" ? body.capability : "";
+    const resourceType =
+      typeof body.resourceType === "string" ? body.resourceType.trim() : "";
+    const resourceId =
+      typeof body.resourceId === "string" ? body.resourceId.trim() : "";
+
+    const gate = await requireRole(c, ["owner", "admin"], "grants.create", {
+      targetId: userId,
+      capability,
+      resourceType,
+      resourceId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 403 | 404 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.create",
+        resourceType: "grant",
+        resourceId: null,
+        decision: "deny",
+        reason,
+        data: { userId, capability, resourceType, resourceId },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    // Invariant §9.3: no API path may create a wildcard grant row for ANY
+    // target, not even the owner — implicit role bundles are the only
+    // wildcard mechanism from B3 on. Missing fields are rejected the same
+    // way (they can never resolve to a valid scoped grant).
+    if (
+      !resourceType ||
+      !resourceId ||
+      resourceType === "*" ||
+      resourceId === "*"
+    ) {
+      return deny("wildcard_forbidden");
+    }
+
+    const target = getFoundationUserById(state.db, userId);
+    if (!target) return deny("user_not_found", 404);
+    if (
+      (target.role === "admin" || target.role === "owner") &&
+      gate.user.role !== "owner"
+    ) {
+      return deny("owner_required", 403);
+    }
+
+    const VALID_CAPS: ScopedGrantCapability[] = [
+      "terminal.create",
+      "terminal.attach",
+      "terminal.write",
+      "terminal.manage",
+      "root.use",
+    ];
+    if (!VALID_CAPS.includes(capability as ScopedGrantCapability)) {
+      return deny("invalid_capability");
+    }
+
+    const grantId = state.db.transaction(() => {
+      const id = grantScopedCapability(state.db, {
+        userId,
+        capability: capability as ScopedGrantCapability,
+        resourceType,
+        resourceId,
+      });
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.create",
+        resourceType: "grant",
+        resourceId: id,
+        decision: "allow",
+        reason: "ok",
+        data: { userId, capability, resourceType, resourceId },
+      });
+      return id;
+    })();
+
+    return c.json({ grantId });
+  });
+
+  app.delete("/api/grants/:id", async (c) => {
+    const grantId = c.req.param("id");
+    const gate = await requireRole(c, ["owner", "admin"], "grants.revoke", {
+      targetId: grantId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 403 | 404 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.revoke",
+        resourceType: "grant",
+        resourceId: grantId,
+        decision: "deny",
+        reason,
+        data: {},
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    const grant = getScopedGrantById(state.db, grantId);
+    if (!grant) return deny("grant_not_found", 404);
+
+    const target = getFoundationUserById(state.db, grant.userId);
+    if (
+      target &&
+      (target.role === "admin" || target.role === "owner") &&
+      gate.user.role !== "owner"
+    ) {
+      return deny("owner_required", 403);
+    }
+
+    const revoked = state.db.transaction(() => {
+      const ok = revokeScopedCapability(state.db, grantId);
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "grants.revoke",
+        resourceType: "grant",
+        resourceId: grantId,
+        decision: "allow",
+        reason: "ok",
+        data: { userId: grant.userId },
+      });
+      return ok;
+    })();
+
+    // Conservative revocation subset (plan §5, Codex #6): close the target's
+    // foreign-terminal attachments; owned terminals survive.
+    await closeUserForeignAttachments(grant.userId, "grant_revoked");
+
+    return c.json({ ok: revoked });
   });
 
   // Server stats endpoint (CPU, RAM, Disk)

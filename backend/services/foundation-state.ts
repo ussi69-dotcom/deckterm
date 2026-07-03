@@ -1237,6 +1237,85 @@ export function setUserDisabled(
   return updated;
 }
 
+/**
+ * Marks a user as reviewed under the §1.6 multiuser enablement gate (sets
+ * multiuser_reviewed_at). Used by POST /api/users/:id/review (all four
+ * decisions set it, per plan §4/§6) and the orphan-principal disable path.
+ */
+export function markUserReviewed(
+  db: Database,
+  opts: { userId: string; now?: Date },
+): void {
+  const timestamp = isoDate(opts.now || new Date());
+  db.query(
+    "UPDATE users SET multiuser_reviewed_at = ?, updated_at = ? WHERE id = ?",
+  ).run(timestamp, timestamp, opts.userId);
+}
+
+/** Looks up a single scoped grant row by id (for DELETE /api/grants/:id). */
+export function getScopedGrantById(
+  db: Database,
+  grantId: string,
+): {
+  id: string;
+  userId: string;
+  capability: string;
+  resourceType: string;
+  resourceId: string;
+} | null {
+  const row = db
+    .query(
+      `SELECT id, user_id, capability, resource_type, resource_id
+       FROM scoped_grants WHERE id = ?`,
+    )
+    .get(grantId) as {
+    id: string;
+    user_id: string;
+    capability: string;
+    resource_type: string;
+    resource_id: string;
+  } | null;
+  if (!row) return null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    capability: row.capability,
+    resourceType: row.resource_type,
+    resourceId: row.resource_id,
+  };
+}
+
+/**
+ * Creates (or re-disables) a disabled 'member' users row for an orphan grant
+ * principal — a scoped_grants.user_id holding wildcard rows with no `users`
+ * row (pre-B3 legacy grant data, plan §4 `POST /api/grants/review`
+ * `decision: 'disable'`). No identity triple exists for these principals
+ * (they predate canonical identity), so this is a raw insert keyed on the
+ * existing principal id — NOT `createInvitedUser`, which requires and dedupes
+ * on a (provider, issuer, subject) triple that doesn't exist here. Marked
+ * reviewed immediately: the owner explicitly disabled it via the review API.
+ */
+export function disableOrphanGrantPrincipal(
+  db: Database,
+  opts: { userId: string; now?: Date },
+): FoundationUser {
+  const timestamp = isoDate(opts.now || new Date());
+  db.query(
+    `INSERT INTO users
+      (id, email, display_name, role, disabled, multiuser_reviewed_at, created_at, updated_at)
+     VALUES (?, NULL, NULL, 'member', 1, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       disabled = 1,
+       multiuser_reviewed_at = excluded.multiuser_reviewed_at,
+       updated_at = excluded.updated_at`,
+  ).run(opts.userId, timestamp, timestamp, timestamp);
+  const user = getFoundationUserById(db, opts.userId);
+  if (!user) {
+    throw new Error(`failed to create orphan principal user: ${opts.userId}`);
+  }
+  return user;
+}
+
 /** Deletes a scoped grant by id. Returns whether a row was actually deleted. */
 export function revokeScopedCapability(db: Database, grantId: string): boolean {
   const result = db
