@@ -215,6 +215,17 @@ test("isolation mode: surface denials + owner-gated /api/os-mappings", async () 
   ]).toContain(browseBody.reason);
   expect(browseBody.surface).toBe("files");
 
+  // (1b) git surface is likewise resolver-gated under isolation (B4-S5) — an
+  // unmapped/untrusted actor is denied, never run as the service account.
+  const gitRes = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(process.env.HOME || "/tmp")}`,
+    ),
+  );
+  expect(gitRes.status).toBe(403);
+  const gitBody = await gitRes.json();
+  expect(gitBody.surface).toBe("git");
+
   // (2) Mapping a privileged/service account is refused (uid 0 root).
   const rootRes = await app.fetch(
     new Request("http://deckterm.test/api/os-mappings", {

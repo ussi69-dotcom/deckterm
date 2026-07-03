@@ -102,7 +102,7 @@ import {
   evaluateOsAccountEligibility,
   resolveEligibilityPolicy,
 } from "./services/os-mapping-eligibility";
-import { brokerCheck, brokerKill } from "./services/broker-client";
+import { brokerCheck, brokerKill, brokerExec } from "./services/broker-client";
 import {
   getFsExecutor,
   matchGrantedRoot,
@@ -5909,21 +5909,71 @@ export function createWebApp() {
   // GIT API - Secure git operations with realpath validation
   // =============================================================================
 
-  async function validateGitCwd(c: any, cwd: string): Promise<boolean> {
-    const resolved = await resolveAllowedPath(cwd);
-    if (!resolved) return false;
-    const fileAccess = await requireFileAccess(c, resolved);
-    return fileAccess.ok;
+  // B4-S5: git routes resolve their cwd through the execution context (legacy vs
+  // mapped-user broker), replacing the old boolean `validateGitCwd`. A resolved
+  // git working dir carries the context + the granted root + the subdir beneath
+  // it. Legacy runs git in `root/reldir`; brokered passes root+reldir to the
+  // broker `git` profile (fd-resolved cwd, hardened env, schema-rebuilt argv).
+  type GitCwd = { ctx: FsExecutorContext; root: string; reldir: string };
+
+  async function resolveGitCwd(
+    c: any,
+    cwd: string | undefined,
+  ): Promise<
+    | { ok: true; git: GitCwd }
+    | { ok: false; status: number; body: Record<string, unknown> }
+  > {
+    if (!cwd) {
+      return {
+        ok: false,
+        status: 403,
+        body: { error: "Forbidden path", reason: "no_matching_root" },
+      };
+    }
+    const execCtx = await resolveExecFsContext(c, "git");
+    if (!execCtx.ok) return execCtx;
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, cwd);
+    if (!scoped.ok) return scoped;
+    return {
+      ok: true,
+      git: { ctx: execCtx.ctx, root: scoped.root, reldir: scoped.relPath },
+    };
   }
 
-  // Shared runner for git child processes. GIT_TERMINAL_PROMPT=0 makes
-  // credential prompts (e.g. push to an auth-requiring remote) fail fast
-  // instead of hanging the request until the timeout.
+  // Shared runner for git child processes. Legacy: direct spawn with
+  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast. Brokered: the broker
+  // `git` profile (argv rebuilt from the fixed schema; cwd resolved fd-safely
+  // beneath the granted root as the mapped user). `args` is the argv AFTER `git`.
   async function runGit(
-    cwd: string,
+    git: GitCwd,
     args: string[],
     timeoutMs = 10000,
   ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
+    if (git.ctx.kind === "brokered") {
+      const res = await brokerExec(
+        {
+          session:
+            "git" +
+            Math.random().toString(36).slice(2).padEnd(10, "0").slice(0, 12),
+          username: git.ctx.osUsername,
+          uid: git.ctx.uid,
+          gid: git.ctx.gid,
+          cwd: git.root,
+          reldir: git.reldir,
+          profile: "git",
+          profileArgs: args,
+        },
+        process.env,
+        timeoutMs,
+      );
+      return {
+        ok: res.code === 0,
+        output: res.stdout,
+        stderr: res.stderr,
+        code: res.code,
+      };
+    }
+    const cwd = git.reldir ? join(git.root, git.reldir) : git.root;
     const proc = Bun.spawn(["git", ...args], {
       cwd,
       stdout: "pipe",
@@ -6089,27 +6139,21 @@ export function createWebApp() {
   // GET /api/git/status?cwd=/path/to/repo
   app.get("/api/git/status", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     try {
-      const proc = Bun.spawn(["git", "status", "--porcelain", "-uall", "-b"], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const [output, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
+      const statusRes = await runGit(g.git, [
+        "status",
+        "--porcelain",
+        "-uall",
+        "-b",
       ]);
-      clearTimeout(timeoutId);
+      const output = statusRes.output;
+      const stderr = statusRes.stderr;
+      const exitCode = statusRes.code;
 
       if (exitCode !== 0) {
         return c.json(
@@ -6169,18 +6213,8 @@ export function createWebApp() {
       // null if the lookup fails, never breaks the status response.
       let root: string | null = null;
       try {
-        const rootProc = Bun.spawn(["git", "rev-parse", "--show-toplevel"], {
-          cwd,
-          stdout: "pipe",
-          stderr: "ignore",
-        });
-        const rootTimeout = setTimeout(() => rootProc.kill(), 10000);
-        const [rootOut, rootExit] = await Promise.all([
-          new Response(rootProc.stdout).text(),
-          rootProc.exited,
-        ]);
-        clearTimeout(rootTimeout);
-        if (rootExit === 0) root = rootOut.trim() || null;
+        const rootRes = await runGit(g.git, ["rev-parse", "--show-toplevel"]);
+        if (rootRes.code === 0) root = rootRes.output.trim() || null;
       } catch {
         root = null;
       }
@@ -6200,11 +6234,9 @@ export function createWebApp() {
     const path = c.req.query("path");
     const staged = c.req.query("staged");
     const commit = c.req.query("commit");
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (
@@ -6228,30 +6260,18 @@ export function createWebApp() {
     try {
       let args: string[];
       if (commit) {
-        args = ["git", "show", "--format=", "--color=never", commit];
+        args = ["show", "--format=", "--color=never", commit];
       } else if (stagedEnabled) {
-        args = ["git", "diff", "--staged", "--color=never"];
+        args = ["diff", "--staged", "--color=never"];
       } else {
-        args = ["git", "diff", "--color=never"];
+        args = ["diff", "--color=never"];
       }
 
       if (path) {
         args.push("--", path);
       }
 
-      const proc = Bun.spawn(args, {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const [output, stderr, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(),
-        new Response(proc.stderr).text(),
-        proc.exited,
-      ]);
-      clearTimeout(timeoutId);
+      const { output, stderr, code: exitCode } = await runGit(g.git, args);
 
       if (exitCode !== 0) {
         return c.json(
@@ -6267,7 +6287,19 @@ export function createWebApp() {
       // NOTE: `git diff --no-index` exits with code 1 when files differ — treat
       // exit code 1 + non-empty stdout as SUCCESS (not an error). Only 400 on
       // exit code > 1.
-      if (!commit && !stagedEnabled && path && output.trim() === "") {
+      //
+      // B4-S5: --no-index takes an ABSOLUTE path and is refused by the broker git
+      // schema (it is an escape vector). It is therefore LEGACY-ONLY; under
+      // isolation an untracked file simply shows in the tree without an inline
+      // content preview (documented 1.0 limitation).
+      if (
+        g.git.ctx.kind === "legacy" &&
+        !commit &&
+        !stagedEnabled &&
+        path &&
+        output.trim() === ""
+      ) {
+        const cwd = g.git.reldir ? join(g.git.root, g.git.reldir) : g.git.root;
         const statusProc = Bun.spawn(
           ["git", "status", "--porcelain", "--", path],
           { cwd, stdout: "pipe", stderr: "pipe" },
@@ -6346,11 +6378,9 @@ export function createWebApp() {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, paths } = body;
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (!paths || !Array.isArray(paths) || paths.length === 0) {
@@ -6358,16 +6388,13 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "add", "--", ...paths], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      await proc.exited;
-      clearTimeout(timeoutId);
-
+      const result = await runGit(g.git, ["add", "--", ...paths]);
+      if (!result.ok) {
+        return c.json(
+          { error: "Git add failed", message: result.stderr.trim() },
+          400,
+        );
+      }
       return c.json({ ok: true });
     } catch (err) {
       return c.json({ error: "Git add failed", message: String(err) }, 400);
@@ -6379,11 +6406,9 @@ export function createWebApp() {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, paths } = body;
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (!paths || !Array.isArray(paths) || paths.length === 0) {
@@ -6391,16 +6416,18 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "restore", "--staged", "--", ...paths], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      await proc.exited;
-      clearTimeout(timeoutId);
-
+      const result = await runGit(g.git, [
+        "restore",
+        "--staged",
+        "--",
+        ...paths,
+      ]);
+      if (!result.ok) {
+        return c.json(
+          { error: "Git restore failed", message: result.stderr.trim() },
+          400,
+        );
+      }
       return c.json({ ok: true });
     } catch (err) {
       return c.json({ error: "Git restore failed", message: String(err) }, 400);
@@ -6412,11 +6439,9 @@ export function createWebApp() {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, message, amend } = body;
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (!message?.trim()) {
@@ -6427,7 +6452,7 @@ export function createWebApp() {
       const args = amend
         ? ["commit", "--amend", "-m", message]
         : ["commit", "-m", message];
-      const result = await runGit(cwd, args);
+      const result = await runGit(g.git, args);
 
       if (!result.ok) {
         // git reports the common failure ("nothing to commit") on stdout, not
@@ -6447,27 +6472,17 @@ export function createWebApp() {
   // GET /api/git/branches?cwd=...
   app.get("/api/git/branches", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     try {
-      const proc = Bun.spawn(
-        ["git", "branch", "-a", "--format=%(refname:short)"],
-        {
-          cwd,
-          stdout: "pipe",
-          stderr: "pipe",
-        },
-      );
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const output = await new Response(proc.stdout).text();
-      clearTimeout(timeoutId);
-
+      const { output } = await runGit(g.git, [
+        "branch",
+        "-a",
+        "--format=%(refname:short)",
+      ]);
       const branches = output.trim().split("\n").filter(Boolean);
       return c.json({ branches, cwd });
     } catch (err) {
@@ -6481,11 +6496,9 @@ export function createWebApp() {
     const limit = parseInt(c.req.query("limit") || "50");
     const path = c.req.query("path");
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (path && (path.startsWith("/") || path.includes(".."))) {
@@ -6494,7 +6507,6 @@ export function createWebApp() {
 
     try {
       const args = [
-        "git",
         "log",
         `--max-count=${Math.min(limit, 200)}`,
         "--format=%h|%H|%s|%an|%aI",
@@ -6502,15 +6514,7 @@ export function createWebApp() {
         "--",
       ];
       if (path) args.push(path);
-      const proc = Bun.spawn(args, {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const output = await new Response(proc.stdout).text();
-      clearTimeout(timeoutId);
+      const { output } = await runGit(g.git, args);
 
       const commits = output
         .trim()
@@ -6551,11 +6555,9 @@ export function createWebApp() {
   app.get("/api/git/commit-files", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
     const commit = c.req.query("commit");
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
     // Same ref validation as /api/git/show: hex/HEAD/refname + optional ~N/^N,
     // never a leading dash (argv-flag smuggling), passed argv-style (no shell).
@@ -6566,7 +6568,7 @@ export function createWebApp() {
     ) {
       return c.json({ error: "Invalid commit reference" }, 400);
     }
-    const res = await runGit(cwd, [
+    const res = await runGit(g.git, [
       "diff-tree",
       "--no-commit-id",
       "--name-status",
@@ -6601,11 +6603,9 @@ export function createWebApp() {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, branch } = body;
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     if (
@@ -6617,16 +6617,11 @@ export function createWebApp() {
     }
 
     try {
-      const proc = Bun.spawn(["git", "checkout", branch, "--"], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const stderr = await new Response(proc.stderr).text();
-      const exitCode = await proc.exited;
-      clearTimeout(timeoutId);
+      const { stderr, code: exitCode } = await runGit(g.git, [
+        "checkout",
+        branch,
+        "--",
+      ]);
 
       if (exitCode !== 0) {
         return c.json({ error: "Checkout failed", message: stderr }, 400);
@@ -6645,11 +6640,9 @@ export function createWebApp() {
   app.post("/api/git/branch", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, action, name, checkout, force } = body;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
     if (!["create", "delete"].includes(action)) {
       return c.json({ error: "Invalid branch action" }, 400);
@@ -6663,7 +6656,7 @@ export function createWebApp() {
           ? ["checkout", "-b", name]
           : ["branch", name]
         : ["branch", force ? "-D" : "-d", name];
-    const result = await runGit(cwd, args);
+    const result = await runGit(g.git, args);
     if (!result.ok) {
       const reason =
         result.stderr.trim() || result.output.trim() || "git branch failed";
@@ -6675,13 +6668,11 @@ export function createWebApp() {
   // GET /api/git/stash?cwd= — list stashes
   app.get("/api/git/stash", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
-    const result = await runGit(cwd, ["stash", "list", "--format=%gd%x09%s"]);
+    const result = await runGit(g.git, ["stash", "list", "--format=%gd%x09%s"]);
     if (!result.ok) {
       return c.json(
         { error: "Git stash failed", message: result.stderr.trim() },
@@ -6703,11 +6694,9 @@ export function createWebApp() {
   app.post("/api/git/stash", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, action, message, index } = body;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
     if (!["push", "pop", "apply", "drop"].includes(action)) {
       return c.json({ error: "Invalid stash action" }, 400);
@@ -6724,7 +6713,7 @@ export function createWebApp() {
     } else if (index !== undefined) {
       args.push(`stash@{${index}}`);
     }
-    const result = await runGit(cwd, args);
+    const result = await runGit(g.git, args);
     if (!result.ok) {
       const reason =
         result.stderr.trim() || result.output.trim() || "git stash failed";
@@ -6739,11 +6728,9 @@ export function createWebApp() {
   app.post("/api/git/discard", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const { cwd, paths, confirm } = body;
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
     if (
       !Array.isArray(paths) ||
@@ -6758,7 +6745,12 @@ export function createWebApp() {
         400,
       );
     }
-    const status = await runGit(cwd, ["status", "--porcelain", "--", ...paths]);
+    const status = await runGit(g.git, [
+      "status",
+      "--porcelain",
+      "--",
+      ...paths,
+    ]);
     if (!status.ok) {
       return c.json(
         { error: "Git status failed", message: status.stderr.trim() },
@@ -6773,7 +6765,7 @@ export function createWebApp() {
       (line.startsWith("??") ? untracked : tracked).push(path);
     }
     if (tracked.length > 0) {
-      const res = await runGit(cwd, [
+      const res = await runGit(g.git, [
         "restore",
         "--worktree",
         "--",
@@ -6787,7 +6779,7 @@ export function createWebApp() {
       }
     }
     if (untracked.length > 0) {
-      const res = await runGit(cwd, ["clean", "-f", "--", ...untracked]);
+      const res = await runGit(g.git, ["clean", "-f", "--", ...untracked]);
       if (!res.ok) {
         return c.json(
           { error: "Git clean failed", message: res.stderr.trim() },
@@ -6811,9 +6803,30 @@ export function createWebApp() {
     app.post(`/api/git/${op}`, async (c) => {
       const body = await c.req.json().catch(() => ({}));
       const { cwd, remote, branch, setUpstream } = body;
-      if (!cwd || !(await validateGitCwd(c, cwd))) {
+      const g = await resolveGitCwd(c, cwd);
+      if (!g.ok) {
+        return c.json(g.body, { status: g.status as any });
+      }
+      // Network git needs credential-helper + network execution the broker git
+      // profile deliberately does not support (B4 D-B4-6); under isolation it is
+      // permanently unsupported — conflict/remote work belongs in the terminal.
+      if (g.git.ctx.kind === "brokered") {
+        const state = await getFoundationState();
+        writeAuditEvent(state.db, {
+          actorUserId: getCurrentActor(c).id,
+          action: "surface.access",
+          resourceType: "surface",
+          resourceId: `git.${op}`,
+          decision: "deny",
+          reason: "os_isolation_unsupported",
+          data: { surface: "git", op, osIsolation: true },
+        });
         return c.json(
-          { error: "Forbidden path", reason: "no_matching_root" },
+          {
+            error: "Network git is not available under OS isolation",
+            reason: "os_isolation_unsupported",
+            surface: "git",
+          },
           403,
         );
       }
@@ -6833,7 +6846,7 @@ export function createWebApp() {
       if (op === "push" && setUpstream) args.push("-u");
       if (remote) args.push(remote);
       if (op !== "fetch" && branch) args.push(branch);
-      const result = await runGit(cwd, args, 30000);
+      const result = await runGit(g.git, args, 30000);
       if (!result.ok) {
         const reason =
           result.stderr.trim() || result.output.trim() || `git ${op} failed`;
@@ -6849,11 +6862,9 @@ export function createWebApp() {
     const commit = c.req.query("commit");
     const path = c.req.query("path");
 
-    if (!cwd || !(await validateGitCwd(c, cwd))) {
-      return c.json(
-        { error: "Forbidden path", reason: "no_matching_root" },
-        403,
-      );
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
     }
 
     // Allow hex hashes (4-40 chars), HEAD, INDEX, and branch/tag names, each
@@ -6880,16 +6891,11 @@ export function createWebApp() {
     const ref = commit === "INDEX" ? ":0" : commit;
 
     try {
-      const proc = Bun.spawn(["git", "show", `${ref}:${path}`, "--"], {
-        cwd,
-        stdout: "pipe",
-        stderr: "pipe",
-      });
-
-      const timeoutId = setTimeout(() => proc.kill(), 10000);
-      const content = await new Response(proc.stdout).text();
-      const exitCode = await proc.exited;
-      clearTimeout(timeoutId);
+      const { output: content, code: exitCode } = await runGit(g.git, [
+        "show",
+        `${ref}:${path}`,
+        "--",
+      ]);
 
       if (exitCode !== 0) {
         return c.json({ error: "File not found at commit" }, 404);
