@@ -6,9 +6,12 @@ import {
   getFoundationUserById,
   grantScopedCapability,
   hasScopedGrant,
+  recordTerminalSession,
   setUserDisabled,
   setUserRole,
+  type FoundationState,
 } from "./services/foundation-state";
+import type { WsData } from "./server";
 
 // B3-S3: /api/users* and /api/grants* admin API + revocation primitive.
 // Foundation state is a module-level singleton in server.ts, so this file
@@ -32,6 +35,10 @@ let stateDir: string;
 let allowedRoot: string;
 let app: { fetch: (req: Request) => Response | Promise<Response> };
 let bootstrapToken: string;
+let validateLiveSocket: (
+  state: FoundationState,
+  wsData: WsData,
+) => Promise<{ ok: true } | { ok: false; reason: string }>;
 
 const TOGGLE_ENV_KEYS = [
   "CF_ACCESS_REQUIRED",
@@ -59,9 +66,28 @@ beforeAll(async () => {
   process.env.CF_ACCESS_TEAM_NAME = TEST_ISSUER;
   resetToggleEnv();
 
-  const { createWebApp } = await import("./server");
-  app = createWebApp();
+  const serverModule = await import("./server");
+  app = serverModule.createWebApp();
+  validateLiveSocket = serverModule.validateLiveSocket;
 });
+
+function fakeState(): FoundationState {
+  return { db: openDb() } as unknown as FoundationState;
+}
+
+function fakeWsData(overrides: Partial<WsData>): WsData {
+  return {
+    type: "terminal",
+    terminalId: "term_fake",
+    ownerId: "anonymous",
+    actorUserId: "anonymous",
+    mode: "write",
+    protocol: "v2",
+    clientId: null,
+    lastEventId: null,
+    ...overrides,
+  };
+}
 
 afterAll(async () => {
   await Promise.all(
@@ -408,6 +434,31 @@ test("PATCH /api/users/:id demoting admin->member deletes that user's wildcard g
   expect(after.count).toBe(0);
 });
 
+test("PATCH /api/users/:id promoting member->admin as owner sets multiuserReviewedAt (Fix 7)", async () => {
+  const { body: invited } = await invite(
+    "member",
+    "promote-to-admin-subject-1",
+  );
+  const targetId = invited.user.id;
+  expect(invited.user.multiuserReviewedAt).toBeNull();
+
+  const res = await app.fetch(
+    new Request(`http://deckterm.test/api/users/${targetId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ role: "admin" }),
+    }),
+  );
+  expect(res.status).toBe(200);
+  const body = await json(res);
+  expect(body.user.role).toBe("admin");
+  expect(body.user.multiuserReviewedAt).toBeTruthy();
+
+  // Persisted, not just in the response payload.
+  const persisted = getFoundationUserById(openDb(), targetId);
+  expect(persisted?.multiuserReviewedAt).toBeTruthy();
+});
+
 // ---------------------------------------------------------------------
 // POST /api/users/:id/review
 // ---------------------------------------------------------------------
@@ -633,6 +684,32 @@ test("POST /api/grants/review rejects a principal that already has a users row w
   expect((await json(res)).reason).toBe("not_orphan");
 });
 
+test("POST /api/grants/review rejects a principal with no wildcard grant rows at all (400 not_wildcard_principal, Fix 6)", async () => {
+  const principalId = "random-id-no-grants-at-all";
+  const res = await app.fetch(
+    new Request("http://deckterm.test/api/grants/review", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ principalId, decision: "disable" }),
+    }),
+  );
+  expect(res.status).toBe(400);
+  expect((await json(res)).reason).toBe("not_wildcard_principal");
+  // The vulnerability this closes: this endpoint must not be able to create
+  // an identity-less users row for an arbitrary id that never held a
+  // wildcard grant.
+  expect(getFoundationUserById(openDb(), principalId)).toBeNull();
+
+  const deny = queryAudit(
+    "action = ? and reason = ? and resource_id = ?",
+    "grants.review",
+    "not_wildcard_principal",
+    principalId,
+  );
+  expect(deny.length).toBeGreaterThan(0);
+  expect(deny[0].decision).toBe("deny");
+});
+
 // ---------------------------------------------------------------------
 // grants
 // ---------------------------------------------------------------------
@@ -797,4 +874,73 @@ test("disabling a user denies subsequent terminal creation with 403 user_disable
   } finally {
     setUserDisabled(openDb(), { userId: "anonymous", disabled: false });
   }
+});
+
+// ---------------------------------------------------------------------
+// validateLiveSocket (Fix 2+3(b)): the WS open-handler post-registration
+// recheck, extracted so it is unit-testable without a real WebSocket
+// connection.
+// ---------------------------------------------------------------------
+
+test("validateLiveSocket: an enabled owner attaching to their own terminal is ok", async () => {
+  const result = await validateLiveSocket(
+    fakeState(),
+    fakeWsData({
+      terminalId: "term_owner_ok",
+      ownerId: "anonymous",
+      actorUserId: "anonymous",
+    }),
+  );
+  expect(result).toEqual({ ok: true });
+});
+
+test("validateLiveSocket: a disabled actor is closed with reason user_disabled_postcheck", async () => {
+  const { body: invited } = await invite(
+    "member",
+    "validate-disabled-subject-1",
+  );
+  const targetId = invited.user.id;
+  setUserDisabled(openDb(), { userId: targetId, disabled: true });
+  try {
+    const result = await validateLiveSocket(
+      fakeState(),
+      fakeWsData({
+        terminalId: "term_disabled_1",
+        ownerId: targetId,
+        actorUserId: targetId,
+      }),
+    );
+    expect(result).toEqual({ ok: false, reason: "user_disabled_postcheck" });
+  } finally {
+    setUserDisabled(openDb(), { userId: targetId, disabled: false });
+  }
+});
+
+test("validateLiveSocket: a foreign attacher whose grant vanished is closed with reason grant_revoked_postcheck", async () => {
+  const { body: invited } = await invite(
+    "member",
+    "validate-foreign-subject-1",
+  );
+  const targetId = invited.user.id;
+
+  const db = openDb();
+  recordTerminalSession(db, {
+    id: "term_foreign_1",
+    actorUserId: "anonymous",
+    cwd: allowedRoot,
+    status: "active",
+  });
+
+  // targetId never had (or no longer has) any grant on this terminal, and is
+  // not its owner nor an owner/admin — the same shape as a revoked grant.
+  const result = await validateLiveSocket(
+    fakeState(),
+    fakeWsData({
+      terminalId: "term_foreign_1",
+      ownerId: "anonymous",
+      actorUserId: targetId,
+      mode: "read",
+    }),
+  );
+  expect(result).toEqual({ ok: false, reason: "grant_revoked_postcheck" });
 });

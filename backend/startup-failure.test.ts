@@ -111,6 +111,15 @@ async function spawnGateChild(opts: {
   stateDir: string;
   isolation: "1" | undefined;
   port: number;
+  // Fix 8 test support: when set, forces DECKTERM_LEGACY_NO_BOOTSTRAP=1 plus
+  // one of isLegacyBootstrapBypassAllowed's required env markers
+  // (DECKTERM_RUNTIME_ENV=development) so the bypass is deterministically
+  // active regardless of what the parent shell happens to have exported —
+  // when unset, both are explicitly cleared for the same reason (existing
+  // gate tests must not flip outcomes if the ambient environment leaks
+  // DECKTERM_LEGACY_NO_BOOTSTRAP=1, per CLAUDE.md's known interactive-shell
+  // env-leak note).
+  legacyBypass?: "1";
 }): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   const env: Record<string, string | undefined> = {
     ...process.env,
@@ -124,6 +133,12 @@ async function spawnGateChild(opts: {
     DECKTERM_OS_ISOLATION: opts.isolation,
   };
   if (!opts.isolation) delete env.DECKTERM_OS_ISOLATION;
+  if (opts.legacyBypass) {
+    env.DECKTERM_LEGACY_NO_BOOTSTRAP = opts.legacyBypass;
+    env.DECKTERM_RUNTIME_ENV = "development";
+  } else {
+    delete env.DECKTERM_LEGACY_NO_BOOTSTRAP;
+  }
 
   const child = Bun.spawn(["bun", "run", "backend/index.ts"], {
     cwd: process.cwd(),
@@ -349,6 +364,25 @@ test("server starts when DECKTERM_OS_ISOLATION=1 and the multiuser state is clea
 
   expect(exitCode).toBe(0);
   expect(stderr).not.toContain("multiuser enablement gate refused startup");
+});
+
+test("server exits when DECKTERM_OS_ISOLATION=1 and DECKTERM_LEGACY_NO_BOOTSTRAP=1 are combined (legacy_bypass_conflict)", async () => {
+  const stateDir = await seedGateStateDir((db) => {
+    insertGateUser(db, { id: "owner_1", role: "owner", reviewed: true });
+  });
+  const port = await getFreePort();
+
+  const { exitCode, stdout, stderr } = await spawnGateChild({
+    stateDir,
+    isolation: "1",
+    port,
+    legacyBypass: "1",
+  });
+
+  const combined = `${stdout}\n${stderr}`;
+  expect(exitCode).not.toBe(0);
+  expect(combined).toContain("legacy_bypass_conflict");
+  expect(combined).toContain("DECKTERM_LEGACY_NO_BOOTSTRAP");
 });
 
 test("server starts when DECKTERM_OS_ISOLATION is unset regardless of unreviewed multiuser state (zero behavior change)", async () => {

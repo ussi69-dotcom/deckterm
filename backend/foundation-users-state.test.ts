@@ -838,6 +838,223 @@ test("resolveUserForActor returns null for a fully unknown actor", async () => {
   state.db.close();
 });
 
+// ---------------------------------------------------------------------
+// Fix 1: invite must not shadow a grandfathered identity.
+// ---------------------------------------------------------------------
+
+test("createInvitedUser rejects a subject shadowing a grandfathered (provider, '') identity row", async () => {
+  const stateDir = await createTempDir(".deckterm-b3-fix1-grandfathered-");
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: {},
+    now: new Date("2026-07-03T14:00:00Z"),
+  });
+
+  const { user: grandfatheredUser } = createInvitedUser(state.db, {
+    provider: "cloudflare_access",
+    issuer: "",
+    subject: "cf-shadow-sub",
+    role: "member",
+  });
+
+  const usersBefore = (
+    state.db.query("SELECT COUNT(*) as c FROM users").get() as { c: number }
+  ).c;
+
+  expect(() =>
+    createInvitedUser(state.db, {
+      provider: "cloudflare_access",
+      issuer: "team.cloudflareaccess.com",
+      subject: "cf-shadow-sub",
+      role: "member",
+    }),
+  ).toThrow(IdentityConflictError);
+
+  const usersAfter = (
+    state.db.query("SELECT COUNT(*) as c FROM users").get() as { c: number }
+  ).c;
+  expect(usersAfter).toBe(usersBefore);
+  // The original (possibly disabled) grandfathered user is untouched.
+  expect(getFoundationUserById(state.db, grandfatheredUser.id)).toMatchObject({
+    id: grandfatheredUser.id,
+  });
+  state.db.close();
+});
+
+test("createInvitedUser rejects a cloudflare_access subject shadowing an existing users.id row", async () => {
+  const stateDir = await createTempDir(".deckterm-b3-fix1-usersid-");
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: {},
+    now: new Date("2026-07-03T14:30:00Z"),
+  });
+
+  // Grandfathered single-tenant row keyed directly on the actor id (no
+  // identity row at all — the users.id === actor.id fallback path).
+  state.db
+    .query(
+      `INSERT INTO users (id, email, display_name, role, disabled, multiuser_reviewed_at, created_at, updated_at)
+       VALUES ('legacy-owner-id', 'owner@example.com', 'owner', 'owner', 0, NULL, ?, ?)`,
+    )
+    .run("2026-07-03T00:00:00.000Z", "2026-07-03T00:00:00.000Z");
+
+  const usersBefore = (
+    state.db.query("SELECT COUNT(*) as c FROM users").get() as { c: number }
+  ).c;
+
+  expect(() =>
+    createInvitedUser(state.db, {
+      provider: "cloudflare_access",
+      issuer: "team.cloudflareaccess.com",
+      subject: "legacy-owner-id",
+      role: "member",
+    }),
+  ).toThrow(IdentityConflictError);
+
+  const usersAfter = (
+    state.db.query("SELECT COUNT(*) as c FROM users").get() as { c: number }
+  ).c;
+  expect(usersAfter).toBe(usersBefore);
+  state.db.close();
+});
+
+test("resolveUserForActor throws IdentityConflictError on an exact-triple / grandfathered dual-row ambiguity", async () => {
+  const stateDir = await createTempDir(".deckterm-b3-fix1-dualrow-");
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: {},
+    now: new Date("2026-07-03T15:00:00Z"),
+  });
+
+  const { user: grandfatheredUser } = createInvitedUser(state.db, {
+    provider: "cloudflare_access",
+    issuer: "",
+    subject: "cf-dualrow-sub",
+    role: "member",
+  });
+  const { user: exactUser } = createInvitedUser(state.db, {
+    provider: "cloudflare_access",
+    issuer: "unrelated.example.com",
+    subject: "cf-dualrow-other",
+    role: "member",
+  });
+
+  // Seed the ambiguous dual row directly via raw SQL — this bypasses
+  // createInvitedUser's Fix 1 pre-check, simulating pre-existing/legacy data
+  // or a manual DB edit that predates the guard.
+  state.db
+    .query(
+      `INSERT INTO auth_identities
+        (id, provider, issuer, provider_subject, user_id, email, created_at, updated_at)
+       VALUES ('ident_dualrow_exact', 'cloudflare_access', 'team.cloudflareaccess.com', 'cf-dualrow-sub', ?, NULL, ?, ?)`,
+    )
+    .run(exactUser.id, "2026-07-03T15:00:00.000Z", "2026-07-03T15:00:00.000Z");
+
+  const actor: DeckTermActor = {
+    id: "cf-dualrow-sub",
+    email: "dualrow@example.com",
+    source: "cloudflare_access",
+  };
+
+  expect(() =>
+    resolveUserForActor(state.db, actor, {
+      CF_ACCESS_TEAM_NAME: "team.cloudflareaccess.com",
+    }),
+  ).toThrow(IdentityConflictError);
+
+  // Neither row was silently merged or picked.
+  const grandRow = state.db
+    .query(
+      "SELECT user_id FROM auth_identities WHERE id != 'ident_dualrow_exact' AND provider_subject = 'cf-dualrow-sub'",
+    )
+    .get() as { user_id: string };
+  expect(grandRow.user_id).toBe(grandfatheredUser.id);
+  state.db.close();
+});
+
+// ---------------------------------------------------------------------
+// Fix 5: atomic migration rebuild with FK check.
+// ---------------------------------------------------------------------
+
+test("migration 5 rolls back atomically on a mid-rebuild failure, leaving original rows intact and no marker written", async () => {
+  const stateDir = await createTempDir(".deckterm-b3-fix5-fail-");
+  seedPreMigration5Db(stateDir, {
+    users: [{ id: "user_admin", email: "admin@example.com", role: "admin" }],
+  });
+
+  // Pre-create a conflicting `users_new` table so the rebuild's own
+  // `CREATE TABLE users_new` (inside the migration's transaction) throws —
+  // simulating a mid-rebuild failure.
+  const preDb = new Database(join(stateDir, "deckterm.db"));
+  preDb.exec("CREATE TABLE users_new (id TEXT PRIMARY KEY)");
+  preDb.close();
+
+  await expect(
+    initializeFoundationState({
+      stateDir,
+      allowedFileRoots: [],
+      env: {},
+      now: new Date("2026-07-03T16:00:00Z"),
+    }),
+  ).rejects.toThrow();
+
+  const db = new Database(join(stateDir, "deckterm.db"));
+  // Original (pre-B3) users table is untouched: ROLLBACK undid whatever ran
+  // before the throw, so the table was never dropped/renamed.
+  const cols = db
+    .query("PRAGMA table_info(users)")
+    .all()
+    .map((row) => (row as { name: string }).name);
+  expect(cols).not.toContain("disabled");
+  const admin = db
+    .query("SELECT role FROM users WHERE id = 'user_admin'")
+    .get() as { role: string };
+  expect(admin.role).toBe("admin");
+  // Migration marker was never committed — a subsequent boot will retry it.
+  const migrationRow = db
+    .query("SELECT version FROM schema_migrations WHERE version = 5")
+    .get();
+  expect(migrationRow).toBeNull();
+  db.close();
+});
+
+test("migration 5 leaves foreign_key_check clean and foreign_keys enforcement ON after a successful migration", async () => {
+  const stateDir = await createTempDir(".deckterm-b3-fix5-fkcheck-");
+  seedPreMigration5Db(stateDir, {
+    users: [
+      { id: "user_admin", email: "admin@example.com", role: "admin" },
+      { id: "user_member", email: "member@example.com", role: "member" },
+    ],
+    identities: [
+      {
+        id: "ident_admin",
+        provider: "cloudflare_access",
+        subject: "cf-admin-sub",
+        userId: "user_admin",
+      },
+    ],
+    wildcardGrants: [{ id: "grant_admin_1", userId: "user_admin" }],
+  });
+
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [],
+    env: {},
+    now: new Date("2026-07-03T17:00:00Z"),
+  });
+
+  const dangling = state.db.query("PRAGMA foreign_key_check").all();
+  expect(dangling).toEqual([]);
+  const fkPragma = state.db.query("PRAGMA foreign_keys").get() as {
+    foreign_keys: number;
+  };
+  expect(fkPragma.foreign_keys).toBe(1);
+  state.db.close();
+});
+
 test("CHECK constraint rejects a role outside owner/admin/member", async () => {
   const stateDir = await createTempDir(".deckterm-b3-check-role-");
   const state = await initializeFoundationState({

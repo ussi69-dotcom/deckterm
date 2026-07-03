@@ -295,65 +295,96 @@ function applyB3IdentityRolesMigration(db: Database): void {
     "issuer",
   );
 
-  if (needsUsersRebuild || needsAuthIdentitiesRebuild) {
-    // openFoundationDb runs PRAGMA foreign_keys = ON, and auth_identities /
-    // scoped_grants hold FKs referencing users(id); dropping either table
-    // under FK enforcement fails, so enforcement is suspended for the
-    // duration of the rebuild only.
-    db.exec("PRAGMA foreign_keys = OFF");
+  if (!needsUsersRebuild && !needsAuthIdentitiesRebuild) {
+    // Fresh DB, already born in the target shape by the boot-time DDL —
+    // nothing to rebuild. Owner promotion still needs to run (e.g. a DB
+    // hand-seeded post-B3), but with no rebuild there is no FK-suspended
+    // transaction to run it inside.
+    promoteDeterministicOwner(db);
+    return;
   }
 
-  if (needsUsersRebuild) {
-    db.exec(`
-      CREATE TABLE users_new (
-        id TEXT PRIMARY KEY,
-        email TEXT,
-        display_name TEXT,
-        role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner','admin','member')),
-        disabled INTEGER NOT NULL DEFAULT 0,
-        multiuser_reviewed_at TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-    db.query(
-      `INSERT INTO users_new
-        (id, email, display_name, role, disabled, multiuser_reviewed_at, created_at, updated_at)
-       SELECT id, email, display_name, role, 0, NULL, created_at, updated_at FROM users`,
-    ).run();
-    db.exec("DROP TABLE users");
-    db.exec("ALTER TABLE users_new RENAME TO users");
-  }
+  // Fix 5: atomic rebuild. openFoundationDb runs PRAGMA foreign_keys = ON,
+  // and auth_identities / scoped_grants hold FKs referencing users(id), so
+  // dropping either table under FK enforcement fails — enforcement is
+  // suspended for the duration of the rebuild. PRAGMA foreign_keys is a
+  // no-op *inside* a transaction, so it must straddle BEGIN/COMMIT rather
+  // than live inside it. The rebuild, a `PRAGMA foreign_key_check` sanity
+  // pass, and owner promotion all run in ONE transaction: if any step
+  // throws (including a dangling FK the check surfaces), ROLLBACK restores
+  // the original tables atomically instead of leaving the DB half-rebuilt
+  // (e.g. a `*_new` table with no corresponding rename, or a dropped
+  // original table with nothing to replace it) — which would otherwise
+  // brick every future boot against this state dir.
+  db.exec("PRAGMA foreign_keys = OFF");
+  try {
+    db.exec("BEGIN");
+    try {
+      if (needsUsersRebuild) {
+        db.exec(`
+          CREATE TABLE users_new (
+            id TEXT PRIMARY KEY,
+            email TEXT,
+            display_name TEXT,
+            role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('owner','admin','member')),
+            disabled INTEGER NOT NULL DEFAULT 0,
+            multiuser_reviewed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
+        `);
+        db.query(
+          `INSERT INTO users_new
+            (id, email, display_name, role, disabled, multiuser_reviewed_at, created_at, updated_at)
+           SELECT id, email, display_name, role, 0, NULL, created_at, updated_at FROM users`,
+        ).run();
+        db.exec("DROP TABLE users");
+        db.exec("ALTER TABLE users_new RENAME TO users");
+      }
 
-  if (needsAuthIdentitiesRebuild) {
-    db.exec(`
-      CREATE TABLE auth_identities_new (
-        id TEXT PRIMARY KEY,
-        provider TEXT NOT NULL,
-        issuer TEXT NOT NULL DEFAULT '',
-        provider_subject TEXT NOT NULL,
-        user_id TEXT NOT NULL,
-        email TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(provider, issuer, provider_subject),
-        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-      );
-    `);
-    db.query(
-      `INSERT INTO auth_identities_new
-        (id, provider, issuer, provider_subject, user_id, email, created_at, updated_at)
-       SELECT id, provider, '', provider_subject, user_id, email, created_at, updated_at FROM auth_identities`,
-    ).run();
-    db.exec("DROP TABLE auth_identities");
-    db.exec("ALTER TABLE auth_identities_new RENAME TO auth_identities");
-  }
+      if (needsAuthIdentitiesRebuild) {
+        db.exec(`
+          CREATE TABLE auth_identities_new (
+            id TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            issuer TEXT NOT NULL DEFAULT '',
+            provider_subject TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            email TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(provider, issuer, provider_subject),
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+          );
+        `);
+        db.query(
+          `INSERT INTO auth_identities_new
+            (id, provider, issuer, provider_subject, user_id, email, created_at, updated_at)
+           SELECT id, provider, '', provider_subject, user_id, email, created_at, updated_at FROM auth_identities`,
+        ).run();
+        db.exec("DROP TABLE auth_identities");
+        db.exec("ALTER TABLE auth_identities_new RENAME TO auth_identities");
+      }
 
-  if (needsUsersRebuild || needsAuthIdentitiesRebuild) {
+      const danglingRows = db.query("PRAGMA foreign_key_check").all();
+      if (danglingRows.length > 0) {
+        throw new Error(
+          `migration 5: PRAGMA foreign_key_check found ${danglingRows.length} dangling row(s) after rebuild: ${JSON.stringify(danglingRows)}`,
+        );
+      }
+
+      // Kept inside the same transaction: promotion is part of the same
+      // atomic unit as the rebuild it depends on.
+      promoteDeterministicOwner(db);
+
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      throw err;
+    }
+  } finally {
     db.exec("PRAGMA foreign_keys = ON");
   }
-
-  promoteDeterministicOwner(db);
 }
 
 // Deterministic single-run owner promotion (plan §1.3): (a) exactly one
@@ -1119,6 +1150,35 @@ export function createInvitedUser(
     );
   }
 
+  // Fix 1 (defense against a disable bypass): reject the invite when it
+  // would shadow a grandfathered identity that future logins still resolve
+  // to via resolveUserForActor's fallback chain. Without this, an admin
+  // could re-invite a disabled/owner subject and future logins would
+  // resolve to the fresh, enabled invited row instead of the original
+  // (possibly disabled) one — the exact-triple pre-check above only catches
+  // an identical (provider, issuer, subject) row, not these fallbacks.
+  const grandfatheredIdentity = db
+    .query(
+      `SELECT user_id FROM auth_identities
+       WHERE provider = ? AND issuer = '' AND provider_subject = ?`,
+    )
+    .get(opts.provider, opts.subject) as { user_id: string } | null;
+  if (grandfatheredIdentity) {
+    throw new IdentityConflictError(
+      `a grandfathered identity already exists for provider=${opts.provider} subject=${opts.subject} (user_id=${grandfatheredIdentity.user_id}); inviting this subject would shadow future logins for that user`,
+    );
+  }
+  if (opts.provider === "cloudflare_access") {
+    const grandfatheredUserRow = db
+      .query("SELECT id FROM users WHERE id = ?")
+      .get(opts.subject) as { id: string } | null;
+    if (grandfatheredUserRow) {
+      throw new IdentityConflictError(
+        `a users row already exists with id=${opts.subject} (the grandfathered users.id fallback resolveUserForActor uses for cloudflare_access); inviting this subject would shadow it`,
+      );
+    }
+  }
+
   const userId = generateUserId();
   const identityId = createId("ident");
   const reviewedAt = opts.role === "admin" ? timestamp : null;
@@ -1441,6 +1501,30 @@ export function resolveUserForActor(
       triple.subject,
     ) as IdentityRowRaw | null;
   if (exact) {
+    // Defense-in-depth (Fix 1): createInvitedUser's pre-check refuses to
+    // create a fresh triple that would shadow a grandfathered (provider, '',
+    // subject) row, but this guards against dual rows arriving any other way
+    // (legacy data, manual DB edits, a future insert path). An exact-triple
+    // hit that is ALSO shadowed by a grandfathered row mapping to a
+    // DIFFERENT user is an ambiguous dual identity — never silently pick
+    // one, fail closed instead. (When triple.issuer === "" the exact lookup
+    // above IS the grandfathered lookup, so this only applies once the actor
+    // presents a non-empty issuer.)
+    if (triple.issuer !== "") {
+      const grandfatheredCollision = db
+        .query(
+          `SELECT user_id FROM auth_identities
+           WHERE provider = ? AND issuer = '' AND provider_subject = ? AND user_id != ?`,
+        )
+        .get(triple.provider, triple.subject, exact.user_id) as {
+        user_id: string;
+      } | null;
+      if (grandfatheredCollision) {
+        throw new IdentityConflictError(
+          `dual identity ambiguity for provider=${triple.provider} issuer=${triple.issuer} subject=${triple.subject}: exact triple resolves to user_id=${exact.user_id}, but a grandfathered (provider, '', subject) row also exists mapping to user_id=${grandfatheredCollision.user_id}`,
+        );
+      }
+    }
     const user = getFoundationUserById(db, exact.user_id);
     if (!user) return null;
     return { user, identity: mapIdentityRow(exact) };

@@ -163,7 +163,7 @@ type TerminalWsData = {
   clientId: string | null;
   lastEventId: number | null;
 };
-type WsData = TerminalWsData;
+export type WsData = TerminalWsData;
 
 // Configuration
 const DEBUG = process.env.OPENCODE_WEB_DEBUG === "1";
@@ -2549,6 +2549,65 @@ async function killTmuxSessionIfLast(
 // B3-S3 revocation kill primitive (plan §5, invariant §9.7).
 // -----------------------------------------------------------------------
 
+/**
+ * Fix 4 (invariant §9.7): runs the canonical single-terminal kill sequence
+ * (the same steps as `DELETE /api/terminals/:id` above) with EACH step in
+ * its own try/catch. A failing step (e.g. a process that already exited, or
+ * an already-closed socket) must never skip the steps after it — every
+ * subsequent cleanup step still runs regardless of an earlier failure, and
+ * the audit write failing must not abort the kill steps that already ran.
+ * Shared by `killOwnedTerminalsFor`'s sweep loop and the post-registration
+ * single-terminal kill on a disable race (Fix 2, POST /api/terminals).
+ */
+async function killSingleTerminal(
+  state: FoundationState,
+  term: Terminal,
+  reason: string,
+): Promise<void> {
+  try {
+    markTerminalSessionEnded(state.db, term.id);
+  } catch (err) {
+    debug(`[revocation] markTerminalSessionEnded failed for ${term.id}`, err);
+  }
+  try {
+    closeTerminalSockets(term.id, reason);
+  } catch (err) {
+    debug(`[revocation] closeTerminalSockets failed for ${term.id}`, err);
+  }
+  try {
+    removeTerminalState(term.id);
+  } catch (err) {
+    debug(`[revocation] removeTerminalState failed for ${term.id}`, err);
+  }
+  try {
+    await killTmuxSessionIfLast(term.sessionName);
+  } catch (err) {
+    debug(`[revocation] killTmuxSessionIfLast failed for ${term.id}`, err);
+  }
+  try {
+    term.proc.kill();
+  } catch (err) {
+    debug(`[revocation] proc.kill failed for ${term.id}`, err);
+  }
+  try {
+    term.terminal.close();
+  } catch (err) {
+    debug(`[revocation] terminal.close failed for ${term.id}`, err);
+  }
+  try {
+    writeAuditEvent(state.db, {
+      actorUserId: term.ownerId,
+      action: "terminal.revoked",
+      resourceType: "terminal",
+      resourceId: term.id,
+      decision: "allow",
+      reason,
+    });
+  } catch (err) {
+    debug(`[revocation] audit write failed for ${term.id}`, err);
+  }
+}
+
 /** Kills every live terminal owned by `userId`, running the same sequence as
  * the canonical `DELETE /api/terminals/:id` handler above (server.ts
  * `app.delete("/api/terminals/:id", ...)`. */
@@ -2561,27 +2620,7 @@ async function killOwnedTerminalsFor(
     (term) => term.ownerId === userId,
   );
   for (const term of owned) {
-    try {
-      markTerminalSessionEnded(state.db, term.id);
-      closeTerminalSockets(term.id, reason);
-      removeTerminalState(term.id);
-      await killTmuxSessionIfLast(term.sessionName);
-      term.proc.kill();
-      term.terminal.close();
-      writeAuditEvent(state.db, {
-        actorUserId: userId,
-        action: "terminal.revoked",
-        resourceType: "terminal",
-        resourceId: term.id,
-        decision: "allow",
-        reason,
-      });
-    } catch (err) {
-      debug(
-        `[revocation] failed to kill terminal ${term.id} owned by ${userId}`,
-        err,
-      );
-    }
+    await killSingleTerminal(state, term, reason);
   }
 }
 
@@ -2597,19 +2636,26 @@ function closeAllSocketsFor(
   for (const [terminalId, sockets] of terminalSockets.entries()) {
     for (const ws of sockets) {
       if (ws.data.actorUserId !== userId) continue;
+      // Enforcement (close) before audit (Fix 4): the audit write is
+      // best-effort and must never abort the sweep — a failed audit row for
+      // one socket must not skip closing the rest.
       try {
         ws.close();
       } catch {
         // ignore
       }
-      writeAuditEvent(state.db, {
-        actorUserId: userId,
-        action: "terminal.revoked",
-        resourceType: "terminal",
-        resourceId: terminalId,
-        decision: "allow",
-        reason,
-      });
+      try {
+        writeAuditEvent(state.db, {
+          actorUserId: userId,
+          action: "terminal.revoked",
+          resourceType: "terminal",
+          resourceId: terminalId,
+          decision: "allow",
+          reason,
+        });
+      } catch (err) {
+        debug(`[revocation] audit write failed for ${terminalId}`, err);
+      }
     }
   }
 }
@@ -2653,21 +2699,67 @@ async function closeUserForeignAttachments(
     if (term && term.ownerId === userId) continue;
     for (const ws of sockets) {
       if (ws.data.actorUserId !== userId) continue;
+      // Enforcement (close) before audit (Fix 4): the audit write is
+      // best-effort and must never abort the sweep.
       try {
         ws.close();
       } catch {
         // ignore
       }
-      writeAuditEvent(state.db, {
-        actorUserId: userId,
-        action: "terminal.revoked",
-        resourceType: "terminal",
-        resourceId: terminalId,
-        decision: "allow",
-        reason,
-      });
+      try {
+        writeAuditEvent(state.db, {
+          actorUserId: userId,
+          action: "terminal.revoked",
+          resourceType: "terminal",
+          resourceId: terminalId,
+          decision: "allow",
+          reason,
+        });
+      } catch (err) {
+        debug(`[revocation] audit write failed for ${terminalId}`, err);
+      }
     }
   }
+}
+
+/**
+ * Fix 2+3(b) (invariant §9.2/§9.7): re-validates a just-opened terminal
+ * WebSocket AFTER registration (the `open()` websocket handler adds it to
+ * `terminalSockets` before this runs). The pre-upgrade authorization check
+ * and the socket actually opening are not atomic — a disable, grant
+ * revocation, or role demotion can land in the interleave between them.
+ * Extracted as a standalone helper (rather than inlined in `open()`) so it
+ * is unit-testable without a real WebSocket connection. Skipped entirely
+ * under legacy bypass (invariant §9.10 — those envs have no DB gating at
+ * all, zero behavior change).
+ */
+export async function validateLiveSocket(
+  state: FoundationState,
+  wsData: WsData,
+): Promise<{ ok: true } | { ok: false; reason: string }> {
+  if (isFoundationLegacyBypassEnabled()) return { ok: true };
+
+  const user = getFoundationUserById(state.db, wsData.actorUserId);
+  if (user?.disabled) {
+    return { ok: false, reason: "user_disabled_postcheck" };
+  }
+
+  // Foreign attacher (not the terminal's owner): re-run the same
+  // authorization decision the pre-upgrade gate used. If the grant or role
+  // bundle that authorized this attach was revoked/demoted in the
+  // interleave window, this denies and the caller closes the socket.
+  if (wsData.actorUserId !== wsData.ownerId) {
+    const decision = authorizeTerminalSessionAccess(state.db, {
+      actorUserId: wsData.actorUserId,
+      terminalId: wsData.terminalId,
+      capability: "terminal.attach",
+    });
+    if (!decision.allow) {
+      return { ok: false, reason: "grant_revoked_postcheck" };
+    }
+  }
+
+  return { ok: true };
 }
 
 async function getTmuxSessionInfo(sessionName: string): Promise<{
@@ -3437,6 +3529,16 @@ export function createWebApp() {
           userId: targetId,
           role: wantsRole as FoundationUserRole,
         });
+        if (wantsRole === "admin") {
+          // Fix 7: this route is already owner-gated for any target that
+          // touches the admin surface (touchesAdminSurface check above), so
+          // a promotion here is always an owner-approved decision — it must
+          // not leave the target in the unreviewed-admin state the §1.6
+          // startup gate rejects. Mark reviewed in the same transaction as
+          // the role change.
+          markUserReviewed(state.db, { userId: targetId });
+          next = getFoundationUserById(state.db, targetId) ?? next;
+        }
       }
       if (wantsDisabled !== null && wantsDisabled !== target.disabled) {
         next = setUserDisabled(state.db, {
@@ -3584,6 +3686,22 @@ export function createWebApp() {
     const existingUser = getFoundationUserById(state.db, principalId);
     if (existingUser) {
       return deny("not_orphan");
+    }
+
+    // Fix 6: principalId must actually appear in listWildcardGrantPrincipals
+    // with hasUserRow === false — i.e. it must genuinely hold an orphaned
+    // wildcard grant row. Without this, the "not_orphan" check above is the
+    // ONLY gate, and it only rejects ids that already have a users row —
+    // any other arbitrary id (a typo, a guessed id, anything) would sail
+    // through to `disableOrphanGrantPrincipal`, which creates an
+    // identity-less users row for it. This closes that path.
+    const isOrphanWildcardPrincipal = listWildcardGrantPrincipals(
+      state.db,
+    ).some(
+      (principal) => principal.userId === principalId && !principal.hasUserRow,
+    );
+    if (!isOrphanWildcardPrincipal) {
+      return deny("not_wildcard_principal");
     }
 
     const updated = state.db.transaction(() => {
@@ -4179,6 +4297,40 @@ export function createWebApp() {
       cwd: resolvedCwd,
       status: "active",
     });
+
+    // Post-registration recheck (Fix 2, invariant §9.2/§9.7): the terminal
+    // is now registered in `terminals` and its session recorded — closes the
+    // race where a disable lands AFTER the pre-side-effect recheck above but
+    // DURING the PTY spawn inside createOwnedTerminal (a real async
+    // subprocess-start await, a genuine interleaving window) and BEFORE this
+    // point. Skipped under legacy bypass: those envs have no DB gating at
+    // all (invariant §9.10, zero behavior change).
+    if (!isFoundationLegacyBypassEnabled()) {
+      const postRegistrationUser = getFoundationUserById(state.db, ownerId);
+      if (postRegistrationUser?.disabled) {
+        await killSingleTerminal(state, terminal, "user_disabled_postcheck");
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.create",
+          resourceType: "terminal",
+          resourceId: terminal.id,
+          decision: "deny",
+          reason: "user_disabled_postcheck",
+          data: { cwd: resolvedCwd },
+        });
+        return c.json(
+          foundationGateJson({
+            message: "DeckTerm account disabled",
+            reason: "user_disabled_postcheck",
+            capability: "terminal.create",
+            resourceType: "terminal",
+            resourceId: "*",
+          }),
+          403,
+        );
+      }
+    }
+
     writeAuditEvent(state.db, {
       actorUserId: ownerId,
       action: "terminal.create",
@@ -6099,6 +6251,14 @@ export async function startWebServer(host: string, port: number) {
     if (wildcardPrincipals.length > 0) {
       violations.push("unreviewed_wildcard_grants");
     }
+    // Fix 8: DECKTERM_LEGACY_NO_BOOTSTRAP bypasses DB-backed authorization
+    // entirely on terminal/root surfaces (requireFoundationCapability's
+    // first check), so "disabled wins" and the role/grant precedence this
+    // gate exists to protect cannot actually hold under that bypass — the
+    // combination must fail closed rather than silently coexist.
+    if (isFoundationLegacyBypassEnabled()) {
+      violations.push("legacy_bypass_conflict");
+    }
 
     if (violations.length > 0) {
       writeAuditEvent(state.db, {
@@ -6137,6 +6297,11 @@ export async function startWebServer(host: string, port: number) {
             .join(
               ", ",
             )}. Review each via POST /api/users/:id/review (existing user) or POST /api/grants/review (orphan principal with no users row).`,
+        );
+      }
+      if (isFoundationLegacyBypassEnabled()) {
+        details.push(
+          "legacy_bypass_conflict: DECKTERM_LEGACY_NO_BOOTSTRAP=1 bypasses DB-backed authorization on terminal/root surfaces, so DECKTERM_OS_ISOLATION=1's disabled-wins/role precedence cannot hold while it is set. Unset DECKTERM_LEGACY_NO_BOOTSTRAP to enable multiuser mode.",
         );
       }
 
@@ -6394,6 +6559,51 @@ export async function startWebServer(host: string, port: number) {
             }
           }, 750);
         }
+
+        // Post-registration recheck (Fix 2+3(b)): fire-and-forget so open()
+        // itself stays synchronous. Runs after the socket is already added
+        // to `sockets` above — the recheck's job is to close it right back
+        // down if it should never have opened. Any unexpected error here
+        // fails closed (close the socket) rather than ever leaving a socket
+        // alive on an error we didn't anticipate.
+        void (async () => {
+          try {
+            const state = await getFoundationState();
+            const validation = await validateLiveSocket(state, data);
+            if (!validation.ok) {
+              try {
+                writeAuditEvent(state.db, {
+                  actorUserId: data.actorUserId,
+                  action: "terminal.attach",
+                  resourceType: "terminal",
+                  resourceId: terminalId,
+                  decision: "deny",
+                  reason: validation.reason,
+                });
+              } catch (err) {
+                debug(
+                  `[ws] post-registration audit write failed for ${terminalId}`,
+                  err,
+                );
+              }
+              try {
+                ws.close();
+              } catch {
+                // ignore
+              }
+            }
+          } catch (err) {
+            console.error(
+              `[ws] post-registration validation error for ${terminalId}:`,
+              err,
+            );
+            try {
+              ws.close();
+            } catch {
+              // ignore
+            }
+          }
+        })();
       },
 
       message(ws: ServerWebSocket<WsData>, message) {
