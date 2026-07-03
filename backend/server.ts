@@ -678,9 +678,13 @@ export async function reconcileSessionsOnStartup(
     // B2 behavior — the session is simply recreated. This closes both the
     // "uid-only mapping match" and "misrouted brokered recovery" gaps at once.
     if (isOsIsolationEnabled(process.env)) {
+      const orphanUids = new Set<number>();
       for (const session of activeSessions) {
         markTerminalSessionEnded(db, session.id);
         fixed++;
+        if (session.exec_kind === "brokered" && session.os_uid != null) {
+          orphanUids.add(session.os_uid);
+        }
         writeAuditEvent(db, {
           actorUserId: session.actor_user_id,
           action: "session.reconcile_denied",
@@ -691,9 +695,20 @@ export async function reconcileSessionsOnStartup(
           data: { execKind: session.exec_kind, osUid: session.os_uid },
         });
       }
+      // Stop each orphaned per-uid tmux-server scope (integrated-review
+      // residual #3): brokered tmux servers survive a service restart
+      // (KillMode=process), so ending the DB rows alone would leave shells
+      // running until a later suspend/delete. Reap them now.
+      for (const uid of orphanUids) {
+        try {
+          await brokerKill({ tmuxServerUid: uid });
+        } catch (err) {
+          debug(`[reconciliation] brokerKill tmux-server ${uid} failed`, err);
+        }
+      }
       if (fixed > 0) {
         console.log(
-          `[reconciliation] Ended ${fixed} pre-existing session(s) under OS isolation (no legacy resurrection)`,
+          `[reconciliation] Ended ${fixed} pre-existing session(s) under OS isolation (reaped ${orphanUids.size} broker server scope(s))`,
         );
       }
       return fixed;
@@ -4886,7 +4901,12 @@ export function createWebApp() {
         recheck.exec.uid !== exec.uid ||
         recheck.exec.gid !== exec.gid
       ) {
-        await killSingleTerminal(state, terminal, "os_mapping_postcheck");
+        // The resolver's own deny path may already have killed this terminal via
+        // killUserSessions; guard so we don't double-kill (integrated-review
+        // residual #1). killSingleTerminal is idempotent, but skipping is cleaner.
+        if (terminals.has(terminal.id)) {
+          await killSingleTerminal(state, terminal, "os_mapping_postcheck");
+        }
         writeAuditEvent(state.db, {
           actorUserId: ownerId,
           action: "terminal.create",
@@ -4972,12 +4992,15 @@ export function createWebApp() {
     if (!linkExec.ok) {
       return c.json(linkExec.body, linkExec.status);
     }
+    // Refuse any execution-kind change between the source and the re-resolve
+    // (integrated-review residual #2): a legacy source must not gain a brokered
+    // client, a brokered source must not drop to legacy, and a brokered source's
+    // uid must still match — otherwise the linked view would attach a divergent
+    // identity to the shared session.
     if (
-      sourceTerm.exec &&
-      (!linkExec.exec || linkExec.exec.uid !== sourceTerm.exec.uid)
+      Boolean(sourceTerm.exec) !== Boolean(linkExec.exec) ||
+      (sourceTerm.exec && linkExec.exec?.uid !== sourceTerm.exec.uid)
     ) {
-      // The source is brokered but the re-resolve no longer yields the same uid
-      // (mapping changed) — refuse rather than attach a divergent identity.
       return c.json(
         { error: "OS isolation denied", reason: "os_mapping_changed" },
         403,
