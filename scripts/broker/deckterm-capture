@@ -5,35 +5,75 @@
 # The only argument is a regex-validated session id; the spool path is fixed and
 # derived here. Root-owned but runs unprivileged (the user's tmux runs it); it
 # just copies stdin to the session's append-only pipe.log.
+#
+# fd-safety (Codex #7): the session dir is owned by this (mapped) user and was
+# root-created by the broker; we open it with O_NOFOLLOW and openat() pipe.log
+# relative to that dir fd — never resolving the whole path component-by-
+# component through directories the user might race — and fstat both to reject
+# symlinks / non-regular / foreign-owned surprises before writing a byte.
 
 import os
 import re
+import stat
 import sys
 
 CAPTURE_ROOT = "/var/lib/deckterm/capture"
 SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,63}$")
 
 
+def _fail(msg, code=1):
+    sys.stderr.write("deckterm-capture: %s\n" % msg)
+    return code
+
+
 def main(argv):
     if len(argv) != 1 or not SESSION_RE.match(argv[0]):
-        sys.stderr.write("deckterm-capture: bad session id\n")
-        return 2
+        return _fail("bad session id", 2)
     session = argv[0]
-    path = os.path.join(CAPTURE_ROOT, session, "pipe.log")
-    # O_NOFOLLOW: never write through a symlink the (untrusted) user planted.
+    me = os.getuid()
+    session_dir = os.path.join(CAPTURE_ROOT, session)
+
+    # Open the session dir with O_NOFOLLOW (reject a symlinked session dir) and
+    # verify via fstat it's a real dir owned by us and not writable by others.
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        dir_fd = os.open(session_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError as exc:
-        sys.stderr.write("deckterm-capture: open failed: %s\n" % exc)
-        return 1
+        return _fail("open session dir failed: %s" % exc)
     try:
-        while True:
-            chunk = os.read(0, 65536)
-            if not chunk:
-                break
-            os.write(fd, chunk)
+        dst = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dst.st_mode):
+            return _fail("session path not a directory")
+        if dst.st_uid != me:
+            return _fail("session dir not owned by caller")
+        if dst.st_mode & stat.S_IWOTH:
+            return _fail("session dir world-writable")
+
+        # openat pipe.log relative to the verified dir fd; O_NOFOLLOW rejects a
+        # symlink planted at pipe.log.
+        try:
+            fd = os.open(
+                "pipe.log",
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW,
+                0o640,
+                dir_fd=dir_fd,
+            )
+        except OSError as exc:
+            return _fail("open pipe.log failed: %s" % exc)
+        try:
+            fst = os.fstat(fd)
+            if not stat.S_ISREG(fst.st_mode):
+                return _fail("pipe.log not a regular file")
+            if fst.st_uid != me:
+                return _fail("pipe.log not owned by caller")
+            while True:
+                chunk = os.read(0, 65536)
+                if not chunk:
+                    break
+                os.write(fd, chunk)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(dir_fd)
     return 0
 
 

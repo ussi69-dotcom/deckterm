@@ -385,6 +385,91 @@ test("server exits when DECKTERM_OS_ISOLATION=1 and DECKTERM_LEGACY_NO_BOOTSTRAP
   expect(combined).toContain("DECKTERM_LEGACY_NO_BOOTSTRAP");
 });
 
+// B2 §4.4.1: cloudflare-tunnel + non-loopback bind fail-closed.
+
+test("server exits when DECKTERM_PUBLISH_MODE=cloudflare-tunnel binds a non-loopback host without the trust-proxy override", async () => {
+  const child = Bun.spawn(["bun", "run", "backend/index.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOST: "0.0.0.0",
+      PORT: "0",
+      TMUX_BACKEND: "0",
+      CF_ACCESS_REQUIRED: "0",
+      CF_ACCESS_TEAM_NAME: "",
+      CF_ACCESS_AUD: "",
+      DECKTERM_PUBLISH_MODE: "cloudflare-tunnel",
+      // Clear every dev/CI marker so the (production-only) guard actually runs,
+      // and ensure the trust-proxy override is absent.
+      CI: undefined,
+      DECKTERM_RUNTIME_ENV: undefined,
+      NODE_ENV: undefined,
+      BUN_ENV: undefined,
+      DECKTERM_DEV_INSECURE_LOCAL_ADMIN: undefined,
+      DECKTERM_DANGEROUSLY_TRUST_PROXY_HEADERS: undefined,
+      DECKTERM_LEGACY_NO_BOOTSTRAP: undefined,
+    },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  childProcesses.add(child);
+
+  const exitCode = await Promise.race([
+    child.exited,
+    new Promise<number>((_, reject) =>
+      setTimeout(() => reject(new Error("Startup process did not exit")), 3000),
+    ),
+  ]);
+  const stderr = await new Response(child.stderr).text();
+  const stdout = await new Response(child.stdout).text();
+  childProcesses.delete(child);
+
+  expect(exitCode).not.toBe(0);
+  expect(`${stdout}\n${stderr}`).toContain("cloudflare-tunnel refuses to bind");
+});
+
+test("server starts when cloudflare-tunnel binds a loopback host (guard does not fire)", async () => {
+  const port = await getFreePort();
+  const child = Bun.spawn(["bun", "run", "backend/index.ts"], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOST: "127.0.0.1",
+      PORT: String(port),
+      TMUX_BACKEND: "0",
+      CF_ACCESS_REQUIRED: "0",
+      CF_ACCESS_TEAM_NAME: "",
+      CF_ACCESS_AUD: "",
+      DECKTERM_PUBLISH_MODE: "cloudflare-tunnel",
+      CI: undefined,
+      DECKTERM_RUNTIME_ENV: undefined,
+      NODE_ENV: undefined,
+      BUN_ENV: undefined,
+      DECKTERM_LEGACY_NO_BOOTSTRAP: undefined,
+    },
+    stderr: "pipe",
+    stdout: "pipe",
+  });
+  childProcesses.add(child);
+
+  const exitCode = await Promise.race([
+    child.exited,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+  ]);
+  if (exitCode === null) {
+    child.kill();
+    await child.exited.catch(() => {});
+    childProcesses.delete(child);
+    // Started (still running after grace) — the loopback bind is allowed.
+    expect(true).toBe(true);
+    return;
+  }
+  const stderr = await new Response(child.stderr).text();
+  childProcesses.delete(child);
+  // If it exited, it must NOT be due to the tunnel guard.
+  expect(stderr).not.toContain("cloudflare-tunnel refuses to bind");
+});
+
 test("server starts when DECKTERM_OS_ISOLATION is unset regardless of unreviewed multiuser state (zero behavior change)", async () => {
   const stateDir = await seedGateStateDir((db) => {
     insertGateUser(db, { id: "owner_1", role: "owner", reviewed: true });

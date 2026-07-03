@@ -166,8 +166,17 @@ function accountCanWritePath(
   try {
     st = statSync(path);
   } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
     // ENOENT ⇒ the protected path isn't present on this host ⇒ not a write surface.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (code === "ENOENT") return false;
+    // EACCES/EPERM ⇒ the SERVICE account itself cannot even traverse to the
+    // path — it lives in a root-restricted subtree (e.g. /etc/sudoers.d, 0750
+    // root:root). An unprivileged mapped account cannot reach it either, and
+    // the ROOT broker re-checks every protected path authoritatively on each
+    // call (Codex #2, the "three places" rule), so this is not a
+    // service-account-provable write surface. Treating it as writable here
+    // would fail-closed so hard that NO account is ever mappable.
+    if (code === "EACCES" || code === "EPERM") return false;
     // Any other stat error ⇒ we cannot prove non-writability ⇒ fail closed.
     return true;
   }

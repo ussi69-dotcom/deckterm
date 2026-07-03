@@ -60,9 +60,16 @@ chmod 0644 "$ETC_DIR/broker.json"
 # 4. Runtime registry (root 0700) + tmpfiles persistence + capture root.
 install -d -o root -g root -m 0700 /run/deckterm-broker
 echo "d /run/deckterm-broker 0700 root root -" > /etc/tmpfiles.d/deckterm-broker.conf
-install -d -o root -g "$SERVICE_USER" -m 0750 /var/lib/deckterm/capture
+# Capture root is 0751 (root:service group): the service group reads spools; a
+# mapped user (NOT in the service group) needs only o+x to traverse INTO its own
+# root-created 2750 session dir — it still cannot list or read siblings. Parent
+# /var/lib/deckterm stays 0755 root:root.
+install -d -o root -g root -m 0755 /var/lib/deckterm
+install -d -o root -g "$SERVICE_USER" -m 0751 /var/lib/deckterm/capture
 
-# 5. Broker log (root 0600, append-only where supported).
+# 5. Broker log (root 0600, append-only where supported). Drop any existing
+# append-only attr first so a re-run can re-chown/chmod (idempotency).
+chattr -a /var/log/deckterm-broker.log 2>/dev/null || true
 touch /var/log/deckterm-broker.log
 chown root:root /var/log/deckterm-broker.log
 chmod 0600 /var/log/deckterm-broker.log

@@ -22,7 +22,9 @@ export function isEdgeProtectedTunnelMode(env: FoundationActorEnv): boolean {
   return env.DECKTERM_PUBLISH_MODE === "cloudflare-tunnel";
 }
 
-function hasExplicitLegacyDevActorMode(env: FoundationActorEnv): boolean {
+export function hasExplicitLegacyDevActorMode(
+  env: FoundationActorEnv,
+): boolean {
   return (
     env.CI === "true" ||
     env.NODE_ENV === "test" ||

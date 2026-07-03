@@ -15,6 +15,18 @@ export type TerminalBackendSession = {
   pipeOffset?: number;
 };
 
+/**
+ * B2 OS-isolation execution context (design §5). When present, the backend
+ * spawns the PTY/tmux client AS THIS UNIX ACCOUNT through the root-owned broker
+ * instead of as the service account. Absent ⇒ today's legacy path verbatim
+ * (invariant §7.1). Server-resolved only — never from the client (§7.2).
+ */
+export type BrokeredExecContext = {
+  uid: number;
+  gid: number;
+  osUsername: string;
+};
+
 export type TerminalBackendAttachOptions = {
   cwd: string;
   cols: number;
@@ -23,6 +35,11 @@ export type TerminalBackendAttachOptions = {
   shellCommand?: string[];
   env?: Record<string, string | undefined>;
   waitForClient?: boolean;
+  /**
+   * When set, spawn through the broker as this account (design §5). Absent ⇒
+   * legacy service-account spawn, byte-identical to pre-B2 (invariant §7.1).
+   */
+  exec?: BrokeredExecContext;
   onExit?: (
     proc: Subprocess,
     exitCode: number,

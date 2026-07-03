@@ -165,6 +165,8 @@ test("foundation C1 records and ends terminal session metadata", async () => {
     updatedAt: "2026-05-13T10:00:00.000Z",
     endedAt: null,
     lastEventId: 0,
+    execKind: null,
+    osUid: null,
   });
 
   markTerminalSessionEnded(

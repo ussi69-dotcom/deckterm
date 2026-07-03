@@ -47,6 +47,10 @@ const C1B_TERMINAL_EVENTS_MIGRATION = 3;
 const C3_USER_SETTINGS_MIGRATION = 4;
 const B3_IDENTITY_ROLES_MIGRATION = 5;
 const B2_OS_MAPPINGS_MIGRATION = 6;
+// B2-S4: persisted aggregation of high-volume isolation denials so per-request
+// audit rows don't have to be written unboundedly under probing, while exact
+// evidence (count + first/last seen) survives restarts (§4.3, Codex #11).
+const B2_ISOLATION_DENY_COUNTERS_MIGRATION = 7;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -65,6 +69,12 @@ export type RecordedTerminalSession = {
   updatedAt: string;
   endedAt: string | null;
   lastEventId: number;
+  /** B2: how the PTY was executed — 'legacy' (service account), 'brokered'
+   *  (run as a mapped uid), or null for pre-B2 rows. Authoritative across
+   *  restarts so isolation reconcile refuses to resurrect non-brokered rows
+   *  (§4.4, Codex #8). */
+  execKind: "legacy" | "brokered" | null;
+  osUid: number | null;
 };
 
 export type TerminalEventKind = "output" | "state" | "exit" | "lifecycle";
@@ -274,6 +284,18 @@ export function migrateFoundationDb(db: Database): void {
       updated_at TEXT NOT NULL,
       PRIMARY KEY (user_id, key)
     );
+
+    CREATE TABLE IF NOT EXISTS os_isolation_deny_counters (
+      actor_user_id TEXT NOT NULL DEFAULT '',
+      actor_source TEXT NOT NULL DEFAULT '',
+      surface TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      count INTEGER NOT NULL DEFAULT 0,
+      first_seen TEXT NOT NULL,
+      last_seen TEXT NOT NULL,
+      last_request_id TEXT,
+      PRIMARY KEY (actor_user_id, actor_source, surface, reason)
+    );
   `);
 
   const c3Existing = db
@@ -315,6 +337,18 @@ export function migrateFoundationDb(db: Database): void {
     db.query(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(B2_OS_MAPPINGS_MIGRATION, new Date().toISOString());
+  }
+
+  // Migration 7 (B2-S4): the deny-counter table is created by the boot DDL
+  // above (a brand-new table, so no rebuild — existing DBs simply gain it on
+  // next init); this only records the marker.
+  const b2DenyExisting = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(B2_ISOLATION_DENY_COUNTERS_MIGRATION);
+  if (!b2DenyExisting) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(B2_ISOLATION_DENY_COUNTERS_MIGRATION, new Date().toISOString());
   }
 }
 
@@ -663,19 +697,23 @@ export function recordTerminalSession(
     cwd: string;
     status?: "active" | "ended";
     lastEventId?: number;
+    execKind?: "legacy" | "brokered" | null;
+    osUid?: number | null;
     now?: Date;
   },
 ): void {
   const timestamp = isoDate(session.now || new Date());
   db.query(
     `INSERT INTO terminal_sessions
-      (id, actor_user_id, root_id, cwd, status, created_at, updated_at, ended_at, last_event_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        actor_user_id = excluded.actor_user_id,
        root_id = excluded.root_id,
        cwd = excluded.cwd,
        status = excluded.status,
+       exec_kind = excluded.exec_kind,
+       os_uid = excluded.os_uid,
        updated_at = excluded.updated_at,
        ended_at = excluded.ended_at,
        last_event_id = MAX(terminal_sessions.last_event_id, excluded.last_event_id)`,
@@ -685,6 +723,8 @@ export function recordTerminalSession(
     session.rootId || null,
     session.cwd,
     session.status || "active",
+    session.execKind ?? null,
+    session.osUid ?? null,
     timestamp,
     timestamp,
     session.status === "ended" ? timestamp : null,
@@ -752,7 +792,7 @@ export function getTerminalSession(
 ): RecordedTerminalSession | null {
   const row = db
     .query(
-      `SELECT id, actor_user_id, root_id, cwd, status, created_at, updated_at, ended_at, last_event_id
+      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
        FROM terminal_sessions
        WHERE id = ?`,
     )
@@ -762,6 +802,8 @@ export function getTerminalSession(
     root_id: string | null;
     cwd: string;
     status: "active" | "ended";
+    exec_kind: "legacy" | "brokered" | null;
+    os_uid: number | null;
     created_at: string;
     updated_at: string;
     ended_at: string | null;
@@ -779,6 +821,8 @@ export function getTerminalSession(
     updatedAt: row.updated_at,
     endedAt: row.ended_at,
     lastEventId: row.last_event_id || 0,
+    execKind: row.exec_kind ?? null,
+    osUid: row.os_uid ?? null,
   };
 }
 
@@ -788,7 +832,7 @@ export function listTerminalSessionsForActor(
 ): RecordedTerminalSession[] {
   const rows = db
     .query(
-      `SELECT id, actor_user_id, root_id, cwd, status, created_at, updated_at, ended_at, last_event_id
+      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
        FROM terminal_sessions
        WHERE actor_user_id = ?
        ORDER BY created_at DESC`,
@@ -799,6 +843,8 @@ export function listTerminalSessionsForActor(
     root_id: string | null;
     cwd: string;
     status: "active" | "ended";
+    exec_kind: "legacy" | "brokered" | null;
+    os_uid: number | null;
     created_at: string;
     updated_at: string;
     ended_at: string | null;
@@ -815,6 +861,8 @@ export function listTerminalSessionsForActor(
     updatedAt: row.updated_at,
     endedAt: row.ended_at,
     lastEventId: row.last_event_id || 0,
+    execKind: row.exec_kind ?? null,
+    osUid: row.os_uid ?? null,
   }));
 }
 
@@ -1502,6 +1550,50 @@ export function reactivateOsMapping(
 
 export function deleteOsMapping(db: Database, userId: string): void {
   db.query("DELETE FROM user_os_mappings WHERE user_id = ?").run(userId);
+}
+
+/**
+ * Record an isolation-mode denial in the persisted aggregation counter (§4.3,
+ * Codex #11 / inv 14) and return the new cumulative count. Callers use the
+ * count to decide whether to ALSO write a full audit row (e.g. first hit + every
+ * Nth), so evidence is never lost yet per-request rows stay bounded under
+ * probing. Keyed by (actor, source, surface, reason); `count`/`first_seen`/
+ * `last_seen` survive restarts, unlike a once-per-process in-memory guard.
+ */
+export function recordIsolationDeny(
+  db: Database,
+  opts: {
+    actorUserId?: string | null;
+    actorSource: string;
+    surface: string;
+    reason: string;
+    requestId?: string | null;
+    now?: Date;
+  },
+): number {
+  const timestamp = isoDate(opts.now || new Date());
+  const actorUserId = opts.actorUserId || "";
+  const row = db
+    .query(
+      `INSERT INTO os_isolation_deny_counters
+         (actor_user_id, actor_source, surface, reason, count, first_seen, last_seen, last_request_id)
+       VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+       ON CONFLICT(actor_user_id, actor_source, surface, reason) DO UPDATE SET
+         count = os_isolation_deny_counters.count + 1,
+         last_seen = excluded.last_seen,
+         last_request_id = excluded.last_request_id
+       RETURNING count`,
+    )
+    .get(
+      actorUserId,
+      opts.actorSource,
+      opts.surface,
+      opts.reason,
+      timestamp,
+      timestamp,
+      opts.requestId || null,
+    ) as { count: number } | null;
+  return row?.count ?? 1;
 }
 
 /** Looks up a single scoped grant row by id (for DELETE /api/grants/:id). */

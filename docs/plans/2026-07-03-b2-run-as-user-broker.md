@@ -12,24 +12,38 @@
 > - **S1 done** (`bdba581`): migration 6 (`user_os_mappings` + active-uid index +
 >   `terminal_sessions.exec_kind/os_uid`), `os-mapping-eligibility.ts` pure matrix + probe,
 >   mapping CRUD. 10 tests.
-> - **S2 done** (`c3cee5e`): the broker (`scripts/broker/*`) + capture helper + installer +
->   contract test. **Installed + proven live on the dev host** — PTY drop yields a shell as the
->   mapped uid with NO root/service supplementary-group leak; all refusals fire; kill + GC work.
->   Codex per-slice review **deferred** (codex sandbox returned empty/hung all session);
->   substituted by live host testing + Fable adversarial review (one hardening applied: cgroup
->   path-component match). A Codex integrated-diff pass is owed before the dev→main promotion.
+> - **S2 done** (`c3cee5e`) + **broker debt cleared (uncommitted, this session)**: the broker
+>   (`scripts/broker/*`) + capture helper + installer + contract test. The deferred **Codex deep
+>   review ran** (11-finding sandbox recovered) and surfaced 8 real issues — **all fixed**:
+>   absolute tool paths (no root PATH exec), `close fds>2` in `__drop`, NSS-safe `getgrouplist` +
+>   stored numeric gid set installed via `setgroups` (fixes group fail-open + validation→drop
+>   TOCTOU), per-subcommand tmux argv schemas (kills `#(...)`/command-option/glued-`-t` injection),
+>   socket-path safety (lstat components + socket-type + first-vs-subsequent server scope), fd-safe
+>   config/drop-record reads, and capture-helper fd-relative openat. **Re-proven live on dev**
+>   (clean uid drop, 6 injection vectors refused, multi-session-per-uid).
 > - **S3a done** (`1821671`): `broker-client.ts` + `resolveExecutionContext` (the single
 >   chokepoint) + 12 tests.
-> - **S3b TODO**: `TerminalBackend.exec` plumbing, raw brokered spawn, `brokered-tmux-backend.ts`,
->   per-uid backend cache, **broker capture-dir provisioning** (create
->   `/var/lib/deckterm/capture/<session>` 2750 + precreate `pipe.log` on tmux `new-session`;
->   fd-safe `readPipeDelta`).
-> - **S4 TODO**: server wiring (PTY-surface context+deny+audit, not-yet-brokered 403,
->   `/api/os-mappings` owner API, tunnel + isolation + reconcile startup guards).
-> - **Blocker for live tmux verification:** dev runs `DECKTERM_LEGACY_NO_BOOTSTRAP=1`, so the B3
->   gate refuses `DECKTERM_OS_ISOLATION=1` (`legacy_bypass_conflict`). End-to-end tmux brokering
->   on the running dev service needs dev reconfigured (bootstrap a real owner, drop the bypass) or
->   a dedicated isolation test harness — decide at S4.
+> - **S3b done (uncommitted, this session)**: `TerminalBackend.exec` plumbing, raw brokered spawn,
+>   `brokered-tmux-backend.ts` + per-uid cache, **broker capture-dir provisioning** (2750 dir +
+>   precreated `pipe.log` 0640 `<uid>:<service_group>` on `new-session`; fd-safe `readPipeDelta`).
+>   **Codex per-slice review ran** → 1 critical (path-following `chown`/`chmod` on `pipe.log` →
+>   fully fd-based `fchown`/`fchmod`), 1 high (per-uid cache tuple-consistency), 1 medium (read
+>   size cap) — all fixed. 11 backend tests; capture root moved to `0751` so mapped users traverse
+>   to their own session dir.
+> - **S4 done (uncommitted, this session)**: PTY-surface context+deny+audit + `exec_kind`/`os_uid`
+>   persistence; not-yet-brokered 403 `os_isolation_pending` on files/git/task surfaces with a
+>   persisted aggregation counter (migration 7); owner-only `/api/os-mappings` CRUD (uid/gid
+>   resolved server-side); startup guards (tunnel non-loopback fail-closed, `brokerCheck()`
+>   fail-closed, isolation reconcile refusing non-brokered rows). Fixed a latent eligibility bug:
+>   the service account can't `stat` `/etc/sudoers.d/deckterm-broker` (0750 parent), so `EACCES`
+>   now defers to the root broker's authoritative check instead of fail-closing every mapping.
+>   `foundation-os-isolation.test.ts` (own chained invocation) + tunnel-guard `startup-failure`
+>   tests. Full `test:unit` + `tsc` green; legacy mode re-verified healthy live on 4174.
+> - **Live-isolation-on-dev blocker still stands:** dev runs `DECKTERM_LEGACY_NO_BOOTSTRAP=1`, so
+>   the B3 gate refuses `DECKTERM_OS_ISOLATION=1` (`legacy_bypass_conflict`). The broker path is
+>   proven via the standalone live harness + the throwaway-account API test; full end-to-end
+>   isolation on the running service still needs dev reconfigured (real owner, drop the bypass) or
+>   a dedicated harness — deferred to the B4/Alice-Bob e2e work.
 
 ## 0. Scope
 

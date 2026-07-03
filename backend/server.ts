@@ -83,11 +83,35 @@ import {
   authorizeTerminalWrite,
   getRouteCapability,
   isLegacyBootstrapBypassAllowed,
+  isOsIsolationEnabled,
+  resolveExecutionContext,
   roleImpliesCapability,
+  type ExecutionContext,
 } from "./services/foundation-authorization";
+import {
+  createOsMapping,
+  deleteOsMapping,
+  getOsMapping,
+  listOsMappings,
+  reactivateOsMapping,
+  recordIsolationDeny,
+  suspendOsMapping,
+} from "./services/foundation-state";
+import {
+  gatherOsAccountFacts,
+  evaluateOsAccountEligibility,
+  resolveEligibilityPolicy,
+} from "./services/os-mapping-eligibility";
+import { brokerCheck, brokerKill } from "./services/broker-client";
+import {
+  BrokeredTmuxBackendCache,
+  type BrokeredTmuxBackend,
+} from "./services/brokered-tmux-backend";
+import type { BrokeredExecContext } from "./services/terminal-backend";
 import {
   resolveActorFromAccessPayload,
   isEdgeProtectedTunnelMode,
+  hasExplicitLegacyDevActorMode,
   type DeckTermActor,
 } from "./services/foundation-actors";
 
@@ -151,6 +175,11 @@ type Terminal = {
   lastTmuxCapture: string;
   tmuxPipePath: string | null;
   tmuxPipeOffset: number;
+  // B2 OS isolation: when brokered, the mapped identity + the per-uid backend
+  // that created this terminal, so attach/resize/kill/pipe-read all route back
+  // to the same broker path instead of the legacy service-account backend.
+  exec?: BrokeredExecContext;
+  backend?: TerminalBackend;
 };
 
 type TerminalWsData = {
@@ -278,6 +307,27 @@ const tmuxTerminalBackend =
   terminalBackend.mode === "tmux"
     ? (terminalBackend as TmuxTerminalBackend)
     : null;
+
+// B2 OS isolation (design §5): per-uid brokered tmux backends. Constructed
+// lazily-populated but always present so the resolver result can select a
+// backend; empty + untouched unless DECKTERM_OS_ISOLATION=1 selects a brokered
+// context, so legacy mode is byte-unchanged.
+const DECKTERM_CAPTURE_ROOT =
+  process.env.DECKTERM_CAPTURE_ROOT || "/var/lib/deckterm/capture";
+const brokeredTmuxCache = new BrokeredTmuxBackendCache({
+  namespace: TMUX_SESSION_NAMESPACE,
+  captureRoot: DECKTERM_CAPTURE_ROOT,
+});
+
+/**
+ * Select the terminal backend for a resolved brokered execution context. In
+ * tmux mode a per-uid `BrokeredTmuxBackend`; in raw mode the shared raw backend
+ * (which brokers per-call via the `exec` attach option). Never called for a
+ * legacy context (invariant §7.1).
+ */
+function backendForExec(exec: BrokeredExecContext): TerminalBackend {
+  return TMUX_BACKEND ? brokeredTmuxCache.get(exec) : terminalBackend;
+}
 const SCROLLBACK_MAX_LINES = parseInt(
   process.env.SCROLLBACK_MAX_LINES || "2000",
   10,
@@ -610,8 +660,44 @@ export async function reconcileSessionsOnStartup(
   let fixed = 0;
   try {
     const activeSessions = db
-      .query("SELECT id FROM terminal_sessions WHERE status = 'active'")
-      .all() as { id: string }[];
+      .query(
+        "SELECT id, actor_user_id, exec_kind, os_uid FROM terminal_sessions WHERE status = 'active'",
+      )
+      .all() as {
+      id: string;
+      actor_user_id: string | null;
+      exec_kind: "legacy" | "brokered" | null;
+      os_uid: number | null;
+    }[];
+    // B2 (§4.4.3, Codex #8 + integrated-review #3/#6): under isolation, END
+    // EVERY pre-existing active session rather than adopt any of them. Brokered
+    // sessions live on a per-uid broker socket the shared tmux backend can't
+    // see, and a legacy row would otherwise be resurrected on the service
+    // account. Recovering brokered sessions across a restart is deferred (needs
+    // per-uid backend rebuild + broker-side liveness); ending them is the safe
+    // B2 behavior — the session is simply recreated. This closes both the
+    // "uid-only mapping match" and "misrouted brokered recovery" gaps at once.
+    if (isOsIsolationEnabled(process.env)) {
+      for (const session of activeSessions) {
+        markTerminalSessionEnded(db, session.id);
+        fixed++;
+        writeAuditEvent(db, {
+          actorUserId: session.actor_user_id,
+          action: "session.reconcile_denied",
+          resourceType: "terminal",
+          resourceId: session.id,
+          decision: "deny",
+          reason: "isolation_reconcile_end_all",
+          data: { execKind: session.exec_kind, osUid: session.os_uid },
+        });
+      }
+      if (fixed > 0) {
+        console.log(
+          `[reconciliation] Ended ${fixed} pre-existing session(s) under OS isolation (no legacy resurrection)`,
+        );
+      }
+      return fixed;
+    }
     for (const session of activeSessions) {
       const sessionName = buildTmuxSessionName({
         namespace: TMUX_SESSION_NAMESPACE,
@@ -637,6 +723,10 @@ export async function reconcileSessionsOnStartup(
 // Recover existing tmux sessions on startup (for TMUX_BACKEND)
 async function recoverTmuxSessions(): Promise<number> {
   if (!TMUX_BACKEND) return 0;
+  // B2: legacy recovery walks the SHARED tmux socket as the service account —
+  // never do that under isolation (reconcile already ended pre-existing rows;
+  // brokered recovery is a per-uid concern deferred past B2).
+  if (isOsIsolationEnabled(process.env)) return 0;
 
   try {
     const sessions =
@@ -1880,6 +1970,14 @@ async function requireFileAccess(
   c: any,
   resolvedPath: string,
 ): Promise<{ ok: true } | { ok: false; status: number; body: any }> {
+  // B2 (§4.3, inv 17): in isolation mode every filesystem surface denies
+  // `os_isolation_pending` — a mapped user's fs op must never run as the
+  // service account (B4 brokers these). Checked BEFORE the legacy bypass so it
+  // cannot be bypassed, though the startup gate already forbids
+  // isolation × legacy-bypass coexisting.
+  const isolationDeny = await denyIfOsIsolationPending(c, "files");
+  if (isolationDeny) return isolationDeny;
+
   if (isFoundationLegacyBypassEnabled()) {
     return { ok: true };
   }
@@ -2526,8 +2624,12 @@ function hasOtherTerminalForSession(
 async function killTmuxSessionIfLast(
   sessionName: string | undefined,
   excludedTerminalId?: string,
+  // Brokered terminals kill through their per-uid backend (design §5); legacy
+  // uses the shared tmux backend.
+  backendOverride?: TerminalBackend,
 ) {
-  if (!TMUX_BACKEND || !tmuxTerminalBackend || !sessionName) return false;
+  const backend = backendOverride ?? tmuxTerminalBackend;
+  if (!TMUX_BACKEND || !backend || !sessionName) return false;
   if (hasOtherTerminalForSession(sessionName, excludedTerminalId)) {
     debug(
       `[tmux] Preserving shared session ${sessionName} for other attached DeckTerm views`,
@@ -2537,7 +2639,7 @@ async function killTmuxSessionIfLast(
 
   debug(`[tmux] Killing session ${sessionName}`);
   try {
-    await tmuxTerminalBackend.kill(sessionName);
+    await backend.kill(sessionName);
   } catch (err) {
     debug(`[tmux] kill-session failed for ${sessionName}`, err);
     return false;
@@ -2580,7 +2682,7 @@ async function killSingleTerminal(
     debug(`[revocation] removeTerminalState failed for ${term.id}`, err);
   }
   try {
-    await killTmuxSessionIfLast(term.sessionName);
+    await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
   } catch (err) {
     debug(`[revocation] killTmuxSessionIfLast failed for ${term.id}`, err);
   }
@@ -2786,8 +2888,13 @@ async function captureTmuxPane(sessionName: string): Promise<string> {
 }
 
 async function readTmuxPipeDelta(term: Terminal): Promise<string> {
-  if (!tmuxTerminalBackend || !term.tmuxPipePath) return "";
-  const delta = await tmuxTerminalBackend.readPipeDelta(
+  if (!term.tmuxPipePath) return "";
+  // Brokered terminals read their fd-safe spool via the per-uid backend; legacy
+  // uses the shared tmux backend.
+  const backend =
+    (term.backend as BrokeredTmuxBackend | undefined) ?? tmuxTerminalBackend;
+  if (!backend) return "";
+  const delta = await backend.readPipeDelta(
     term.tmuxPipePath,
     term.tmuxPipeOffset,
   );
@@ -3052,6 +3159,7 @@ async function createManagedTerminal({
   initialRuntimeState,
   initialLastExitCode = null,
   initialScrollback = "",
+  exec,
 }: {
   id?: string;
   cwd: string;
@@ -3068,9 +3176,16 @@ async function createManagedTerminal({
   };
   initialLastExitCode?: number | null;
   initialScrollback?: string;
+  /** B2: when set, spawn the PTY through the broker as this mapped uid. */
+  exec?: BrokeredExecContext;
 }): Promise<Terminal> {
   const terminal = createTerminalHandle(id, cols, rows);
   let activeSessionName = sessionName;
+  // Brokered context selects a per-uid backend; legacy uses the shared one
+  // (invariant §7.1 — absent exec ⇒ byte-identical legacy path).
+  const backend: TerminalBackend = exec
+    ? backendForExec(exec)
+    : terminalBackend;
 
   const closeAndRemoveTerminal = (
     exitCode: number,
@@ -3092,7 +3207,7 @@ async function createManagedTerminal({
   let tmuxPipeOffset = 0;
 
   if (createTmuxSession || !TMUX_BACKEND) {
-    const backendSession = await terminalBackend.createSession(
+    const backendSession = await backend.createSession(
       id,
       cwd,
       cols,
@@ -3108,12 +3223,13 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
-  const attachResult = await terminalBackend.attach(attachSessionName, {
+  const attachResult = await backend.attach(attachSessionName, {
     cwd,
     cols,
     rows,
     terminal,
     waitForClient: TMUX_BACKEND,
+    exec,
     onExit(
       _proc: Subprocess,
       exitCode: number | null,
@@ -3154,6 +3270,8 @@ async function createManagedTerminal({
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
     tmuxPipeOffset,
+    exec,
+    backend: exec ? backend : undefined,
   };
 
   terminals.set(id, managedTerminal);
@@ -3175,12 +3293,15 @@ async function createOwnedTerminal({
   rows = 30,
   ownerId,
   ownerEmail,
+  exec,
 }: {
   cwd: string;
   cols?: number;
   rows?: number;
   ownerId: string;
   ownerEmail: string;
+  /** B2: brokered execution context (mapped uid) when isolation is active. */
+  exec?: BrokeredExecContext;
 }): Promise<Terminal> {
   const fs = await import("fs/promises");
   let resolvedCwd = cwd || process.env.HOME || "/";
@@ -3210,7 +3331,118 @@ async function createOwnedTerminal({
     ownerEmail,
     sessionName,
     createTmuxSession: Boolean(sessionName),
+    exec,
   });
+}
+
+/**
+ * B2 (§4.3, invariant §7.17): surfaces not yet brokered (files/git/search/
+ * tasks) must NOT run as the service account in isolation mode — B4 lifts this
+ * per-surface later. Returns a 403 `os_isolation_pending` deny for EVERY actor
+ * when isolation is on, else null (byte-identical legacy path). Every deny is
+ * recorded in the persisted aggregation counter; a full audit row is written on
+ * the first hit and periodically thereafter so evidence survives without
+ * unbounded rows under probing (Codex #11 / inv 14).
+ */
+async function denyIfOsIsolationPending(
+  c: Parameters<typeof getCurrentActor>[0],
+  surface: string,
+  requestId?: string | null,
+): Promise<{ ok: false; status: 403; body: Record<string, unknown> } | null> {
+  // Flag check FIRST so legacy mode never even resolves the actor — keeps the
+  // legacy path byte-identical (no new getCurrentActor call, no DB touch).
+  if (!isOsIsolationEnabled(process.env)) return null;
+  const actor = getCurrentActor(c);
+  const state = await getFoundationState();
+  const count = recordIsolationDeny(state.db, {
+    actorUserId: actor.id,
+    actorSource: actor.source,
+    surface,
+    reason: "os_isolation_pending",
+    requestId: requestId ?? null,
+  });
+  // First occurrence + every 100th thereafter get a full audit row.
+  if (count === 1 || count % 100 === 0) {
+    writeAuditEvent(state.db, {
+      actorUserId: actor.id,
+      action: "surface.access",
+      resourceType: "surface",
+      resourceId: surface,
+      decision: "deny",
+      reason: "os_isolation_pending",
+      data: { surface, actorSource: actor.source, count },
+    });
+  }
+  return {
+    ok: false,
+    status: 403,
+    body: {
+      error: "OS isolation pending",
+      reason: "os_isolation_pending",
+      surface,
+    },
+  };
+}
+
+/** Loopback bind targets (B2 §4.4.1): the tunnel fail-closed guard treats these
+ *  as safe because only local processes can reach them. */
+function isLoopbackHost(host: string): boolean {
+  const h = (host || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "");
+  return (
+    h === "localhost" ||
+    h === "::1" ||
+    h === "0:0:0:0:0:0:0:1" ||
+    /^127\./.test(h)
+  );
+}
+
+/**
+ * B2 (§4.3): resolve the execution context for a PTY surface and, on deny,
+ * produce the 403 body + audit + revocation. Returns either the brokered exec
+ * context to spawn with (undefined ⇒ legacy), or a `deny` with the JSON to
+ * return. A drift/ineligibility deny already suspended the mapping in the
+ * resolver; we run that user's revocation kill path here (Codex #6).
+ */
+async function resolvePtyExecutionContext(
+  state: FoundationState,
+  actor: DeckTermActor,
+  ownerId: string,
+  cwd: string,
+): Promise<
+  | { ok: true; exec?: BrokeredExecContext }
+  | { ok: false; status: 403; body: Record<string, unknown> }
+> {
+  const ctx: ExecutionContext = resolveExecutionContext(state.db, {
+    actor,
+    env: process.env,
+  });
+  if (ctx.kind === "legacy") return { ok: true };
+  if (ctx.kind === "brokered") {
+    return {
+      ok: true,
+      exec: { uid: ctx.uid, gid: ctx.gid, osUsername: ctx.osUsername },
+    };
+  }
+  // deny — the mapping may have just been suspended; tear down live sessions.
+  if (ctx.suspendedUserId) {
+    await killUserSessions(ctx.suspendedUserId, `os_mapping:${ctx.reason}`);
+  }
+  writeAuditEvent(state.db, {
+    actorUserId: ownerId,
+    action: "terminal.create",
+    resourceType: "terminal",
+    decision: "deny",
+    reason: ctx.reason,
+    data: { cwd, osIsolation: true, actorSource: actor.source },
+  });
+  return {
+    ok: false,
+    status: 403,
+    body: { error: "OS isolation denied", reason: ctx.reason },
+  };
 }
 
 export function createWebApp() {
@@ -3892,6 +4124,283 @@ export function createWebApp() {
     return c.json({ ok: revoked });
   });
 
+  // ---------------------------------------------------------------------
+  // B2 (§4.3): OS-mapping owner API. Owner-only via requireRole (no legacy /
+  // edge-tunnel bypass). The client never supplies uid/gid — they are resolved
+  // server-side from the username via getent, validated by the same eligibility
+  // policy the broker independently re-checks (invariant §7.2/§7.5). Every call
+  // is audited by the gate; bodies audit business denials + the outcome.
+  // ---------------------------------------------------------------------
+
+  function osMappingProtectedPaths(): string[] {
+    const stateDir =
+      process.env.DECKTERM_STATE_DIR ||
+      `${process.env.HOME || "/home/deploy"}/.deckterm`;
+    return [
+      stateDir,
+      "/usr/local/lib/deckterm/deckterm-broker",
+      "/etc/deckterm",
+      "/etc/deckterm/broker.json",
+      "/etc/sudoers.d/deckterm-broker",
+    ];
+  }
+
+  app.get("/api/os-mappings", async (c) => {
+    const gate = await requireRole(c, ["owner"], "os_mapping.list");
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+    const state = await getFoundationState();
+    const policy = resolveEligibilityPolicy(process.env);
+    const protectedPaths = osMappingProtectedPaths();
+    const mappings = listOsMappings(state.db).map((m) => {
+      // Live eligibility re-probe per row so the owner sees drift/ineligibility
+      // before it bites at use time.
+      const facts = gatherOsAccountFacts(m.osUsername, protectedPaths);
+      const eligibility = evaluateOsAccountEligibility(facts, policy);
+      const drift =
+        !facts.exists || facts.uid !== m.osUid || facts.gid !== m.osGid;
+      return {
+        ...m,
+        probe: {
+          exists: facts.exists,
+          uid: facts.uid,
+          gid: facts.gid,
+          drift,
+          eligible: eligibility.ok,
+          reason: eligibility.ok ? null : eligibility.reason,
+        },
+      };
+    });
+    return c.json({ mappings });
+  });
+
+  app.post("/api/os-mappings", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const userId = typeof body.userId === "string" ? body.userId.trim() : "";
+    const osUsername =
+      typeof body.osUsername === "string" ? body.osUsername.trim() : "";
+    const gate = await requireRole(c, ["owner"], "os_mapping.create", {
+      targetId: userId,
+      osUsername,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+
+    const state = await getFoundationState();
+    const deny = (reason: string, status: 400 | 404 | 409 = 400) => {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.create",
+        resourceType: "user",
+        resourceId: userId || null,
+        decision: "deny",
+        reason,
+        data: { userId, osUsername },
+      });
+      return c.json({ error: reason, reason }, status);
+    };
+
+    if (!userId || !osUsername) return deny("missing_fields");
+    if (!getFoundationUserById(state.db, userId))
+      return deny("unknown_user", 404);
+
+    // Resolve uid/gid server-side + enforce the full eligibility policy (the
+    // same one the broker independently re-checks). The client never supplies
+    // numeric ids (invariant §7.2).
+    const facts = gatherOsAccountFacts(osUsername, osMappingProtectedPaths());
+    if (!facts.exists) return deny("account_missing");
+    const eligibility = evaluateOsAccountEligibility(
+      facts,
+      resolveEligibilityPolicy(process.env),
+    );
+    if (!eligibility.ok) return deny(`ineligible:${eligibility.reason}`);
+
+    try {
+      const mapping = createOsMapping(state.db, {
+        userId,
+        osUsername,
+        osUid: facts.uid,
+        osGid: facts.gid,
+        createdBy: gate.ownerId,
+      });
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.create",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "allow",
+        data: { osUsername, osUid: facts.uid, osGid: facts.gid },
+      });
+      return c.json({ mapping });
+    } catch (err) {
+      // The active-uid partial unique index rejects a second active mapping on
+      // one uid (B1 Codex #2).
+      return deny("uid_already_mapped", 409);
+    }
+  });
+
+  app.post("/api/os-mappings/:userId/suspend", async (c) => {
+    const userId = c.req.param("userId");
+    const body = await c.req.json().catch(() => ({}));
+    const reason =
+      typeof body.reason === "string" && body.reason.trim()
+        ? body.reason.trim()
+        : "owner_suspended";
+    const gate = await requireRole(c, ["owner"], "os_mapping.suspend", {
+      targetId: userId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+    const state = await getFoundationState();
+    const suspendMapping = getOsMapping(state.db, userId);
+    if (!suspendMapping) {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.suspend",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "deny",
+        reason: "no_mapping",
+      });
+      return c.json({ error: "no_mapping", reason: "no_mapping" }, 404);
+    }
+    suspendOsMapping(state.db, { userId, reason });
+    // Suspension synchronously tears down the user's live sessions AND the
+    // per-uid tmux-server scope (Codex #6, inv 12) — no open shell survives.
+    await killUserSessions(userId, `os_mapping_suspended:${reason}`);
+    try {
+      await brokerKill({ tmuxServerUid: suspendMapping.osUid });
+    } catch (err) {
+      debug(`[os-mapping] brokerKill tmux-server failed for ${userId}`, err);
+    }
+    writeAuditEvent(state.db, {
+      actorUserId: gate.ownerId,
+      action: "os_mapping.suspend",
+      resourceType: "user",
+      resourceId: userId,
+      decision: "allow",
+      reason,
+    });
+    return c.json({ mapping: getOsMapping(state.db, userId) });
+  });
+
+  app.post("/api/os-mappings/:userId/reactivate", async (c) => {
+    const userId = c.req.param("userId");
+    const gate = await requireRole(c, ["owner"], "os_mapping.reactivate", {
+      targetId: userId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+    const state = await getFoundationState();
+    const mapping = getOsMapping(state.db, userId);
+    if (!mapping) {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.reactivate",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "deny",
+        reason: "no_mapping",
+      });
+      return c.json({ error: "no_mapping", reason: "no_mapping" }, 404);
+    }
+    // Reactivation re-runs the full eligibility validation (§2 — suspension is
+    // never auto-reversed).
+    const facts = gatherOsAccountFacts(
+      mapping.osUsername,
+      osMappingProtectedPaths(),
+    );
+    const drift =
+      !facts.exists ||
+      facts.uid !== mapping.osUid ||
+      facts.gid !== mapping.osGid;
+    const eligibility = evaluateOsAccountEligibility(
+      facts,
+      resolveEligibilityPolicy(process.env),
+    );
+    if (drift || !eligibility.ok) {
+      const reason = drift
+        ? "drift"
+        : `ineligible:${!eligibility.ok ? eligibility.reason : "unknown"}`;
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.reactivate",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "deny",
+        reason,
+      });
+      return c.json({ error: "reactivate_refused", reason }, 409);
+    }
+    reactivateOsMapping(state.db, { userId });
+    writeAuditEvent(state.db, {
+      actorUserId: gate.ownerId,
+      action: "os_mapping.reactivate",
+      resourceType: "user",
+      resourceId: userId,
+      decision: "allow",
+    });
+    return c.json({ mapping: getOsMapping(state.db, userId) });
+  });
+
+  app.delete("/api/os-mappings/:userId", async (c) => {
+    const userId = c.req.param("userId");
+    const gate = await requireRole(c, ["owner"], "os_mapping.delete", {
+      targetId: userId,
+    });
+    if (!gate.ok) return c.json(gate.body, gate.status as never);
+    const state = await getFoundationState();
+    const mapping = getOsMapping(state.db, userId);
+    if (!mapping) {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.delete",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "deny",
+        reason: "no_mapping",
+      });
+      return c.json({ error: "no_mapping", reason: "no_mapping" }, 404);
+    }
+    // Refuse while a brokered session is still recorded active (integrated-review
+    // #2): check the PERSISTED sessions, not just in-memory `terminals` (which is
+    // empty after a restart while a brokered tmux server may still be alive).
+    const persistedActive = state.db
+      .query(
+        "SELECT 1 FROM terminal_sessions WHERE actor_user_id = ? AND status = 'active' AND exec_kind = 'brokered' LIMIT 1",
+      )
+      .get(userId);
+    if (persistedActive) {
+      writeAuditEvent(state.db, {
+        actorUserId: gate.ownerId,
+        action: "os_mapping.delete",
+        resourceType: "user",
+        resourceId: userId,
+        decision: "deny",
+        reason: "live_brokered_sessions",
+      });
+      return c.json(
+        { error: "live_brokered_sessions", reason: "live_brokered_sessions" },
+        409,
+      );
+    }
+    // Tear down any residual sessions BEFORE removing the mapping (Codex #6 +
+    // integrated-review #2): killUserSessions + the per-uid tmux-server scope
+    // need the uid, so brokerKill the server scope while we still hold it, then
+    // delete the mapping.
+    await killUserSessions(userId, "os_mapping_deleted");
+    try {
+      await brokerKill({ tmuxServerUid: mapping.osUid });
+    } catch (err) {
+      debug(`[os-mapping] brokerKill tmux-server failed for ${userId}`, err);
+    }
+    deleteOsMapping(state.db, userId);
+    writeAuditEvent(state.db, {
+      actorUserId: gate.ownerId,
+      action: "os_mapping.delete",
+      resourceType: "user",
+      resourceId: userId,
+      decision: "allow",
+    });
+    return c.json({ ok: true });
+  });
+
   // Server stats endpoint (CPU, RAM, Disk)
   app.get("/api/stats", async (c) => {
     const os = await import("os");
@@ -4083,6 +4592,10 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/start", async (c) => {
     const { ownerId, ownerEmail } = getCurrentUser(c);
+    // Task workspaces spawn agent PTYs as the service account — a B4 surface,
+    // denied under isolation until B4 brokers them (§4.3, inv 17).
+    const taskDeny = await denyIfOsIsolationPending(c, "tasks");
+    if (taskDeny) return c.json(taskDeny.body, taskDeny.status);
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
       const creationError = getTerminalCreationError(ownerId);
@@ -4113,6 +4626,8 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/run-checks", async (c) => {
     const { ownerId } = getCurrentUser(c);
+    const checkDeny = await denyIfOsIsolationPending(c, "tasks");
+    if (checkDeny) return c.json(checkDeny.body, checkDeny.status);
     try {
       return c.json(await taskRunner.runChecks(c.req.param("id"), { ownerId }));
     } catch (err) {
@@ -4122,6 +4637,8 @@ export function createWebApp() {
 
   app.post("/api/tasks/:id/judge", async (c) => {
     const { ownerId, ownerEmail } = getCurrentUser(c);
+    const judgeDeny = await denyIfOsIsolationPending(c, "tasks");
+    if (judgeDeny) return c.json(judgeDeny.body, judgeDeny.status);
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
       const prompt = await taskRunner.buildJudgePrompt(task.id, { ownerId });
@@ -4280,6 +4797,20 @@ export function createWebApp() {
       );
     }
 
+    // B2 OS isolation (§4.3): resolve legacy vs brokered vs deny. Off ⇒ legacy
+    // (byte-identical). A deny is audited + 403'd here; a drift/ineligibility
+    // deny also tore down the user's live sessions inside the resolver path.
+    const execResolution = await resolvePtyExecutionContext(
+      state,
+      actor,
+      ownerId,
+      resolvedCwd,
+    );
+    if (!execResolution.ok) {
+      return c.json(execResolution.body, execResolution.status);
+    }
+    const exec = execResolution.exec;
+
     rateLimitState.record();
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
@@ -4287,6 +4818,7 @@ export function createWebApp() {
       rows: body.rows || 30,
       ownerId,
       ownerEmail,
+      exec,
     });
 
     const rootId = resolveFoundationRootIdForPath(state, resolvedCwd);
@@ -4296,6 +4828,10 @@ export function createWebApp() {
       rootId,
       cwd: resolvedCwd,
       status: "active",
+      // Persist the execution kind so the isolation reconcile refuses to
+      // resurrect non-brokered sessions after a restart (§4.4, Codex #8).
+      execKind: exec ? "brokered" : "legacy",
+      osUid: exec?.uid ?? null,
     });
 
     // Post-registration recheck (Fix 2, invariant §9.2/§9.7): the terminal
@@ -4331,13 +4867,56 @@ export function createWebApp() {
       }
     }
 
+    // Post-registration mapping recheck for brokered terminals (integrated-
+    // review #4): closes the resolve→spawn race where a suspend/delete/drift
+    // lands between the first resolution and the PTY spawn. Re-resolving here
+    // (and only for a brokered terminal) catches it — a deny already suspended
+    // the mapping and ran the kill path, and any uid change is a divergent
+    // identity — so we tear the just-created terminal down and 403.
+    if (exec) {
+      const recheck = await resolvePtyExecutionContext(
+        state,
+        actor,
+        ownerId,
+        resolvedCwd,
+      );
+      if (
+        !recheck.ok ||
+        !recheck.exec ||
+        recheck.exec.uid !== exec.uid ||
+        recheck.exec.gid !== exec.gid
+      ) {
+        await killSingleTerminal(state, terminal, "os_mapping_postcheck");
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.create",
+          resourceType: "terminal",
+          resourceId: terminal.id,
+          decision: "deny",
+          reason: "os_mapping_postcheck",
+          data: { cwd: resolvedCwd, os_uid: exec.uid },
+        });
+        return c.json(
+          { error: "OS isolation denied", reason: "os_mapping_postcheck" },
+          403,
+        );
+      }
+    }
+
     writeAuditEvent(state.db, {
       actorUserId: ownerId,
       action: "terminal.create",
       resourceType: "terminal",
       resourceId: terminal.id,
       decision: "allow",
-      data: { cwd: resolvedCwd },
+      data: exec
+        ? {
+            cwd: resolvedCwd,
+            brokered: true,
+            os_uid: exec.uid,
+            os_username: exec.osUsername,
+          }
+        : { cwd: resolvedCwd },
     });
 
     return c.json(serializeTerminal(terminal));
@@ -4378,6 +4957,33 @@ export function createWebApp() {
       return c.json(creationError.body, creationError.status);
     }
 
+    // A linked view spawns a NEW client, so it goes through the resolver
+    // chokepoint again (integrated-review #1) — never reuse the source's cached
+    // exec. If the mapping was suspended/drifted/made-ineligible since the
+    // source was created, this denies + audits + tears down (via the resolver),
+    // and a brokered result must match the source session's uid.
+    const state = await getFoundationState();
+    const linkExec = await resolvePtyExecutionContext(
+      state,
+      actor,
+      ownerId,
+      sourceTerm.cwd,
+    );
+    if (!linkExec.ok) {
+      return c.json(linkExec.body, linkExec.status);
+    }
+    if (
+      sourceTerm.exec &&
+      (!linkExec.exec || linkExec.exec.uid !== sourceTerm.exec.uid)
+    ) {
+      // The source is brokered but the re-resolve no longer yields the same uid
+      // (mapping changed) — refuse rather than attach a divergent identity.
+      return c.json(
+        { error: "OS isolation denied", reason: "os_mapping_changed" },
+        403,
+      );
+    }
+
     rateLimitState.record();
 
     const tmuxInfo = await getTmuxSessionInfo(sourceTerm.sessionName).catch(
@@ -4390,14 +4996,16 @@ export function createWebApp() {
       ownerId,
       ownerEmail,
       sessionName: sourceTerm.sessionName,
+      exec: linkExec.exec,
     });
-    const state = await getFoundationState();
     recordTerminalSession(state.db, {
       id: terminal.id,
       actorUserId: ownerId,
       rootId: resolveFoundationRootIdForPath(state, terminal.cwd),
       cwd: terminal.cwd,
       status: "active",
+      execKind: linkExec.exec ? "brokered" : "legacy",
+      osUid: linkExec.exec?.uid ?? null,
     });
 
     return c.json(serializeTerminal(terminal));
@@ -4516,7 +5124,7 @@ export function createWebApp() {
     markTerminalSessionEnded(state.db, id);
     closeTerminalSockets(id);
     removeTerminalState(id);
-    await killTmuxSessionIfLast(term.sessionName);
+    await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
 
     term.proc.kill();
     term.terminal.close();
@@ -6220,6 +6828,48 @@ export async function startWebServer(host: string, port: number) {
     );
   }
 
+  // B2 (§4.4.1, B1 §1.2, invariant §7.15): `cloudflare-tunnel` publish mode
+  // trusts an edge proxy for identity. On a NON-loopback bind that trust is
+  // only sound if a real proxy fronts the port; refuse to start bound to a
+  // public interface unless the operator explicitly accepts that
+  // (DECKTERM_DANGEROUSLY_TRUST_PROXY_HEADERS=1). Dev/CI (loopback) and prod
+  // (access mode, not tunnel) are unaffected.
+  if (
+    !hasExplicitLegacyDevActorMode(process.env) &&
+    isEdgeProtectedTunnelMode(process.env) &&
+    !isLoopbackHost(host) &&
+    process.env.DECKTERM_DANGEROUSLY_TRUST_PROXY_HEADERS !== "1"
+  ) {
+    throw new Error(
+      `DECKTERM_PUBLISH_MODE=cloudflare-tunnel refuses to bind non-loopback host ${host}: ` +
+        "in tunnel mode identity is edge-asserted, so a public bind is only safe " +
+        "behind a trusted proxy. Bind a loopback address, or set " +
+        "DECKTERM_DANGEROUSLY_TRUST_PROXY_HEADERS=1 to accept the risk.",
+    );
+  }
+
+  // B2 (§4.4.2, invariant §7.15): isolation mode has no meaning without a
+  // working broker — fail closed rather than silently run every mapped user on
+  // the service account. Only the flag-on path pays this check (legacy startups
+  // are byte-identical). Exempt ONLY CI/test (integrated-review #5), where no
+  // broker is installed and a brokered spawn would still fail closed at
+  // runtime — a real dev/prod deploy with isolation on DOES check the broker.
+  const isCiOrTestEnv =
+    process.env.CI === "true" ||
+    process.env.NODE_ENV === "test" ||
+    process.env.BUN_ENV === "test";
+  if (process.env.DECKTERM_OS_ISOLATION === "1" && !isCiOrTestEnv) {
+    const brokerOk = await brokerCheck(process.env);
+    if (!brokerOk) {
+      throw new Error(
+        "DECKTERM_OS_ISOLATION=1 but the launch broker self-check failed. Install/repair it " +
+          "(scripts/broker/install-broker.sh --service-user <acct>) so `sudo -n " +
+          "/usr/local/lib/deckterm/deckterm-broker check` returns 0, then restart. Refusing to " +
+          "start in a half-isolated state where mapped users would fall back to the service account.",
+      );
+    }
+  }
+
   // B3 §1.6 multiuser enablement gate (fail-closed startup, plan
   // docs/plans/2026-07-03-b3-user-provisioning-roles-revocation.md §6,
   // invariant §9.8). DECKTERM_OS_ISOLATION is the only multiuser flag until
@@ -6784,7 +7434,11 @@ export async function startWebServer(host: string, port: number) {
           closeTerminalSockets(id);
           removeTerminalState(id);
           try {
-            await killTmuxSessionIfLast(term.sessionName);
+            await killTmuxSessionIfLast(
+              term.sessionName,
+              undefined,
+              term.backend,
+            );
           } catch (err) {
             if (term.sessionName) {
               debug(`[cleanup] tmux kill-session error for ${id}:`, err);
@@ -6831,7 +7485,11 @@ export async function startWebServer(host: string, port: number) {
           removeTerminalState(id);
 
           try {
-            await killTmuxSessionIfLast(term.sessionName);
+            await killTmuxSessionIfLast(
+              term.sessionName,
+              undefined,
+              term.backend,
+            );
           } catch (err) {
             if (term.sessionName) {
               debug(`[reaper] tmux kill-session error for ${id}:`, err);
