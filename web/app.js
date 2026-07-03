@@ -4503,6 +4503,13 @@ class SettingsManager {
     this.envLoaded = false;
     this.envRows = [];
     this.root = null;
+    // B3-S5: role-gated "Users" category, appended after the schema-derived
+    // categories (never disturbs their order). Visibility + the resolved
+    // actor come from GET /api/foundation/status (fetched once per open).
+    this.usersAdmin = window.UsersAdmin || null;
+    this.usersAdminVisible = false;
+    this.usersAdminCurrentUser = null;
+    this.usersAdminController = null;
   }
 
   // Build (once) the detached content element the SurfaceWindow will host.
@@ -4546,6 +4553,9 @@ class SettingsManager {
   renderSidebar() {
     if (!this.sidebarEl) return;
     const categories = window.SettingsSchema?.categoriesOf?.(this.schema) || [];
+    // Appended AFTER the schema-derived categories so their order/tests are
+    // undisturbed; absent entirely for members/disabled/logged-out actors.
+    if (this.usersAdminVisible) categories.push("Users");
     if (!this.activeCategory && categories.length) {
       this.activeCategory = categories[0];
     }
@@ -4569,6 +4579,14 @@ class SettingsManager {
   renderList() {
     if (!this.listEl || !this.ui) return;
     this.listEl.replaceChildren();
+
+    // "Users" is a custom, non-schema category (B3-S5) — its panel is owned
+    // by the users-admin module, not the settings-schema group/search view.
+    if (this.activeCategory === "Users" && this.usersAdminVisible) {
+      this.renderSidebar();
+      this.renderUsersPanel();
+      return;
+    }
 
     const trimmed = this.query.trim();
     let groups;
@@ -4740,6 +4758,45 @@ class SettingsManager {
     return section;
   }
 
+  // Fetches /api/foundation/status and derives Users-category visibility +
+  // the resolved actor for the users-admin module's gate (shouldShowUsersCategory
+  // — plan §7 Codex #15: non-null user, role owner|admin, disabled === false).
+  // Any fetch/parse failure hides the category (fail-closed, matches the
+  // server's own deny-by-default posture).
+  async loadUsersAdminStatus() {
+    this.usersAdminVisible = false;
+    this.usersAdminCurrentUser = null;
+    if (!this.fetchImpl || !this.usersAdmin) return;
+    try {
+      const res = await this.fetchImpl("/api/foundation/status");
+      if (!res || !res.ok) return;
+      const status = await res.json();
+      this.usersAdminCurrentUser = status?.auth?.user || null;
+      this.usersAdminVisible = Boolean(
+        this.usersAdmin.shouldShowUsersCategory?.(status),
+      );
+    } catch {
+      // Non-fatal — the category is simply absent.
+    }
+  }
+
+  // Mounts the users-admin DOM controller into a fresh host inside the
+  // settings list. The controller owns its own fetch/render/action wiring
+  // (web/users-admin.js); this is intentionally the entire integration point.
+  renderUsersPanel() {
+    if (!this.usersAdmin) return;
+    const host = document.createElement("div");
+    host.className = "users-admin-host";
+    this.listEl.appendChild(host);
+    if (!this.usersAdminController) {
+      this.usersAdminController = new this.usersAdmin.UsersAdminController({
+        fetchImpl: this.fetchImpl,
+        getCurrentUser: () => this.usersAdminCurrentUser,
+      });
+    }
+    this.usersAdminController.mount(host);
+  }
+
   async loadServerConfig() {
     if (this.envLoaded || !this.fetchImpl) return;
     try {
@@ -4757,6 +4814,7 @@ class SettingsManager {
 
   async render() {
     this.buildContent();
+    await this.loadUsersAdminStatus();
     this.renderSidebar();
     this.renderList();
     await this.loadServerConfig();
