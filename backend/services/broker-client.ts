@@ -37,10 +37,16 @@ export type BrokerExecContext = {
 };
 
 export type BrokerSpawnOptions = BrokerExecContext & {
-  profile: "pty" | "tmux" | "fs";
+  profile: "pty" | "tmux" | "fs" | "git" | "search";
   cols?: number;
   rows?: number;
-  /** Extra profile args (e.g. tmux subcommand argv). Never a shell string. */
+  /**
+   * For `git`/`search` profiles: the subdirectory (relative to the granted root
+   * passed as `cwd`) the tool runs in. The broker resolves it fd-safely beneath
+   * the root as the dropped user, so a symlinked component can't escape the root.
+   */
+  reldir?: string;
+  /** Extra profile args (e.g. tmux subcommand / git argv). Never a shell string. */
   profileArgs?: string[];
   /**
    * For `exec_stdin` profiles (B4 `fs` helper): a single request payload written
@@ -85,6 +91,7 @@ export function buildBrokerArgv(
     "--profile",
     opts.profile,
   ];
+  if (opts.reldir != null) argv.push("--reldir", opts.reldir);
   if (opts.cols != null) argv.push("--cols", String(opts.cols));
   if (opts.rows != null) argv.push("--rows", String(opts.rows));
   if (opts.profileArgs && opts.profileArgs.length > 0) {

@@ -45,6 +45,65 @@
       },
       "runtime_max_sec": 30,
       "nofile": 256
+    },
+    "git": {
+      "kind": "git",
+      "git_path": "/usr/bin/git",
+      "properties": {
+        "MemoryMax": "1G",
+        "TasksMax": "64",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 1024
+    },
+    "search": {
+      "kind": "search",
+      "grep_path": "/usr/bin/grep",
+      "properties": {
+        "MemoryMax": "512M",
+        "TasksMax": "16",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 256
     }
-  }
+  },
+  "search_secret_excludes": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.pkcs12",
+    "*.keystore",
+    "*.jks",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "*.ppk",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".htpasswd",
+    "*token*",
+    "*secret*",
+    "*credential*",
+    "*password*",
+    "*.kdbx"
+  ],
+  "search_exclude_dirs": [
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    "out",
+    "target",
+    "coverage",
+    ".cache"
+  ]
 }

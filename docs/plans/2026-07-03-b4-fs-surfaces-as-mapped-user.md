@@ -213,9 +213,16 @@ resolves **inside** the granted root — so a `.git` above the grant can't be di
 
 **Hardening env (fixed, per D-B4-6):** `GIT_CONFIG_GLOBAL=/dev/null
 GIT_CONFIG_SYSTEM=/dev/null GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 GIT_LITERAL_PATHSPECS=1
-GIT_CEILING_DIRECTORIES=<root> HOME=<user home>`; base argv carries `-c core.pager=cat
--c core.fsmonitor=false`. `GIT_LITERAL_PATHSPECS=1` neutralizes `:(top)`/`:/`/`:(glob)` pathspec
-magic (Codex #3), so a relpath operand can only ever mean a literal path under cwd.
+GIT_CEILING_DIRECTORIES=<parent-of-root> HOME=<user home>`; base argv carries `-c core.pager=cat
+-c core.fsmonitor=false -c core.hooksPath=/dev/null`, and `diff`/`show` add `--no-ext-diff
+--no-textconv`. `GIT_LITERAL_PATHSPECS=1` neutralizes `:(top)`/`:/`/`:(glob)` pathspec magic
+(Codex #3), so a relpath operand can only ever mean a literal path under cwd. **Ceiling is the
+root's PARENT** (S2 Codex #1) — a `.git` at the granted root is still discovered, but discovery
+never climbs above it. **Containment scope (S2 Codex #2/#4):** with config/pager/hooks/ext-diff/
+textconv execution neutralized, the hard guarantee is **cross-uid** isolation; fine-grained root
+containment within one uid is best-effort (mount-namespace/chroot is 1.1 container work). The
+broker resolves cwd from the canonical (realpath'd) root, so the fd walk and git's ceiling agree
+(S2 Codex #3).
 
 Broker-side argv schema table (S2 tmux pattern — validated token-by-token, canonical argv
 rebuilt by the broker, never caller strings passed through):

@@ -326,7 +326,8 @@ def _registry_ready(cfg):
     return d
 
 
-def write_drop_record(cfg, session, unit, pw, gid, groups, cwd, argv, env, nofile):
+def write_drop_record(cfg, session, unit, pw, gid, groups, cwd, argv, env, nofile,
+                      extra=None):
     d = _registry_ready(cfg)
     token = secrets.token_hex(16)
     record = {
@@ -344,6 +345,8 @@ def write_drop_record(cfg, session, unit, pw, gid, groups, cwd, argv, env, nofil
         "env": env,
         "nofile": nofile,
     }
+    if extra:
+        record.update(extra)
     path = os.path.join(d, token + ".json")
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as fh:
@@ -753,6 +756,277 @@ def provision_capture_dir(cfg, session, uid):
         os.close(dfd)
 
 
+# --------------------------------------------------------------------------
+# git / search profiles (B4 §3/§4). Every subcommand argv is REBUILT from a
+# fixed schema — the caller's tokens are validated piecewise and a canonical
+# argv is emitted, so no caller string ever reaches git/grep unchecked. cwd is
+# NOT a caller string either: it is resolved fd-safely beneath the granted root
+# post-drop (see do_drop, cwd_mode="fd_beneath").
+# --------------------------------------------------------------------------
+
+GIT_REV_RE = re.compile(r"^[A-Za-z0-9._/@{}~^-]{1,128}$")
+GIT_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
+# The exact --format strings the routes emit (B4 inventory). Only these pass.
+GIT_FORMATS = {"", "%(refname:short)", "%h|%H|%s|%an|%aI", "%gd%x09%s"}
+
+
+def _git_rev(tok):
+    if not tok or tok.startswith("-") or not GIT_REV_RE.match(tok):
+        die("git rev token not allowed: %r" % tok)
+    return tok
+
+
+def _git_name(tok):
+    if (not tok or tok.startswith("-") or tok.startswith(".")
+            or not GIT_NAME_RE.match(tok)):
+        die("git name token not allowed: %r" % tok)
+    return tok
+
+
+def _git_relpath(tok):
+    if (tok is None or tok == "" or tok.startswith("-") or tok.startswith(":")
+            or tok.startswith("/") or "\x00" in tok):
+        die("git path not allowed: %r" % tok)
+    for seg in tok.split("/"):
+        if seg in (".", ".."):
+            die("git path segment not allowed: %r" % tok)
+    return tok
+
+
+def _git_fmt(tok):
+    if not tok.startswith("--format="):
+        die("git format flag not allowed: %r" % tok)
+    val = tok[len("--format="):]
+    if val not in GIT_FORMATS:
+        die("git format value not allowlisted: %r" % val)
+    return "--format=" + val
+
+
+def _git_dashsep(rest):
+    if not rest or rest[0] != "--":
+        die("expected -- <paths>")
+    return ["--"] + [_git_relpath(p) for p in rest[1:]]
+
+
+def build_git_argv(git_path, operands):
+    if not operands:
+        die("git requires a subcommand")
+    sub = operands[0]
+    rest = operands[1:]
+    # Fixed hardening -c options prepended by the broker (B4 §3, D-B4-6): pager,
+    # fsmonitor, and hooks can execute commands from repo-local config; neutralize
+    # them. GIT_CONFIG_*, CEILING, and LITERAL_PATHSPECS are set via env in
+    # build_git_env(). External diff / textconv drivers are killed per-subcommand
+    # below with --no-ext-diff / --no-textconv (Codex S2 #2). Note: this bounds
+    # git's execution surface but is UID containment, not a chroot — see §3.4.
+    base = [git_path, "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null"]
+
+    def out(args):
+        return base + args
+
+    if sub == "status":
+        argv = ["status"]
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t in ("--porcelain", "-uall", "-b", "-z"):
+                argv.append(t)
+            elif t == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+                break
+            else:
+                die("git status arg not allowed: %r" % t)
+            i += 1
+        if "--porcelain" not in argv:
+            die("git status requires --porcelain")
+        return out(argv)
+    if sub == "rev-parse":
+        if rest == ["--show-toplevel"]:
+            return out(["rev-parse", "--show-toplevel"])
+        die("git rev-parse form not allowed: %r" % rest)
+    if sub == "diff":
+        # --no-ext-diff/--no-textconv kill repo-local external diff/textconv
+        # drivers that would otherwise run as the uid (Codex S2 #2).
+        argv = ["diff"]
+        i = 0
+        if i < len(rest) and rest[i] == "--staged":
+            argv.append("--staged")
+            i += 1
+        if i < len(rest) and rest[i] == "--color=never":
+            argv.append("--color=never")
+            i += 1
+        else:
+            die("git diff requires --color=never")
+        argv += ["--no-ext-diff", "--no-textconv"]
+        if i < len(rest):
+            if rest[i] == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+            else:
+                die("git diff trailing arg not allowed: %r" % rest[i:])
+        return out(argv)
+    if sub == "show":
+        if len(rest) >= 2 and rest[0] == "--format=":
+            if rest[1] != "--color=never" or len(rest) != 3:
+                die("git show form not allowed: %r" % rest)
+            return out(["show", "--format=", "--color=never", "--no-ext-diff",
+                        "--no-textconv", _git_rev(rest[2])])
+        if len(rest) == 2 and rest[1] == "--":
+            combined = rest[0]
+            if ":" not in combined:
+                die("git show expects <ref>:<path>")
+            ref, path = combined.split(":", 1)
+            if ref != "" and (ref.startswith("-") or not GIT_REV_RE.match(ref)):
+                die("git show ref not allowed: %r" % ref)
+            _git_relpath(path)
+            return out(["show", "--no-textconv", "%s:%s" % (ref, path), "--"])
+        die("git show form not allowed: %r" % rest)
+    if sub == "diff-tree":
+        if len(rest) == 5 and rest[:4] == ["--no-commit-id", "--name-status", "-r", "--root"]:
+            return out(["diff-tree", "--no-commit-id", "--name-status", "-r",
+                        "--root", _git_rev(rest[4])])
+        die("git diff-tree form not allowed: %r" % rest)
+    if sub == "add":
+        return out(["add"] + _git_dashsep(rest))
+    if sub == "restore":
+        if rest[:1] and rest[0] in ("--staged", "--worktree"):
+            return out(["restore", rest[0]] + _git_dashsep(rest[1:]))
+        die("git restore requires --staged/--worktree -- <paths>")
+    if sub == "commit":
+        argv = ["commit"]
+        i = 0
+        if i < len(rest) and rest[i] == "--amend":
+            argv.append("--amend")
+            i += 1
+        if i + 1 < len(rest) and rest[i] == "-m" and "\x00" not in rest[i + 1]:
+            argv += ["-m", rest[i + 1]]
+            i += 2
+        else:
+            die("git commit requires -m <message>")
+        if i != len(rest):
+            die("git commit trailing args: %r" % rest[i:])
+        return out(argv)
+    if sub == "branch":
+        if rest == ["-a", "--format=%(refname:short)"]:
+            return out(["branch", "-a", "--format=%(refname:short)"])
+        if len(rest) == 1:
+            return out(["branch", _git_name(rest[0])])
+        if len(rest) == 2 and rest[0] in ("-d", "-D"):
+            return out(["branch", rest[0], _git_name(rest[1])])
+        die("git branch form not allowed: %r" % rest)
+    if sub == "checkout":
+        if len(rest) == 2 and rest[0] == "-b":
+            return out(["checkout", "-b", _git_name(rest[1])])
+        if len(rest) == 2 and rest[1] == "--":
+            return out(["checkout", _git_name(rest[0]), "--"])
+        die("git checkout form not allowed: %r" % rest)
+    if sub == "log":
+        argv = ["log"]
+        i = 0
+        if i < len(rest) and rest[i].startswith("--max-count="):
+            val = rest[i][len("--max-count="):]
+            if not val.isdigit() or int(val) > 100000:
+                die("git log max-count out of range: %r" % rest[i])
+            argv.append("--max-count=%d" % int(val))
+            i += 1
+        else:
+            die("git log requires --max-count=<n>")
+        if i < len(rest) and rest[i].startswith("--format="):
+            argv.append(_git_fmt(rest[i]))
+            i += 1
+        else:
+            die("git log requires --format=")
+        if i < len(rest) and rest[i] == "--graph":
+            argv.append("--graph")
+            i += 1
+        if i < len(rest):
+            if rest[i] == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+            else:
+                die("git log trailing arg not allowed: %r" % rest[i:])
+        return out(argv)
+    if sub == "stash":
+        if rest[:1] == ["list"]:
+            if rest == ["list", "--format=%gd%x09%s"]:
+                return out(["stash", "list", "--format=%gd%x09%s"])
+            die("git stash list form not allowed: %r" % rest)
+        if rest[:1] == ["push"]:
+            argv = ["stash", "push"]
+            i = 1
+            if i < len(rest) and rest[i] == "--include-untracked":
+                argv.append("--include-untracked")
+                i += 1
+            if i + 1 < len(rest) and rest[i] == "-m" and "\x00" not in rest[i + 1]:
+                argv += ["-m", rest[i + 1]]
+                i += 2
+            if i != len(rest):
+                die("git stash push trailing args: %r" % rest[i:])
+            return out(argv)
+        if rest and rest[0] in ("pop", "apply", "drop"):
+            argv = ["stash", rest[0]]
+            if len(rest) == 2:
+                m = re.match(r"^stash@\{(\d+)\}$", rest[1])
+                if not m or int(m.group(1)) > 10000:
+                    die("git stash ref not allowed: %r" % rest[1])
+                argv.append("stash@{%d}" % int(m.group(1)))
+            elif len(rest) != 1:
+                die("git stash form not allowed: %r" % rest)
+            return out(argv)
+        die("git stash subcommand not allowed: %r" % rest)
+    if sub == "clean":
+        if rest[:2] == ["-f", "--"]:
+            return out(["clean", "-f", "--"] + [_git_relpath(p) for p in rest[2:]])
+        die("git clean form not allowed: %r" % rest)
+    die("git subcommand not allowed: %r" % sub)
+
+
+def build_git_env(cfg, pw, root_abs):
+    # Hardening env (B4 §3, D-B4-6): neutralize global/system config execution,
+    # forbid credential prompts + optional locks, disable pathspec magic, and cap
+    # repo discovery to the granted root. The repo's OWN config still applies (the
+    # repo is the user's — commits author as the mapped user); containment is to
+    # the granted root + the mapped uid, not sandboxing the user from themselves.
+    env = build_child_env(cfg, pw, 80, 24)
+    # Ceiling must be the root's PARENT, not the root itself: a ceiling stops
+    # discovery BEFORE entering the listed dir, so ceiling=root would hide a .git
+    # that lives AT the granted root. Parent lets git check the root but never
+    # climb above it (Codex S2 #1). root_abs is already canonical (see do_spawn).
+    parent = os.path.dirname(root_abs.rstrip("/")) or "/"
+    env.update({
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_LITERAL_PATHSPECS": "1",
+        "GIT_CEILING_DIRECTORIES": parent,
+    })
+    env.pop("COLUMNS", None)
+    env.pop("LINES", None)
+    return env
+
+
+def build_search_argv(grep_path, operands, cfg):
+    if not operands:
+        die("search requires a pattern")
+    mode = "-F"
+    i = 0
+    if operands[0] in ("-F", "-E"):
+        mode = operands[0]
+        i = 1
+    if i + 1 != len(operands):
+        die("search takes exactly [mode] <pattern>")
+    pattern = operands[i]
+    if "\x00" in pattern:
+        die("search pattern contains NUL")
+    argv = [grep_path, "-rnIZ", mode]
+    for g in cfg.get("search_secret_excludes", []):
+        argv.append("--exclude=%s" % g)
+    for d in cfg.get("search_exclude_dirs", []):
+        argv.append("--exclude-dir=%s" % d)
+    argv += ["-e", pattern, "."]
+    return argv
+
+
 def assemble_argv(cfg, profile, pw, cwd, cols, rows, extra_args, session):
     kind = profile.get("kind")
     if kind == "pty":
@@ -776,6 +1050,12 @@ def assemble_argv(cfg, profile, pw, cwd, cols, rows, extra_args, session):
             die("exec_stdin helper not a regular file: %s" % exec_path)
         _assert_root_owned_safe(exec_path, est, world_writable_ok=False)
         return [exec_path]
+    if kind == "git":
+        git_path = profile.get("git_path", "/usr/bin/git")
+        return build_git_argv(git_path, list(extra_args))
+    if kind == "search":
+        grep_path = profile.get("grep_path", "/usr/bin/grep")
+        return build_search_argv(grep_path, list(extra_args), cfg)
     if kind == "tmux":
         if not extra_args:
             die("tmux profile requires a subcommand")
@@ -877,10 +1157,39 @@ def do_spawn(cfg, args, is_exec):
     if kind == "tmux" and unit.startswith("deckterm-%s" % args.session):
         unit = "deckterm-%s-%s.scope" % (args.session, secrets.token_hex(4))
 
-    child_env = build_child_env(cfg, pw, args.cols, args.rows)
+    # cwd model. PTY/tmux/fs run in `cwd` (chdir post-drop). git/search instead
+    # take a granted ROOT + a relative subdir and resolve it fd-safely BENEATH the
+    # root as the dropped user (B4 §3/§4, D-B4-5) — a symlinked/swapped component
+    # cannot redirect the tool outside the root. The server passes the granted root
+    # as --cwd and the subdir as --reldir.
+    record_extra = {}
+    if kind in ("git", "search"):
+        reldir = args.reldir if args.reldir is not None else ""
+        # Validate reldir as a contained relative path (empty ⇒ the root itself).
+        # Reject empty/'.'/'..' segments so the recorded contract is strict and
+        # auditable (Codex S2 quality note); `cwd` (already realpath-canonical, not
+        # raw args.cwd) is the root so the fd walk and git's ceiling agree (S2 #3).
+        if reldir.startswith("/") or "\x00" in reldir:
+            die("--reldir must be relative and NUL-free")
+        if reldir != "":
+            for seg in reldir.split("/"):
+                if seg in ("", ".", ".."):
+                    die("--reldir segment not allowed: %r" % reldir)
+        record_extra = {"cwd_mode": "fd_beneath", "root_abs": cwd,
+                        "reldir": reldir}
+        if kind == "git":
+            child_env = build_git_env(cfg, pw, cwd)
+        else:
+            child_env = build_child_env(cfg, pw, args.cols, args.rows)
+            child_env["LC_ALL"] = "C"
+            child_env["PATH"] = "/usr/bin:/bin"
+            child_env.pop("COLUMNS", None)
+            child_env.pop("LINES", None)
+    else:
+        child_env = build_child_env(cfg, pw, args.cols, args.rows)
     token = write_drop_record(
         cfg, args.session, unit, pw, args.gid, groups, cwd, argv, child_env,
-        profile.get("nofile"),
+        profile.get("nofile"), extra=record_extra,
     )
 
     _log(verb="exec" if is_exec else "spawn", session=args.session,
@@ -889,6 +1198,48 @@ def do_spawn(cfg, args, is_exec):
 
     cmd = systemd_run_scope(cfg, unit, profile, token)
     os.execv(cmd[0], cmd)  # absolute path; replace self; scope runs on our stdio
+
+
+def _fchdir_beneath_root(root_abs, reldir):
+    """As the dropped user, open the granted root by a component-wise O_NOFOLLOW
+    walk from '/' (every ancestor fstat'd a real dir — no symlink swap), then walk
+    the relative subdir the same way, and fchdir into the result. A symlinked or
+    non-directory component anywhere ⇒ refuse. This is the git/search analogue of
+    the fs helper's fd-based containment (B4 §3, D-B4-5).
+
+    Scope (Codex S2 #2/#4): this bounds where the tool STARTS, and git runs with
+    hooks/pager/fsmonitor/ext-diff/textconv/global-config execution neutralized, so
+    the primary root-escape-via-config vectors are closed. But `fchdir` is not a
+    chroot: after it, git/grep do ordinary path resolution as the mapped uid, so
+    the hard boundary B4 guarantees is CROSS-UID isolation (Alice's uid cannot
+    reach Bob's files). Fine-grained root containment WITHIN one uid (a subdir grant
+    that a determined repo config could still read around) is best-effort in 1.0;
+    a mount-namespace/chroot boundary is the 1.1 container work (B1 D1)."""
+    if not os.path.isabs(root_abs):
+        die("root_abs must be absolute")
+    segs = [s for s in os.path.normpath(root_abs).split("/") if s]
+    if not segs:
+        die("root_abs must not be the filesystem root")
+    segs += [s for s in reldir.split("/") if s]
+    dirfd = os.open("/", os.O_PATH | os.O_DIRECTORY)
+    try:
+        for seg in segs:
+            if seg in (".", ".."):
+                die("unsafe cwd segment")
+            try:
+                nfd = os.open(
+                    seg, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd
+                )
+            except OSError as exc:
+                die("cwd_unsafe: %s (%s)" % (seg, os.strerror(exc.errno)))
+            os.close(dirfd)
+            dirfd = nfd
+        try:
+            os.fchdir(dirfd)
+        except OSError as exc:
+            die("fchdir failed: %s" % exc)
+    finally:
+        os.close(dirfd)
 
 
 def do_drop(cfg, token):
@@ -998,10 +1349,17 @@ def do_drop(cfg, token):
             except OSError as exc:
                 die("TIOCSCTTY failed: %s" % exc)
 
-    try:
-        os.chdir(cwd)
-    except OSError as exc:
-        die("chdir(%r) failed as user: %s" % (cwd, exc))
+    # cwd. git/search resolve their working dir fd-safely BENEATH the granted root
+    # as the now-dropped user (B4 §3/§4) — a symlinked/swapped component cannot
+    # redirect the tool outside the root. Everything else chdir's to the recorded
+    # cwd (already validated/realpath'd pre-drop).
+    if record.get("cwd_mode") == "fd_beneath":
+        _fchdir_beneath_root(record["root_abs"], record.get("reldir", ""))
+    else:
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            die("chdir(%r) failed as user: %s" % (cwd, exc))
 
     # Close every fd above stderr before handing control to the untrusted child
     # (Codex #2): systemd-run or the interpreter may have left a privileged fd
@@ -1097,6 +1455,7 @@ def build_parser():
         s.add_argument("--uid", type=int, required=True)
         s.add_argument("--gid", type=int, required=True)
         s.add_argument("--cwd", required=True)
+        s.add_argument("--reldir", default=None)  # git/search: subdir beneath cwd
         s.add_argument("--profile", required=True)
         s.add_argument("--cols", type=int, default=120)
         s.add_argument("--rows", type=int, default=30)
