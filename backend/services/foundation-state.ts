@@ -898,15 +898,48 @@ export function getTerminalSession(
 export function listTerminalSessionsForActor(
   db: Database,
   actorUserId: string,
+  options: {
+    /**
+     * Cap on ENDED sessions returned. The capped subset is SELECTED by
+     * ended-at recency (most recently ended survive the cap), but the
+     * returned list keeps the legacy presentation order: created_at DESC
+     * across active + ended alike. Active sessions are always returned in
+     * full. Ended rows past the cap stay in the DB for their retention TTL —
+     * this only bounds the listing, so the sessions UI / GET /api/terminals
+     * don't pay for weeks of dead rows. Omit for the unlimited legacy
+     * behavior.
+     */
+    endedLimit?: number;
+  } = {},
 ): RecordedTerminalSession[] {
-  const rows = db
-    .query(
-      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+  const endedLimit = options.endedLimit;
+  const capEnded =
+    typeof endedLimit === "number" &&
+    Number.isFinite(endedLimit) &&
+    endedLimit >= 0;
+  const query = capEnded
+    ? `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+       FROM terminal_sessions
+       WHERE actor_user_id = ?1 AND status != 'ended'
+       UNION ALL
+       SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+       FROM (
+         SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+         FROM terminal_sessions
+         WHERE actor_user_id = ?1 AND status = 'ended'
+         ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
+         LIMIT ?2
+       )
+       ORDER BY created_at DESC`
+    : `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
        FROM terminal_sessions
        WHERE actor_user_id = ?
-       ORDER BY created_at DESC`,
-    )
-    .all(actorUserId) as Array<{
+       ORDER BY created_at DESC`;
+  const rows = (
+    capEnded
+      ? db.query(query).all(actorUserId, Math.floor(endedLimit))
+      : db.query(query).all(actorUserId)
+  ) as Array<{
     id: string;
     actor_user_id: string | null;
     root_id: string | null;

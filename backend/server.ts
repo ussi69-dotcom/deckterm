@@ -231,6 +231,16 @@ const MAX_TERMINALS_PER_USER = parseInt(
   process.env.MAX_TERMINALS_PER_USER || "10",
   10,
 );
+// Cap on ended sessions in GET /api/terminals (recent-history rows in the
+// sessions drawer). Ended rows past the cap stay in the DB for their B6
+// retention TTL — this only bounds the listing and its per-row telemetry.
+const TERMINAL_LIST_ENDED_LIMIT = (() => {
+  const parsed = parseInt(
+    process.env.DECKTERM_TERMINAL_LIST_ENDED_LIMIT || "10",
+    10,
+  );
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 10;
+})();
 const RATE_LIMIT_WINDOW_MS = Math.max(
   1_000,
   parseInt(
@@ -5643,7 +5653,9 @@ export function createWebApp() {
       }
       throw err;
     }
-    const recordedSessions = listTerminalSessionsForActor(state.db, ownerId);
+    const recordedSessions = listTerminalSessionsForActor(state.db, ownerId, {
+      endedLimit: TERMINAL_LIST_ENDED_LIMIT,
+    });
     const seenIds = new Set<string>();
 
     const list = await Promise.all(
@@ -8247,6 +8259,13 @@ export async function startWebServer(host: string, port: number) {
     process.env.DECKTERM_SESSION_RETENTION_DAYS || "30",
     10,
   );
+  const STATE_EVENT_RETENTION_DAYS = (() => {
+    const parsed = parseInt(
+      process.env.DECKTERM_STATE_EVENT_RETENTION_DAYS || "2",
+      10,
+    );
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 2;
+  })();
   const retentionTick = async () => {
     if (RETENTION_DISABLED) return;
     try {
@@ -8257,11 +8276,12 @@ export async function startWebServer(host: string, port: number) {
         const result = await runRetentionPrune(state.db, {
           eventTtlDays: EVENT_RETENTION_DAYS,
           endedSessionTtlDays: SESSION_RETENTION_DAYS,
+          stateEventTtlDays: STATE_EVENT_RETENTION_DAYS,
           liveTerminalIds: new Set(terminals.keys()),
           now,
         });
         console.log(
-          `[retention] prune completed: output=${result.outputEventsPurged} expired=${result.expiredEventsPruned} endedSessions=${result.endedSessionsPruned}`,
+          `[retention] prune completed: output=${result.outputEventsPurged} expired=${result.expiredEventsPruned} staleState=${result.staleStateEventsPruned} endedSessions=${result.endedSessionsPruned}`,
         );
       }
       const lastCheckpoint = getLastSuccessfulRunAt(

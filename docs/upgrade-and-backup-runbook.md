@@ -138,7 +138,11 @@ on a non-loopback bind (bind loopback or switch to `cloudflare-access`).
 
 The retention scheduler prunes only `terminal_events` and ended `terminal_sessions` past
 their TTL (`DECKTERM_EVENT_RETENTION_DAYS` / `DECKTERM_SESSION_RETENTION_DAYS`, default 30)
-and runs weekly WAL checkpoints. It never runs `VACUUM` on its own — space reclaim is a
+and runs weekly WAL checkpoints. `state`-kind events additionally get a short TTL of their
+own (`DECKTERM_STATE_EVENT_RETENTION_DAYS`, default 2) that applies to live sessions too —
+they are best-effort reconnect-replay metadata, and a weeks-running agent terminal would
+otherwise accumulate them unboundedly (the live-id belt exempts every other kind and all
+session rows, unchanged). It never runs `VACUUM` on its own — space reclaim is a
 manual maintenance action (`bun scripts/db-maintenance.ts --vacuum`, run during a
 maintenance window; every backup is a compacted copy anyway). It never touches
 `audit_events` (audit pruning arrives with

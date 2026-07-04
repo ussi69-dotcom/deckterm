@@ -185,6 +185,99 @@ test("retention prune: output purge, TTL boundaries, ended-only, live-id exclusi
   db.close();
 });
 
+test("retention prune: state-event TTL prunes stale state events even for live sessions", async () => {
+  const { state, projectRoot } = await setupState();
+  const db = state.db;
+  const rootId = state.roots[0]?.id;
+  const now = new Date("2026-07-04T12:00:00Z");
+  const stale = new Date("2026-07-01T12:00:00Z"); // 3 days old — past the 2d state TTL, inside the 30d event TTL
+  const fresh = new Date("2026-07-04T11:00:00Z"); // 1 hour old
+
+  // Live session: stale + fresh state events, plus a stale lifecycle event.
+  addSession(db, "term-live", rootId, projectRoot, stale);
+  appendTerminalEvent(db, {
+    terminalId: "term-live",
+    kind: "state",
+    dataJson: { running: true },
+    now: stale,
+  });
+  appendTerminalEvent(db, {
+    terminalId: "term-live",
+    kind: "state",
+    dataJson: { running: false },
+    now: fresh,
+  });
+  appendTerminalEvent(db, {
+    terminalId: "term-live",
+    kind: "lifecycle",
+    dataJson: { phase: "spawn" },
+    now: stale,
+  });
+
+  // Ended session inside the session TTL: stale + fresh state events.
+  addSession(db, "term-ended", rootId, projectRoot, stale);
+  appendTerminalEvent(db, {
+    terminalId: "term-ended",
+    kind: "state",
+    dataJson: { running: true },
+    now: stale,
+  });
+  appendTerminalEvent(db, {
+    terminalId: "term-ended",
+    kind: "state",
+    dataJson: { running: false },
+    now: fresh,
+  });
+  endSession(db, "term-ended", fresh.toISOString());
+
+  const result = await runRetentionPrune(db, {
+    eventTtlDays: 30,
+    endedSessionTtlDays: 30,
+    stateEventTtlDays: 2,
+    liveTerminalIds: new Set(["term-live"]),
+    now,
+    chunkSize: 100,
+  });
+
+  // Stale state events die on BOTH the live and the ended session — state
+  // events are transient replay metadata, exempt from the I3 live belt.
+  expect(result.staleStateEventsPruned).toBe(2);
+
+  const kindsFor = (id: string) =>
+    db
+      .query(
+        "SELECT kind, created_at FROM terminal_events WHERE terminal_id = ? ORDER BY id",
+      )
+      .all(id) as Array<{ kind: string; created_at: string }>;
+
+  // Live session keeps the fresh state event and the stale lifecycle event
+  // (non-state kinds stay under the I3 belt).
+  expect(kindsFor("term-live")).toEqual([
+    { kind: "state", created_at: fresh.toISOString() },
+    { kind: "lifecycle", created_at: stale.toISOString() },
+  ]);
+  // Ended session keeps only its fresh state event.
+  expect(kindsFor("term-ended")).toEqual([
+    { kind: "state", created_at: fresh.toISOString() },
+  ]);
+
+  // Session rows are untouched by the state-event stage.
+  expect(countRows(db, "terminal_sessions")).toBe(2);
+
+  // Idempotence.
+  const second = await runRetentionPrune(db, {
+    eventTtlDays: 30,
+    endedSessionTtlDays: 30,
+    stateEventTtlDays: 2,
+    liveTerminalIds: new Set(["term-live"]),
+    now,
+    chunkSize: 100,
+  });
+  expect(second.staleStateEventsPruned).toBe(0);
+
+  db.close();
+});
+
 test("retention prune: chunked deletion crosses chunk boundaries correctly", async () => {
   const { state, projectRoot } = await setupState();
   const db = state.db;

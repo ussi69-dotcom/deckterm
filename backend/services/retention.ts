@@ -34,6 +34,15 @@ export type RetentionPruneOptions = {
   /** TTL for terminal_sessions rows with status='ended'. Default 30 days. */
   endedSessionTtlDays?: number;
   /**
+   * Short TTL for `state`-kind terminal_events. State events exist only for
+   * the best-effort reconnect delta replay (never suppresses capture replay,
+   * D-B6-1), yet a busy agent terminal emits thousands per day — so they get
+   * their own aggressive TTL, and it applies to LIVE sessions too (the one
+   * deliberate carve-out from the I3 belt; session rows and all other event
+   * kinds stay protected). Default 2 days.
+   */
+  stateEventTtlDays?: number;
+  /**
    * Ids of terminals currently live in the server's in-memory map. Their
    * session rows and events are never pruned regardless of timestamps
    * (invariant I3 — belt over the status check, protects against drift).
@@ -47,11 +56,13 @@ export type RetentionPruneOptions = {
 export type RetentionPruneResult = {
   outputEventsPurged: number;
   expiredEventsPruned: number;
+  staleStateEventsPruned: number;
   endedSessionsPruned: number;
   runId: number;
 };
 
 const DEFAULT_TTL_DAYS = 30;
+const DEFAULT_STATE_EVENT_TTL_DAYS = 2;
 const DEFAULT_CHUNK_SIZE = 5_000;
 
 function isoCutoff(now: Date, ttlDays: number): string {
@@ -153,6 +164,10 @@ export async function runRetentionPrune(
     now,
     options.endedSessionTtlDays ?? DEFAULT_TTL_DAYS,
   );
+  const stateEventCutoff = isoCutoff(
+    now,
+    options.stateEventTtlDays ?? DEFAULT_STATE_EVENT_TTL_DAYS,
+  );
 
   const runId = startRun(db, RETENTION_JOB_PRUNE, now);
   try {
@@ -171,6 +186,19 @@ export async function runRetentionPrune(
       [eventCutoff, ...liveEvents.params],
       chunkSize,
     );
+    // Deliberately NO live-id exclusion: state events are transient replay
+    // metadata (see the option doc); pruning them for live sessions is what
+    // bounds the log for weeks-running agent terminals. Safe against the
+    // session's last_event_id: event ids are AUTOINCREMENT (never reused), so
+    // it stays a valid high-water mark and the `id > cursor` delta replay is
+    // best-effort by design (D-B6-1) — nothing dereferences pruned ids.
+    const staleStateEventsPruned = await deleteChunked(
+      db,
+      EVENTS_TABLE,
+      `kind = 'state' AND created_at < ?`,
+      [stateEventCutoff],
+      chunkSize,
+    );
 
     const liveSessions = notLiveClause("id", liveIds);
     const endedSessionsPruned = await deleteChunked(
@@ -184,9 +212,11 @@ export async function runRetentionPrune(
     const counts = {
       outputEventsPurged,
       expiredEventsPruned,
+      staleStateEventsPruned,
       endedSessionsPruned,
       eventCutoff,
       sessionCutoff,
+      stateEventCutoff,
     };
     // Durable record FIRST (Codex pre-final #4): `retention_runs` is the
     // authoritative evidence of what a prune deleted. The audit row is a
@@ -212,6 +242,7 @@ export async function runRetentionPrune(
     return {
       outputEventsPurged,
       expiredEventsPruned,
+      staleStateEventsPruned,
       endedSessionsPruned,
       runId,
     };

@@ -1,7 +1,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdtemp, rm, stat } from "node:fs/promises";
 import { join } from "node:path";
-import { initializeFoundationState } from "./services/foundation-state";
+import {
+  initializeFoundationState,
+  listTerminalSessionsForActor,
+  recordTerminalSession,
+} from "./services/foundation-state";
 
 const tempDirs: string[] = [];
 
@@ -64,6 +68,64 @@ test("foundation C0 initializes minimal DB, bootstrap token, and imported roots"
     ]),
   );
   state.db.close();
+});
+
+test("listTerminalSessionsForActor caps ended sessions when endedLimit is set", async () => {
+  const stateDir = await createTempDir(".deckterm-foundation-state-");
+  const projectRoot = await createTempDir(".deckterm-foundation-project-");
+  const state = await initializeFoundationState({
+    stateDir,
+    allowedFileRoots: [projectRoot],
+    env: {},
+    now: new Date("2026-07-04T00:00:00Z"),
+  });
+  const db = state.db;
+  const rootId = state.roots[0]?.id;
+
+  const addSession = (id: string, createdAt: Date) =>
+    recordTerminalSession(db, {
+      id,
+      actorUserId: "user_owner",
+      rootId,
+      cwd: projectRoot,
+      now: createdAt,
+    });
+  const endSession = (id: string, endedAt: string) =>
+    db
+      .query(
+        `UPDATE terminal_sessions SET status = 'ended', ended_at = ?, updated_at = ? WHERE id = ?`,
+      )
+      .run(endedAt, endedAt, id);
+
+  addSession("active-1", new Date("2026-07-04T10:00:00Z"));
+  for (let i = 1; i <= 4; i++) {
+    addSession(`ended-${i}`, new Date(`2026-07-0${i}T00:00:00Z`));
+    endSession(`ended-${i}`, `2026-07-0${i}T01:00:00Z`);
+  }
+
+  // Default: unlimited, newest-created first (existing behavior).
+  const all = listTerminalSessionsForActor(db, "user_owner");
+  expect(all.map((s) => s.id)).toEqual([
+    "active-1",
+    "ended-4",
+    "ended-3",
+    "ended-2",
+    "ended-1",
+  ]);
+
+  // Cap: all active sessions + the N most recently ENDED, same ordering.
+  const capped = listTerminalSessionsForActor(db, "user_owner", {
+    endedLimit: 2,
+  });
+  expect(capped.map((s) => s.id)).toEqual(["active-1", "ended-4", "ended-3"]);
+
+  // Zero hides ended sessions entirely; active always survives the cap.
+  const activeOnly = listTerminalSessionsForActor(db, "user_owner", {
+    endedLimit: 0,
+  });
+  expect(activeOnly.map((s) => s.id)).toEqual(["active-1"]);
+
+  db.close();
 });
 
 test("foundation C0 refuses filesystem root import unless explicitly allowed", async () => {
