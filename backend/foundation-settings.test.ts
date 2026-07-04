@@ -130,4 +130,26 @@ test("settings API stores and merges per-actor settings", async () => {
     }),
   );
   expect(badRes.status).toBe(400);
+
+  // B7 (D-B7-2): the `policy.*` namespace is reserved for the C3 admin-managed
+  // session policy store — actor-scoped self-service must not be able to
+  // squat on it (users setting their own idle/rate limits).
+  for (const key of ["policy", "policy.idleTimeoutMs"]) {
+    const policyRes = await app.fetch(
+      new Request("http://localhost/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: { [key]: 1 } }),
+      }),
+    );
+    expect(policyRes.status).toBe(400);
+  }
+  const afterPolicy = await app.fetch(
+    new Request("http://localhost/api/settings"),
+  );
+  const afterPolicyBody = (await afterPolicy.json()) as {
+    settings: Record<string, unknown>;
+  };
+  expect(afterPolicyBody.settings["policy"]).toBeUndefined();
+  expect(afterPolicyBody.settings["policy.idleTimeoutMs"]).toBeUndefined();
 });
