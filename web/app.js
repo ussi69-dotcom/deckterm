@@ -6229,10 +6229,52 @@ class TerminalManager {
       rootInput.value = this.getCurrentDirectoryValue() || "";
     }
     await this.refreshTasks();
+    await this.refreshHarnessOptions();
     if (focusTitle) {
       panel.querySelector("#task-title")?.focus();
     }
     this.syncSurfaceButtonState();
+  }
+
+  // Rebuild the worker/judge provider selects from live availability probes.
+  // Best-effort only: on any failure the static claude/codex options baked
+  // into index.html remain untouched as the no-JS/failure fallback.
+  async refreshHarnessOptions() {
+    const panel = this.getTaskPanel();
+    if (!panel) return;
+    const selects = [
+      panel.querySelector("#task-worker-provider"),
+      panel.querySelector("#task-judge-provider"),
+    ].filter(Boolean);
+    if (!selects.length) return;
+    try {
+      const payload = await this.fetchTaskJson("/api/harnesses");
+      const harnesses = Array.isArray(payload?.harnesses)
+        ? payload.harnesses
+        : [];
+      if (!harnesses.length) return;
+      for (const select of selects) {
+        const currentValue = select.value;
+        const keepCurrent = harnesses.some(
+          (harness) =>
+            harness.id === currentValue && harness.available !== false,
+        );
+        while (select.firstChild) select.removeChild(select.firstChild);
+        for (const harness of harnesses) {
+          const option = document.createElement("option");
+          option.value = harness.id;
+          option.textContent =
+            harness.available === false
+              ? `${harness.label} (unavailable)`
+              : harness.label;
+          if (harness.available === false) option.disabled = true;
+          select.appendChild(option);
+        }
+        select.value = keepCurrent ? currentValue : "claude";
+      }
+    } catch (err) {
+      console.debug("Failed to load harness availability", err);
+    }
   }
 
   closeTaskPanel() {
