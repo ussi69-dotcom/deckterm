@@ -5302,7 +5302,11 @@ export function createWebApp() {
           reason = "terminal_not_live";
         } else if (target.ownerId !== ownerId) {
           reason = "owner_mismatch";
-        } else if (target.agentName !== expectedAgent) {
+        } else if (
+          !expectedAgent ||
+          !target.agentName ||
+          target.agentName !== expectedAgent
+        ) {
           // Live telemetry must show the expected agent running RIGHT NOW —
           // otherwise the pointer would land on a shell prompt (it is inert
           // there, but delivery must still be reported as failed).
