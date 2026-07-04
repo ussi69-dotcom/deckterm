@@ -55,6 +55,7 @@ import {
   runRetentionPrune,
   runWalCheckpoint,
 } from "./services/retention";
+import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
@@ -244,10 +245,31 @@ const RATE_LIMIT_MAX_REQUESTS = Math.max(
     10,
   ) || 40,
 );
+// B7: the terminal-create budget is per-owner (one user must not exhaust
+// everyone's budget) with a global backstop against aggregate abuse. Defaults
+// preserve the pre-B7 observable limit for a single-user install.
+const RATE_LIMIT_PER_USER_MAX = Math.max(
+  1,
+  parseInt(
+    process.env.TERMINAL_RATE_LIMIT_PER_USER_MAX ||
+      String(RATE_LIMIT_MAX_REQUESTS),
+    10,
+  ) || RATE_LIMIT_MAX_REQUESTS,
+);
+const RATE_LIMIT_GLOBAL_MAX = Math.max(
+  RATE_LIMIT_PER_USER_MAX,
+  parseInt(
+    process.env.TERMINAL_RATE_LIMIT_GLOBAL_MAX ||
+      String(4 * RATE_LIMIT_PER_USER_MAX),
+    10,
+  ) || 4 * RATE_LIMIT_PER_USER_MAX,
+);
 const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
   process.env.TERMINAL_IDLE_TIMEOUT_MS || String(2 * 60 * 60 * 1000),
   10,
 ); // 2 hours default
+const DECKTERM_ORPHAN_TTL_MS_DEFAULT =
+  parseInt(process.env.DECKTERM_ORPHAN_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
 const AGENT_RESPONDING_IDLE_MS = parseInt(
   process.env.AGENT_RESPONDING_IDLE_MS || "700",
   10,
@@ -620,23 +642,29 @@ async function finalizeReconnectReady(
   }
 }
 
-// Rate limiting state (simple in-memory)
-const rateLimitState = {
-  timestamps: [] as number[],
-  clean() {
-    const now = Date.now();
-    this.timestamps = this.timestamps.filter(
-      (t) => now - t < RATE_LIMIT_WINDOW_MS,
-    );
-  },
-  canCreate(): boolean {
-    this.clean();
-    return this.timestamps.length < RATE_LIMIT_MAX_REQUESTS;
-  },
-  record() {
-    this.timestamps.push(Date.now());
-  },
-};
+// Rate limiting state (B7: per-owner buckets + global backstop). ownerId
+// always comes from the server-side resolved actor — never from client
+// input — and unauthenticated requests are rejected before any limiter
+// check (D-B7-1).
+const rateLimitState = createTerminalRateLimiter({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  perUserMax: RATE_LIMIT_PER_USER_MAX,
+  globalMax: RATE_LIMIT_GLOBAL_MAX,
+});
+
+// B7 (D-B7-2): per-owner session policy seam. Env defaults only for now —
+// C3 adds the admin-managed per-user policy store + UX on this seam. The
+// `policy.` settings prefix is reserved (rejected in PUT /api/settings) so
+// nothing can squat on it via actor-scoped self-service before C3.
+function resolveSessionPolicy(_ownerId: string): {
+  idleTimeoutMs: number;
+  detachedTtlMs: number;
+} {
+  return {
+    idleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+    detachedTtlMs: DECKTERM_ORPHAN_TTL_MS_DEFAULT,
+  };
+}
 
 // =============================================================================
 // CLIPBOARD IMAGE HELPERS
@@ -2715,7 +2743,14 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
 }
 
 function getTerminalCreationError(ownerId: string) {
-  if (!rateLimitState.canCreate()) {
+  const rateVerdict = rateLimitState.canCreate(ownerId);
+  if (rateVerdict === "global_limit") {
+    return {
+      status: 429 as const,
+      body: { error: "Server is busy creating terminals. Try again later." },
+    };
+  }
+  if (rateVerdict === "user_limit") {
     return {
       status: 429 as const,
       body: { error: "Rate limit exceeded. Try again later." },
@@ -5082,7 +5117,7 @@ export function createWebApp() {
       if (creationError) {
         return c.json(creationError.body, creationError.status);
       }
-      rateLimitState.record();
+      rateLimitState.record(ownerId);
       const terminal = await createOwnedTerminal({
         cwd: task.workingDirectory,
         cols: 120,
@@ -5127,7 +5162,7 @@ export function createWebApp() {
       if (creationError) {
         return c.json(creationError.body, creationError.status);
       }
-      rateLimitState.record();
+      rateLimitState.record(ownerId);
       const terminal = await createOwnedTerminal({
         cwd: task.workingDirectory,
         cols: 120,
@@ -5372,7 +5407,7 @@ export function createWebApp() {
     }
     const exec = execResolution.exec;
 
-    rateLimitState.record();
+    rateLimitState.record(ownerId);
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
       cols: body.cols || 120,
@@ -5552,7 +5587,7 @@ export function createWebApp() {
       );
     }
 
-    rateLimitState.record();
+    rateLimitState.record(ownerId);
 
     const tmuxInfo = await getTmuxSessionInfo(sourceTerm.sessionName).catch(
       () => null,
@@ -6491,6 +6526,12 @@ export function createWebApp() {
     for (const key of keys) {
       if (!key || key.length > SETTINGS_MAX_KEY_LENGTH) {
         return c.json({ error: "invalid settings key" }, 400);
+      }
+      // B7 (D-B7-2, Codex #7): `policy.*` is reserved for the C3 admin-managed
+      // per-user session policy store. Actor-scoped self-service must never be
+      // able to squat on it — that would let users set their own limits.
+      if (key === "policy" || key.startsWith("policy.")) {
+        return c.json({ error: `reserved settings key: ${key}` }, 400);
       }
       const value = record[key];
       if (
@@ -8087,12 +8128,6 @@ export async function startWebServer(host: string, port: number) {
 
   console.log(`🚀 DeckTerm running at http://${host}:${port}`);
 
-  const DECKTERM_ORPHAN_TTL_HOURS = parseInt(
-    process.env.DECKTERM_ORPHAN_TTL_HOURS || "8",
-    10,
-  );
-  const DECKTERM_ORPHAN_TTL_MS = DECKTERM_ORPHAN_TTL_HOURS * 60 * 60 * 1000;
-
   const cleanupIdleTerminals = async () => {
     const now = Date.now();
 
@@ -8104,7 +8139,7 @@ export async function startWebServer(host: string, port: number) {
       if (activeSocketsCount > 0) {
         const idleTime = now - term.lastActivityAt;
 
-        if (idleTime > TERMINAL_IDLE_TIMEOUT_MS) {
+        if (idleTime > resolveSessionPolicy(term.ownerId).idleTimeoutMs) {
           console.log(
             `[cleanup] Closing idle active terminal ${id} (idle: ${Math.round(idleTime / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
@@ -8154,10 +8189,13 @@ export async function startWebServer(host: string, port: number) {
       if (activeSocketsCount === 0 && term.lastDetachedAt) {
         const detachedTime = now - term.lastDetachedAt;
         const idleTime = now - term.lastActivityAt;
-        // Detached and inactive for DECKTERM_ORPHAN_TTL_MS
+        // Detached and inactive past the owner's detached TTL
         const timeSinceLastActivityOrDetach = Math.max(detachedTime, idleTime);
 
-        if (timeSinceLastActivityOrDetach > DECKTERM_ORPHAN_TTL_MS) {
+        if (
+          timeSinceLastActivityOrDetach >
+          resolveSessionPolicy(term.ownerId).detachedTtlMs
+        ) {
           console.log(
             `[reaper] Reaping expired detached terminal ${id} (detached/inactive: ${Math.round(timeSinceLastActivityOrDetach / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
