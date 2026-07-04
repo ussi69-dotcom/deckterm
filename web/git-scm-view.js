@@ -69,6 +69,25 @@ function getScm() {
   return null;
 }
 
+// Resolve the GitHistoryView module (browser global OR CommonJS under bun).
+// Returns { GitHistoryViewController } or null when not available.
+function getGitHistoryView() {
+  if (
+    typeof window !== "undefined" &&
+    window.GitHistoryView?.GitHistoryViewController
+  ) {
+    return window.GitHistoryView;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./git-history-view");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 // ── Pure helpers (DOM-free, unit-tested) ─────────────────────────────────────
 
 // The three SCM group section descriptors, in render order, with the file list
@@ -142,8 +161,16 @@ class GitScmViewController {
 
     this.root = null; // the mounted skeleton element
     this.container = null; // the host slot
-    // In-section collapse + branches/stashes section collapse (UI-local).
-    this.collapsed = { branches: true, stashes: false };
+    // In-section collapse + branches/stashes/history section collapse (UI-local).
+    // History defaults to collapsed (lazy fetch on first expand).
+    this.collapsed = { branches: true, stashes: false, history: true };
+    // History scope: "repo" (whole-repo log, 6a) or "file" (active editor file's
+    // commits, 6b). UI-local; defaults to repo.
+    this.historyScope = "repo";
+    // GitHistoryViewController instance + the path it was built for, so a scope
+    // change (repo↔file or file→file) can recreate it. Created lazily on expand.
+    this._historyCtl = null;
+    this._historyPath = null;
     // Subscriptions to tear down on unmount.
     this._unsubscribe = null;
   }
@@ -200,6 +227,10 @@ class GitScmViewController {
       }
       this._unsubscribe = null;
     }
+    if (this._historyCtl) {
+      this._historyCtl.unmount();
+      this._historyCtl = null;
+    }
     if (this.root && this.root.parentElement) {
       this.root.parentElement.removeChild(this.root);
     }
@@ -223,14 +254,14 @@ class GitScmViewController {
   async refresh() {
     const gm = this.gitManager;
     if (!gm) return;
-    // Ensure the GitManager has a cwd to work with (the active workspace).
-    if (!gm.state?.cwd && !gm.currentCwd) {
-      const tm = this.terminalManager;
-      const cwd = tm?.getActiveWorkspaceContext?.()?.cwd;
-      if (cwd) {
-        gm.state.cwd = cwd;
-        gm.currentCwd = cwd;
-      }
+    // Re-resolve the LIVE cwd on EVERY refresh (not just when gm has none set)
+    // — this used to only fire once, so after the first (often wrong) value it
+    // never updated and the panel froze on the initial cwd. getGitCwd() is the
+    // canonical source (explorer path, falling back to the active workspace).
+    const cwd = this.terminalManager?.getGitCwd?.();
+    if (cwd) {
+      if (gm.state) gm.state.cwd = cwd;
+      gm.currentCwd = cwd;
     }
     try {
       await gm.refresh();
@@ -271,6 +302,17 @@ class GitScmViewController {
       </div>
       <div class="ide-scm-tree"></div>
       <div class="ide-scm-sections">
+        <div class="ide-scm-section ide-scm-history">
+          <div class="ide-scm-section-header" data-section="history">
+            <span class="ide-scm-section-chevron"></span>
+            <span class="ide-scm-section-label">History</span>
+            <span class="ide-scm-history-scope">
+              <button type="button" class="ide-scm-history-scope-btn" data-history-scope="repo" title="Repository history">Repo</button>
+              <button type="button" class="ide-scm-history-scope-btn" data-history-scope="file" title="Active file history">File</button>
+            </span>
+          </div>
+          <div class="ide-scm-section-body ide-scm-history-body"></div>
+        </div>
         <div class="ide-scm-section ide-scm-branches">
           <div class="ide-scm-section-header" data-section="branches">
             <span class="ide-scm-section-chevron"></span>
@@ -337,7 +379,8 @@ class GitScmViewController {
       syncEl.textContent = parts.join(" ");
     }
 
-    this.renderTree(groups, scm);
+    this.renderTree(groups, scm, gm.state?.error || null);
+    this.renderHistory();
     this.renderBranches(gm);
     this.renderStashes(gm);
   }
@@ -360,6 +403,7 @@ class GitScmViewController {
         branch: branches.current || "",
         ahead: sync.ahead || 0,
         behind: sync.behind || 0,
+        error: gm.state?.error || "",
         staged: fileSig(groups.staged),
         changes: fileSig(groups.changes),
         untracked: fileSig(groups.untracked),
@@ -367,15 +411,25 @@ class GitScmViewController {
         stashes: stashes.map((s) => `${s.index}:${s.message}`),
         collBranches: !!this.collapsed.branches,
         collStashes: !!this.collapsed.stashes,
+        collHistory: !!this.collapsed.history,
+        histScope: this.historyScope,
       });
     } catch {
       return null;
     }
   }
 
-  renderTree(groups, scm) {
+  renderTree(groups, scm, errorMessage) {
     const tree = this.q(".ide-scm-tree");
     if (!tree) return;
+    // A status-fetch error (most commonly "Not a git repository") must show a
+    // distinct banner — NOT the silent "No changes" empty state the classic
+    // Git window would never show in this situation. Mirrors the classic
+    // window's `.error` red banner (reuses that existing shared class).
+    if (errorMessage) {
+      tree.innerHTML = `<p class="error">${this.esc(errorMessage)}</p>`;
+      return;
+    }
     const sections = scmSections(groups);
     const total = scmTotalCount(groups);
     if (total === 0) {
@@ -423,6 +477,106 @@ class GitScmViewController {
         </div>`;
     }
     tree.innerHTML = html;
+  }
+
+  renderHistory() {
+    const body = this.q(".ide-scm-history-body");
+    const section = this.q(".ide-scm-history");
+    if (!body || !section) return;
+    section.classList.toggle("collapsed", this.collapsed.history);
+    this.setChevron(
+      ".ide-scm-history .ide-scm-section-chevron",
+      this.collapsed.history,
+    );
+    this.updateHistoryScopeButtons();
+    if (this.collapsed.history) {
+      // Collapsed: unmount the history controller to free resources.
+      if (this._historyCtl) {
+        this._historyCtl.unmount();
+        this._historyCtl = null;
+      }
+      this._historyPath = null;
+      body.innerHTML = "";
+      return;
+    }
+    // Expanded: mount/refresh the history controller into the body.
+    const ghv = getGitHistoryView();
+    if (!ghv) {
+      body.innerHTML = '<p class="ide-scm-empty">History view unavailable</p>';
+      return;
+    }
+
+    // Resolve the scope path: file-scope (6b) needs an active editor file, else
+    // null (repo-wide, 6a). When file-scope is selected but no file is active,
+    // show a hint instead of mounting an empty repo log.
+    const desiredPath =
+      this.historyScope === "file" ? this.activeFileRelPath() : null;
+    if (this.historyScope === "file" && !desiredPath) {
+      if (this._historyCtl) {
+        this._historyCtl.unmount();
+        this._historyCtl = null;
+      }
+      this._historyPath = null;
+      body.innerHTML =
+        '<p class="ide-scm-empty">Open a file to see its history</p>';
+      return;
+    }
+
+    // Recreate the controller when the scope path changes (repo↔file, file→file).
+    if (this._historyCtl && this._historyPath !== desiredPath) {
+      this._historyCtl.unmount();
+      this._historyCtl = null;
+    }
+    if (!this._historyCtl) {
+      // Clear any stale empty-hint/markup so it doesn't linger above the freshly
+      // mounted history list (the controller appends its own root, it doesn't
+      // own the whole body).
+      body.innerHTML = "";
+      this._historyPath = desiredPath;
+      this._historyCtl = new ghv.GitHistoryViewController({
+        document: this.doc,
+        getTerminalManager: this.getTerminalManagerFn,
+        getCwd: () => this.cwd(),
+        path: desiredPath,
+      });
+      this._historyCtl.mount(body);
+    } else {
+      // Already mounted with the same scope — refresh to pick up cwd changes.
+      void this._historyCtl.refresh();
+    }
+  }
+
+  // The active editor file's path relative to the repo cwd, or null. Powers
+  // file-scoped (6b) history: the TerminalManager exposes the active file tab's
+  // ABSOLUTE path; we strip the cwd prefix so /api/git/log?path= is repo-relative.
+  activeFileRelPath() {
+    const tm = this.terminalManager;
+    const abs = tm?.getActiveEditorFilePath?.();
+    if (!abs) return null;
+    const cwd = (this.cwd() || "").replace(/\/$/, "");
+    if (cwd && abs.startsWith(`${cwd}/`)) return abs.slice(cwd.length + 1);
+    return null;
+  }
+
+  // Reflect the active history scope on the Repo/File toggle buttons.
+  updateHistoryScopeButtons() {
+    const btns = this.root?.querySelectorAll?.("[data-history-scope]");
+    if (!btns) return;
+    btns.forEach((b) =>
+      b.classList.toggle(
+        "active",
+        b.dataset.historyScope === this.historyScope,
+      ),
+    );
+  }
+
+  // Host hook: the active editor tab changed. Refresh file-scoped history so it
+  // follows the active file. No-op unless History is expanded AND in file scope
+  // (repo-wide history doesn't depend on the active file). Called directly (not
+  // via render()) so it bypasses the render() dedupe.
+  onActiveFileChanged() {
+    if (this.collapsed.history || this.historyScope !== "file") return;
+    this.renderHistory();
   }
 
   renderBranches(gm) {
@@ -591,11 +745,27 @@ class GitScmViewController {
   onSectionsClick(e) {
     const gm = this.gitManager;
     if (!gm) return;
+    // History scope toggle (Repo/File) — caught BEFORE the header collapse so a
+    // scope click doesn't also collapse the section. Picking a scope expands it.
+    const scopeBtn = e.target.closest("[data-history-scope]");
+    if (scopeBtn) {
+      const scope = scopeBtn.dataset.historyScope;
+      if (scope && scope !== this.historyScope) {
+        this.historyScope = scope;
+        this.collapsed.history = false;
+        this.render();
+      }
+      return;
+    }
     // Section collapse toggles.
     const header = e.target.closest(".ide-scm-section-header");
     if (header) {
       const section = header.dataset.section;
-      if (section === "branches") {
+      if (section === "history") {
+        this.collapsed.history = !this.collapsed.history;
+        // renderHistory() mounts/unmounts the controller on expand/collapse.
+        this.render();
+      } else if (section === "branches") {
         this.collapsed.branches = !this.collapsed.branches;
         if (!this.collapsed.branches)
           void gm.loadBranches?.().then(() => this.render());

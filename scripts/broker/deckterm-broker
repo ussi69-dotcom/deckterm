@@ -1,0 +1,1505 @@
+#!/usr/bin/python3
+# DeckTerm launch broker — the single root-owned privilege boundary for
+# OS-isolated PTYs (design: docs/plans/2026-07-03-b2-run-as-user-broker.md §3;
+# B1 §2.3). Reached only by the DeckTerm service account via a pinned NOPASSWD
+# sudoers line. Stdlib only, fixed absolute interpreter (root-owned).
+#
+# Verbs:
+#   spawn  --session <id> --username <name> --uid <n> --gid <n> --cwd <abs>
+#          --profile pty|tmux [--cols N --rows M] [-- <profile-args…>]
+#   exec   … (same, non-PTY; stdout/stderr piped to the caller)
+#   kill   --session <id> | --tmux-server --uid <n>
+#   check                       (health probe: perms/config/systemd, rc 0/1)
+#   __drop --token <key>        (internal re-exec stage; NOT for direct use)
+#
+# The broker NEVER trusts caller argv for the privileged action: spawn/exec
+# validate everything, write a single-use root-owned drop record, then re-exec
+# under a systemd scope into `__drop`, which reloads the parameters from that
+# record (not its argv) and performs the privilege drop with a post-drop
+# capability/identity assertion before execve.
+
+import argparse
+import ctypes
+import fcntl
+import grp
+import json
+import os
+import pwd
+import re
+import resource
+import secrets
+import stat
+import struct
+import sys
+import termios
+import time
+
+SELF_PATH = "/usr/local/lib/deckterm/deckterm-broker"
+CONFIG_PATH = "/etc/deckterm/broker.json"
+
+# Absolute tool paths — a root privilege-boundary must NOT depend on sudo's
+# secure_path/env_reset for the executables it invokes (Codex #1). Overridable
+# only via the root-owned config for portability; the defaults are fixed.
+DEFAULT_SYSTEMD_RUN = "/usr/bin/systemd-run"
+DEFAULT_SYSTEMCTL = "/usr/bin/systemctl"
+
+SESSION_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{7,63}$")
+SESSION_NAME_RE = re.compile(r"^deckterm[a-z0-9_-]*$")
+
+
+def systemd_run_path(cfg):
+    return cfg.get("systemd_run_path", DEFAULT_SYSTEMD_RUN)
+
+
+def systemctl_path(cfg):
+    return cfg.get("systemctl_path", DEFAULT_SYSTEMCTL)
+
+
+def scope_active(cfg, unit):
+    systemctl = systemctl_path(cfg)
+    rc = os.spawnv(
+        os.P_WAIT, systemctl, [systemctl, "is-active", "--quiet", unit]
+    )
+    return rc == 0
+
+# libc prctl constants
+PR_SET_KEEPCAPS = 8
+PR_SET_NO_NEW_PRIVS = 38
+
+# TIOCGSID ioctl (Linux, asm-generic) — get a tty's session id; errors ENOTTY
+# when the tty is nobody's controlling terminal. Not exposed by CPython termios.
+TIOCGSID = 0x5429
+
+
+def die(reason, code=71):
+    sys.stderr.write("deckterm-broker: %s\n" % reason)
+    _log(reason=reason, verdict="refuse")
+    sys.exit(code)
+
+
+def _log(**fields):
+    try:
+        cfg = _CONFIG or {}
+        path = cfg.get("log_path", "/var/log/deckterm-broker.log")
+        line = json.dumps({"ts": int(time.time()), **fields}, sort_keys=True)
+        # Append-only; best-effort (never let logging failure abort a decision).
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (line + "\n").encode("utf-8", "replace"))
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+
+_CONFIG = None
+
+
+def load_config():
+    global _CONFIG
+    # fd-based read (Codex #8): assert the parent chain is root-owned, then open
+    # with O_NOFOLLOW and fstat the fd itself — no lstat-then-open TOCTOU.
+    _assert_parents_root_safe(CONFIG_PATH)
+    data = _read_root_file_nofollow(CONFIG_PATH, "config")
+    _CONFIG = json.loads(data)
+    return _CONFIG
+
+
+def _lstat_or_die(path, label):
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        die("%s missing/unreadable: %s (%s)" % (label, path, exc))
+
+
+def _assert_root_owned_safe(path, st, world_writable_ok):
+    # Root-owned, not group- or world-writable, and not a symlink.
+    if stat.S_ISLNK(st.st_mode):
+        die("refusing symlinked path: %s" % path)
+    if st.st_uid != 0 or st.st_gid != 0:
+        die("path not root:root: %s (uid=%d gid=%d)" % (path, st.st_uid, st.st_gid))
+    if st.st_mode & stat.S_IWGRP or st.st_mode & stat.S_IWOTH:
+        die("path group/world-writable: %s (mode=%o)" % (path, st.st_mode))
+
+
+def _assert_parents_root_safe(path):
+    # Every parent directory of `path` must be a root-owned, non-group/world-
+    # writable real directory (Codex #8) — otherwise a non-root-controlled
+    # parent could swap a component under us.
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        st = _lstat_or_die(d, "parent dir")
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            die("unsafe parent dir (symlink/non-dir): %s" % d)
+        if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            die("unsafe parent dir: %s (uid=%d mode=%o)"
+                % (d, st.st_uid, st.st_mode))
+        if d == "/":
+            break
+        d = os.path.dirname(d)
+
+
+def _read_root_file_nofollow(path, label):
+    """Open `path` O_RDONLY|O_NOFOLLOW, fstat the fd: must be a root-owned
+    regular file, not group/world-writable. Returns its bytes. Defeats the
+    lstat-then-open race (Codex #8)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        die("%s missing/unreadable or symlink: %s (%s)" % (label, path, exc))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            die("%s not a regular file: %s" % (label, path))
+        if st.st_uid != 0 or st.st_gid != 0:
+            die("%s not root:root: %s (uid=%d gid=%d)"
+                % (label, path, st.st_uid, st.st_gid))
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            die("%s group/world-writable: %s (mode=%o)"
+                % (label, path, st.st_mode))
+        chunks = []
+        while True:
+            b = os.read(fd, 65536)
+            if not b:
+                break
+            chunks.append(b)
+        return b"".join(chunks).decode("utf-8")
+    finally:
+        os.close(fd)
+
+
+def assert_packaging():
+    # Must run as root, from a root-owned non-writable binary + config, with
+    # every parent dir root-owned. Refuse otherwise (B1 §2.3, inv 9).
+    if os.geteuid() != 0:
+        die("must run as root (euid=%d)" % os.geteuid())
+    for path in (SELF_PATH,):
+        st = _lstat_or_die(path, "binary")
+        _assert_root_owned_safe(path, st, world_writable_ok=False)
+    # Walk parent dirs of the binary — none may be group/world-writable.
+    d = os.path.dirname(SELF_PATH)
+    while True:
+        st = _lstat_or_die(d, "parent dir")
+        if st.st_uid != 0 or (st.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+            die("unsafe parent dir: %s (uid=%d mode=%o)" % (d, st.st_uid, st.st_mode))
+        if d == "/":
+            break
+        d = os.path.dirname(d)
+
+
+def sanitize_process():
+    os.umask(0o022)
+    # Close every fd above stderr except when we deliberately keep PTY stdio.
+    try:
+        max_fd = os.sysconf("SC_OPEN_MAX")
+    except (ValueError, OSError):
+        max_fd = 4096
+    os.closerange(3, max_fd)
+
+
+# --------------------------------------------------------------------------
+# Eligibility — the SAME policy as backend/services/os-mapping-eligibility.ts,
+# independently enforced here (Codex #2). Numeric gids only.
+# --------------------------------------------------------------------------
+
+
+def account_group_gids(username, primary_gid):
+    # os.getgrouplist mirrors what the kernel will actually grant via the NSS
+    # stack (LDAP/SSSD included) — grp.getgrall() only enumerates locally
+    # enumerable groups and can MISS supplementary gids that initgroups() would
+    # later add, a fail-open (Codex #3). Returns the exact numeric set we both
+    # validate against and later install with setgroups() (Codex #3/#4).
+    try:
+        listed = os.getgrouplist(username, primary_gid)
+    except (OSError, KeyError):
+        # Cannot enumerate the account's groups ⇒ cannot prove eligibility.
+        die("ineligible: group_enumeration_failed (%s)" % username)
+    return set(listed) | {primary_gid}
+
+
+def privileged_gids(cfg):
+    gids = {0}
+    for name in cfg.get("privileged_groups", ["sudo", "wheel", "admin"]):
+        try:
+            gids.add(grp.getgrnam(name).gr_gid)
+        except KeyError:
+            pass
+    for g in cfg.get("privileged_gids_extra", []):
+        gids.add(int(g))
+    return gids
+
+
+def account_can_write_protected(cfg, uid, group_gids):
+    for path in cfg.get("protected_paths", []):
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True  # cannot prove non-writable ⇒ fail closed
+        mode = st.st_mode
+        if mode & stat.S_IWOTH:
+            return True
+        if st.st_uid == uid and mode & stat.S_IWUSR:
+            return True
+        if st.st_gid in group_gids and mode & stat.S_IWGRP:
+            return True
+    return False
+
+
+def resolve_and_check_identity(cfg, username, want_uid, want_gid):
+    """getpwnam(username), assert the caller's uid/gid match exactly (drift),
+    then enforce the full eligibility policy. Returns (pwd record, gid set) —
+    the numeric gid set is stored in the drop record and installed verbatim via
+    setgroups() post-drop (Codex #3/#4), never re-derived from the mutable
+    username inside the privileged scope."""
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        die("identity_unknown: no such account %r" % username)
+
+    if pw.pw_uid != want_uid or pw.pw_gid != want_gid:
+        die(
+            "identity_drift: %s resolves to uid=%d gid=%d, caller passed uid=%d gid=%d"
+            % (username, pw.pw_uid, pw.pw_gid, want_uid, want_gid)
+        )
+
+    min_uid = int(cfg.get("min_uid", 1000))
+    service_uid = int(cfg.get("service_uid", 0))
+    if service_uid <= 0:
+        die("config service_uid not set — run install-broker.sh --service-user")
+    try:
+        service_primary_gid = pwd.getpwuid(service_uid).pw_gid
+    except KeyError:
+        service_primary_gid = int(cfg.get("service_gid", -1))
+
+    if pw.pw_uid == 0:
+        die("ineligible: uid_zero")
+    if pw.pw_uid < min_uid:
+        die("ineligible: uid_below_min (%d < %d)" % (pw.pw_uid, min_uid))
+    if pw.pw_gid == 0:
+        die("ineligible: gid_zero")
+    if pw.pw_uid == service_uid:
+        die("ineligible: is_service_account")
+
+    gids = account_group_gids(username, pw.pw_gid)
+    if service_primary_gid in gids:
+        die("ineligible: service_group_member")
+
+    required = cfg.get("required_group", "deckterm-users")
+    try:
+        required_gid = grp.getgrnam(required).gr_gid
+    except KeyError:
+        die("ineligible: required_group %r does not exist" % required)
+    if required_gid not in gids:
+        die("ineligible: missing_required_group (%s)" % required)
+
+    if gids & privileged_gids(cfg):
+        die("ineligible: privileged_group_member")
+
+    shell = (pw.pw_shell or "").strip()
+    nologin = ("/nologin", "nologin", "/false", "false")
+    if not shell or any(shell.endswith(s) for s in nologin):
+        die("ineligible: nologin_shell (%r)" % shell)
+
+    if account_can_write_protected(cfg, pw.pw_uid, gids):
+        die("ineligible: protected_path_writable")
+
+    return pw, sorted(gids)
+
+
+# --------------------------------------------------------------------------
+# Registry — root-owned single-use drop records + unit tracking.
+# --------------------------------------------------------------------------
+
+
+def registry_dir(cfg):
+    return cfg.get("registry_dir", "/run/deckterm-broker")
+
+
+def _registry_ready(cfg):
+    d = registry_dir(cfg)
+    st = _lstat_or_die(d, "registry dir")
+    _assert_root_owned_safe(d, st, world_writable_ok=False)
+    if not stat.S_ISDIR(st.st_mode):
+        die("registry dir is not a directory: %s" % d)
+    return d
+
+
+def write_drop_record(cfg, session, unit, pw, gid, groups, cwd, argv, env, nofile,
+                      extra=None):
+    d = _registry_ready(cfg)
+    token = secrets.token_hex(16)
+    record = {
+        "token": token,
+        "session": session,
+        "unit": unit,
+        "uid": pw.pw_uid,
+        "gid": gid,
+        # The exact numeric supplementary gid set validated at check time —
+        # installed verbatim via setgroups() post-drop (Codex #3/#4).
+        "groups": groups,
+        "username": pw.pw_name,
+        "cwd": cwd,
+        "argv": argv,
+        "env": env,
+        "nofile": nofile,
+    }
+    if extra:
+        record.update(extra)
+    path = os.path.join(d, token + ".json")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(record, fh)
+    # Also track the unit for kill().
+    unit_path = os.path.join(d, "unit-" + session + ".json")
+    ufd = os.open(unit_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(ufd, "w") as fh:
+        json.dump({"unit": unit, "session": session, "uid": pw.pw_uid}, fh)
+    return token
+
+
+def gc_stale_units(cfg):
+    # Prune unit-*.json records whose scope is no longer active. A session that
+    # exits on its own (rather than via `kill`) would otherwise leak its record
+    # until reboot; the server also calls `kill --session` on teardown, so this
+    # is a belt-and-braces sweep, kept cheap (only runs on spawn).
+    d = registry_dir(cfg)
+    try:
+        entries = os.listdir(d)
+    except OSError:
+        return
+    for name in entries:
+        if not (name.startswith("unit-") and name.endswith(".json")):
+            continue
+        path = os.path.join(d, name)
+        try:
+            with open(path, "r") as fh:
+                unit = json.load(fh).get("unit", "")
+        except (OSError, ValueError):
+            continue
+        if not unit:
+            continue
+        systemctl = systemctl_path(_CONFIG or {})
+        rc = os.spawnv(
+            os.P_WAIT, systemctl, [systemctl, "is-active", "--quiet", unit]
+        )
+        if rc != 0:  # not active
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+
+def read_consume_drop_record(cfg, token):
+    d = _registry_ready(cfg)
+    if not re.match(r"^[0-9a-f]{32}$", token or ""):
+        die("bad drop token")
+    path = os.path.join(d, token + ".json")
+    # fd-safe read (Codex #8): O_NOFOLLOW + fstat root-owned regular file, no
+    # lstat-then-open gap. The registry dir is already asserted root-owned 0700.
+    data = _read_root_file_nofollow(path, "drop record")
+    record = json.loads(data)
+    os.unlink(path)  # single-use
+    return record
+
+
+# --------------------------------------------------------------------------
+# Profiles & argv assembly.
+# --------------------------------------------------------------------------
+
+
+def get_profile(cfg, name):
+    profiles = cfg.get("profiles", {})
+    if name not in profiles:
+        die("unknown profile: %r" % name)
+    return profiles[name]
+
+
+def build_child_env(cfg, pw, cols, rows):
+    return {
+        "HOME": pw.pw_dir,
+        "USER": pw.pw_name,
+        "LOGNAME": pw.pw_name,
+        "SHELL": pw.pw_shell,
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "TERM": "xterm-256color",
+        "COLORTERM": "truecolor",
+        "LANG": cfg.get("lang", "C.UTF-8"),
+        "COLUMNS": str(cols),
+        "LINES": str(rows),
+    }
+
+
+# tmux formats/options can execute shell via `#(command)` or command-bearing
+# options (default-command, hooks). A permissive allowlist that passes caller
+# args through therefore still permits arbitrary command execution AS THE MAPPED
+# USER (Codex #5). Instead every subcommand is rebuilt from a FIXED schema:
+# the broker emits a canonical argv from validated pieces, never the caller's
+# raw tokens — so "fixed argv" containment actually holds.
+
+
+def _t_int(tok, allow_negative=False):
+    try:
+        v = int(tok)
+    except (TypeError, ValueError):
+        die("tmux arg not an integer: %r" % tok)
+    if v < 0 and not allow_negative:
+        die("tmux arg must be non-negative: %r" % tok)
+    return v
+
+
+def _t_name(tok):
+    if not tok or not SESSION_NAME_RE.match(tok):
+        die("tmux -t target not allowed: %r" % tok)
+    return tok
+
+
+def _t_fmt(tok):
+    # `#(...)` in a tmux format runs a shell command — forbid it outright.
+    # `#{...}` (internal variables) and literals are fine.
+    if tok is None or "#(" in tok:
+        die("tmux format not allowed: %r" % tok)
+    return tok
+
+
+def _t_flags(tokens, bool_flags, value_flags, combined=()):
+    """Parse `tokens` (subcommand operands) into a dict. `bool_flags` is a set of
+    valueless flags; `value_flags` maps a flag → validator(next_token). `combined`
+    lists accepted glued boolean clusters (e.g. '-ep' → ['-e','-p']). Any
+    unknown flag or bare operand is refused — this is what forbids caller shell
+    operands (new-session command) and glued `-tTARGET` forms (Codex #5)."""
+    out = {}
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        expanded = None
+        for cluster, parts in combined:
+            if tok == cluster:
+                expanded = parts
+                break
+        if expanded is not None:
+            for p in expanded:
+                out[p] = True
+            i += 1
+            continue
+        if tok in value_flags:
+            if i + 1 >= n:
+                die("tmux flag %r missing value" % tok)
+            out[tok] = value_flags[tok](tokens[i + 1])
+            i += 2
+            continue
+        if tok in bool_flags:
+            out[tok] = True
+            i += 1
+            continue
+        die("tmux arg not permitted for this subcommand: %r" % tok)
+    return out
+
+
+def build_tmux_subcmd_argv(sub, operands, pw, cwd, cols, rows):
+    """Return a canonical, fully-broker-controlled argv for an allowlisted tmux
+    subcommand, built from validated operands only. pipe-pane is handled by the
+    caller (broker-owned helper command)."""
+    if sub == "new-session":
+        f = _t_flags(
+            operands,
+            bool_flags={"-d"},
+            value_flags={"-s": _t_name, "-x": _t_int, "-y": _t_int,
+                         "-c": lambda t: t},
+        )
+        if "-s" not in f:
+            die("new-session requires -s <name>")
+        name = f["-s"]
+        x = f.get("-x", cols)
+        y = f.get("-y", rows)
+        # -c is IGNORED in favor of the broker's validated cwd; the shell is the
+        # target's login shell from passwd, never a caller operand.
+        shell = pw.pw_shell or "/bin/bash"
+        return ["new-session", "-d", "-s", name, "-x", str(x), "-y", str(y),
+                "-c", cwd, shell]
+    if sub in ("attach-session", "kill-session", "has-session"):
+        f = _t_flags(operands, bool_flags=set(), value_flags={"-t": _t_name})
+        if "-t" not in f:
+            die("%s requires -t <name>" % sub)
+        return [sub, "-t", f["-t"]]
+    if sub == "list-sessions":
+        f = _t_flags(operands, bool_flags=set(), value_flags={"-F": _t_fmt})
+        return ["list-sessions", "-F", f.get("-F", "#{session_name}")]
+    if sub == "list-clients":
+        f = _t_flags(operands, bool_flags=set(),
+                     value_flags={"-F": _t_fmt, "-t": _t_name})
+        out = ["list-clients", "-F", f.get("-F", "#{client_name}")]
+        if "-t" in f:
+            out += ["-t", f["-t"]]
+        return out
+    if sub == "capture-pane":
+        f = _t_flags(
+            operands,
+            bool_flags={"-e", "-p"},
+            value_flags={"-S": lambda t: _t_int(t, allow_negative=True),
+                         "-t": _t_name},
+            combined=[("-ep", ["-e", "-p"]), ("-pe", ["-p", "-e"])],
+        )
+        if "-t" not in f:
+            die("capture-pane requires -t <name>")
+        out = ["capture-pane"]
+        if f.get("-e"):
+            out.append("-e")
+        if f.get("-p"):
+            out.append("-p")
+        if "-S" in f:
+            out += ["-S", str(f["-S"])]
+        out += ["-t", f["-t"]]
+        return out
+    if sub in ("resize-window", "resize-pane", "resize-client"):
+        f = _t_flags(operands, bool_flags=set(),
+                     value_flags={"-t": _t_name, "-x": _t_int, "-y": _t_int})
+        if "-t" not in f or "-x" not in f or "-y" not in f:
+            die("%s requires -t <name> -x <n> -y <n>" % sub)
+        return [sub, "-t", f["-t"], "-x", str(f["-x"]), "-y", str(f["-y"])]
+    if sub == "set-option":
+        # Only the fixed presentation toggle DeckTerm needs — never a
+        # command-bearing option (default-command, hooks, …).
+        f = _t_flags(operands, bool_flags=set(), value_flags={"-t": _t_name})
+        rest = [t for t in operands if t not in ("-t", f.get("-t"))]
+        if "-t" not in f or len(rest) != 2:
+            die("set-option only supports: -t <name> status on|off")
+        option, value = rest[0], rest[1]
+        if option != "status" or value not in ("on", "off"):
+            die("set-option only supports: status on|off (got %r %r)"
+                % (option, value))
+        return ["set-option", "-t", f["-t"], "status", value]
+    if sub == "display-message":
+        f = _t_flags(operands, bool_flags={"-p"},
+                     value_flags={"-t": _t_name, "-F": _t_fmt})
+        # display-message prints a format with -p; the format follows as an
+        # operand. Accept a single trailing format operand, validated no `#(`.
+        trailing = [t for t in operands
+                    if t not in ("-p", "-t", f.get("-t"))]
+        if "-t" not in f or not f.get("-p") or len(trailing) != 1:
+            die("display-message only supports: -t <name> -p <format>")
+        fmt = _t_fmt(trailing[0])
+        return ["display-message", "-t", f["-t"], "-p", fmt]
+    if sub in ("start-server", "kill-server"):
+        if operands:
+            die("%s takes no arguments" % sub)
+        return [sub]
+    die("tmux subcommand not allowed: %r" % sub)
+
+
+def user_socket_path(cfg, pw):
+    ns = cfg.get("namespace", "deckterm")
+    return os.path.join(pw.pw_dir, ".deckterm", "tmux", "deckterm_%s.sock" % ns)
+
+
+def service_group_gid(cfg):
+    """The DeckTerm service account's primary gid — the capture spool's group,
+    so the service can read a mapped user's reconnect spool (design §3.5)."""
+    service_uid = int(cfg.get("service_uid", 0))
+    try:
+        return pwd.getpwuid(service_uid).pw_gid
+    except KeyError:
+        return int(cfg.get("service_gid", -1))
+
+
+def _lstat_component_owned(path, uid, mode):
+    """lstat a single path component: must exist, not be a symlink, be owned by
+    `uid`, and have exactly `mode` permission bits. Refuses otherwise."""
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        die("socket_path_unsafe: %s missing (%s)" % (path, exc))
+    if stat.S_ISLNK(st.st_mode):
+        die("socket_path_unsafe: %s is a symlink" % path)
+    if st.st_uid != uid:
+        die("socket_path_unsafe: %s not owned by uid %d (uid=%d)"
+            % (path, uid, st.st_uid))
+    if stat.S_IMODE(st.st_mode) != mode:
+        die("socket_path_unsafe: %s mode=%o expected %o"
+            % (path, stat.S_IMODE(st.st_mode), mode))
+    return st
+
+
+def ensure_socket_dirs(pw):
+    """For a server-spawning op (new-session/start-server), create the socket
+    dirs if absent then verify. Root creates ~/.deckterm[/tmux] when missing and
+    chowns them to the mapped user 0700 (equivalent to the design's post-drop
+    create-as-user, without a second drop); an existing component is verified
+    user-owned 0700 non-symlink. The user's home is admin-created and user-owned,
+    so this is the user racing their own home at worst."""
+    for path in (
+        os.path.join(pw.pw_dir, ".deckterm"),
+        os.path.join(pw.pw_dir, ".deckterm", "tmux"),
+    ):
+        try:
+            st = os.lstat(path)
+        except OSError:
+            os.mkdir(path, 0o700)
+            os.chown(path, pw.pw_uid, pw.pw_gid)
+            os.chmod(path, 0o700)
+            continue
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            die("socket_path_unsafe: %s not a real dir" % path)
+        _lstat_component_owned(path, pw.pw_uid, 0o700)
+
+
+def assert_socket_dirs_safe(pw):
+    """Before any tmux connect, verify ~/.deckterm and ~/.deckterm/tmux are
+    user-owned 0700 non-symlink dirs (design §3.5 / inv 10). The mapped user
+    owns these, so a symlinked component is the classic redirect vector."""
+    base = os.path.join(pw.pw_dir, ".deckterm")
+    tmuxdir = os.path.join(base, "tmux")
+    _lstat_component_owned(base, pw.pw_uid, 0o700)
+    _lstat_component_owned(tmuxdir, pw.pw_uid, 0o700)
+
+
+def assert_socket_type_safe(sock_path):
+    """For a CONNECT op (not new-session/start-server), the socket must already
+    exist as a real unix socket, not a symlink/regular/FIFO the user planted to
+    redirect the client (design §3.5, tmux_server_foreign)."""
+    try:
+        st = os.lstat(sock_path)
+    except OSError:
+        die("tmux_server_foreign: no live server socket at %s" % sock_path)
+    if stat.S_ISLNK(st.st_mode):
+        die("tmux_server_foreign: %s is a symlink" % sock_path)
+    if not stat.S_ISSOCK(st.st_mode):
+        die("tmux_server_foreign: %s is not a socket (mode=%o)"
+            % (sock_path, st.st_mode))
+    if st.st_uid != 0 and st.st_uid != os.stat(os.path.dirname(sock_path)).st_uid:
+        # Socket must be owned by the same uid that owns its (already-verified
+        # user-owned) directory — a foreign-owned socket is refused.
+        die("tmux_server_foreign: %s owner unexpected (uid=%d)"
+            % (sock_path, st.st_uid))
+
+
+def provision_capture_dir(cfg, session, uid):
+    """Create /var/lib/deckterm/capture/<session> 2750 <uid>:<service_group>
+    and precreate pipe.log <uid>:<service_group> 0640, as ROOT, before the
+    mapped user's tmux appends (design §3.5, inv 10). Root creates the dir so
+    the user cannot pre-plant it; owner is set to the mapped uid so the user's
+    capture helper can append, group is the service group (setgid) so the
+    service can read the spool; pipe.log is 0640 for that group read. The
+    reader (BrokeredTmuxBackend.readPipeDelta) still verifies owner/regular/
+    nlink fd-safely, since the user owns the dir and could later swap the file."""
+    if not SESSION_RE.match(session or ""):
+        die("capture_dir_unsafe: bad session id")
+    root = cfg.get("capture_root", "/var/lib/deckterm/capture")
+    # The capture root's parents AND the root itself must be root-owned non-
+    # symlink dirs (installer makes it root:<service> 0751); refuse if tampered.
+    _assert_parents_root_safe(root)
+    rst = _lstat_or_die(root, "capture root")
+    if stat.S_ISLNK(rst.st_mode) or rst.st_uid != 0 or not stat.S_ISDIR(rst.st_mode):
+        die("capture_root_unsafe: %s (uid=%d)" % (root, rst.st_uid))
+    sgid = service_group_gid(cfg)
+    session_dir = os.path.join(root, session)
+    # Create-or-adopt the session dir, then operate ONLY on its fd — never a
+    # path-based chown/chmod, which the (untrusted) dir-owning user could
+    # redirect by swapping a component for a symlink between ops (Codex S3b #1).
+    try:
+        os.mkdir(session_dir, 0o2750)
+    except FileExistsError:
+        pass
+    try:
+        dfd = os.open(session_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        die("capture_dir_unsafe: open %s (%s)" % (session_dir, exc))
+    try:
+        dst = os.fstat(dfd)
+        if not stat.S_ISDIR(dst.st_mode):
+            die("capture_dir_unsafe: %s not a directory" % session_dir)
+        # Only a root-owned (freshly created) or already-mapped-uid dir is
+        # adopted; anything else is a planted dir.
+        if dst.st_uid not in (0, uid):
+            die("capture_dir_unsafe: %s owner uid=%d" % (session_dir, dst.st_uid))
+        os.fchown(dfd, uid, sgid)
+        os.fchmod(dfd, 0o2750)
+        # pipe.log via openat relative to the verified dir fd. Create fresh where
+        # possible (O_EXCL|O_NOFOLLOW ⇒ a brand-new regular file, no symlink
+        # race); adopt an existing one only after fstat proves it a regular,
+        # single-link, root/uid-owned file (a swapped symlink ⇒ O_NOFOLLOW fails).
+        created = True
+        try:
+            lfd = os.open(
+                "pipe.log",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o640,
+                dir_fd=dfd,
+            )
+        except FileExistsError:
+            created = False
+            try:
+                lfd = os.open(
+                    "pipe.log",
+                    os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW,
+                    dir_fd=dfd,
+                )
+            except OSError as exc:
+                die("capture_pipe_unsafe: reopen (%s)" % exc)
+        except OSError as exc:
+            die("capture_pipe_unsafe: create (%s)" % exc)
+        try:
+            lst = os.fstat(lfd)
+            if not stat.S_ISREG(lst.st_mode):
+                die("capture_pipe_unsafe: not a regular file")
+            if lst.st_nlink != 1:
+                die("capture_pipe_unsafe: nlink=%d" % lst.st_nlink)
+            if lst.st_uid not in (0, uid):
+                die("capture_pipe_unsafe: owner uid=%d" % lst.st_uid)
+            os.fchown(lfd, uid, sgid)
+            os.fchmod(lfd, 0o640)
+        finally:
+            os.close(lfd)
+    finally:
+        os.close(dfd)
+
+
+# --------------------------------------------------------------------------
+# git / search profiles (B4 §3/§4). Every subcommand argv is REBUILT from a
+# fixed schema — the caller's tokens are validated piecewise and a canonical
+# argv is emitted, so no caller string ever reaches git/grep unchecked. cwd is
+# NOT a caller string either: it is resolved fd-safely beneath the granted root
+# post-drop (see do_drop, cwd_mode="fd_beneath").
+# --------------------------------------------------------------------------
+
+GIT_REV_RE = re.compile(r"^[A-Za-z0-9._/@{}~^-]{1,128}$")
+GIT_NAME_RE = re.compile(r"^[A-Za-z0-9._/-]{1,128}$")
+# The exact --format strings the routes emit (B4 inventory). Only these pass.
+GIT_FORMATS = {"", "%(refname:short)", "%h|%H|%s|%an|%aI", "%gd%x09%s"}
+
+
+def _git_rev(tok):
+    if not tok or tok.startswith("-") or not GIT_REV_RE.match(tok):
+        die("git rev token not allowed: %r" % tok)
+    return tok
+
+
+def _git_name(tok):
+    if (not tok or tok.startswith("-") or tok.startswith(".")
+            or not GIT_NAME_RE.match(tok)):
+        die("git name token not allowed: %r" % tok)
+    return tok
+
+
+def _git_relpath(tok):
+    if (tok is None or tok == "" or tok.startswith("-") or tok.startswith(":")
+            or tok.startswith("/") or "\x00" in tok):
+        die("git path not allowed: %r" % tok)
+    for seg in tok.split("/"):
+        if seg in (".", ".."):
+            die("git path segment not allowed: %r" % tok)
+    return tok
+
+
+def _git_fmt(tok):
+    if not tok.startswith("--format="):
+        die("git format flag not allowed: %r" % tok)
+    val = tok[len("--format="):]
+    if val not in GIT_FORMATS:
+        die("git format value not allowlisted: %r" % val)
+    return "--format=" + val
+
+
+def _git_dashsep(rest):
+    if not rest or rest[0] != "--":
+        die("expected -- <paths>")
+    return ["--"] + [_git_relpath(p) for p in rest[1:]]
+
+
+def build_git_argv(git_path, operands):
+    if not operands:
+        die("git requires a subcommand")
+    sub = operands[0]
+    rest = operands[1:]
+    # Fixed hardening -c options prepended by the broker (B4 §3, D-B4-6): pager,
+    # fsmonitor, and hooks can execute commands from repo-local config; neutralize
+    # them. GIT_CONFIG_*, CEILING, and LITERAL_PATHSPECS are set via env in
+    # build_git_env(). External diff / textconv drivers are killed per-subcommand
+    # below with --no-ext-diff / --no-textconv (Codex S2 #2). Note: this bounds
+    # git's execution surface but is UID containment, not a chroot — see §3.4.
+    base = [git_path, "-c", "core.pager=cat", "-c", "core.fsmonitor=false",
+            "-c", "core.hooksPath=/dev/null"]
+
+    def out(args):
+        return base + args
+
+    if sub == "status":
+        argv = ["status"]
+        i = 0
+        while i < len(rest):
+            t = rest[i]
+            if t in ("--porcelain", "-uall", "-b", "-z"):
+                argv.append(t)
+            elif t == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+                break
+            else:
+                die("git status arg not allowed: %r" % t)
+            i += 1
+        if "--porcelain" not in argv:
+            die("git status requires --porcelain")
+        return out(argv)
+    if sub == "rev-parse":
+        if rest == ["--show-toplevel"]:
+            return out(["rev-parse", "--show-toplevel"])
+        die("git rev-parse form not allowed: %r" % rest)
+    if sub == "diff":
+        # --no-ext-diff/--no-textconv kill repo-local external diff/textconv
+        # drivers that would otherwise run as the uid (Codex S2 #2).
+        argv = ["diff"]
+        i = 0
+        if i < len(rest) and rest[i] == "--staged":
+            argv.append("--staged")
+            i += 1
+        if i < len(rest) and rest[i] == "--color=never":
+            argv.append("--color=never")
+            i += 1
+        else:
+            die("git diff requires --color=never")
+        argv += ["--no-ext-diff", "--no-textconv"]
+        if i < len(rest):
+            if rest[i] == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+            else:
+                die("git diff trailing arg not allowed: %r" % rest[i:])
+        return out(argv)
+    if sub == "show":
+        if len(rest) >= 2 and rest[0] == "--format=":
+            if rest[1] != "--color=never" or len(rest) != 3:
+                die("git show form not allowed: %r" % rest)
+            return out(["show", "--format=", "--color=never", "--no-ext-diff",
+                        "--no-textconv", _git_rev(rest[2])])
+        if len(rest) == 2 and rest[1] == "--":
+            combined = rest[0]
+            if ":" not in combined:
+                die("git show expects <ref>:<path>")
+            ref, path = combined.split(":", 1)
+            if ref != "" and (ref.startswith("-") or not GIT_REV_RE.match(ref)):
+                die("git show ref not allowed: %r" % ref)
+            _git_relpath(path)
+            return out(["show", "--no-textconv", "%s:%s" % (ref, path), "--"])
+        die("git show form not allowed: %r" % rest)
+    if sub == "diff-tree":
+        if len(rest) == 5 and rest[:4] == ["--no-commit-id", "--name-status", "-r", "--root"]:
+            return out(["diff-tree", "--no-commit-id", "--name-status", "-r",
+                        "--root", _git_rev(rest[4])])
+        die("git diff-tree form not allowed: %r" % rest)
+    if sub == "add":
+        return out(["add"] + _git_dashsep(rest))
+    if sub == "restore":
+        if rest[:1] and rest[0] in ("--staged", "--worktree"):
+            return out(["restore", rest[0]] + _git_dashsep(rest[1:]))
+        die("git restore requires --staged/--worktree -- <paths>")
+    if sub == "commit":
+        argv = ["commit"]
+        i = 0
+        if i < len(rest) and rest[i] == "--amend":
+            argv.append("--amend")
+            i += 1
+        if i + 1 < len(rest) and rest[i] == "-m" and "\x00" not in rest[i + 1]:
+            argv += ["-m", rest[i + 1]]
+            i += 2
+        else:
+            die("git commit requires -m <message>")
+        if i != len(rest):
+            die("git commit trailing args: %r" % rest[i:])
+        return out(argv)
+    if sub == "branch":
+        if rest == ["-a", "--format=%(refname:short)"]:
+            return out(["branch", "-a", "--format=%(refname:short)"])
+        if len(rest) == 1:
+            return out(["branch", _git_name(rest[0])])
+        if len(rest) == 2 and rest[0] in ("-d", "-D"):
+            return out(["branch", rest[0], _git_name(rest[1])])
+        die("git branch form not allowed: %r" % rest)
+    if sub == "checkout":
+        if len(rest) == 2 and rest[0] == "-b":
+            return out(["checkout", "-b", _git_name(rest[1])])
+        if len(rest) == 2 and rest[1] == "--":
+            return out(["checkout", _git_name(rest[0]), "--"])
+        die("git checkout form not allowed: %r" % rest)
+    if sub == "log":
+        argv = ["log"]
+        i = 0
+        if i < len(rest) and rest[i].startswith("--max-count="):
+            val = rest[i][len("--max-count="):]
+            if not val.isdigit() or int(val) > 100000:
+                die("git log max-count out of range: %r" % rest[i])
+            argv.append("--max-count=%d" % int(val))
+            i += 1
+        else:
+            die("git log requires --max-count=<n>")
+        if i < len(rest) and rest[i].startswith("--format="):
+            argv.append(_git_fmt(rest[i]))
+            i += 1
+        else:
+            die("git log requires --format=")
+        if i < len(rest) and rest[i] == "--graph":
+            argv.append("--graph")
+            i += 1
+        if i < len(rest):
+            if rest[i] == "--":
+                argv += ["--"] + [_git_relpath(p) for p in rest[i + 1:]]
+            else:
+                die("git log trailing arg not allowed: %r" % rest[i:])
+        return out(argv)
+    if sub == "stash":
+        if rest[:1] == ["list"]:
+            if rest == ["list", "--format=%gd%x09%s"]:
+                return out(["stash", "list", "--format=%gd%x09%s"])
+            die("git stash list form not allowed: %r" % rest)
+        if rest[:1] == ["push"]:
+            argv = ["stash", "push"]
+            i = 1
+            if i < len(rest) and rest[i] == "--include-untracked":
+                argv.append("--include-untracked")
+                i += 1
+            if i + 1 < len(rest) and rest[i] == "-m" and "\x00" not in rest[i + 1]:
+                argv += ["-m", rest[i + 1]]
+                i += 2
+            if i != len(rest):
+                die("git stash push trailing args: %r" % rest[i:])
+            return out(argv)
+        if rest and rest[0] in ("pop", "apply", "drop"):
+            argv = ["stash", rest[0]]
+            if len(rest) == 2:
+                m = re.match(r"^stash@\{(\d+)\}$", rest[1])
+                if not m or int(m.group(1)) > 10000:
+                    die("git stash ref not allowed: %r" % rest[1])
+                argv.append("stash@{%d}" % int(m.group(1)))
+            elif len(rest) != 1:
+                die("git stash form not allowed: %r" % rest)
+            return out(argv)
+        die("git stash subcommand not allowed: %r" % rest)
+    if sub == "clean":
+        if rest[:2] == ["-f", "--"]:
+            return out(["clean", "-f", "--"] + [_git_relpath(p) for p in rest[2:]])
+        die("git clean form not allowed: %r" % rest)
+    die("git subcommand not allowed: %r" % sub)
+
+
+def build_git_env(cfg, pw, root_abs):
+    # Hardening env (B4 §3, D-B4-6): neutralize global/system config execution,
+    # forbid credential prompts + optional locks, disable pathspec magic, and cap
+    # repo discovery to the granted root. The repo's OWN config still applies (the
+    # repo is the user's — commits author as the mapped user); containment is to
+    # the granted root + the mapped uid, not sandboxing the user from themselves.
+    env = build_child_env(cfg, pw, 80, 24)
+    # Ceiling must be the root's PARENT, not the root itself: a ceiling stops
+    # discovery BEFORE entering the listed dir, so ceiling=root would hide a .git
+    # that lives AT the granted root. Parent lets git check the root but never
+    # climb above it (Codex S2 #1). root_abs is already canonical (see do_spawn).
+    parent = os.path.dirname(root_abs.rstrip("/")) or "/"
+    env.update({
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_LITERAL_PATHSPECS": "1",
+        "GIT_CEILING_DIRECTORIES": parent,
+    })
+    env.pop("COLUMNS", None)
+    env.pop("LINES", None)
+    return env
+
+
+def build_search_argv(grep_path, operands, cfg):
+    if not operands:
+        die("search requires a pattern")
+    mode = "-F"
+    i = 0
+    if operands[0] in ("-F", "-E"):
+        mode = operands[0]
+        i = 1
+    if i + 1 != len(operands):
+        die("search takes exactly [mode] <pattern>")
+    pattern = operands[i]
+    if "\x00" in pattern:
+        die("search pattern contains NUL")
+    argv = [grep_path, "-rnIZ", mode]
+    for g in cfg.get("search_secret_excludes", []):
+        argv.append("--exclude=%s" % g)
+    for d in cfg.get("search_exclude_dirs", []):
+        argv.append("--exclude-dir=%s" % d)
+    argv += ["-e", pattern, "."]
+    return argv
+
+
+def assemble_argv(cfg, profile, pw, cwd, cols, rows, extra_args, session):
+    kind = profile.get("kind")
+    if kind == "pty":
+        if extra_args:
+            die("pty profile takes no profile args")
+        shell = pw.pw_shell or "/bin/bash"
+        return [shell, "-l"]
+    if kind == "exec_stdin":
+        # A fixed root-owned helper that reads a single JSON request on stdin and
+        # writes a JSON response on stdout (B4 fs helper). NO caller argv is ever
+        # accepted — the request travels entirely over stdin, so there is no argv
+        # attack surface (design §2.1). The exec path must be absolute + root-safe.
+        if extra_args:
+            die("exec_stdin profile takes no profile args")
+        exec_path = profile.get("exec_path")
+        if not exec_path or not os.path.isabs(exec_path):
+            die("exec_stdin profile missing absolute exec_path")
+        _assert_parents_root_safe(exec_path)
+        est = _lstat_or_die(exec_path, "exec_stdin helper")
+        if stat.S_ISLNK(est.st_mode) or not stat.S_ISREG(est.st_mode):
+            die("exec_stdin helper not a regular file: %s" % exec_path)
+        _assert_root_owned_safe(exec_path, est, world_writable_ok=False)
+        return [exec_path]
+    if kind == "git":
+        git_path = profile.get("git_path", "/usr/bin/git")
+        return build_git_argv(git_path, list(extra_args))
+    if kind == "search":
+        grep_path = profile.get("grep_path", "/usr/bin/grep")
+        return build_search_argv(grep_path, list(extra_args), cfg)
+    if kind == "tmux":
+        if not extra_args:
+            die("tmux profile requires a subcommand")
+        sub = extra_args[0]
+        operands = list(extra_args[1:])
+        tmux = profile.get("tmux_path", "/usr/bin/tmux")
+        sock = user_socket_path(cfg, pw)
+        if sub == "pipe-pane":
+            # The broker OWNS the pipe command (Codex #9): the caller supplies
+            # no command string. tmux runs the pipe target via `sh -c`, but the
+            # helper path is fixed+absolute and the session id is regex-checked,
+            # so nothing caller-controlled reaches that shell. Only a validated
+            # -t target and the fixed -o flag are accepted from the caller.
+            helper = cfg.get(
+                "capture_helper", "/usr/local/lib/deckterm/deckterm-capture"
+            )
+            f = _t_flags(operands, bool_flags={"-o"},
+                         value_flags={"-t": _t_name})
+            if "-t" not in f:
+                die("pipe-pane requires -t <name>")
+            args = ["pipe-pane", "-o", "-t", f["-t"],
+                    "%s %s" % (helper, session)]
+        else:
+            args = build_tmux_subcmd_argv(sub, operands, pw, cwd, cols, rows)
+        return [tmux, "-S", sock] + args
+    die("profile kind not supported: %r" % kind)
+
+
+# --------------------------------------------------------------------------
+# Verbs.
+# --------------------------------------------------------------------------
+
+
+def systemd_run_scope(cfg, unit, profile, token):
+    props = []
+    for key, val in profile.get("properties", {}).items():
+        props += ["--property=%s=%s" % (key, val)]
+    runtime_max = profile.get("runtime_max_sec")
+    if runtime_max:
+        props += ["--property=RuntimeMaxSec=%s" % runtime_max]
+    return [
+        systemd_run_path(cfg), "--scope", "--collect", "--quiet",
+        "--unit=%s" % unit,
+    ] + props + ["--", SELF_PATH, "__drop", "--token", token]
+
+
+def do_spawn(cfg, args, is_exec):
+    if not SESSION_RE.match(args.session or ""):
+        die("bad --session")
+    gc_stale_units(cfg)
+    pw, groups = resolve_and_check_identity(cfg, args.username, args.uid, args.gid)
+
+    if not os.path.isabs(args.cwd):
+        die("--cwd must be absolute")
+    cwd = os.path.realpath(args.cwd)
+
+    profile = get_profile(cfg, args.profile)
+    kind = profile.get("kind")
+
+    # A tmux subcommand that would START the per-user server (the FIRST
+    # new-session/start-server for this uid) runs in the per-user server scope;
+    # everything else — control ops AND subsequent new-sessions once the server
+    # is already up — connects to the running server in an anonymous scope.
+    tmuxsrv_unit = "deckterm-tmuxsrv-%d.scope" % pw.pw_uid
+    wants_server = (
+        kind == "tmux"
+        and args.profile_args
+        and args.profile_args[0] in ("new-session", "start-server")
+    )
+    server_already_up = wants_server and scope_active(cfg, tmuxsrv_unit)
+    starts_server = wants_server and not server_already_up
+
+    if starts_server:
+        unit = tmuxsrv_unit
+    else:
+        unit = "deckterm-%s.scope" % args.session
+
+    # tmux socket-path safety (design §3.5, inv 10): the socket lives in the
+    # (untrusted) user's home. The server-starting op ensures+verifies the dirs;
+    # every connect (control op OR a new-session joining an existing server)
+    # verifies the dirs AND that the socket is a real user-owned socket, not a
+    # planted symlink/file redirecting the client to a foreign server.
+    if kind == "tmux":
+        if starts_server:
+            ensure_socket_dirs(pw)
+        else:
+            assert_socket_dirs_safe(pw)
+            assert_socket_type_safe(user_socket_path(cfg, pw))
+        # A new-session (first or subsequent) always provisions its own capture
+        # dir; start-server has no pane to capture.
+        if args.profile_args and args.profile_args[0] == "new-session":
+            provision_capture_dir(cfg, args.session, pw.pw_uid)
+
+    argv = assemble_argv(
+        cfg, profile, pw, cwd, args.cols, args.rows, args.profile_args, args.session
+    )
+    # For tmux ops that aren't the server-spawning ones, run in an anonymous
+    # per-invocation scope (no persistent unit) so they end with the client.
+    if kind == "tmux" and unit.startswith("deckterm-%s" % args.session):
+        unit = "deckterm-%s-%s.scope" % (args.session, secrets.token_hex(4))
+
+    # cwd model. PTY/tmux/fs run in `cwd` (chdir post-drop). git/search instead
+    # take a granted ROOT + a relative subdir and resolve it fd-safely BENEATH the
+    # root as the dropped user (B4 §3/§4, D-B4-5) — a symlinked/swapped component
+    # cannot redirect the tool outside the root. The server passes the granted root
+    # as --cwd and the subdir as --reldir.
+    record_extra = {}
+    if kind in ("git", "search"):
+        reldir = args.reldir if args.reldir is not None else ""
+        # Validate reldir as a contained relative path (empty ⇒ the root itself).
+        # Reject empty/'.'/'..' segments so the recorded contract is strict and
+        # auditable (Codex S2 quality note); `cwd` (already realpath-canonical, not
+        # raw args.cwd) is the root so the fd walk and git's ceiling agree (S2 #3).
+        if reldir.startswith("/") or "\x00" in reldir:
+            die("--reldir must be relative and NUL-free")
+        if reldir != "":
+            for seg in reldir.split("/"):
+                if seg in ("", ".", ".."):
+                    die("--reldir segment not allowed: %r" % reldir)
+        record_extra = {"cwd_mode": "fd_beneath", "root_abs": cwd,
+                        "reldir": reldir}
+        if kind == "git":
+            child_env = build_git_env(cfg, pw, cwd)
+        else:
+            child_env = build_child_env(cfg, pw, args.cols, args.rows)
+            child_env["LC_ALL"] = "C"
+            child_env["PATH"] = "/usr/bin:/bin"
+            child_env.pop("COLUMNS", None)
+            child_env.pop("LINES", None)
+    else:
+        child_env = build_child_env(cfg, pw, args.cols, args.rows)
+    token = write_drop_record(
+        cfg, args.session, unit, pw, args.gid, groups, cwd, argv, child_env,
+        profile.get("nofile"), extra=record_extra,
+    )
+
+    _log(verb="exec" if is_exec else "spawn", session=args.session,
+         uid=pw.pw_uid, username=pw.pw_name, profile=args.profile,
+         unit=unit, verdict="allow")
+
+    cmd = systemd_run_scope(cfg, unit, profile, token)
+    os.execv(cmd[0], cmd)  # absolute path; replace self; scope runs on our stdio
+
+
+def _fchdir_beneath_root(root_abs, reldir):
+    """As the dropped user, open the granted root by a component-wise O_NOFOLLOW
+    walk from '/' (every ancestor fstat'd a real dir — no symlink swap), then walk
+    the relative subdir the same way, and fchdir into the result. A symlinked or
+    non-directory component anywhere ⇒ refuse. This is the git/search analogue of
+    the fs helper's fd-based containment (B4 §3, D-B4-5).
+
+    Scope (Codex S2 #2/#4): this bounds where the tool STARTS, and git runs with
+    hooks/pager/fsmonitor/ext-diff/textconv/global-config execution neutralized, so
+    the primary root-escape-via-config vectors are closed. But `fchdir` is not a
+    chroot: after it, git/grep do ordinary path resolution as the mapped uid, so
+    the hard boundary B4 guarantees is CROSS-UID isolation (Alice's uid cannot
+    reach Bob's files). Fine-grained root containment WITHIN one uid (a subdir grant
+    that a determined repo config could still read around) is best-effort in 1.0;
+    a mount-namespace/chroot boundary is the 1.1 container work (B1 D1)."""
+    if not os.path.isabs(root_abs):
+        die("root_abs must be absolute")
+    segs = [s for s in os.path.normpath(root_abs).split("/") if s]
+    if not segs:
+        die("root_abs must not be the filesystem root")
+    segs += [s for s in reldir.split("/") if s]
+    dirfd = os.open("/", os.O_PATH | os.O_DIRECTORY)
+    try:
+        for seg in segs:
+            if seg in (".", ".."):
+                die("unsafe cwd segment")
+            try:
+                nfd = os.open(
+                    seg, os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd
+                )
+            except OSError as exc:
+                die("cwd_unsafe: %s (%s)" % (seg, os.strerror(exc.errno)))
+            os.close(dirfd)
+            dirfd = nfd
+        try:
+            os.fchdir(dirfd)
+        except OSError as exc:
+            die("fchdir failed: %s" % exc)
+    finally:
+        os.close(dirfd)
+
+
+def do_drop(cfg, token):
+    record = read_consume_drop_record(cfg, token)
+    uid = int(record["uid"])
+    gid = int(record["gid"])
+    username = record["username"]
+    groups = [int(g) for g in record.get("groups", [])]
+    cwd = record["cwd"]
+    argv = list(record["argv"])
+    env = dict(record["env"])
+    expected_unit = record["unit"]
+
+    # Re-resolve identity inside the scope (Codex #4): the account must STILL map
+    # to the recorded uid/gid. Closes the validation→drop TOCTOU where the
+    # account was renamed / UID-reused between record creation and here. We drop
+    # to the recorded NUMERIC uid/gid/groups regardless, but refuse if the name
+    # no longer resolves to them (drift while the request was in flight).
+    try:
+        pw_now = pwd.getpwnam(username)
+    except KeyError:
+        die("identity_drift: %r no longer resolves in __drop" % username)
+    if pw_now.pw_uid != uid or pw_now.pw_gid != gid:
+        die("identity_drift: %r now uid=%d gid=%d (record uid=%d gid=%d)"
+            % (username, pw_now.pw_uid, pw_now.pw_gid, uid, gid))
+
+    # Prove we're inside the broker-created scope, not invoked standalone
+    # (Codex #3): the scope's unit name must be a PATH COMPONENT of our cgroup
+    # (a full "/<unit>" segment, not a loose substring) — a direct
+    # `sudo broker __drop` runs outside any deckterm scope and fails here.
+    try:
+        with open("/proc/self/cgroup", "r") as fh:
+            cgroup = fh.read()
+    except OSError as exc:
+        die("cannot read cgroup: %s" % exc)
+    components = set()
+    for line in cgroup.strip().splitlines():
+        # format: hierarchy-id:controllers:/path
+        path = line.split(":", 2)[-1]
+        components.update(seg for seg in path.split("/") if seg)
+    if expected_unit not in components:
+        die("cgroup mismatch: %r not a component of %r" % (expected_unit, cgroup.strip()))
+
+    # Load libc by soname through the dynamic linker (ld.so cache) — NOT
+    # ctypes.util.find_library("c"), which shells out to gcc/ld/objdump via
+    # PATH as root (Codex #1).
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+    # Do not retain capabilities across setuid; forbid new privileges.
+    if libc.prctl(PR_SET_KEEPCAPS, 0, 0, 0, 0) != 0:
+        die("prctl(KEEPCAPS,0) failed")
+
+    # Install the EXACT numeric supplementary set validated at check time
+    # (Codex #3) — never os.initgroups(username, …), whose NSS re-enumeration
+    # could differ from what eligibility saw and add a privileged/service gid.
+    # The record's set already excludes the primary gid duplication concern; add
+    # gid to be explicit and drop any accidental 0.
+    want_groups = sorted(set(groups) | {gid})
+    if 0 in want_groups:
+        die("refusing to install group 0 in supplementary set")
+    try:
+        os.setgroups(want_groups)
+    except OSError as exc:
+        die("setgroups failed: %s" % exc)
+    try:
+        os.setgid(gid)
+        os.setuid(uid)
+    except OSError as exc:
+        die("setgid/setuid failed: %s" % exc)
+
+    if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
+        die("prctl(NO_NEW_PRIVS,1) failed")
+
+    # Post-drop identity + capability + group assertion (Codex #3/#4):
+    # getresuid==uid is necessary but not sufficient — a leftover cap set would
+    # allow re-escalation, and an unexpected supplementary group would widen
+    # reach beyond what eligibility validated.
+    assert_dropped_identity(uid, gid, want_groups)
+
+    # rlimits from the record's profile were applied via scope properties where
+    # possible; apply NOFILE here (scopes don't take Limit*).
+    nofile = record.get("nofile")
+    if nofile:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (int(nofile), int(nofile)))
+        except (ValueError, OSError):
+            pass
+
+    # Controlling terminal (fd 0 = PTY slave handed by the server). Only claim
+    # it when the slave has NO controlling session yet — probe with TIOCGSID,
+    # which errors (ENOTTY) precisely when the tty is nobody's controlling
+    # terminal. A fresh slave ⇒ we setsid + TIOCSCTTY so the shell gets full
+    # job control; a slave whose session an outer layer already established
+    # (e.g. the server/Bun PTY setup) ⇒ inherit it, since a post-drop
+    # unprivileged process cannot steal another session's ctty (Codex note:
+    # ioctl failure aborts — but only in the genuine fresh-slave case).
+    if os.isatty(0):
+        has_ctty = True
+        try:
+            fcntl.ioctl(0, TIOCGSID, struct.pack("i", 0))
+        except OSError:
+            has_ctty = False
+        if not has_ctty:
+            os.setsid()
+            try:
+                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            except OSError as exc:
+                die("TIOCSCTTY failed: %s" % exc)
+
+    # cwd. git/search resolve their working dir fd-safely BENEATH the granted root
+    # as the now-dropped user (B4 §3/§4) — a symlinked/swapped component cannot
+    # redirect the tool outside the root. Everything else chdir's to the recorded
+    # cwd (already validated/realpath'd pre-drop).
+    if record.get("cwd_mode") == "fd_beneath":
+        _fchdir_beneath_root(record["root_abs"], record.get("reldir", ""))
+    else:
+        try:
+            os.chdir(cwd)
+        except OSError as exc:
+            die("chdir(%r) failed as user: %s" % (cwd, exc))
+
+    # Close every fd above stderr before handing control to the untrusted child
+    # (Codex #2): systemd-run or the interpreter may have left a privileged fd
+    # open, which os.execve would otherwise leak into the mapped-user shell/tmux.
+    # fds 0/1/2 (the server-owned PTY / pipes) are deliberately preserved.
+    try:
+        max_fd = os.sysconf("SC_OPEN_MAX")
+    except (ValueError, OSError):
+        max_fd = 4096
+    os.closerange(3, max_fd)
+
+    os.execve(argv[0], argv, env)
+
+
+def assert_dropped_identity(uid, gid, want_groups):
+    ruid, euid, suid = os.getresuid()
+    rgid, egid, sgid = os.getresgid()
+    if not (ruid == euid == suid == uid):
+        die("uid not fully dropped: %r" % ((ruid, euid, suid),))
+    if not (rgid == egid == sgid == gid):
+        die("gid not fully dropped: %r" % ((rgid, egid, sgid),))
+    # Supplementary groups must be EXACTLY the validated set (Codex #3) — no
+    # extra (privileged/service) gid leaked in, none of the intended dropped.
+    actual_groups = set(os.getgroups())
+    if actual_groups != set(want_groups):
+        die("supplementary groups mismatch: have %r want %r"
+            % (sorted(actual_groups), want_groups))
+    caps = {}
+    with open("/proc/self/status", "r") as fh:
+        for line in fh:
+            if line.startswith(("CapInh:", "CapPrm:", "CapEff:", "CapAmb:")):
+                key, val = line.split(":", 1)
+                caps[key] = int(val.strip(), 16)
+    for key in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        if caps.get(key, -1) != 0:
+            die("capability %s not zero: %x" % (key, caps.get(key, -1)))
+
+
+def do_kill(cfg, args):
+    d = _registry_ready(cfg)
+    if args.tmux_server:
+        if args.uid is None or int(args.uid) <= 0:
+            die("bad --uid for --tmux-server")
+        unit = "deckterm-tmuxsrv-%d.scope" % int(args.uid)
+    else:
+        if not SESSION_RE.match(args.session or ""):
+            die("bad --session")
+        unit_path = os.path.join(d, "unit-" + args.session + ".json")
+        try:
+            with open(unit_path, "r") as fh:
+                unit = json.load(fh)["unit"]
+        except (OSError, ValueError, KeyError):
+            # No registry entry — nothing to kill; treat as success (idempotent).
+            _log(verb="kill", session=args.session, verdict="noop")
+            return 0
+    if not unit.startswith("deckterm-") or not unit.endswith(".scope"):
+        die("refusing to stop non-deckterm unit: %r" % unit)
+    _log(verb="kill", unit=unit, verdict="allow")
+    systemctl = systemctl_path(cfg)
+    rc = os.spawnv(os.P_WAIT, systemctl, [systemctl, "stop", unit])
+    try:
+        if not args.tmux_server:
+            os.unlink(os.path.join(d, "unit-" + args.session + ".json"))
+    except OSError:
+        pass
+    return 0 if rc == 0 else 0  # stop of an already-gone unit is not an error
+
+
+def do_check(cfg):
+    # Packaging already asserted in main(); verify systemd + config reachability.
+    # Absolute paths only (Codex #1) — no PATH search.
+    if not os.access(systemd_run_path(cfg), os.X_OK):
+        die("systemd-run not executable: %s" % systemd_run_path(cfg), code=1)
+    if not os.access(systemctl_path(cfg), os.X_OK):
+        die("systemctl not executable: %s" % systemctl_path(cfg), code=1)
+    try:
+        int(cfg["service_uid"])
+    except (KeyError, ValueError):
+        die("config missing/invalid service_uid", code=1)
+    _registry_ready(cfg)
+    sys.stdout.write("ok\n")
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="deckterm-broker", add_help=False)
+    sub = p.add_subparsers(dest="verb", required=True)
+
+    for verb in ("spawn", "exec"):
+        s = sub.add_parser(verb, add_help=False)
+        s.add_argument("--session", required=True)
+        s.add_argument("--username", required=True)
+        s.add_argument("--uid", type=int, required=True)
+        s.add_argument("--gid", type=int, required=True)
+        s.add_argument("--cwd", required=True)
+        s.add_argument("--reldir", default=None)  # git/search: subdir beneath cwd
+        s.add_argument("--profile", required=True)
+        s.add_argument("--cols", type=int, default=120)
+        s.add_argument("--rows", type=int, default=30)
+        s.add_argument("profile_args", nargs="*")
+
+    k = sub.add_parser("kill", add_help=False)
+    k.add_argument("--session")
+    k.add_argument("--tmux-server", dest="tmux_server", action="store_true")
+    k.add_argument("--uid", type=int)
+
+    sub.add_parser("check", add_help=False)
+
+    dr = sub.add_parser("__drop", add_help=False)
+    dr.add_argument("--token", required=True)
+    return p
+
+
+def main(argv):
+    load_config()
+    # __drop runs INSIDE the scope (already re-execed); it still runs as root
+    # until it drops, and must pass packaging too.
+    assert_packaging()
+
+    args = build_parser().parse_args(argv)
+
+    if args.verb == "__drop":
+        # Keep stdio (PTY); only sanitize env, do not close fds 0-2.
+        os.umask(0o022)
+        do_drop(_CONFIG, args.token)
+        return 0  # unreachable (execve)
+
+    if args.verb in ("spawn", "exec"):
+        # spawn keeps stdio (PTY handed by server); close only >2.
+        sanitize_process()
+        do_spawn(_CONFIG, args, is_exec=(args.verb == "exec"))
+        return 0  # unreachable (execvp)
+
+    sanitize_process()
+    if args.verb == "kill":
+        return do_kill(_CONFIG, args)
+    if args.verb == "check":
+        return do_check(_CONFIG)
+    die("unknown verb")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

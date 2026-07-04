@@ -208,7 +208,7 @@ function upsertEnvContent(content: string, updates: Record<string, string>) {
 export function parseDoctorChecks(output: string): DoctorCheck[] {
   return output
     .split(/\r?\n/)
-    .map((line) => {
+    .map((line): DoctorCheck | null => {
       const match = line.match(/^(OK|WARN|FAIL):\s*(.+)$/);
       if (!match) return null;
 
@@ -221,7 +221,7 @@ export function parseDoctorChecks(output: string): DoctorCheck[] {
         message,
         raw: line,
         source: "script",
-      } satisfies DoctorCheck;
+      };
     })
     .filter((check): check is DoctorCheck => Boolean(check));
 }

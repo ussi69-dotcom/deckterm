@@ -185,7 +185,7 @@ test.describe("Mobile regressions", () => {
     ).toBeVisible();
   });
 
-  test("keeps fixed More available when all customizable mobile actions are unpinned", async ({
+  test("hides the entire mobile action bar (including More) when every action is unpinned, and the top-left Menu still reaches Edit layout to re-pin", async ({
     page,
   }) => {
     const mobileBar = page.locator("#mobile-action-bar");
@@ -204,15 +204,38 @@ test.describe("Mobile regressions", () => {
       );
     }
 
-    await expect(mobileBar).toBeVisible();
-    await expectButtonLabelsExactly(mobileBar, ["More"]);
-
     await page.getByRole("button", { name: "Done" }).click();
-    await page.locator("#mobile-more-btn").click();
+
+    // The whole bar (the non-removable More button included) disappears once
+    // nothing is pinned, reclaiming --mobile-action-bar-height for the
+    // terminal/extra-keys (bug: empty-mobile-action-bar). #mobile-more-btn is
+    // no longer reachable — the top-left Menu (#toolbar-toggle) opens the
+    // SAME tools/More sheet instead.
+    await expect(mobileBar).toBeHidden();
+    await expect(page.locator("#toolbar-toggle")).toBeVisible();
+
+    await page.locator("#toolbar-toggle").click();
     await expect(page.locator("#tools-sheet")).toBeVisible();
     await expect(
       page.getByRole("button", { name: "Edit layout" }),
     ).toBeVisible();
+
+    // Re-pinning any action brings the bar back immediately.
+    await page.getByRole("button", { name: "Edit layout" }).click();
+    await page.getByRole("button", { name: "Mobile" }).click();
+    const layoutEditorAgain = page.getByTestId(LAYOUT_EDITOR_TEST_IDS.root);
+    await expect(layoutEditorAgain).toBeVisible();
+    await dragLayoutEditorItem(
+      page,
+      layoutEditorAgain
+        .getByTestId(LAYOUT_EDITOR_TEST_IDS.available)
+        .getByRole("button", { name: "Files" }),
+      layoutEditorAgain.getByTestId(LAYOUT_EDITOR_TEST_IDS.pinned),
+    );
+    await page.getByRole("button", { name: "Done" }).click();
+
+    await expect(mobileBar).toBeVisible();
+    await expectButtonLabelsExactly(mobileBar, ["Files", "More"]);
   });
 
   test("keeps the top-left menu toggle usable and the mobile tools sheet vertically reachable", async ({

@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260618d" />
+    <link rel="stylesheet" href="/styles.css?v=20260620a" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -443,6 +443,10 @@
               <i data-lucide="folder-plus"></i>
               <span>New Folder</span>
             </button>
+            <button id="file-explorer-newfile-btn" class="btn">
+              <i data-lucide="file-plus"></i>
+              <span>New File</span>
+            </button>
             <button
               id="file-explorer-refresh-btn"
               class="btn-icon"
@@ -479,6 +483,33 @@
               Close
             </button>
           </div>
+        </section>
+      </div>
+
+      <div
+        id="settings-sheet"
+        class="settings-sheet hidden"
+        aria-hidden="true"
+      >
+        <div class="settings-sheet-backdrop"></div>
+        <section
+          class="settings-sheet-shell"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="settings-sheet-title"
+        >
+          <div class="settings-sheet-header">
+            <h3 id="settings-sheet-title">Settings</h3>
+            <button
+              id="settings-sheet-close"
+              class="btn-icon"
+              title="Close settings"
+              aria-label="Close settings"
+            >
+              <i data-lucide="x"></i>
+            </button>
+          </div>
+          <div id="settings-sheet-body" class="settings-sheet-body"></div>
         </section>
       </div>
 
@@ -537,21 +568,6 @@
           <button id="debug-panel-close" type="button" class="debug-panel-close">X</button>
         </div>
         <div id="debug-log"></div>
-      </div>
-
-      <!-- Search Bar -->
-      <div id="search-bar" class="search-bar hidden">
-        <input type="text" id="search-input" placeholder="Search..." />
-        <button id="search-prev" class="btn-icon" title="Previous">
-          <i data-lucide="chevron-left"></i>
-        </button>
-        <button id="search-next" class="btn-icon" title="Next">
-          <i data-lucide="chevron-right"></i>
-        </button>
-        <span id="search-count"></span>
-        <button id="search-close" class="btn-icon" title="Close">
-          <i data-lucide="x"></i>
-        </button>
       </div>
 
       <!-- Command Palette -->
@@ -721,7 +737,8 @@
     <script src="/git-timeline.js?v=20260616a"></script>
     <script src="/git-status-store.js?v=20260616a"></script>
     <script src="/git-decorations.js?v=20260616a"></script>
-    <script src="/git-scm-view.js?v=20260617b"></script>
+    <script src="/git-scm-view.js?v=20260620b"></script>
+    <script src="/git-history-view.js?v=20260620b"></script>
     <script src="/session-actions.js?v=20260601b"></script>
     <script src="/reconnect-classify.js?v=20260601a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
@@ -741,16 +758,17 @@
     <script src="/settings-runtime.js?v=20260616b"></script>
     <script src="/settings-store.js?v=20260612a"></script>
     <script src="/settings-migration.js?v=20260616a"></script>
+    <script src="/users-admin.js?v=20260703a"></script>
     <script src="/surface-windows.js?v=20260612a"></script>
     <script src="/view-host.js?v=20260616a"></script>
     <script src="/file-tree-store.js?v=20260616a"></script>
     <script src="/ide-shell.js?v=20260618c"></script>
-    <script src="/file-explorer.js?v=20260618c"></script>
+    <script src="/file-explorer.js?v=20260620a"></script>
     <script src="/file-editor.js?v=20260618a"></script>
     <script src="/editor-tabs.js?v=20260618a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260618c"></script>
+    <script src="/app.js?v=20260620a"></script>
   </body>
 </html>

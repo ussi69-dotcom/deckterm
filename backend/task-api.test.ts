@@ -7,6 +7,18 @@ import {
 } from "./services/foundation-state";
 
 const tempDirs: string[] = [];
+const ISOLATED_ENV_KEYS = [
+  "DECKTERM_STATE_DIR",
+  "ALLOWED_FILE_ROOTS",
+  "DECKTERM_RUNTIME_ENV",
+  "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "CF_ACCESS_REQUIRED",
+] as const;
+const previousEnv: Record<string, string | undefined> = {};
+for (const key of ISOLATED_ENV_KEYS) {
+  previousEnv[key] = process.env[key];
+}
 
 async function createHomeTempDir(prefix: string) {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", prefix));
@@ -15,6 +27,13 @@ async function createHomeTempDir(prefix: string) {
 }
 
 afterEach(async () => {
+  for (const key of ISOLATED_ENV_KEYS) {
+    if (previousEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousEnv[key];
+    }
+  }
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
@@ -32,6 +51,10 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const allowedRoot = process.env.HOME || "/tmp";
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
+  process.env.CF_ACCESS_REQUIRED = "0";
+  delete process.env.DECKTERM_PUBLISH_MODE;
+  delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
 
   // C2 routes task project roots through the foundation gate, which requires a
   // completed bootstrap. Make the anonymous test actor the first admin.

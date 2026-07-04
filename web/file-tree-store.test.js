@@ -30,6 +30,24 @@ test("items and decorations clone on read and write", () => {
   expect(store.getDecorations("ws")).toEqual({ "/x": { letter: "M" } });
 });
 
+test("setDecorations stores folder rollup map and getFolderDecorations returns it", () => {
+  const store = new FileTreeStore();
+  const folderMap = {
+    "/repo/src": { count: 2, colorClass: "git-status-modified" },
+  };
+  store.setDecorations(
+    "ws",
+    { "/repo/src/a.js": { letter: "M", colorClass: "git-status-modified" } },
+    folderMap,
+  );
+  expect(store.getFolderDecorations("ws")).toEqual(folderMap);
+  // Existing callers omitting folderDecorations get an empty map.
+  store.setDecorations("ws2", {
+    "/x": { letter: "A", colorClass: "git-status-added" },
+  });
+  expect(store.getFolderDecorations("ws2")).toEqual({});
+});
+
 test("global flags update and selection clears on null", () => {
   const store = new FileTreeStore();
 

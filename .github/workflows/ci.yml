@@ -34,6 +34,9 @@ jobs:
       - name: Install root dependencies
         run: bun install --frozen-lockfile
 
+      - name: Type check
+        run: bun x tsc --noEmit
+
       - name: Run unit tests
         run: bun run test:unit
 
@@ -77,15 +80,8 @@ jobs:
       - name: Wait for health check
         run: ./scripts/wait_for_health.sh http://127.0.0.1:4174/api/health 45
 
-      # TEMPORARY: the smoke E2E harness is broken in CI (terminals barely get
-      # created in the headless runner; the suite passes on a clean local dev and
-      # the unit gate covers correctness). Kept running for visibility but made
-      # non-blocking so it doesn't gate merges/deploys. Re-enable (remove
-      # continue-on-error) once the CI terminal-creation harness is fixed.
-      # Follow-up tracked in Notion Backlog.
       - name: Run smoke E2E suite
         run: bun run test:e2e:smoke
-        continue-on-error: true
 
       - name: Upload E2E artifacts on failure
         if: always()
@@ -104,3 +100,37 @@ jobs:
           if [ -f /tmp/deckterm-ci.pid ]; then
             kill "$(cat /tmp/deckterm-ci.pid)" || true
           fi
+
+  isolation-e2e:
+    needs: unit
+    # MUST be the GitHub-hosted VM runner (real systemd + passwordless sudo), not
+    # a job container — the broker needs `sudo systemd-run --scope`. run.sh
+    # preflights and FAILS LOUD (never skips) if the host can't support it.
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.5
+
+      - name: Install root dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Run Alice/Bob adversarial isolation e2e
+        run: ./scripts/isolation-e2e/run.sh
+
+      - name: Upload isolation-e2e logs on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: isolation-e2e-logs-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: /tmp/deckterm-iso-e2e-*/sut-*.log

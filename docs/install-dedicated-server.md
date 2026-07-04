@@ -33,7 +33,7 @@ Edit `.env`:
 ```dotenv
 PORT=4174
 HOST=127.0.0.1
-DECKTERM_PUBLISH_MODE=cloudflare
+DECKTERM_PUBLISH_MODE=cloudflare-access
 TMUX_BACKEND=1
 ALLOWED_FILE_ROOTS=/home/deploy
 CF_ACCESS_REQUIRED=1
@@ -45,9 +45,15 @@ TRUSTED_ORIGINS=https://deckterm.example.com
 Use `HOST=127.0.0.1` when nginx or cloudflared is on the same server. Use
 `HOST=0.0.0.0` only on a trusted private network.
 
-Use `DECKTERM_PUBLISH_MODE=cloudflare` for Cloudflare Tunnel publishing or
-`DECKTERM_PUBLISH_MODE=nginx` for a local reverse proxy. The Setup doctor uses
-that value to check the expected binary, auth, and bind-address requirements.
+`DECKTERM_PUBLISH_MODE` accepts `cloudflare-tunnel` (edge-only enforcement,
+server-side JWT validation off — keep `CF_ACCESS_REQUIRED=0`),
+`cloudflare-access` (DeckTerm also validates the Cloudflare Access JWT itself —
+requires `CF_ACCESS_REQUIRED=1` plus `CF_ACCESS_TEAM_NAME`/`CF_ACCESS_AUD`, as
+in the block above), or `nginx` for a local reverse proxy. (`cloudflare` is
+accepted as a legacy alias for `cloudflare-access`, kept for backward
+compatibility — prefer the explicit name in new installs.) The Setup doctor
+uses that value to check the expected binary, auth, and bind-address
+requirements.
 
 ## 3. Firewall
 

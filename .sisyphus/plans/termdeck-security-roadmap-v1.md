@@ -229,8 +229,7 @@ app.use(
 // MODIFY: Create terminal (line ~133)
 // Add owner from JWT payload
 const accessPayload = c.get("accessPayload") as
-  | CloudflareAccessPayload
-  | undefined;
+  CloudflareAccessPayload | undefined;
 const ownerId = accessPayload?.sub || "anonymous";
 const ownerEmail = accessPayload?.email || "anonymous";
 
@@ -249,8 +248,7 @@ terminals.set(id, {
 // MODIFY: List terminals (line ~239)
 // Filter by owner
 const accessPayload = c.get("accessPayload") as
-  | CloudflareAccessPayload
-  | undefined;
+  CloudflareAccessPayload | undefined;
 const currentUser = accessPayload?.sub || "anonymous";
 const list = Array.from(terminals.values())
   .filter((t) => t.ownerId === currentUser) // NEW: Only show own terminals
@@ -263,8 +261,7 @@ const list = Array.from(terminals.values())
 // MODIFY: Delete terminal (line ~249)
 // Check ownership
 const accessPayload = c.get("accessPayload") as
-  | CloudflareAccessPayload
-  | undefined;
+  CloudflareAccessPayload | undefined;
 const currentUser = accessPayload?.sub || "anonymous";
 const term = terminals.get(id);
 if (!term) return c.json({ error: "Terminal not found" }, 404);

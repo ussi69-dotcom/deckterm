@@ -1,9 +1,18 @@
 import { expect, test } from "bun:test";
+import type { CloudflareAccessPayload } from "@hono/cloudflare-access";
 import { resolveActorFromAccessPayload } from "./services/foundation-actors";
 
-const accessPayload = {
+const accessPayload: CloudflareAccessPayload = {
   sub: "cf-user-123",
   email: "admin@example.com",
+  aud: ["test-aud"],
+  exp: 9999999999,
+  iat: 1000000000,
+  nbf: 1000000000,
+  iss: "https://test.cloudflareaccess.com",
+  type: "app",
+  identity_nonce: "test-nonce",
+  country: "US",
 };
 
 test("resolveActorFromAccessPayload uses Cloudflare Access identity when present", () => {

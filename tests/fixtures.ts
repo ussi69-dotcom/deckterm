@@ -445,6 +445,32 @@ async function clearServerTerminals(page: Page, url: string) {
   }
 }
 
+async function clearServerSettings(page: Page, url: string) {
+  // The actor-scoped server settings KV (user_settings table) survives a
+  // browser-storage clear. A stale `files.defaultCwd` left by a prior test
+  // (e.g. a directory-picker fixture dir that was later deleted) gets restored
+  // into the new-terminal cwd on load, so createTerminal returns 403
+  // "Forbidden terminal root", waitForTerminal times out in beforeEach, and the
+  // failure cascades to every later test in the single worker. Reset the KV to
+  // empty so each test starts from a clean server-side state.
+  try {
+    const getRes = await page.request.get(`${url}/api/settings`);
+    if (!getRes.ok()) return;
+    const payload = (await getRes.json().catch(() => null)) as {
+      settings?: Record<string, unknown>;
+    } | null;
+    const keys = Object.keys(payload?.settings ?? {});
+    if (keys.length === 0) return;
+    const cleared: Record<string, null> = {};
+    for (const key of keys) cleared[key] = null;
+    await page.request.put(`${url}/api/settings`, {
+      data: { settings: cleared },
+    });
+  } catch {
+    // Keep tests running even if the settings endpoint is unavailable.
+  }
+}
+
 async function clearBrowserStateForOrigin(page: Page, url: string) {
   const origin = new URL(url).origin;
 
@@ -473,6 +499,7 @@ async function clearBrowserStateForOrigin(page: Page, url: string) {
  */
 export async function resetAppState(page: Page, url = DEFAULT_APP_URL) {
   await clearServerTerminals(page, url);
+  await clearServerSettings(page, url);
   await clearBrowserStateForOrigin(page, url);
   await page.context().clearCookies();
   await reserveTerminalCreateBudget(1);

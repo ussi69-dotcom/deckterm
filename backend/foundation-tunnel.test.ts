@@ -17,6 +17,17 @@ let stateDir: string;
 let allowedRoot: string;
 let outsideRoot: string;
 let app: { fetch: (req: Request) => Response | Promise<Response> };
+const ISOLATED_ENV_KEYS = [
+  "DECKTERM_STATE_DIR",
+  "ALLOWED_FILE_ROOTS",
+  "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "CF_ACCESS_REQUIRED",
+] as const;
+const previousEnv: Record<string, string | undefined> = {};
+for (const key of ISOLATED_ENV_KEYS) {
+  previousEnv[key] = process.env[key];
+}
 
 beforeAll(async () => {
   const home = process.env.HOME || "/tmp";
@@ -28,6 +39,7 @@ beforeAll(async () => {
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
   process.env.DECKTERM_PUBLISH_MODE = "cloudflare-tunnel";
+  process.env.CF_ACCESS_REQUIRED = "0";
   // A shell inside a DeckTerm dev terminal inherits the service's
   // DECKTERM_LEGACY_NO_BOOTSTRAP=1, which short-circuits requireFileAccess
   // before the edge_trusted_tunnel audit path this test asserts.
@@ -46,7 +58,13 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
-  delete process.env.DECKTERM_PUBLISH_MODE;
+  for (const key of ISOLATED_ENV_KEYS) {
+    if (previousEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousEnv[key];
+    }
+  }
   await Promise.all(
     [stateDir, allowedRoot, outsideRoot].map((dir) =>
       rm(dir, { recursive: true, force: true }),

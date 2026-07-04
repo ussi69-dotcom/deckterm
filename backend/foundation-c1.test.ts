@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   bootstrapFirstAdmin,
+  getFoundationUserById,
   getTerminalSession,
   grantScopedCapability,
   hasScopedGrant,
@@ -14,6 +15,7 @@ import {
   authorizeTerminalSessionAccess,
   getRouteCapability,
   isLegacyBootstrapBypassAllowed,
+  roleImpliesCapability,
 } from "./services/foundation-authorization";
 
 const tempDirs: string[] = [];
@@ -51,7 +53,12 @@ test("foundation C1 migrates auth identity and scoped grant tables", async () =>
   state.db.close();
 });
 
-test("foundation C1 bootstraps admin identity and seeds terminal/root grants", async () => {
+// B3 S2 removed the bootstrap-time grant materialization (ensureDefaultAdmin
+// Grants): a bootstrapped owner acts via the check-time role bundle
+// (roleImpliesCapability) instead of materialized `*/*` scoped_grants rows.
+// This test now asserts that behavior directly rather than the (now-absent)
+// grant rows.
+test("foundation C1 bootstraps admin identity as owner, acting via the check-time role bundle (no materialized grants)", async () => {
   const stateDir = await createTempDir(".deckterm-c1-state-");
   const state = await initializeFoundationState({
     stateDir,
@@ -92,12 +99,17 @@ test("foundation C1 bootstraps admin identity and seeds terminal/root grants", a
     email: "admin@example.com",
   });
 
+  const admin = getFoundationUserById(state.db, "user_admin");
+  expect(admin?.role).toBe("owner");
+  expect(admin?.disabled).toBe(false);
+
   for (const capability of [
     "terminal.create",
     "terminal.attach",
     "terminal.manage",
     "root.use",
   ] as const) {
+    // No materialized grant row for any of them...
     expect(
       hasScopedGrant(state.db, {
         userId: "user_admin",
@@ -105,7 +117,9 @@ test("foundation C1 bootstraps admin identity and seeds terminal/root grants", a
         resourceType: "*",
         resourceId: "*",
       }),
-    ).toBe(true);
+    ).toBe(false);
+    // ...yet the owner role bundle implies every one of them at check time.
+    expect(roleImpliesCapability(admin!.role, capability)).toBe(true);
   }
   expect(
     hasScopedGrant(state.db, {
@@ -151,6 +165,8 @@ test("foundation C1 records and ends terminal session metadata", async () => {
     updatedAt: "2026-05-13T10:00:00.000Z",
     endedAt: null,
     lastEventId: 0,
+    execKind: null,
+    osUid: null,
   });
 
   markTerminalSessionEnded(
@@ -187,7 +203,7 @@ test("foundation C1 authorizes terminal session access by owner or scoped grant"
   state.db
     .query(
       `INSERT INTO users (id, email, display_name, role, created_at, updated_at)
-       VALUES (?, ?, ?, 'user', ?, ?)`,
+       VALUES (?, ?, ?, 'member', ?, ?)`,
     )
     .run(
       "user_other",
@@ -338,6 +354,8 @@ test("foundation C1 ignores the legacy anonymous user when deciding bootstrap co
     now: new Date("2026-06-12T19:00:00Z"),
   });
   expect(result.ok).toBe(true);
+  // No boot-time/bootstrap-time grant materialization (B3 S2): the new
+  // owner acts via the check-time role bundle, not a materialized row.
   expect(
     hasScopedGrant(state.db, {
       userId: "cf-sub-uuid",
@@ -345,6 +363,13 @@ test("foundation C1 ignores the legacy anonymous user when deciding bootstrap co
       resourceType: "*",
       resourceId: "*",
     }),
+  ).toBe(false);
+  expect(getFoundationUserById(state.db, "cf-sub-uuid")?.role).toBe("owner");
+  expect(
+    roleImpliesCapability(
+      getFoundationUserById(state.db, "cf-sub-uuid")!.role,
+      "terminal.create",
+    ),
   ).toBe(true);
   state.db.close();
 });

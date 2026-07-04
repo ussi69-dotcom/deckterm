@@ -51,7 +51,71 @@ function buildDecorationMap(statusFiles, root) {
   return map;
 }
 
-const GitDecorationsModule = { buildDecorationMap };
+// Color class precedence for folder rollup: a folder's color is the
+// "most alarming" status among its changed descendants. Order (highest first):
+// conflict > deleted > modified/added/renamed > untracked > unknown.
+const FOLDER_COLOR_PRECEDENCE = [
+  "git-status-conflict",
+  "git-status-deleted",
+  "git-status-modified",
+  "git-status-added",
+  "git-status-renamed",
+  "git-status-untracked",
+];
+
+function higherPrecedenceColor(a, b) {
+  const ai = FOLDER_COLOR_PRECEDENCE.indexOf(a);
+  const bi = FOLDER_COLOR_PRECEDENCE.indexOf(b);
+  // Unknown classes fall to end (index -1 → treat as lowest).
+  if (ai === -1 && bi === -1) return a || b;
+  if (ai === -1) return b;
+  if (bi === -1) return a;
+  return ai <= bi ? a : b;
+}
+
+// For each changed file, walk its ancestor directories up to (and including)
+// `root`, incrementing `count` and resolving a representative `colorClass`
+// by precedence. Returns { <absDirPath>: { count, colorClass } }.
+// The existing file-keyed buildDecorationMap shape is left intact.
+function buildFolderDecorationMap(statusFiles, root) {
+  const map = {};
+  const normalizedRoot = String(root || "")
+    .trim()
+    .replace(/\/+$/, "");
+  if (!normalizedRoot || !Array.isArray(statusFiles)) return map;
+
+  const scm = getGitScm();
+  const statusLetter = scm?.statusLetter;
+  const statusClass = scm?.statusClass;
+  if (!statusLetter || !statusClass) return map;
+
+  for (const file of statusFiles) {
+    if (!file || !file.path) continue;
+    const letter = statusLetter(file);
+    const colorClass = statusClass(letter);
+    const absFile = joinRepoPath(normalizedRoot, file.path);
+
+    // Walk every ancestor dir from parent up to (and including) the root.
+    let dir = absFile.split("/").slice(0, -1).join("/");
+    while (dir && dir.startsWith(normalizedRoot)) {
+      const existing = map[dir];
+      if (existing) {
+        existing.count += 1;
+        existing.colorClass = higherPrecedenceColor(
+          existing.colorClass,
+          colorClass,
+        );
+      } else {
+        map[dir] = { count: 1, colorClass };
+      }
+      if (dir === normalizedRoot) break;
+      dir = dir.split("/").slice(0, -1).join("/");
+    }
+  }
+  return map;
+}
+
+const GitDecorationsModule = { buildDecorationMap, buildFolderDecorationMap };
 
 if (typeof window !== "undefined") {
   window.GitDecorations = GitDecorationsModule;
@@ -63,4 +127,5 @@ if (typeof module !== "undefined" && module.exports) {
 
 if (typeof exports !== "undefined") {
   exports.buildDecorationMap = buildDecorationMap;
+  exports.buildFolderDecorationMap = buildFolderDecorationMap;
 }

@@ -37,3 +37,4 @@ tests/test-results/
 .playwright-mcp/
 artifacts/
 
+scripts/broker/__pycache__/

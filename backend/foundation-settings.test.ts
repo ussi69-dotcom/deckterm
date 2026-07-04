@@ -8,8 +8,27 @@ import {
 } from "./services/foundation-state";
 
 const tempDirs: string[] = [];
+const ISOLATED_ENV_KEYS = [
+  "DECKTERM_STATE_DIR",
+  "ALLOWED_FILE_ROOTS",
+  "DECKTERM_RUNTIME_ENV",
+  "DECKTERM_PUBLISH_MODE",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "CF_ACCESS_REQUIRED",
+] as const;
+const previousEnv: Record<string, string | undefined> = {};
+for (const key of ISOLATED_ENV_KEYS) {
+  previousEnv[key] = process.env[key];
+}
 
 afterEach(async () => {
+  for (const key of ISOLATED_ENV_KEYS) {
+    if (previousEnv[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = previousEnv[key];
+    }
+  }
   await Promise.all(
     tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
@@ -53,6 +72,7 @@ test("settings API stores and merges per-actor settings", async () => {
   tempDirs.push(stateDir);
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = process.env.HOME || "/tmp";
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   process.env.DECKTERM_LEGACY_NO_BOOTSTRAP = "1";
   delete process.env.DECKTERM_PUBLISH_MODE;
   // The shell running tests can inherit the dev service's Cloudflare Access
@@ -110,4 +130,26 @@ test("settings API stores and merges per-actor settings", async () => {
     }),
   );
   expect(badRes.status).toBe(400);
+
+  // B7 (D-B7-2): the `policy.*` namespace is reserved for the C3 admin-managed
+  // session policy store — actor-scoped self-service must not be able to
+  // squat on it (users setting their own idle/rate limits).
+  for (const key of ["policy", "policy.idleTimeoutMs"]) {
+    const policyRes = await app.fetch(
+      new Request("http://localhost/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: { [key]: 1 } }),
+      }),
+    );
+    expect(policyRes.status).toBe(400);
+  }
+  const afterPolicy = await app.fetch(
+    new Request("http://localhost/api/settings"),
+  );
+  const afterPolicyBody = (await afterPolicy.json()) as {
+    settings: Record<string, unknown>;
+  };
+  expect(afterPolicyBody.settings["policy"]).toBeUndefined();
+  expect(afterPolicyBody.settings["policy.idleTimeoutMs"]).toBeUndefined();
 });

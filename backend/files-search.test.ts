@@ -76,6 +76,7 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   delete process.env.DECKTERM_PUBLISH_MODE;
   delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
   delete process.env.CF_ACCESS_REQUIRED;

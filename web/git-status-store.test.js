@@ -83,6 +83,22 @@ test("onChange returns an unsubscribe function", async () => {
   expect(events).toHaveLength(0);
 });
 
+test("two near-simultaneous getStatus calls for the same cwd trigger only one network call", async () => {
+  const fetchImpl = makeFetch([{ branch: "main", files: [], root: "/repo" }]);
+  const store = new GitStatusStore({ fetchImpl });
+
+  // Both calls start before either resolves — the in-flight `pending` map
+  // must dedupe them into a single fetch.
+  const [a, b] = await Promise.all([
+    store.getStatus("/repo"),
+    store.getStatus("/repo"),
+  ]);
+
+  expect(fetchImpl.calls).toHaveLength(1);
+  expect(a).toBe(b);
+  expect(a.root).toBe("/repo");
+});
+
 test("invalidate drops a cached cwd so the next getStatus re-fetches", async () => {
   const fetchImpl = makeFetch([
     { files: [], root: "/repo" },

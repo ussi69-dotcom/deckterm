@@ -11,9 +11,13 @@ const ISOLATED_ENV_KEYS = [
   "ALLOWED_FILE_ROOTS",
   "TMUX_BACKEND",
   "CF_ACCESS_REQUIRED",
+  "CF_ACCESS_TEAM_NAME",
+  "CF_ACCESS_AUD",
   "DECKTERM_RUNTIME_ENV",
   "DECKTERM_PUBLISH_MODE",
   "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "DECKTERM_BOOTSTRAP_ADMIN_EMAIL",
+  "PORT",
   "SHELL",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -85,7 +89,11 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   process.env.ALLOWED_FILE_ROOTS = projectRoot;
   process.env.TMUX_BACKEND = "0";
   process.env.CF_ACCESS_REQUIRED = "0";
+  delete process.env.CF_ACCESS_TEAM_NAME;
+  delete process.env.CF_ACCESS_AUD;
   process.env.DECKTERM_RUNTIME_ENV = "development";
+  process.env.PORT = "4174";
+  delete process.env.DECKTERM_BOOTSTRAP_ADMIN_EMAIL;
   // Pin non-tunnel mode so this test deterministically exercises the
   // bootstrap-required gate. In cloudflare-tunnel mode that gate is bypassed by
   // design (see foundation-tunnel.test.ts), and a local .env enabling tunnel
@@ -197,6 +205,16 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
     ended_at: null,
   });
 
+  // B3 S2: owner/admin now imply attach on ANY terminal via the check-time
+  // role bundle (roleImpliesCapability), independent of materialized grant
+  // rows — bootstrapFirstAdmin makes "anonymous" the owner (S1). Temporarily
+  // demote to member so this grant-only deny/allow scenario still exercises
+  // the scoped-grant path rather than short-circuiting via role_bundle;
+  // restored to owner below before the final DELETE (which needs
+  // terminal.manage on a terminal "anonymous" no longer owns).
+  writeDb
+    .query("UPDATE users SET role = 'member' WHERE id = ?")
+    .run("anonymous");
   writeDb
     .query("DELETE FROM scoped_grants WHERE user_id = ? AND capability = ?")
     .run("anonymous", "terminal.attach");
@@ -235,6 +253,14 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   );
   expect(socket.readyState).toBe(WebSocket.OPEN);
   socket.close();
+
+  // Restore "anonymous" to owner: the DELETE below needs terminal.manage on
+  // a terminal it no longer owns (reassigned to "user_other" above), which
+  // the owner role bundle covers exactly like the pre-B3 materialized
+  // wildcard admin grant did.
+  writeDb
+    .query("UPDATE users SET role = 'owner' WHERE id = ?")
+    .run("anonymous");
 
   const deleteRes = await app.fetch(
     new Request(`http://deckterm.test/api/terminals/${created.id}`, {

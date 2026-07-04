@@ -50,6 +50,7 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
   // Same env isolation as foundation-c2.test.ts (Bun .env auto-load + service
   // env leak through DeckTerm terminals — see 5fcd118).
   delete process.env.DECKTERM_PUBLISH_MODE;
@@ -351,4 +352,88 @@ test("show accepts a <sha>~N revision suffix (commit-diff before-side)", async (
   );
   expect(res.status).toBe(200);
   expect(((await res.json()) as any).content).toBe("first\n");
+});
+
+test("diff falls back to --no-index for an untracked file (was empty)", async () => {
+  // Plain `git diff -- <path>` produces no output for an untracked file, which
+  // left the SCM diff preview empty. The route now detects the untracked status
+  // and re-runs with --no-index so the whole file shows as an addition.
+  await writeFile(join(repo, "fresh-untracked.txt"), "brand new line\n");
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/diff?cwd=${encodeURIComponent(repo)}&path=fresh-untracked.txt`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  expect(data.diff).toContain("brand new line");
+  expect(data.diff).toContain("+brand new line");
+  await rm(join(repo, "fresh-untracked.txt"), { force: true });
+});
+
+test("status -uall lists files inside an untracked directory individually", async () => {
+  // Default porcelain collapses an untracked dir to a single `dir/` row; -uall
+  // expands it so the explorer/SCM see each nested file (and folder rollups are
+  // accurate). Create a nested untracked file and assert its full path appears.
+  const { mkdir } = await import("node:fs/promises");
+  const nestedDir = join(repo, "untracked-nest");
+  await mkdir(nestedDir, { recursive: true });
+  await writeFile(join(nestedDir, "deep.txt"), "x\n");
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  const paths = (data.files as any[]).map((f) => f.path);
+  expect(paths).toContain("untracked-nest/deep.txt");
+  await rm(nestedDir, { recursive: true, force: true });
+});
+
+test("content PUT creates a brand-new file (allowMissing)", async () => {
+  // PUT /api/files/content previously rejected a non-existent path (403) because
+  // resolveAllowedPath required the file to exist. With allowMissing it creates
+  // the file — the New File explorer action depends on this.
+  const target = join(repo, "created-by-put.txt");
+  const res = await app.fetch(
+    new Request("http://deckterm.test/api/files/content", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: target, content: "" }),
+    }),
+  );
+  expect(res.status).toBe(200);
+  expect(await readFile(target, "utf8")).toBe("");
+  await rm(target, { force: true });
+});
+
+test("commit-files lists the files changed in a single commit", async () => {
+  // Make a commit that touches one tracked file in a subdir, then ask the route
+  // for that commit's changed files (powers the History repo-scope expand view).
+  const { mkdir } = await import("node:fs/promises");
+  await mkdir(join(repo, "sub"), { recursive: true });
+  await writeFile(join(repo, "sub", "thing.txt"), "hello\n");
+  await git(repo, "add", "sub/thing.txt");
+  await git(repo, "commit", "-m", "add sub/thing");
+  const sha = (await git(repo, "rev-parse", "HEAD")).trim();
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/commit-files?cwd=${encodeURIComponent(repo)}&commit=${sha}`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  const entry = (data.files as any[]).find((f) => f.path === "sub/thing.txt");
+  expect(entry).toBeTruthy();
+  expect(entry.status).toBe("A");
+});
+
+test("commit-files rejects a dash-led commit ref (argv flag smuggling)", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/commit-files?cwd=${encodeURIComponent(repo)}&commit=--stat`,
+    ),
+  );
+  expect(res.status).toBe(400);
 });

@@ -16,6 +16,17 @@ const SURFACE_WINDOW_DEFAULT_MIN_HEIGHT_PX = 240;
 const SURFACE_WINDOW_SNAP_THRESHOLD_PCT = 4;
 const SURFACE_WINDOW_LAYOUT_SETTINGS_KEY = "windows.layout";
 
+// Desktop/mobile breakpoint for floating SurfaceWindows — matches the file
+// explorer's own sheet breakpoint so a narrow desktop window and the explorer
+// agree on which mode is active. Pure so it can be unit tested and reused by
+// both the open-time check (isWindowedSurfaces) and the resize-time reconcile
+// (TerminalManager.reconcileSurfaceWindowsForViewport).
+const SURFACE_WINDOW_DESKTOP_MIN_WIDTH_PX = 768;
+
+function isDesktopSurfaceWidth(width) {
+  return Number(width) >= SURFACE_WINDOW_DESKTOP_MIN_WIDTH_PX;
+}
+
 const SNAP_ZONE_BOUNDS = Object.freeze({
   left: Object.freeze({ x: 0, y: 0, width: 50, height: 100 }),
   right: Object.freeze({ x: 50, y: 0, width: 50, height: 100 }),
@@ -571,9 +582,11 @@ const SurfaceWindows = {
   deserializeWindowLayout,
   clampDockHeight,
   dockStateFromSettings,
+  isDesktopSurfaceWidth,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,
+  SURFACE_WINDOW_DESKTOP_MIN_WIDTH_PX,
 };
 
 if (typeof document !== "undefined") {

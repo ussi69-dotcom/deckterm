@@ -352,7 +352,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
   }),
   palette: Object.freeze({
     label: "Palette",
-    icon: "more-horizontal",
+    icon: "search",
     action: "palette",
     desktopId: "command-palette-trigger",
     toolsId: "tools-sheet-palette",
@@ -1993,12 +1993,26 @@ class ExtraKeysManager {
     this.updateVisibility();
 
     // Restore the persisted secondary-row collapsed state (default: expanded).
+    // settingsStore's cache is empty until settingsReady resolves (a server
+    // round-trip), so applying it synchronously here always reads the
+    // fallback on a fresh browser/profile — apply now (so there's no flash
+    // of the wrong state once localStorage IS warm) and re-apply once
+    // settingsReady resolves in case the synchronous read missed a
+    // server-persisted value.
     this.setExtraKeysRow2Collapsed(
       Boolean(
         this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
       ),
       { persist: false },
     );
+    void this.tm?.settingsReady?.then(() => {
+      this.setExtraKeysRow2Collapsed(
+        Boolean(
+          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+        ),
+        { persist: false },
+      );
+    });
 
     // Setup toggle button handler
     document
@@ -2108,8 +2122,17 @@ class ExtraKeysManager {
   }
 
   loadVisibilityState() {
-    // On mobile, always start visible (managed by keyboard)
-    if (platformDetector.isMobile) return true;
+    // Mobile respects the same persisted terminal.extraKeysVisible pref as
+    // desktop (bug: extra-keys-visibility-pref-ignored-on-mobile) — but its
+    // OWN default is visible=true (an on-screen keyboard row a mobile user
+    // can't otherwise get to), unlike the desktop schema default of hidden.
+    // Read the raw store value with that mobile-specific fallback instead of
+    // going through the schema default (false), which is desktop-oriented.
+    if (platformDetector.isMobile) {
+      return Boolean(
+        this.tm?.settingsStore?.get("terminal.extraKeysVisible", true) ?? true,
+      );
+    }
 
     // On desktop, read the canonical terminal.extraKeysVisible from the store
     // (schema default: hidden). No legacy localStorage read — migration owns it.
@@ -2128,11 +2151,21 @@ class ExtraKeysManager {
   applyVisibility(visible) {
     this.visible = Boolean(visible);
     this.updateVisibility();
+    // Showing/hiding the row (and its ⋯ toggle) changes how much vertical
+    // space the terminal has. The container-height calc in
+    // handleViewportResize is otherwise only re-run on the next
+    // visualViewport resize/scroll event — trigger it now so a toggle (e.g.
+    // via the More-sheet action) reclaims/consumes the freed space
+    // synchronously, same as setExtraKeysRow2Collapsed already does.
+    this.tm?.handleViewportResize?.();
   }
 
   setVisible(visible) {
     // Persist through the settings runtime/store; the side effect applies it.
-    if (platformDetector.isDesktop && this.tm?.settingsRuntime) {
+    // Both platforms route through the same terminal.extraKeysVisible pref
+    // now (bug: extra-keys-visibility-pref-ignored-on-mobile) — only the
+    // DEFAULT differs by platform (see loadVisibilityState).
+    if (this.tm?.settingsRuntime) {
       this.tm.settingsRuntime.apply(
         "terminal.extraKeysVisible",
         Boolean(visible),
@@ -2140,9 +2173,7 @@ class ExtraKeysManager {
       return;
     }
     this.applyVisibility(visible);
-    if (platformDetector.isDesktop) {
-      this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
-    }
+    this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
   }
 
   toggle() {
@@ -2178,30 +2209,35 @@ class ExtraKeysManager {
         Boolean(collapsed),
       );
     }
+    // The container-height calc that accounts for the extra-keys row (see
+    // handleViewportResize) is otherwise only re-run on the next
+    // visualViewport resize/scroll event. Trigger it immediately so a
+    // row-2 collapse/expand while the on-screen keyboard is already open
+    // reclaims/consumes the freed vertical space right away, not on the
+    // next keyboard toggle.
+    this.tm?.handleViewportResize?.();
   }
 
-  // Called by viewport resize handler for mobile keyboard
-  // On mobile, extra keys should ALWAYS stay visible (just repositioned)
+  // Called by viewport resize handler for mobile keyboard. Mobile no longer
+  // forces visibility here (bug: extra-keys-visibility-pref-ignored-on-mobile)
+  // — the keyboard opening only REPOSITIONS the row (handleViewportResize's
+  // own inline-style bottom offset, applied unconditionally regardless of
+  // this.visible). Whether the row shows at all is governed solely by the
+  // persisted terminal.extraKeysVisible pref now, same as desktop, so a user
+  // who explicitly hid it (via Settings or the More-sheet action) stays hidden
+  // across keyboard open/close.
   showForKeyboard() {
-    if (platformDetector.isMobile) {
-      this.visible = true;
-      this.updateVisibility();
-    }
+    // No-op: see comment above.
   }
 
   hideForKeyboard() {
-    // On mobile, DO NOT hide extra keys when keyboard closes
-    // They should remain visible at the bottom of the screen
-    // Only hide on desktop if user explicitly toggled them off
+    // Desktop: extra keys were only ever shown transiently for the keyboard,
+    // so hide again once it closes if the user hasn't explicitly enabled them.
     if (platformDetector.isDesktop) {
       this.visible = false;
       this.updateVisibility();
     }
-    // On mobile, keep extra keys visible
-    if (platformDetector.isMobile) {
-      this.visible = true;
-      this.updateVisibility();
-    }
+    // Mobile: keep whatever the persisted pref says — do NOT force back on.
   }
 }
 
@@ -2798,6 +2834,10 @@ class GitManager {
     };
     // Keep currentCwd for backward compatibility with existing methods
     this.currentCwd = null;
+    // Monotonic refresh() generation: a slow response from a superseded
+    // refresh() (stale cwd) must not clobber the state/DOM a newer refresh()
+    // already wrote. See refresh() below.
+    this._refreshGeneration = 0;
     this.init();
   }
 
@@ -3184,7 +3224,14 @@ class GitManager {
   }
 
   async show(cwd) {
-    this.state.cwd = cwd || document.getElementById("directory")?.value || "~";
+    // An explicit cwd arg still wins (existing call sites always pass the
+    // active workspace's cwd); otherwise resolve the canonical LIVE cwd
+    // (explorer path / active workspace) instead of trusting a stale DOM read.
+    this.state.cwd =
+      cwd ||
+      window.terminalManager?.getGitCwd?.() ||
+      document.getElementById("directory")?.value ||
+      "~";
     this.currentCwd = this.state.cwd; // Keep backward compatibility
     this.panel.classList.remove("hidden");
     this.state.selectedIndex = 0;
@@ -3250,23 +3297,46 @@ class GitManager {
   }
 
   async refresh() {
-    if (!this.state.cwd && !this.currentCwd) return;
-    const cwd = this.state.cwd || this.currentCwd;
+    // Resolve the cwd LIVE every call — explorer navigation / a committed
+    // working-dir field change moves the canonical cwd AFTER this panel first
+    // mounted, and trusting the cached state.cwd is exactly the stuck-cwd bug
+    // (the old set-once guard). Falls back to the cached field only when no
+    // live source is available (e.g. GitManager used standalone in a test).
+    const tm = window.terminalManager;
+    const liveCwd = tm?.getGitCwd?.();
+    const cwd = liveCwd || this.state.cwd || this.currentCwd;
+    if (!cwd) return;
+    this.state.cwd = cwd;
+    this.currentCwd = cwd;
     this.state.loading = true;
 
+    // Monotonic generation guard: if a NEWER refresh() starts before this one's
+    // network round trips land, this (now-stale) call must not clobber the
+    // newer state it would otherwise overwrite.
+    const generation = ++this._refreshGeneration;
+    const stale = () => generation !== this._refreshGeneration;
+
     try {
-      // Fetch status
-      const statusRes = await fetch(
-        `/api/git/status?cwd=${encodeURIComponent(cwd)}`,
-      );
-      const statusData = await statusRes.json();
+      // Fetch status through the shared, deduping GitStatusStore instead of a
+      // raw fetch. refreshStatus() force-refetches + repopulates the cache +
+      // EMITS onChange (the IDE SCM view's subscriber re-renders from it) — the
+      // same effect the old separate force-refresh call below used to produce
+      // as a SECOND, redundant fetch; that call is gone (see below).
+      const statusData = tm?.gitStatusStore
+        ? await tm.gitStatusStore.refreshStatus(cwd)
+        : await fetch(`/api/git/status?cwd=${encodeURIComponent(cwd)}`).then(
+            (r) => r.json(),
+          );
+      if (stale()) return;
 
       if (statusData.error) {
+        this.state.error = statusData.error;
         this.panel.querySelector("#git-branch").textContent = "not a repo";
         this.panel.querySelector("#git-files").innerHTML =
           `<p class="error">${this.escapeHtml(statusData.error)}</p>`;
         return;
       }
+      this.state.error = null;
 
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
@@ -3299,21 +3369,20 @@ class GitManager {
         }
       }
 
-      // Keep explorer git decorations + the IDE SCM view in sync with the panel:
-      // force-refresh the shared status cache (which EMITS onChange so the SCM
-      // view's subscriber re-renders), then re-derive explorer decorations. The
-      // force read repopulates the cache the decoration pass reuses.
-      const tm = window.terminalManager;
-      if (tm?.gitStatusStore) {
-        void tm.gitStatusStore.refreshStatus(cwd);
-        void tm.refreshExplorerDecorations();
-      }
+      // Keep explorer git decorations in sync with the panel. The store's
+      // refreshStatus() above already repopulated the cache + emitted
+      // onChange, so this just re-derives decorations from the now-fresh
+      // cache (no extra network call).
+      if (tm) void tm.refreshExplorerDecorations();
+
+      if (stale()) return;
 
       // Fetch commit history
       const logRes = await fetch(
         `/api/git/log?cwd=${encodeURIComponent(cwd)}&limit=30`,
       );
       const logData = await logRes.json();
+      if (stale()) return;
 
       if (!logData.error) {
         this.state.commits = logData.commits || [];
@@ -3325,6 +3394,8 @@ class GitManager {
         `/api/git/stash?cwd=${encodeURIComponent(cwd)}`,
       );
       const stashData = await stashRes.json();
+      if (stale()) return;
+
       if (!stashData.error) {
         this.state.stashes = stashData.stashes || [];
         this.renderStashes();
@@ -3332,7 +3403,7 @@ class GitManager {
     } catch (err) {
       console.error("Git refresh error:", err);
     } finally {
-      this.state.loading = false;
+      if (!stale()) this.state.loading = false;
     }
   }
 
@@ -4468,6 +4539,13 @@ class SettingsManager {
     this.envLoaded = false;
     this.envRows = [];
     this.root = null;
+    // B3-S5: role-gated "Users" category, appended after the schema-derived
+    // categories (never disturbs their order). Visibility + the resolved
+    // actor come from GET /api/foundation/status (fetched once per open).
+    this.usersAdmin = window.UsersAdmin || null;
+    this.usersAdminVisible = false;
+    this.usersAdminCurrentUser = null;
+    this.usersAdminController = null;
   }
 
   // Build (once) the detached content element the SurfaceWindow will host.
@@ -4511,6 +4589,9 @@ class SettingsManager {
   renderSidebar() {
     if (!this.sidebarEl) return;
     const categories = window.SettingsSchema?.categoriesOf?.(this.schema) || [];
+    // Appended AFTER the schema-derived categories so their order/tests are
+    // undisturbed; absent entirely for members/disabled/logged-out actors.
+    if (this.usersAdminVisible) categories.push("Users");
     if (!this.activeCategory && categories.length) {
       this.activeCategory = categories[0];
     }
@@ -4534,6 +4615,14 @@ class SettingsManager {
   renderList() {
     if (!this.listEl || !this.ui) return;
     this.listEl.replaceChildren();
+
+    // "Users" is a custom, non-schema category (B3-S5) — its panel is owned
+    // by the users-admin module, not the settings-schema group/search view.
+    if (this.activeCategory === "Users" && this.usersAdminVisible) {
+      this.renderSidebar();
+      this.renderUsersPanel();
+      return;
+    }
 
     const trimmed = this.query.trim();
     let groups;
@@ -4705,6 +4794,45 @@ class SettingsManager {
     return section;
   }
 
+  // Fetches /api/foundation/status and derives Users-category visibility +
+  // the resolved actor for the users-admin module's gate (shouldShowUsersCategory
+  // — plan §7 Codex #15: non-null user, role owner|admin, disabled === false).
+  // Any fetch/parse failure hides the category (fail-closed, matches the
+  // server's own deny-by-default posture).
+  async loadUsersAdminStatus() {
+    this.usersAdminVisible = false;
+    this.usersAdminCurrentUser = null;
+    if (!this.fetchImpl || !this.usersAdmin) return;
+    try {
+      const res = await this.fetchImpl("/api/foundation/status");
+      if (!res || !res.ok) return;
+      const status = await res.json();
+      this.usersAdminCurrentUser = status?.auth?.user || null;
+      this.usersAdminVisible = Boolean(
+        this.usersAdmin.shouldShowUsersCategory?.(status),
+      );
+    } catch {
+      // Non-fatal — the category is simply absent.
+    }
+  }
+
+  // Mounts the users-admin DOM controller into a fresh host inside the
+  // settings list. The controller owns its own fetch/render/action wiring
+  // (web/users-admin.js); this is intentionally the entire integration point.
+  renderUsersPanel() {
+    if (!this.usersAdmin) return;
+    const host = document.createElement("div");
+    host.className = "users-admin-host";
+    this.listEl.appendChild(host);
+    if (!this.usersAdminController) {
+      this.usersAdminController = new this.usersAdmin.UsersAdminController({
+        fetchImpl: this.fetchImpl,
+        getCurrentUser: () => this.usersAdminCurrentUser,
+      });
+    }
+    this.usersAdminController.mount(host);
+  }
+
   async loadServerConfig() {
     if (this.envLoaded || !this.fetchImpl) return;
     try {
@@ -4722,6 +4850,7 @@ class SettingsManager {
 
   async render() {
     this.buildContent();
+    await this.loadUsersAdminStatus();
     this.renderSidebar();
     this.renderList();
     await this.loadServerConfig();
@@ -4880,6 +5009,9 @@ class TerminalManager {
         force: true,
         userDraft: true,
       });
+      // Committed value (change = blur/Enter commit for text inputs) — unlike
+      // the input-event draft handler above, this one navigates.
+      void this.commitWorkingDirectory(event.target.value);
     });
     this.toolsSheetDirectoryInput?.addEventListener("input", (event) => {
       this.setDirectoryValue(event.target.value, {
@@ -4892,6 +5024,7 @@ class TerminalManager {
         force: true,
         userDraft: true,
       });
+      void this.commitWorkingDirectory(event.target.value);
     });
 
     // Toolbar action buttons
@@ -4975,14 +5108,13 @@ class TerminalManager {
       this.fileExplorer.onDirLoaded = () =>
         void this.refreshExplorerDecorations();
     }
-    // The controller's own close button only hides the explorer content; in
-    // windowed mode the hosting SurfaceWindow has to close with it.
-    document
-      .getElementById("file-explorer-close")
-      ?.addEventListener("click", () => {
-        this.surfaceWindowManager?.close("files");
-        this.syncSurfaceButtonState();
-      });
+    // Both the header × and footer Close button route through the
+    // controller's onRequestClose hook so they both run the full
+    // closeFileExplorer() chokepoint (content + hosting SurfaceWindow +
+    // right-surface bookkeeping) instead of only hiding the panel content.
+    if (this.fileExplorer) {
+      this.fileExplorer.onRequestClose = () => this.closeFileExplorer();
+    }
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
@@ -5202,8 +5334,28 @@ class TerminalManager {
     document.addEventListener("click", this.handleSurfaceActionClick);
   }
 
+  // Width alone (smallScreen) misses a phone in landscape — e.g. 844x390 is
+  // >=768px wide but is still a touch device with no hover, so
+  // platformDetector.isMobile is true (it ORs in isCoarsePointer && noHover
+  // independent of width). Consult both so a landscape phone gets mobile
+  // chrome while a narrow desktop *window* still does too (bug:
+  // landscape-phone-gets-desktop-chrome). isWindowedSurfaces() already makes
+  // the same isMobile check for Files/Git/Tasks/Editor; this keeps the
+  // toolbar/action-bar chrome decision consistent with it.
   getActiveChromeMode() {
-    return platformDetector.smallScreen ? "mobile" : "desktop";
+    return platformDetector.smallScreen || platformDetector.isMobile
+      ? "mobile"
+      : "desktop";
+  }
+
+  // Stamps body.chrome-mobile so CSS can key off the SAME mobile decision as
+  // getActiveChromeMode() (isMobile OR smallScreen) instead of only the
+  // width-based @media breakpoints, which a landscape phone slips past.
+  syncChromeModeClass() {
+    document.body.classList.toggle(
+      "chrome-mobile",
+      this.getActiveChromeMode() === "mobile",
+    );
   }
 
   getActionButtonConfig(actionId) {
@@ -5313,13 +5465,31 @@ class TerminalManager {
     root.dataset.density = density;
 
     if (surface === "mobile-primary") {
-      const isEmpty = actionIds.length === 0;
+      // actionIds always includes the non-removable "more" slot (see
+      // getPrimaryActionIds), so actionIds.length is never 0 even when every
+      // pin has been removed — check the PINNED ids only (bug:
+      // empty-mobile-action-bar). Pure decision lives in navigationSurface so
+      // it's covered without a DOM.
+      const pinnedActionIds = actionIds.filter((id) => id !== "more");
+      const wasHidden = root.hidden;
+      const isEmpty = !(
+        this.navigationSurface.shouldShowMobileActionBar?.(pinnedActionIds) ??
+        pinnedActionIds.length > 0
+      );
       root.hidden = isEmpty;
       root.setAttribute("aria-hidden", isEmpty ? "true" : "false");
       root.style.setProperty(
         "--mobile-action-bar-columns",
         String(actionIds.length || 1),
       );
+      // Hiding/showing the bar changes how much vertical space the
+      // terminal/extra-keys have (--mobile-action-bar-height reclaimed) —
+      // xterm's pixel-fit needs an explicit resize pass, CSS reflow alone
+      // won't trigger it (mirrors ExtraKeysManager's row-2 collapse doing
+      // the same via handleViewportResize).
+      if (wasHidden !== isEmpty) {
+        this.handleViewportResize?.();
+      }
     }
 
     actionIds.forEach((actionId) => {
@@ -5633,6 +5803,7 @@ class TerminalManager {
   }
 
   renderActionSurfaces() {
+    this.syncChromeModeClass();
     this.renderPrimaryActionBar(
       document.getElementById("desktop-primary-actions"),
       "desktop",
@@ -5793,12 +5964,15 @@ class TerminalManager {
     if (this.directoryInput && this.directoryInput.value !== next) {
       this.directoryInput.value = next;
     }
+    if (this.directoryInput) this.directoryInput.title = next;
     if (
       this.toolsSheetDirectoryInput &&
       this.toolsSheetDirectoryInput.value !== next
     ) {
       this.toolsSheetDirectoryInput.value = next;
     }
+    if (this.toolsSheetDirectoryInput)
+      this.toolsSheetDirectoryInput.title = next;
     // Persist the last directory as the canonical files.defaultCwd. Write
     // directly to the store (NOT via runtime.apply) to avoid re-dispatching the
     // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
@@ -6147,12 +6321,25 @@ class TerminalManager {
     document.documentElement.style.setProperty("--color-accent", color);
   }
 
-  // Side effect for terminal.extraKeysVisible (value coerced to bool). Delegates
-  // to ExtraKeysManager without re-persisting. Mobile keeps its own always-on
-  // behavior, so this only re-applies desktop visibility.
+  // Side effect for terminal.extraKeysVisible (value coerced to bool).
+  // Delegates to ExtraKeysManager without re-persisting. Fires from both an
+  // explicit toggle (settingsRuntime.apply — value is already persisted) AND
+  // the startup settingsRuntime.applyAll() sweep, which resolves an UNSET key
+  // to the schema default (false, desktop-oriented). Mobile's own default is
+  // true (see ExtraKeysManager.loadVisibilityState) — so on mobile, only
+  // apply when the key is actually persisted; otherwise leave whatever
+  // loadVisibilityState() already resolved synchronously untouched, instead
+  // of letting the schema default clobber it to hidden on a fresh session.
   applyExtraKeysVisible(visible) {
     if (!this.extraKeys) return;
-    if (platformDetector.isMobile) return;
+    if (platformDetector.isMobile) {
+      const UNSET = Symbol("unset");
+      const persisted = this.settingsStore?.get(
+        "terminal.extraKeysVisible",
+        UNSET,
+      );
+      if (persisted === UNSET) return;
+    }
     this.extraKeys.applyVisibility(Boolean(visible));
   }
 
@@ -6172,7 +6359,6 @@ class TerminalManager {
       this.editorTabs.openSettings();
       return;
     }
-    // Terminal mode: use the existing SurfaceWindow path.
     if (!this.settingsManager) {
       this.settingsManager = new SettingsManager({
         settingsStore: this.settingsStore,
@@ -6181,6 +6367,7 @@ class TerminalManager {
     }
     const content = this.settingsManager.buildContent();
     if (this.isWindowedSurfaces()) {
+      // Desktop: the existing SurfaceWindow path.
       await this.openSurfaceWindow("settings", {
         title: "Settings",
         icon: "⚙",
@@ -6190,9 +6377,48 @@ class TerminalManager {
         minHeightPx: 360,
         onClose: () => this.surfaceWindowManager?.close("settings"),
       });
+    } else {
+      // Mobile (or a narrow desktop window where windowed surfaces are off):
+      // there is no floating-window host, so host the same detached content
+      // in the static full-screen sheet (mirrors openFileExplorer/
+      // openGitPanel's mobile-sheet fallback). releaseSurfaceWindowContent
+      // reparents the content out of any SurfaceWindow body it was
+      // previously mounted in (e.g. after a desktop->mobile resize).
+      this.releaseSurfaceWindowContent("settings", content);
+      const body = document.getElementById("settings-sheet-body");
+      if (body && content && content.parentElement !== body) {
+        body.appendChild(content);
+      }
+      this.openSettingsSheet();
     }
     await this.settingsManager.render();
     this.syncSurfaceButtonState();
+  }
+
+  // Static mobile sheet host for Settings (index.html #settings-sheet) —
+  // the counterpart to FileExplorerController's own show()/hidden-class
+  // toggling, which Settings has no equivalent controller for.
+  openSettingsSheet() {
+    const sheet = document.getElementById("settings-sheet");
+    if (!sheet) return;
+    sheet.classList.remove("hidden");
+    sheet.setAttribute("aria-hidden", "false");
+    if (!sheet.dataset.wired) {
+      sheet.dataset.wired = "1";
+      document
+        .getElementById("settings-sheet-close")
+        ?.addEventListener("click", () => this.closeSettingsSheet());
+      sheet
+        .querySelector(".settings-sheet-backdrop")
+        ?.addEventListener("click", () => this.closeSettingsSheet());
+    }
+  }
+
+  closeSettingsSheet() {
+    const sheet = document.getElementById("settings-sheet");
+    if (!sheet) return;
+    sheet.classList.add("hidden");
+    sheet.setAttribute("aria-hidden", "true");
   }
 
   setSetupStatus(message) {
@@ -7839,7 +8065,7 @@ class TerminalManager {
         title: "Search in Terminal",
         group: "Views",
         keywords: ["find", "search", "terminal"],
-        run: () => this.toggleSearch(),
+        run: () => this.openTerminalSearch(),
       },
       {
         id: "toggle-line-wrap",
@@ -8952,6 +9178,38 @@ class TerminalManager {
     };
   }
 
+  // Canonical LIVE cwd for the Git panel/SCM view — the single authoritative
+  // source both the classic Git window and the IDE SCM view must resolve on
+  // EVERY refresh (never cache once). Prefers the file explorer's live current
+  // path (the most specific, user-navigated location); falls back to the
+  // active workspace's terminal cwd when the explorer hasn't been opened yet.
+  getGitCwd() {
+    return (
+      this.fileExplorer?.currentPath || this.getActiveWorkspaceContext().cwd
+    );
+  }
+
+  // A COMMITTED working-dir value (change/Enter on the toolbar field, or a
+  // Browse-picker selection — never a raw keystroke draft) atomically drives
+  // explorer navigation + a git refresh, alongside the files.defaultCwd
+  // persistence the call sites already do via setDirectoryValue(). One
+  // authoritative cwd source driving explorer + git + new-terminal default,
+  // per the VS Code-grade workspace plan's cwd invariant.
+  async commitWorkingDirectory(value) {
+    const cwd = this.normalizeWorkspaceCwd(value);
+    if (!cwd) return;
+
+    const { workspaceId } = this.getActiveWorkspaceContext();
+    if (this.fileExplorer && workspaceId) {
+      if (this.fileExplorer.currentWorkspaceId !== workspaceId) {
+        this.fileExplorer.openForWorkspace(workspaceId, cwd);
+      }
+      await this.fileExplorer.loadDir(cwd, workspaceId);
+    }
+
+    await window.gitManager?.refresh();
+  }
+
   // Fetch git status for the explorer's current directory (via the shared
   // store), build the decoration map (git-decorations.js), and set it on the
   // explorer snapshot so rows render status badges/colors. Silently skips when
@@ -8983,7 +9241,17 @@ class TerminalManager {
       status.files,
       status.root,
     );
-    this.fileExplorer.setDecorations(workspaceId, decorations);
+    const folderDecorations = window.GitDecorations.buildFolderDecorationMap
+      ? window.GitDecorations.buildFolderDecorationMap(
+          status.files,
+          status.root,
+        )
+      : {};
+    this.fileExplorer.setDecorations(
+      workspaceId,
+      decorations,
+      folderDecorations,
+    );
   }
 
   getRightSurface() {
@@ -9004,9 +9272,33 @@ class TerminalManager {
   isWindowedSurfaces() {
     return (
       !platformDetector.isMobile &&
-      window.innerWidth >= 768 &&
+      (window.SurfaceWindows?.isDesktopSurfaceWidth?.(window.innerWidth) ??
+        window.innerWidth >= 768) &&
       Boolean(window.SurfaceWindows?.SurfaceWindowManager)
     );
+  }
+
+  // isWindowedSurfaces() is only consulted at window-OPEN time, but
+  // PlatformDetector fires on every resize. Without this, a floating
+  // SurfaceWindow opened on desktop stays open (and overflows the viewport,
+  // CSS min-width and all) after the viewport shrinks below the desktop
+  // breakpoint. Closing here reuses each surface's own close chokepoint so
+  // right-surface bookkeeping / aria / persisted layout all stay consistent.
+  // No-op on desktop (isWindowedSurfaces() true) and a no-op per surface that
+  // isn't open (each close path already tolerates being called when closed).
+  reconcileSurfaceWindowsForViewport() {
+    if (this.isWindowedSurfaces()) {
+      // Growing past the desktop breakpoint: close the mobile Settings sheet
+      // (its terminal-mode counterpart of a SurfaceWindow) so it isn't left
+      // open/stuck underneath the now-available windowed surfaces.
+      this.closeSettingsSheet?.();
+      return;
+    }
+    this.closeFileExplorer?.();
+    this.closeGitPanel?.();
+    this.surfaceWindowManager?.close("tasks");
+    this.surfaceWindowManager?.close("settings");
+    this.fileEditor?.close();
   }
 
   async ensureSurfaceWindowManager() {
@@ -9078,12 +9370,49 @@ class TerminalManager {
     });
   }
 
+  // Pixel floor for the IDE terminal panel's height. Unlike the tiled/floating
+  // terminal invariant of 24 rows (bug A3c, which protects a different UI —
+  // see DEFAULT_MIN_PANEL_ROWS), the IDE bottom panel behaves like a VS Code
+  // integrated terminal, so it uses the much smaller IDE_MIN_PANEL_ROWS floor
+  // instead — otherwise the pixel floor eats far more height than the sash's
+  // own 15% minimum (DOCK_MIN_HEIGHT_PCT), capping editor/Settings growth.
+  // Computed from live cell metrics when a terminal is mounted, falling back
+  // to a conservative estimate otherwise (see measureTerminalCellSize).
+  // `chrome` accounts for the panel's border-top plus the terminal's own
+  // vertical padding (TERMINAL_PADDING_Y), PLUS one extra cell of headroom:
+  // the renderer's row-fit floors against real tile chrome that measurement
+  // can't see (observed ~10px beyond padding+border), and without the margin
+  // the floor lands exactly one row short (live-measured at 1440x900).
+  getIdeTerminalPanelMinHeightPx() {
+    const cellMetrics = this.measureTerminalCellSize();
+    const cellHeight = cellMetrics?.cellHeight || 0;
+    return (
+      window.TerminalSizing?.minPanelHeightPx?.({
+        cellHeight,
+        minRows: window.TerminalSizing?.IDE_MIN_PANEL_ROWS,
+        chrome: TERMINAL_PADDING_Y + 1 + Math.ceil(cellHeight || 20),
+      }) ?? 0
+    );
+  }
+
   // Push the persisted IDE terminal-panel height into its CSS var (read by the
   // has-tabs split rule). Independent of the sessions dock's --dock-height.
+  // The stored percentage is clamped against a live pixel floor here — not
+  // rewritten into this.ideDockHeightPct — so neither the 35% default nor a
+  // sash drag that lands below it can ever render fewer than 24 rows
+  // (bug A3c; this is the single choke point both paths go through).
   applyIdeDockHeight() {
-    document
-      .getElementById("workspace-area")
-      ?.style.setProperty("--ide-terminal-height", `${this.ideDockHeightPct}%`);
+    const area = document.getElementById("workspace-area");
+    if (!area) return;
+    const colHeightPx =
+      this.ideShell?.mainColumnEl?.getBoundingClientRect?.().height || 0;
+    const pct =
+      window.TerminalSizing?.clampPanelHeightPercent?.({
+        pct: this.ideDockHeightPct,
+        containerHeightPx: colHeightPx,
+        minHeightPx: this.getIdeTerminalPanelMinHeightPx(),
+      }) ?? this.ideDockHeightPct;
+    area.style.setProperty("--ide-terminal-height", `${pct}%`);
   }
 
   // Reset the IDE terminal-panel split to the default height (double-click the
@@ -9178,6 +9507,11 @@ class TerminalManager {
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
     platformDetector.onChange(() => this.syncIdeAffordance());
+    // A floating SurfaceWindow is only closed/converted at open time
+    // (isWindowedSurfaces()) — without this, one left open on desktop
+    // survives a resize below the 768px breakpoint and overflows the mobile
+    // viewport (A4a).
+    platformDetector.onChange(() => this.reconcileSurfaceWindowsForViewport());
     void this.settingsReady.then(async () => {
       window.IdeShell.migrateLayoutState(this.settingsStore);
       // The Explorer can restore directly into a detached floating window on
@@ -9239,12 +9573,26 @@ class TerminalManager {
         return typeof handle?.isDirty === "function" ? handle.isDirty() : false;
       },
       // Persist descriptors only (never content). Debounced via settingsStore.
-      onChange: (state) =>
+      // Also notify the SCM History view so file-scoped (6b) history follows the
+      // active editor file when the active tab changes.
+      onChange: (state) => {
         this.settingsStore?.set(
           window.EditorTabs.EDITOR_TABS_KEY,
           window.EditorTabs.serializeTabs(state),
-        ),
+        );
+        this.scmView?.onActiveFileChanged?.();
+      },
     });
+  }
+
+  // Absolute path of the active editor FILE tab, or null. Used by the SCM
+  // History view's file scope (6b) to follow the active file. File tabs carry
+  // their absolute path as a string `ref`; diff/settings tabs return null.
+  getActiveEditorFilePath() {
+    const tab = this.editorTabs?.model?.activeTab?.();
+    if (!tab || tab.type !== window.EditorTabs?.TAB_FILE) return null;
+    const ref = tab.ref;
+    return typeof ref === "string" ? ref : ref?.relPath || null;
   }
 
   // --- IDE Source Control view (phase 5, slice 5) ---------------------------
@@ -9638,9 +9986,20 @@ class TerminalManager {
   // Entering IDE mode (after reparent): the `body.ide-mode` class (set by the
   // controller) docks the terminal container to the bottom panel via CSS only —
   // no PTY touch. Close the terminal-mode settings SurfaceWindow if open so
-  // there aren't two settings UIs simultaneously (Codex fix 7).
+  // there aren't two settings UIs simultaneously (Codex fix 7). "files" is
+  // handled separately (reparented into the sidebar, not closed) — every
+  // OTHER floating surface window (tasks/git/editor) is closed here too:
+  // those windows are positioned relative to the whole viewport, so left
+  // open they'd float on top of the freshly-painted IDE shell, visually
+  // disconnected from it.
   onEnterIdeMode() {
-    this.surfaceWindowManager?.close("settings");
+    ["settings", "tasks", "git", "editor"].forEach((id) =>
+      this.surfaceWindowManager?.close(id),
+    );
+    // The scrollback-search overlay is positioned relative to the active
+    // terminal's tile, which the IDE reflow can detach/resize mid-session —
+    // close it rather than let it float over stale geometry (bug A2).
+    this.closeTerminalSearch();
     this.applyIdeDockHeight();
     this.ensureIdeExplorerLoaded();
   }
@@ -9649,7 +10008,12 @@ class TerminalManager {
   // full-bleed TileManager presentation exactly (we only toggled CSS + moved one
   // element). The explorer's prior state is restored via restoreExplorerPresentation.
   // We do NOT auto-spawn a SurfaceWindow for settings on exit (Codex fix 7).
-  onExitIdeMode() {}
+  onExitIdeMode() {
+    // Same rationale as onEnterIdeMode: the terminal reparents back to the
+    // TileManager layout, so any open search overlay must be disposed rather
+    // than left bound to a container it's about to leave.
+    this.closeTerminalSearch();
+  }
 
   // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
   // active workspace's directory itself (the legacy Files surface is what loads it
@@ -9822,6 +10186,17 @@ class TerminalManager {
       this.settingsStore?.set("dock.ide", {
         heightPct: this.ideDockHeightPct,
       });
+      // Per-move work above only sets the CSS var + fires a debounced
+      // synthetic `resize` (window listener refits just the ACTIVE terminal,
+      // 150ms later, and never calls refresh()). That leaves a gap where a
+      // fast drag-and-release can settle on a stale/corrupted paint for any
+      // terminal that isn't the active one. Explicitly run the full
+      // fit -> resize(force) -> refresh sequence for every currently visible
+      // terminal right now instead of relying on that debounce (bug A3b).
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
     };
     document.addEventListener("pointermove", onMove);
     document.addEventListener("pointerup", onEnd);
@@ -10052,7 +10427,7 @@ class TerminalManager {
       }
       if (e.ctrlKey && e.key === "f") {
         e.preventDefault();
-        this.toggleSearch();
+        this.openTerminalSearch();
       }
       if (e.key === "F11") {
         e.preventDefault();
@@ -10248,7 +10623,7 @@ class TerminalManager {
 
     const sizeWarning = document.createElement("div");
     sizeWarning.className = "size-warning";
-    sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
+    sizeWarning.textContent = "Terminal too small. Minimum size: 60x16";
     element.parentElement.appendChild(sizeWarning);
 
     // Build debug overlay with DOM methods (safe, no innerHTML)
@@ -11360,27 +11735,47 @@ class TerminalManager {
         t.fitFrame = 0;
         try {
           this.fitTerminalState(t);
+          // fitTerminalState only recomputes cols/rows and tells the PTY —
+          // it does NOT repaint the buffer. Every other resize path in this
+          // file (performReconnectLayoutSync, scheduleTerminalMetricStabilization,
+          // toggleFullscreen) follows fit with an explicit refresh; this was the
+          // one ResizeObserver-driven path that skipped it, which let a resize
+          // mid-drag (IDE sash, dock sash) leave stale/corrupted glyph rows
+          // until something else happened to repaint (bug A3a).
+          t.terminal.refresh(0, Math.max(0, t.terminal.rows - 1));
 
-          // Match compact chrome behavior to the same width-based breakpoint as CSS.
-          // A narrow layout should not inherit desktop-only minimum-size warnings
-          // just because the device lacks touch input.
+          // Match compact chrome behavior to the SAME mobile decision as the
+          // toolbar/action-bar chrome swap (getActiveChromeMode / chrome-mobile),
+          // not just the width-based smallScreen check. A landscape phone (e.g.
+          // 844x390) gets mobile chrome via isMobile even though it isn't
+          // smallScreen by width alone — it must not be held to the desktop
+          // 60x16 threshold with the warning left un-suppressed.
           const cols = t.terminal.cols;
           const rows = t.terminal.rows;
-          const usesCompactLayout = platformDetector.smallScreen;
+          const usesCompactLayout = this.getActiveChromeMode() === "mobile";
           const minCols = usesCompactLayout ? 40 : 60;
           const minRows = usesCompactLayout ? 12 : 16;
           const isTooSmall = cols < minCols || rows < minRows;
 
           // Hide the warning for compact layouts where the bottom action bar
-          // is expected, and for the bottom dock where a short terminal strip
-          // is the whole point.
+          // is expected, for the bottom dock where a short terminal strip is
+          // the whole point, and for the IDE mode bottom panel — its fixed
+          // activity-bar + sidebar chrome routinely squeezes the main column
+          // below 60 cols at ordinary desktop widths even though the
+          // resulting terminal is perfectly usable (same class of
+          // "intentionally short/narrow docked panel" as sessionsDocked).
           const sessionsDocked =
             document.body.classList.contains("sessions-docked");
+          const ideDocked = document.body.classList.contains("ide-mode");
           if (t.sizeWarning) {
-            t.sizeWarning.classList.toggle(
-              "visible",
-              isTooSmall && !usesCompactLayout && !sessionsDocked,
-            );
+            const showWarning =
+              isTooSmall && !usesCompactLayout && !sessionsDocked && !ideDocked;
+            t.sizeWarning.classList.toggle("visible", showWarning);
+            if (showWarning) {
+              // Keep the warning copy honest — render the ACTUAL thresholds
+              // used above instead of a hardcoded string that can drift.
+              t.sizeWarning.textContent = `Terminal too small. Minimum size: ${minCols}x${minRows}`;
+            }
           }
 
           // Always send resize - terminal will work even if small
@@ -11457,7 +11852,7 @@ class TerminalManager {
 
       const sizeWarning = document.createElement("div");
       sizeWarning.className = "size-warning";
-      sizeWarning.textContent = "Terminal too small. Minimum size: 80x24";
+      sizeWarning.textContent = "Terminal too small. Minimum size: 60x16";
       element.parentElement.appendChild(sizeWarning);
 
       // Build debug overlay with DOM methods (safe, no innerHTML)
@@ -12111,13 +12506,6 @@ class TerminalManager {
       }, 100);
   }
 
-  toggleSearch() {
-    const searchBar = document.getElementById("search-bar");
-    searchBar?.classList.toggle("hidden");
-    if (!searchBar?.classList.contains("hidden"))
-      document.getElementById("search-input")?.focus();
-  }
-
   async openDirPicker() {
     document.getElementById("dir-modal")?.classList.remove("hidden");
     await this.loadDir(this.getCurrentDirectoryValue() || "/");
@@ -12199,6 +12587,7 @@ class TerminalManager {
     const dir = this.selectedDir || this.currentDirPath;
     if (dir) {
       this.setDirectoryValue(dir, { force: true });
+      void this.commitWorkingDirectory(dir);
     }
     this.closeDirPicker();
   }

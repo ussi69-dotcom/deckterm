@@ -1,0 +1,745 @@
+#!/usr/bin/python3
+# DeckTerm filesystem helper — the fd-based containment boundary for OS-isolated
+# file operations (design: docs/plans/2026-07-03-b4-fs-surfaces-as-mapped-user.md
+# §2; B1 §2.5). Invoked by the broker `fs` profile: by the time this runs it has
+# ALREADY been dropped to the mapped user's uid/gid inside a systemd scope, so it
+# holds no privilege — its whole job is to keep every operation strictly inside
+# the granted root regardless of symlink races the (untrusted) user may set up.
+#
+# Protocol (design §2.2): exactly ONE JSON request object on stdin, then EOF; one
+# JSON response on stdout. No argv beyond the fixed profile exec. Stdlib only.
+#
+#   request:  { "op": "list|stat|read|write|mkdir|delete|rename",
+#               "root": "/home/alice",            # absolute, non-symlink dir, != "/"
+#               "path": "projects/x/file.ts",     # relative; "" = the root itself
+#               "toPath": "…",                    # rename only, same root
+#               "contentB64": "…",                # write only
+#               "expectedMode": 420,              # write: mode for a fresh create
+#               "maxBytes": 2097152,              # read cap
+#               "recursive": false }              # delete only
+#   response: { "ok": true, ... } | { "ok": false, "code": "...", "message": "..." }
+#
+# Containment (design §2.3, Codex #1/#2):
+#   - the root fd is opened by a FULL component-wise symlink-rejecting walk from
+#     "/" (never lstat-then-open, which races ancestors), or one openat2 from "/"
+#     with RESOLVE_NO_SYMLINKS where the kernel supports it;
+#   - every path beneath the root is resolved with openat2(RESOLVE_BENEATH |
+#     RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS), or a component-wise O_NOFOLLOW
+#     openat walk on older kernels;
+#   - writes are atomic (O_EXCL temp + renameat), O_NOFOLLOW everywhere; a replace
+#     target must be a regular file, st_nlink == 1, owned by uid (Codex #11);
+#   - deletes/renames operate fd-relative (unlinkat/renameat), never by path.
+
+import base64
+import ctypes
+import ctypes.util
+import errno
+import json
+import os
+import stat
+import sys
+
+MAX_REQUEST_BYTES = 32 * 1024 * 1024  # request envelope hard cap (design §2.2)
+
+# ---------------------------------------------------------------------------
+# openat2 plumbing (no CPython wrapper; syscall via libc).
+# ---------------------------------------------------------------------------
+
+# Syscall numbers are arch-specific. We enable the openat2/renameat2 fast paths
+# ONLY for arches whose numbers we know for certain (Codex: an unknown arch must
+# NOT guess a syscall number — a wrong-but-valid number could invoke something
+# else). Unknown arches fall back to component-wise O_NOFOLLOW walks + os.rename.
+_SYS_openat2_by_machine = {
+    "x86_64": 437,
+    "aarch64": 437,
+    "ppc64le": 437,
+    "s390x": 437,
+    "riscv64": 437,
+}
+_SYS_renameat2_by_machine = {
+    "x86_64": 316,
+    "aarch64": 276,
+    "ppc64le": 357,
+    "s390x": 347,
+    "riscv64": 276,
+}
+try:
+    _MACHINE = os.uname().machine
+except Exception:
+    _MACHINE = ""
+SYS_openat2 = _SYS_openat2_by_machine.get(_MACHINE)  # None on unknown arch
+SYS_renameat2 = _SYS_renameat2_by_machine.get(_MACHINE)
+
+RESOLVE_NO_MAGICLINKS = 0x02
+RESOLVE_NO_SYMLINKS = 0x04
+RESOLVE_BENEATH = 0x08
+
+RENAME_NOREPLACE = 0x01
+RENAME_EXCHANGE = 0x02
+
+AT_FDCWD = -100
+
+
+class OpenHow(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+_libc.syscall.restype = ctypes.c_long  # 64-bit return; default c_int truncates
+_openat2_supported = None  # tri-state cache: None unknown, True/False resolved
+
+
+def _openat2(dirfd, path, flags, mode, resolve):
+    """Raw openat2(2). Returns an fd, or raises OSError. Raises OSError(ENOSYS)
+    when the kernel lacks the syscall so callers can fall back."""
+    how = OpenHow(flags=flags & 0xFFFFFFFFFFFFFFFF, mode=mode, resolve=resolve)
+    ctypes.set_errno(0)
+    fd = _libc.syscall(
+        ctypes.c_long(SYS_openat2),
+        ctypes.c_int(dirfd),
+        ctypes.c_char_p(path.encode("utf-8")),
+        ctypes.byref(how),
+        ctypes.c_size_t(ctypes.sizeof(how)),
+    )
+    if fd < 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    return fd
+
+
+def _have_openat2():
+    global _openat2_supported
+    if _openat2_supported is not None:
+        return _openat2_supported
+    if SYS_openat2 is None:
+        _openat2_supported = False
+        return False
+    try:
+        fd = _openat2(
+            AT_FDCWD, "/", os.O_PATH | os.O_DIRECTORY, 0, RESOLVE_NO_MAGICLINKS
+        )
+        os.close(fd)
+        _openat2_supported = True
+    except OSError as exc:
+        # ENOSYS (no syscall) or EINVAL (no open_how support) ⇒ fall back.
+        _openat2_supported = exc.errno not in (errno.ENOSYS, errno.EINVAL)
+        if not _openat2_supported:
+            return False
+    except Exception:
+        _openat2_supported = False
+    return _openat2_supported
+
+
+def _renameat2(olddirfd, oldpath, newdirfd, newpath, flags):
+    """Raw renameat2(2) for atomic RENAME_NOREPLACE / RENAME_EXCHANGE. Raises
+    OSError(ENOSYS) when unavailable so callers fall back."""
+    if SYS_renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable on this arch")
+    ctypes.set_errno(0)
+    rc = _libc.syscall(
+        ctypes.c_long(SYS_renameat2),
+        ctypes.c_int(olddirfd),
+        ctypes.c_char_p(oldpath.encode("utf-8")),
+        ctypes.c_int(newdirfd),
+        ctypes.c_char_p(newpath.encode("utf-8")),
+        ctypes.c_uint(flags),
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+
+
+def _reopen_regular(pathfd, flags):
+    """Reopen the exact inode pinned by an O_PATH fd via /proc/self/fd — race-free
+    (the O_PATH fd already resolved + type-checked the inode, so no FIFO/device is
+    opened blindly and no path component can be swapped between check and open)."""
+    return os.open("/proc/self/fd/%d" % pathfd, flags)
+
+
+# ---------------------------------------------------------------------------
+# Errors.
+# ---------------------------------------------------------------------------
+
+
+class HelperError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def _escape(msg="path escapes the granted root"):
+    return HelperError("escape_denied", msg)
+
+
+# ---------------------------------------------------------------------------
+# Root open — full fd-safe walk (Codex #2). No lstat-then-open anywhere.
+# ---------------------------------------------------------------------------
+
+
+def _validate_root(root):
+    if not isinstance(root, str) or not root:
+        raise HelperError("bad_request", "root must be a non-empty string")
+    if "\x00" in root:
+        raise HelperError("bad_request", "root contains NUL")
+    if not root.startswith("/"):
+        raise HelperError("bad_request", "root must be absolute")
+    # normpath("//") is "//" on POSIX (a special case), so a "== '/'" check is not
+    # enough — reject any root that normalizes to zero path segments (Codex).
+    if not [seg for seg in os.path.normpath(root).split("/") if seg]:
+        raise HelperError("bad_request", "root must not be the filesystem root")
+
+
+def open_root_fd(root):
+    """Open the granted root directory as an O_PATH fd via a symlink-rejecting
+    walk from '/'. Every ancestor component is opened O_NOFOLLOW and fstat-checked
+    to be a real directory, so no ancestor can be a swapped symlink."""
+    _validate_root(root)
+    segments = [seg for seg in os.path.normpath(root).split("/") if seg]
+
+    if _have_openat2():
+        rel = os.path.normpath(root).lstrip("/") or "."
+        try:
+            return _openat2(
+                _root_slash_fd_cached(),
+                rel,
+                os.O_PATH | os.O_DIRECTORY,
+                0,
+                RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
+            )
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise _escape("a root ancestor is a symlink")
+            raise HelperError("not_found", "root: %s" % os.strerror(exc.errno))
+
+    # Component-wise fallback.
+    dirfd = os.open("/", os.O_PATH | os.O_DIRECTORY)
+    try:
+        for seg in segments:
+            try:
+                nfd = os.open(
+                    seg,
+                    os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dirfd,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise _escape("a root ancestor is a symlink")
+                raise HelperError("not_found", "root: %s" % os.strerror(exc.errno))
+            os.close(dirfd)
+            dirfd = nfd
+        st = os.fstat(dirfd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise HelperError("bad_request", "root is not a directory")
+        keep = dirfd
+        dirfd = -1
+        return keep
+    finally:
+        if dirfd >= 0:
+            os.close(dirfd)
+
+
+_slash_fd = None
+
+
+def _root_slash_fd_cached():
+    global _slash_fd
+    if _slash_fd is None:
+        _slash_fd = os.open("/", os.O_PATH | os.O_DIRECTORY)
+    return _slash_fd
+
+
+# ---------------------------------------------------------------------------
+# Path resolution beneath the root fd.
+# ---------------------------------------------------------------------------
+
+
+def _validate_rel(path, allow_empty):
+    if path is None:
+        path = ""
+    if not isinstance(path, str):
+        raise HelperError("bad_request", "path must be a string")
+    if "\x00" in path:
+        raise HelperError("bad_request", "path contains NUL")
+    if path.startswith("/"):
+        raise HelperError("bad_request", "path must be relative")
+    segs = [s for s in path.split("/") if s != ""]
+    for s in segs:
+        if s in (".", ".."):
+            raise HelperError("bad_request", "path segment '%s' not allowed" % s)
+    if not segs and not allow_empty:
+        raise HelperError("bad_request", "path must not be empty for this op")
+    return segs
+
+
+def _resolve_beneath(rootfd, segs, flags, follow_final=False):
+    """Open segs beneath rootfd. openat2(RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS)
+    where available; else a component-wise O_NOFOLLOW walk. Returns an fd."""
+    rel = "/".join(segs) if segs else "."
+    if _have_openat2():
+        resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS
+        if not follow_final:
+            resolve |= RESOLVE_NO_SYMLINKS
+        try:
+            return _openat2(rootfd, rel, flags, 0, resolve)
+        except OSError as exc:
+            if exc.errno in (errno.EXDEV, errno.ELOOP):
+                raise _escape()
+            raise _os_to_helper(exc)
+
+    # Component-wise fallback: walk dirs O_NOFOLLOW, open the leaf with `flags`.
+    if not segs:
+        return os.open(".", flags | os.O_NOFOLLOW, dir_fd=rootfd)
+    dirfd = os.open(".", os.O_PATH | os.O_DIRECTORY, dir_fd=rootfd)
+    try:
+        for seg in segs[:-1]:
+            try:
+                nfd = os.open(
+                    seg,
+                    os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dirfd,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise _escape()
+                raise _os_to_helper(exc)
+            os.close(dirfd)
+            dirfd = nfd
+        leaf_flags = flags
+        if not follow_final:
+            leaf_flags |= os.O_NOFOLLOW
+        try:
+            return os.open(segs[-1], leaf_flags, dir_fd=dirfd)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise _escape("final component is a symlink")
+            raise _os_to_helper(exc)
+    finally:
+        os.close(dirfd)
+
+
+def _resolve_parent(rootfd, segs):
+    """Return (parent_dir_fd, leaf_name) for a mutating op. Caller closes the fd.
+    Refuses an empty leaf (root-self mutation)."""
+    if not segs:
+        raise HelperError("bad_request", "operation requires a non-root path")
+    leaf = segs[-1]
+    parent_segs = segs[:-1]
+    pfd = _resolve_beneath(rootfd, parent_segs, os.O_PATH | os.O_DIRECTORY)
+    return pfd, leaf
+
+
+def _os_to_helper(exc):
+    if exc.errno == errno.ENOENT:
+        return HelperError("not_found", os.strerror(exc.errno))
+    if exc.errno == errno.EEXIST:
+        return HelperError("exists", os.strerror(exc.errno))
+    if exc.errno == errno.EACCES or exc.errno == errno.EPERM:
+        return HelperError("permission", os.strerror(exc.errno))
+    if exc.errno == errno.ELOOP:
+        return _escape("symlink encountered")
+    return HelperError("io_error", os.strerror(exc.errno))
+
+
+# ---------------------------------------------------------------------------
+# Operations.
+# ---------------------------------------------------------------------------
+
+
+def _dirent_kind(mode):
+    if stat.S_ISDIR(mode):
+        return "dir"
+    if stat.S_ISREG(mode):
+        return "file"
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    return "other"
+
+
+def op_list(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=True)
+    dfd = _resolve_beneath(rootfd, segs, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        st = os.fstat(dfd)
+        if not stat.S_ISDIR(st.st_mode):
+            raise HelperError("not_regular", "not a directory")
+        entries = []
+        names = os.listdir(dfd)
+        for name in names:
+            try:
+                est = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            except OSError:
+                continue
+            entries.append(
+                {
+                    "name": name,
+                    "kind": _dirent_kind(est.st_mode),
+                    "size": est.st_size,
+                    "mtimeMs": int(est.st_mtime * 1000),
+                    "mode": stat.S_IMODE(est.st_mode),
+                }
+            )
+        return {"ok": True, "entries": entries}
+    finally:
+        os.close(dfd)
+
+
+def op_stat(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=True)
+    fd = _resolve_beneath(rootfd, segs, os.O_PATH)
+    try:
+        st = os.fstat(fd)
+        return {
+            "ok": True,
+            "kind": _dirent_kind(st.st_mode),
+            "size": st.st_size,
+            "mtimeMs": int(st.st_mtime * 1000),
+            "mode": stat.S_IMODE(st.st_mode),
+        }
+    finally:
+        os.close(fd)
+
+
+def op_read(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    max_bytes = req.get("maxBytes")
+    if not isinstance(max_bytes, int) or max_bytes < 0:
+        raise HelperError("bad_request", "maxBytes must be a non-negative int")
+    # Resolve with O_PATH first: this opens NO FIFO/device (O_PATH neither blocks
+    # nor triggers device side effects), so we can type-check before a real open.
+    pathfd = _resolve_beneath(rootfd, segs, os.O_PATH)
+    try:
+        st = os.fstat(pathfd)
+        if not stat.S_ISREG(st.st_mode):
+            raise HelperError("not_regular", "not a regular file")
+        if st.st_size > max_bytes:
+            raise HelperError("too_large", "file exceeds maxBytes")
+        fd = _reopen_regular(pathfd, os.O_RDONLY)
+        try:
+            data = b""
+            while len(data) <= max_bytes:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    raise HelperError("too_large", "file grew past maxBytes")
+            return {
+                "ok": True,
+                "contentB64": base64.b64encode(data).decode("ascii"),
+                "size": len(data),
+                "mode": stat.S_IMODE(st.st_mode),
+                "mtimeMs": int(st.st_mtime * 1000),
+            }
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pathfd)
+
+
+def op_write(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    b64 = req.get("contentB64")
+    if not isinstance(b64, str):
+        raise HelperError("bad_request", "contentB64 required")
+    try:
+        content = base64.b64decode(b64, validate=True)
+    except Exception:
+        raise HelperError("bad_request", "contentB64 not valid base64")
+
+    uid = os.getuid()
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    try:
+        # Probe an existing target with O_PATH|O_NOFOLLOW — opens no FIFO/device,
+        # follows no symlink (Codex #5). A replace target must be a regular,
+        # single-link file owned by us (Codex #11); capture its identity so the
+        # final swap can prove it did not change under us (Codex #2).
+        create_mode = req.get("expectedMode")
+        if not isinstance(create_mode, int):
+            create_mode = 0o644
+        target_mode = create_mode
+        replacing = False
+        expect_ino = expect_dev = None
+        try:
+            pf = os.open(leaf, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
+        except OSError as exc:
+            if exc.errno == errno.ENOENT:
+                pf = -1
+            elif exc.errno == errno.ELOOP:
+                raise _escape("target is a symlink")
+            else:
+                raise _os_to_helper(exc)
+        if pf >= 0:
+            try:
+                est = os.fstat(pf)
+                if not stat.S_ISREG(est.st_mode):
+                    raise HelperError("not_regular", "target is not a regular file")
+                if est.st_nlink != 1:
+                    raise HelperError("not_regular", "target has multiple links")
+                if est.st_uid != uid:
+                    raise HelperError("not_owner", "target not owned by the user")
+                target_mode = stat.S_IMODE(est.st_mode)
+                replacing = True
+                expect_ino, expect_dev = est.st_ino, est.st_dev
+            finally:
+                os.close(pf)
+
+        tmp_name = ".deckterm-tmp-%s" % base64.b32encode(os.urandom(8)).decode(
+            "ascii"
+        ).rstrip("=").lower()
+        committed = False
+        tfd = os.open(
+            tmp_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            target_mode,
+            dir_fd=pfd,
+        )
+        try:
+            try:
+                off = 0
+                while off < len(content):
+                    off += os.write(tfd, content[off:])
+                os.fchmod(tfd, target_mode)  # chmod BEFORE fsync (Codex #6)
+                os.fsync(tfd)
+            finally:
+                os.close(tfd)
+
+            committed = _commit_write(pfd, tmp_name, leaf, replacing, expect_ino, expect_dev, uid)
+            # Durability: fsync the containing directory after the rename (Codex #6).
+            try:
+                os.fsync(pfd)
+            except OSError:
+                pass
+        finally:
+            if not committed:
+                try:
+                    os.unlink(tmp_name, dir_fd=pfd)
+                except OSError:
+                    pass
+        return {"ok": True, "size": len(content), "mode": target_mode}
+    finally:
+        os.close(pfd)
+
+
+def _commit_write(pfd, tmp_name, leaf, replacing, expect_ino, expect_dev, uid):
+    """Atomically move tmp_name → leaf. Returns True on success (tmp consumed).
+
+    Replace path (Codex #2): use renameat2(RENAME_EXCHANGE) so tmp and the live
+    target swap atomically, then fstat what came OUT (now at tmp_name) and confirm
+    it is the exact inode + owner we pre-checked; on mismatch, swap back and refuse
+    — a file swapped in under us is never clobbered. Create path uses
+    RENAME_NOREPLACE so a target that appeared after the probe is not overwritten.
+    On arches without renameat2 we fall back to os.rename (best-effort; the primary
+    deploy arch is covered)."""
+    if replacing:
+        try:
+            _renameat2(pfd, tmp_name, pfd, leaf, RENAME_EXCHANGE)
+        except OSError as exc:
+            if exc.errno == errno.ENOSYS:
+                os.rename(tmp_name, leaf, src_dir_fd=pfd, dst_dir_fd=pfd)
+                return True
+            raise _os_to_helper(exc)
+        # tmp_name now holds the file that WAS at leaf — verify it is the inode we
+        # checked. If not, undo the swap and refuse.
+        swapped = os.open(tmp_name, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
+        try:
+            sst = os.fstat(swapped)
+            good = (
+                sst.st_ino == expect_ino
+                and sst.st_dev == expect_dev
+                and sst.st_uid == uid
+                and sst.st_nlink == 1
+            )
+        finally:
+            os.close(swapped)
+        if not good:
+            try:
+                _renameat2(pfd, tmp_name, pfd, leaf, RENAME_EXCHANGE)  # swap back
+            except OSError:
+                pass
+            raise HelperError("not_regular", "replace target changed under us")
+        os.unlink(tmp_name, dir_fd=pfd)  # discard the old content
+        return True
+
+    # Create: refuse to overwrite anything that appeared since the probe.
+    try:
+        _renameat2(pfd, tmp_name, pfd, leaf, RENAME_NOREPLACE)
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ENOSYS:
+            os.rename(tmp_name, leaf, src_dir_fd=pfd, dst_dir_fd=pfd)
+            return True
+        if exc.errno == errno.EEXIST:
+            raise HelperError("exists", "target appeared concurrently")
+        raise _os_to_helper(exc)
+
+
+def op_mkdir(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    try:
+        try:
+            os.mkdir(leaf, 0o755, dir_fd=pfd)
+        except OSError as exc:
+            raise _os_to_helper(exc)
+        return {"ok": True}
+    finally:
+        os.close(pfd)
+
+
+def _recursive_delete(dirfd, root_dev):
+    """Delete the contents of dirfd (an O_RDONLY|O_DIRECTORY fd we own), fd-relative,
+    refusing to cross ANY mount boundary — every child is compared to the granted
+    root's device, and each opened subdir is re-fstat'd to confirm its device AND
+    inode match what lstat saw (a mountpoint or swapped dir under the tree is not
+    entered, Codex #1). Does not close dirfd."""
+    for name in os.listdir(dirfd):
+        try:
+            est = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        except OSError:
+            continue
+        if est.st_dev != root_dev:
+            raise HelperError("io_error", "refusing to cross a mount boundary")
+        if stat.S_ISDIR(est.st_mode):
+            try:
+                child = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dirfd
+                )
+            except OSError as exc:
+                raise _os_to_helper(exc)
+            try:
+                cst = os.fstat(child)
+                if cst.st_dev != root_dev or cst.st_ino != est.st_ino:
+                    # A mount appeared, or the entry was swapped after lstat.
+                    raise HelperError("io_error", "refusing to cross a mount boundary")
+                _recursive_delete(child, root_dev)
+            finally:
+                os.close(child)
+            os.rmdir(name, dir_fd=dirfd)
+        else:
+            os.unlink(name, dir_fd=dirfd)
+
+
+def op_delete(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    recursive = bool(req.get("recursive"))
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    try:
+        try:
+            est = os.stat(leaf, dir_fd=pfd, follow_symlinks=False)
+        except OSError as exc:
+            raise _os_to_helper(exc)
+        if stat.S_ISDIR(est.st_mode):
+            if recursive:
+                child = os.open(
+                    leaf, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=pfd
+                )
+                try:
+                    cst = os.fstat(child)
+                    if cst.st_ino != est.st_ino or cst.st_dev != est.st_dev:
+                        raise _escape("delete target changed under us")
+                    _recursive_delete(child, cst.st_dev)
+                finally:
+                    os.close(child)
+            os.rmdir(leaf, dir_fd=pfd)
+        else:
+            os.unlink(leaf, dir_fd=pfd)
+        return {"ok": True}
+    finally:
+        os.close(pfd)
+
+
+def op_rename(rootfd, req):
+    from_segs = _validate_rel(req.get("path"), allow_empty=False)
+    to_segs = _validate_rel(req.get("toPath"), allow_empty=False)
+    fpfd, fleaf = _resolve_parent(rootfd, from_segs)
+    try:
+        tpfd, tleaf = _resolve_parent(rootfd, to_segs)
+        try:
+            # Refuse if the destination exists — atomically via RENAME_NOREPLACE so
+            # a dest created between a check and the move cannot be clobbered
+            # (Codex #3). Fall back to stat+rename only where renameat2 is absent.
+            try:
+                _renameat2(fpfd, fleaf, tpfd, tleaf, RENAME_NOREPLACE)
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    raise HelperError("exists", "destination exists")
+                if exc.errno != errno.ENOSYS:
+                    raise _os_to_helper(exc)
+                # No renameat2: best-effort stat-then-rename (non-primary arch).
+                try:
+                    os.stat(tleaf, dir_fd=tpfd, follow_symlinks=False)
+                    raise HelperError("exists", "destination exists")
+                except OSError as sexc:
+                    if sexc.errno != errno.ENOENT:
+                        raise _os_to_helper(sexc)
+                os.rename(fleaf, tleaf, src_dir_fd=fpfd, dst_dir_fd=tpfd)
+            return {"ok": True}
+        finally:
+            os.close(tpfd)
+    finally:
+        os.close(fpfd)
+
+
+OPS = {
+    "list": op_list,
+    "stat": op_stat,
+    "read": op_read,
+    "write": op_write,
+    "mkdir": op_mkdir,
+    "delete": op_delete,
+    "rename": op_rename,
+}
+
+
+def _read_request():
+    data = b""
+    while len(data) <= MAX_REQUEST_BYTES:
+        chunk = os.read(0, 65536)
+        if not chunk:
+            break
+        data += chunk
+        if len(data) > MAX_REQUEST_BYTES:
+            raise HelperError("too_large", "request exceeds size cap")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        raise HelperError("bad_request", "request is not valid JSON")
+
+
+def main():
+    os.umask(0o077)
+    try:
+        req = _read_request()
+        if not isinstance(req, dict):
+            raise HelperError("bad_request", "request must be a JSON object")
+        op = req.get("op")
+        handler = OPS.get(op)
+        if handler is None:
+            raise HelperError("bad_request", "unknown op: %r" % (op,))
+        rootfd = open_root_fd(req.get("root"))
+        try:
+            result = handler(rootfd, req)
+        finally:
+            os.close(rootfd)
+        sys.stdout.write(json.dumps(result))
+        sys.stdout.flush()
+        return 0
+    except HelperError as exc:
+        sys.stdout.write(json.dumps({"ok": False, "code": exc.code, "message": exc.message}))
+        sys.stdout.flush()
+        return 0
+    except Exception as exc:  # never leak a traceback to the caller
+        sys.stdout.write(
+            json.dumps({"ok": False, "code": "io_error", "message": str(exc)})
+        )
+        sys.stdout.flush()
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,109 @@
+{
+  "namespace": "deckterm",
+  "min_uid": 1000,
+  "required_group": "deckterm-users",
+  "privileged_groups": ["sudo", "wheel", "admin"],
+  "service_uid": 0,
+  "lang": "C.UTF-8",
+  "registry_dir": "/run/deckterm-broker",
+  "log_path": "/var/log/deckterm-broker.log",
+  "capture_root": "/var/lib/deckterm/capture",
+  "capture_helper": "/usr/local/lib/deckterm/deckterm-capture",
+  "protected_paths": [
+    "/usr/local/lib/deckterm/deckterm-broker",
+    "/etc/deckterm",
+    "/etc/deckterm/broker.json",
+    "/etc/sudoers.d/deckterm-broker"
+  ],
+  "profiles": {
+    "pty": {
+      "kind": "pty",
+      "properties": {
+        "MemoryMax": "2G",
+        "TasksMax": "512",
+        "CPUWeight": "100"
+      },
+      "nofile": 4096
+    },
+    "tmux": {
+      "kind": "tmux",
+      "tmux_path": "/usr/bin/tmux",
+      "properties": {
+        "MemoryMax": "4G",
+        "TasksMax": "1024",
+        "CPUWeight": "100"
+      },
+      "nofile": 8192
+    },
+    "fs": {
+      "kind": "exec_stdin",
+      "exec_path": "/usr/local/lib/deckterm/deckterm-fs-helper",
+      "properties": {
+        "MemoryMax": "512M",
+        "TasksMax": "16",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 256
+    },
+    "git": {
+      "kind": "git",
+      "git_path": "/usr/bin/git",
+      "properties": {
+        "MemoryMax": "1G",
+        "TasksMax": "64",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 1024
+    },
+    "search": {
+      "kind": "search",
+      "grep_path": "/usr/bin/grep",
+      "properties": {
+        "MemoryMax": "512M",
+        "TasksMax": "16",
+        "CPUWeight": "50"
+      },
+      "runtime_max_sec": 30,
+      "nofile": 256
+    }
+  },
+  "search_secret_excludes": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "*.pkcs12",
+    "*.keystore",
+    "*.jks",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "*.ppk",
+    ".netrc",
+    ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".htpasswd",
+    "*token*",
+    "*secret*",
+    "*credential*",
+    "*password*",
+    "*.kdbx"
+  ],
+  "search_exclude_dirs": [
+    ".git",
+    "node_modules",
+    "dist",
+    "build",
+    ".next",
+    "out",
+    "target",
+    "coverage",
+    ".cache"
+  ]
+}

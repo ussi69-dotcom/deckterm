@@ -26,6 +26,8 @@ beforeAll(async () => {
 
   process.env.DECKTERM_STATE_DIR = stateDir;
   process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
+  process.env.CF_ACCESS_REQUIRED = "0";
   // Isolate ambient env so the gates run their real allow/deny + audit logic
   // (same class of leak as 95efecb; leaks come from Bun's .env auto-load and
   // from running tests inside a DeckTerm dev terminal that inherits the

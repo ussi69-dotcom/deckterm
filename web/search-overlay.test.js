@@ -89,3 +89,22 @@ test("close() while already closed does not thrash decorations", () => {
   controller.close();
   expect(calls).toEqual([]);
 });
+
+// Bug A2 regression coverage: entering AND exiting IDE mode both call
+// closeTerminalSearch() unconditionally (app.js onEnterIdeMode/onExitIdeMode),
+// so close() must tolerate back-to-back calls across a mode switch without
+// double-clearing decorations or losing the recalled query for the next open.
+test("close() survives back-to-back dispose calls across a mode switch (enter + exit both dispose)", () => {
+  const { controller, calls, last } = makeHarness();
+  controller.open({ query: "panic" });
+
+  // "Entering" a mode disposes it once...
+  controller.close();
+  expect(calls.filter((c) => c[0] === "clearDecorations")).toHaveLength(1);
+
+  // ...and "exiting" the same mode later disposes it again (already closed).
+  controller.close();
+  expect(calls.filter((c) => c[0] === "clearDecorations")).toHaveLength(1);
+  expect(last().open).toBe(false);
+  expect(last().query).toBe("panic");
+});

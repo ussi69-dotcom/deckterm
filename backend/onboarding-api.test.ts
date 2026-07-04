@@ -20,6 +20,8 @@ const ISOLATED_ENV_KEYS = [
   "CF_ACCESS_REQUIRED",
   "CF_ACCESS_TEAM_NAME",
   "CF_ACCESS_AUD",
+  "DECKTERM_RUNTIME_ENV",
+  "DECKTERM_LEGACY_NO_BOOTSTRAP",
   "PATH",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -57,6 +59,8 @@ function clearInheritedDoctorEnv() {
   delete process.env.CF_ACCESS_REQUIRED;
   delete process.env.CF_ACCESS_TEAM_NAME;
   delete process.env.CF_ACCESS_AUD;
+  process.env.DECKTERM_RUNTIME_ENV = "development";
+  process.env.DECKTERM_LEGACY_NO_BOOTSTRAP = "1";
 }
 
 test("onboarding doctor API runs the configured doctor script and parses deployment warnings", async () => {

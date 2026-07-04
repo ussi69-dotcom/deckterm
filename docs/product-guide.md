@@ -166,15 +166,14 @@ Core endpoints currently present:
 
 - `POST /api/clipboard/image`
 
-### Legacy compatibility routes
-
-The backend still exposes OpenCode proxy routes:
-
-- `GET /api/apps/opencode/health`
-- `ALL /apps/opencode/*`
-- `WS /apps/opencode/ws`
-
-These routes are legacy compatibility only. OpenCode is not part of the current primary DeckTerm UI surface.
+> The API surface above is a partial inventory (terminal/file/git/clipboard). It
+> has grown since this list was written — foundation (`/api/foundation/status`,
+> `/api/bootstrap`), settings (`/api/settings`, `/api/settings/env-info`), tasks
+> (`/api/tasks*`), onboarding (`/api/onboarding/*`), plus additional file/git
+> routes (`/api/files/content`, `/api/files/search`, `/api/git/stash`,
+> `/api/git/discard`, `/api/git/commit-files`, `/api/git/branch`) are not listed
+> here. TODO: full API reference refresh — Track E5,
+> `docs/plans/2026-07-02-enterprise-1.0-program.md`.
 
 ## Runtime Topology
 
