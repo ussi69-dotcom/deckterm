@@ -57,6 +57,17 @@ import {
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
 import { listHarnessSummaries } from "./services/agent-harnesses";
+import { writeTaskFileAtomic } from "./task-file-io";
+import {
+  buildPointerLine,
+  readTaskMessages,
+  renderInboxFile,
+  appendTaskMessageEvent,
+  sanitizeMessageBody,
+  taskInboxDir,
+  taskMessagesPath,
+  type TaskMessageEvent,
+} from "./task-messages";
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
@@ -3917,10 +3928,46 @@ export function createWebApp() {
     allowedProviders: DECKTERM_TASK_PROVIDERS,
   });
 
+  // Audit trail for automatic task transitions (security invariant 3: the
+  // verdict-processing result is auditable). Best-effort — an audit failure
+  // must not break the transition itself.
+  const auditTaskTransition = (
+    ownerId: string,
+    action: string,
+    terminalId: string,
+    task: {
+      id: string;
+      status: string;
+      processedVerdictAtRound: number | null;
+    },
+  ) => {
+    getFoundationState()
+      .then((state) => {
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action,
+          resourceType: "task",
+          resourceId: task.id,
+          decision: "allow",
+          data: {
+            terminalId,
+            status: task.status,
+            processedVerdictAtRound: task.processedVerdictAtRound,
+          },
+        });
+      })
+      .catch((err) => debug("Task transition audit failed:", err));
+  };
+
   // Advance worker/judge tasks when their agent terminal exits.
   onTerminalExit((ownerId, terminalId) => {
     taskRunner
       .handleTerminalExit(ownerId, terminalId)
+      .then((task) => {
+        if (task) {
+          auditTaskTransition(ownerId, "task.terminal-exit", terminalId, task);
+        }
+      })
       .catch((err) => debug("Task terminal-exit sync failed:", err));
   });
 
@@ -3930,6 +3977,16 @@ export function createWebApp() {
   setAgentDoneBridge((ownerId, terminalId, agentName) => {
     taskRunner
       .handleJudgeCompletion(ownerId, terminalId, agentName)
+      .then((task) => {
+        if (task) {
+          auditTaskTransition(
+            ownerId,
+            "task.judge-completion",
+            terminalId,
+            task,
+          );
+        }
+      })
       .catch((err) => debug("Task judge-completion sync failed:", err));
   });
 
@@ -5166,6 +5223,147 @@ export function createWebApp() {
       return c.json(
         await taskRunner.updateTask(c.req.param("id"), { ownerId }, body),
       );
+    } catch (err) {
+      return taskErrorResponse(c, err);
+    }
+  });
+
+  // S7 (Traycer patterns): task messages. GET folds the append-only event
+  // log; POST creates a user-originated message (from is ALWAYS "user" —
+  // judge feedback is an internal server event, never HTTP) and attempts
+  // pointer-only delivery into the task's recorded agent terminal. D1:
+  // message bodies NEVER enter the PTY — only the fixed, server-built,
+  // shell-inert pointer line naming the inbox file.
+  app.get("/api/tasks/:id/messages", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    try {
+      const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
+      return c.json({
+        messages: readTaskMessages(taskMessagesPath(task.taskDir)),
+      });
+    } catch (err) {
+      return taskErrorResponse(c, err);
+    }
+  });
+
+  app.post("/api/tasks/:id/messages", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
+    const body = await c.req.json().catch(() => ({}));
+    try {
+      // Ownership gate first: foreign/missing tasks 404 like every task route.
+      const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
+      const to = body?.to === "worker" || body?.to === "judge" ? body.to : null;
+      const sanitized =
+        typeof body?.body === "string" ? sanitizeMessageBody(body.body) : "";
+      if (!to || !sanitized.trim()) {
+        return c.json(
+          { error: "Message requires to: worker|judge and a non-empty body" },
+          400,
+        );
+      }
+
+      // Create + deliver under the per-task mutex so the recorded terminal
+      // ids can't shift mid-sequence (serializes with start/exit/verdict).
+      const result = await taskRunner.withTaskLock(task.id, async () => {
+        const fresh = await taskRunner.getTask(task.id, { ownerId });
+        const msgId = crypto.randomUUID();
+        const at = new Date().toISOString();
+        const inboxDir = taskInboxDir(fresh.taskDir);
+        const inboxPath = join(inboxDir, `${msgId}.md`);
+        await mkdir(inboxDir, { recursive: true });
+        writeTaskFileAtomic(
+          inboxPath,
+          renderInboxFile({ id: msgId, from: "user", body: sanitized, at }),
+        );
+        appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), {
+          type: "message-created",
+          id: msgId,
+          at,
+          from: "user",
+          to,
+          body: sanitized,
+        });
+
+        // Target provenance: terminal ids come from the task record ONLY.
+        const targetTerminalId =
+          to === "worker" ? fresh.terminalId : fresh.judgeTerminalId;
+        const expectedAgent =
+          to === "worker" ? fresh.workerProvider : fresh.judgeProvider;
+        const target = targetTerminalId
+          ? terminals.get(targetTerminalId)
+          : undefined;
+        let delivered = false;
+        let reason: string | null = null;
+        if (!targetTerminalId) {
+          reason = "no_target_terminal";
+        } else if (!target) {
+          reason = "terminal_not_live";
+        } else if (target.ownerId !== ownerId) {
+          reason = "owner_mismatch";
+        } else if (target.agentName !== expectedAgent) {
+          // Live telemetry must show the expected agent running RIGHT NOW —
+          // otherwise the pointer would land on a shell prompt (it is inert
+          // there, but delivery must still be reported as failed).
+          reason = "agent_not_running";
+        } else {
+          target.terminal.write(buildPointerLine("user", inboxPath));
+          delivered = true;
+        }
+        const outcome: TaskMessageEvent = delivered
+          ? {
+              type: "message-delivered",
+              id: msgId,
+              at: new Date().toISOString(),
+              terminalId: targetTerminalId as string,
+            }
+          : {
+              type: "message-delivery-failed",
+              id: msgId,
+              at: new Date().toISOString(),
+              reason: reason || "undeliverable",
+            };
+        appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), outcome);
+        return {
+          msgId,
+          to,
+          delivered,
+          reason,
+          targetTerminalId,
+          bodyBytes: Buffer.byteLength(sanitized, "utf8"),
+          taskDir: fresh.taskDir,
+        };
+      });
+
+      // Audit every outcome (invariant 3): never the body, only its size.
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "task.message",
+        resourceType: "task",
+        resourceId: task.id,
+        decision: result.delivered ? "allow" : "deny",
+        reason: result.reason,
+        data: {
+          taskId: task.id,
+          from: "user",
+          to: result.to,
+          targetTerminalId: result.targetTerminalId,
+          delivery: result.delivered ? "delivered" : "failed",
+          bodyBytes: result.bodyBytes,
+        },
+      });
+
+      const message =
+        readTaskMessages(taskMessagesPath(result.taskDir)).find(
+          (entry) => entry.id === result.msgId,
+        ) || null;
+      return c.json({
+        message,
+        delivery: result.delivered ? "delivered" : "failed",
+        reason: result.reason,
+      });
     } catch (err) {
       return taskErrorResponse(c, err);
     }

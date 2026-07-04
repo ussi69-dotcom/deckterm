@@ -154,4 +154,47 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const checked = await checksRes.json();
   expect(checked.status).toBe("needs-judge");
   expect(checked.lastCheckRun.success).toBe(true);
+
+  // S7 (Traycer patterns): task messages. No live agent terminal exists in
+  // this test, so delivery must be recorded as failed — while the message
+  // itself is created with the sanitized body as its canonical form.
+  const badMsgRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "nowhere", body: "hi" }),
+    }),
+  );
+  expect(badMsgRes.status).toBe(400);
+
+  const msgRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        to: "worker",
+        body: "please \x1b[31mfocus\x1b[0m on\x07 the tests",
+      }),
+    }),
+  );
+  expect(msgRes.status).toBe(200);
+  const posted = await msgRes.json();
+  expect(posted.delivery).toBe("failed");
+  expect(posted.reason).toBe("no_target_terminal");
+  expect(posted.message.from).toBe("user");
+  expect(posted.message.body).toBe("please focus on the tests");
+  expect(posted.message.delivery).toBe("failed");
+
+  const msgListRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`),
+  );
+  expect(msgListRes.status).toBe(200);
+  const { messages } = await msgListRes.json();
+  expect(messages).toHaveLength(1);
+  expect(messages[0].id).toBe(posted.message.id);
+
+  const foreignMsgRes = await app.fetch(
+    new Request("http://deckterm.test/api/tasks/nonexistent-task/messages"),
+  );
+  expect(foreignMsgRes.status).toBe(404);
 });
