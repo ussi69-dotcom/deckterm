@@ -45,6 +45,19 @@ export interface TaskMessage {
   failureReason?: string;
 }
 
+// Canonical task-message file locations (single source for S6/S7 callers).
+export function taskMessagesPath(taskDir: string): string {
+  return join(taskDir, "messages.jsonl");
+}
+
+export function taskInboxDir(taskDir: string): string {
+  return join(taskDir, "inbox");
+}
+
+export function workerPromptPath(taskDir: string): string {
+  return join(taskDir, "WORKER_PROMPT.md");
+}
+
 const MAX_MESSAGE_BODY_BYTES = 8 * 1024;
 const DEFAULT_MESSAGES_MAX_BYTES = 1024 * 1024; // 1 MiB
 const MAX_VERDICT_BYTES = 64 * 1024;

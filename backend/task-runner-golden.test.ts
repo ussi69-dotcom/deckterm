@@ -64,6 +64,9 @@ function makeTask(
     taskDir,
     terminalId: null,
     judgeTerminalId: null,
+    // Round 0 = the pre-verdict-loop shape these snapshots pin down.
+    round: 0,
+    processedVerdictAtRound: null,
     lastCheckRun: null,
     createdAt: "2026-07-04T00:00:00.000Z",
     updatedAt: "2026-07-04T00:00:00.000Z",

@@ -438,6 +438,31 @@ function notifyTerminalExit(ownerId: string, terminalId: string) {
     }
   }
 }
+
+// Listeners notified on a shell-integration `agent-done` edge (an agent
+// finished while its terminal keeps running). Primary verdict trigger for the
+// task runner's judge loop (D1); terminal exit stays the fallback.
+const agentDoneListeners: Array<
+  (ownerId: string, terminalId: string, agentName: string) => void
+> = [];
+function onAgentDone(
+  listener: (ownerId: string, terminalId: string, agentName: string) => void,
+) {
+  agentDoneListeners.push(listener);
+}
+function notifyAgentDone(
+  ownerId: string,
+  terminalId: string,
+  agentName: string,
+) {
+  for (const listener of agentDoneListeners) {
+    try {
+      listener(ownerId, terminalId, agentName);
+    } catch (err) {
+      debug("Agent done listener failed:", err);
+    }
+  }
+}
 const terminalSockets = new Map<string, Set<ServerWebSocket<WsData>>>();
 type TerminalReconnectState = {
   pendingReady: boolean;
@@ -571,6 +596,15 @@ function applyParsedShellIntegrationState(
   }
   if (stateChanged) {
     broadcastTerminalState(term);
+  }
+
+  // Surface agent-done edges (agent finished, terminal still alive) to
+  // subscribers — the task runner validates terminal id + provider + verdict
+  // file before acting, so this stays a plain notification.
+  for (const event of parsed.events) {
+    if (event.type === "agent-done") {
+      notifyAgentDone(term.ownerId, term.id, event.agentName);
+    }
   }
 
   if (emitOutput && parsed.output) {
@@ -3884,6 +3918,15 @@ export function createWebApp() {
     taskRunner
       .handleTerminalExit(ownerId, terminalId)
       .catch((err) => debug("Task terminal-exit sync failed:", err));
+  });
+
+  // Primary judge-verdict trigger: the judge agent finished while its
+  // terminal keeps running (persistent shell). The runner enforces the
+  // provider-matched judge-terminal edge + per-round verdict identity.
+  onAgentDone((ownerId, terminalId, agentName) => {
+    taskRunner
+      .handleJudgeCompletion(ownerId, terminalId, agentName)
+      .catch((err) => debug("Task judge-completion sync failed:", err));
   });
 
   app.onError((err, c) => {
