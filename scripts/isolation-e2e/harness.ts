@@ -192,6 +192,9 @@ export class Harness {
 
     const common: Record<string, string> = {
       PORT: String(port),
+      // Bind loopback: a test SUT is never public, and tunnel mode refuses a
+      // non-loopback bind (the default HOST is 0.0.0.0 on a clean env).
+      HOST: "127.0.0.1",
       DECKTERM_STATE_DIR: this.stateDir,
       ALLOWED_FILE_ROOTS: "/home/dtalice:/home/dtbob",
       DECKTERM_OS_ISOLATION: "1",
@@ -321,6 +324,18 @@ export class Harness {
     opts?: Parameters<MockEdge["mint"]>[1],
   ): Promise<string> {
     return this.edge.mint(persona, opts);
+  }
+
+  /** Resolve a unix account's numeric uid (uids differ per host — never hardcode). */
+  unixUid(username: string): number {
+    const out = execFileSync("id", ["-u", username], {
+      encoding: "utf8",
+    }).trim();
+    const uid = Number(out);
+    if (!Number.isInteger(uid)) {
+      throw new Error(`could not resolve uid for ${username}`);
+    }
+    return uid;
   }
 
   /** HTTP request authenticated as a CF-Access persona (mode "cf"). */

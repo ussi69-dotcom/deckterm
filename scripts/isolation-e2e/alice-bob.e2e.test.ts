@@ -24,8 +24,9 @@ const ALICE_REPO = `${ALICE_HOME}/repo`;
 const BOB_REPO = `${BOB_HOME}/repo`;
 const BOB_SECRET = `${BOB_HOME}/secret.txt`;
 const BOB_SECRET_MARKER = "THE-SECRET-OF-dtbob";
-const DTALICE_UID = 1003;
-const DTBOB_UID = 1004;
+// Uids differ per host (GH runners assign different numbers) — resolved at
+// setup, never hardcoded.
+let DTALICE_UID = 0;
 
 const stripAnsi = (s: string) =>
   s.replace(/\x1b\[[0-9;?]*[A-Za-z]|\x1b\([AB0]/g, "");
@@ -104,6 +105,7 @@ async function createTerminal(
 beforeAll(async () => {
   await h.setup();
   await h.boot("cf");
+  DTALICE_UID = h.unixUid("dtalice");
 
   userIds.alice = await invite(PERSONAS.alice);
   userIds.bob = await invite(PERSONAS.bob);
