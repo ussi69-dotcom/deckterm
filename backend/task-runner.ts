@@ -636,9 +636,12 @@ export function createTaskRunner(options: TaskRunnerOptions) {
           round: judgedRound + 1,
         }),
       );
+      // Deterministic id: if saveTask fails after this append and the
+      // trigger retries, the re-appended event folds into the same message
+      // instead of duplicating it (Codex S6 review, MED).
       appendTaskMessageEvent(taskMessagesPath(task.taskDir), {
         type: "message-created",
-        id: crypto.randomUUID(),
+        id: `judge-feedback-r${judgedRound}`,
         at: new Date().toISOString(),
         from: "judge",
         to: "worker",
@@ -939,6 +942,13 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     ): Promise<TaskRecord> {
       return runExclusive(id, async () => {
         const task = await loadTask(id, actor.ownerId);
+        // Freshness: a verdict file left over from an aborted judge attempt
+        // (or pre-created by another agent) must never satisfy THIS attempt —
+        // strict round matching alone can't prove freshness (Codex S6
+        // review, HIGH). rm handles symlinks by removing the link itself.
+        await rm(join(task.taskDir, `verdict-r${task.round}.json`), {
+          force: true,
+        });
         task.judgeTerminalId = terminalId;
         task.status = "judge-running";
         await appendJsonLine(task.controlFiles.roundsFile, {

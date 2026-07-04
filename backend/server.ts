@@ -439,28 +439,32 @@ function notifyTerminalExit(ownerId: string, terminalId: string) {
   }
 }
 
-// Listeners notified on a shell-integration `agent-done` edge (an agent
-// finished while its terminal keeps running). Primary verdict trigger for the
-// task runner's judge loop (D1); terminal exit stays the fallback.
-const agentDoneListeners: Array<
-  (ownerId: string, terminalId: string, agentName: string) => void
-> = [];
-function onAgentDone(
-  listener: (ownerId: string, terminalId: string, agentName: string) => void,
-) {
-  agentDoneListeners.push(listener);
+// Bridge for shell-integration `agent-done` edges (an agent finished while
+// its terminal keeps running) — the primary verdict trigger for the task
+// runner's judge loop (D1); terminal exit stays the fallback. A single
+// mutable slot, NOT a grow-only listener list: createWebApp() can run more
+// than once per process (tests), and stacked bridges would fan one edge out
+// to multiple runner instances whose per-task mutexes don't cover each other
+// (Codex S6 review). The most recently created app wins.
+type AgentDoneBridge = (
+  ownerId: string,
+  terminalId: string,
+  agentName: string,
+) => void;
+let agentDoneBridge: AgentDoneBridge | null = null;
+function setAgentDoneBridge(bridge: AgentDoneBridge) {
+  agentDoneBridge = bridge;
 }
 function notifyAgentDone(
   ownerId: string,
   terminalId: string,
   agentName: string,
 ) {
-  for (const listener of agentDoneListeners) {
-    try {
-      listener(ownerId, terminalId, agentName);
-    } catch (err) {
-      debug("Agent done listener failed:", err);
-    }
+  if (!agentDoneBridge) return;
+  try {
+    agentDoneBridge(ownerId, terminalId, agentName);
+  } catch (err) {
+    debug("Agent done bridge failed:", err);
   }
 }
 const terminalSockets = new Map<string, Set<ServerWebSocket<WsData>>>();
@@ -3923,7 +3927,7 @@ export function createWebApp() {
   // Primary judge-verdict trigger: the judge agent finished while its
   // terminal keeps running (persistent shell). The runner enforces the
   // provider-matched judge-terminal edge + per-round verdict identity.
-  onAgentDone((ownerId, terminalId, agentName) => {
+  setAgentDoneBridge((ownerId, terminalId, agentName) => {
     taskRunner
       .handleJudgeCompletion(ownerId, terminalId, agentName)
       .catch((err) => debug("Task judge-completion sync failed:", err));

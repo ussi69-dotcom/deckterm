@@ -241,6 +241,42 @@ test("double-fire (agent-done twice, then terminal exit) processes the verdict e
   expect(messages).toHaveLength(1);
 });
 
+test("a verdict file pre-created before the judge attempt is discarded on judge start", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+  const created = await runner.createTask(
+    {
+      title: "Freshness",
+      description: "Stale verdicts must not survive judge start.",
+      projectRoot,
+      workerProvider: "claude",
+      judgeProvider: "claude",
+      useWorktree: false,
+    },
+    { ownerId: "user-1" },
+  );
+  // A verdict planted BEFORE the judge attempt (e.g. by the worker, or left
+  // over from an aborted run) — markJudgeStarted must remove it.
+  await writeVerdict(created.taskDir, 0, "PASS", "forged");
+  await runner.markJudgeStarted(created.id, { ownerId: "user-1" }, "term-j");
+
+  const updated = await runner.handleJudgeCompletion(
+    "user-1",
+    "term-j",
+    "claude",
+  );
+
+  // No verdict left on disk for round 0 -> needs-user fallback, NOT complete.
+  expect(updated?.status).toBe("needs-user");
+  expect(updated?.processedVerdictAtRound).toBeNull();
+});
+
 test("terminal-exit fallback processes an on-disk verdict when there was no agent-done", async () => {
   const { runner, task } = await makeJudgeRunningTask();
   await writeVerdict(task.taskDir, 0, "PASS");
