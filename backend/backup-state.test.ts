@@ -235,18 +235,18 @@ test("runBackup refuses symlinked DB, backups dir, and anchor log", async () => 
   createStateDb(stateA).close();
   const elsewhereA = createTempStateDir();
   symlinkSync(elsewhereA, join(stateA, "backups"));
-  await expect(runBackup({ stateDir: stateA, now: new Date() })).rejects.toThrow(
-    /symlink/,
-  );
+  await expect(
+    runBackup({ stateDir: stateA, now: new Date() }),
+  ).rejects.toThrow(/symlink/);
 
   // Symlinked source DB → refuse.
   const stateB = createTempStateDir();
   const realDbHome = createTempStateDir();
   createStateDb(realDbHome).close();
   symlinkSync(join(realDbHome, "deckterm.db"), join(stateB, "deckterm.db"));
-  await expect(runBackup({ stateDir: stateB, now: new Date() })).rejects.toThrow(
-    /symlink/,
-  );
+  await expect(
+    runBackup({ stateDir: stateB, now: new Date() }),
+  ).rejects.toThrow(/symlink/);
 
   // Symlinked audit-anchor.log → refuse (DB itself is fine).
   const stateC = createTempStateDir();
@@ -258,7 +258,7 @@ test("runBackup refuses symlinked DB, backups dir, and anchor log", async () => 
     join(stateC, "audit-anchor.log"),
   );
   mkdirSync(join(stateC, "backups"), { recursive: true });
-  await expect(runBackup({ stateDir: stateC, now: new Date() })).rejects.toThrow(
-    /symlink/,
-  );
+  await expect(
+    runBackup({ stateDir: stateC, now: new Date() }),
+  ).rejects.toThrow(/symlink/);
 });
