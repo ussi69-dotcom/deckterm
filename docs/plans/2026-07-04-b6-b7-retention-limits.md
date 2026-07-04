@@ -254,3 +254,10 @@ brief; everything else on the main loop; every diff reviewed against §3 invaria
 - Migration 8 applied on live dev at restart; `bun x tsc --noEmit` green.
 - Visual: desktop classic + IDE, mobile 390px (`scrollWidth` 390 — A4 invariant holds),
   fresh output clean after extreme resizes.
+
+**Codex pre-finalization pass (deep, integrated diff vs `dev`):** 4 findings, all fixed in
+`82bb6f6` — (1) backup prune pattern exact-match only; (2) symlink refusal on DB/backups
+dir/anchor + resolve-under-state-dir check; (3) I1 wording corrected (retention appends
+audit rows, never prunes them); (4) `retention_runs` completed row written before the
+best-effort audit mirror. No material issues in the delta-replay change, the limiter, or the
+`policy.*` reservation. Verdict after fixes: clean.
