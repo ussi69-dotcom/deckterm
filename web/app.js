@@ -4902,6 +4902,8 @@ class TerminalManager {
       items: [],
       selectedId: null,
       loading: false,
+      messages: [],
+      messagesTaskId: null,
     };
     this.setupState = {
       report: null,
@@ -6881,12 +6883,39 @@ class TerminalManager {
           : this.taskState.items[0]?.id || null;
       this.renderTasks();
       this.setTaskStatus("");
+      if (this.taskState.selectedId) {
+        await this.refreshTaskMessages();
+      }
     } catch (err) {
       this.setTaskStatus(
         err instanceof Error ? err.message : "Failed to load tasks",
       );
     } finally {
       this.taskState.loading = false;
+    }
+  }
+
+  // S8 (Traycer patterns): fetch the message timeline for the currently
+  // selected task and re-render the detail panel. Guards against a stale
+  // response landing after the selection changed mid-flight (checked BEFORE
+  // writing to taskState, not just before the re-render) — a slow fetch for
+  // task A must never overwrite messages while task B is now selected.
+  // Failures are non-fatal: the last-known message list stays on screen.
+  async refreshTaskMessages() {
+    const taskId = this.taskState.selectedId;
+    if (!taskId) return;
+    try {
+      const payload = await this.fetchTaskJson(
+        `/api/tasks/${encodeURIComponent(taskId)}/messages`,
+      );
+      if (this.taskState.selectedId !== taskId) return;
+      this.taskState.messages = Array.isArray(payload?.messages)
+        ? payload.messages
+        : [];
+      this.taskState.messagesTaskId = taskId;
+      this.renderTaskDetail(this.getSelectedTask());
+    } catch (err) {
+      console.debug("Failed to load task messages", err);
     }
   }
 
@@ -7150,8 +7179,9 @@ class TerminalManager {
 
     const checkOutput = this.renderTaskCheckOutput(task);
     const rounds = this.renderTaskRounds(task);
+    const messages = this.renderTaskMessages(task);
 
-    detail.append(header, meta, checks, checkOutput, rounds, actions);
+    detail.append(header, meta, checks, checkOutput, rounds, messages, actions);
   }
 
   renderTaskCheckOutput(task) {
@@ -7221,9 +7251,157 @@ class TerminalManager {
     return section;
   }
 
+  // S8 (Traycer patterns): message timeline + compose box for the selected
+  // task. Messages live on this.taskState.messages (only valid when
+  // messagesTaskId matches the task being painted — a stale set from a prior
+  // selection is never shown). createElement/textContent only: message
+  // bodies are user/judge-originated text, never innerHTML.
+  renderTaskMessages(task) {
+    const section = document.createElement("section");
+    section.className = "task-messages";
+    const title = document.createElement("h4");
+    title.textContent = "Messages";
+    section.appendChild(title);
+
+    const messages =
+      this.taskState.messagesTaskId === task.id ? this.taskState.messages : [];
+
+    const list = document.createElement("div");
+    list.className = "task-message-list";
+    if (!messages.length) {
+      const empty = document.createElement("div");
+      empty.className = "task-detail-meta";
+      empty.textContent = "No messages yet";
+      list.appendChild(empty);
+    } else {
+      messages.forEach((msg) => {
+        const formatted = window.TasksView?.formatTaskMessageRow
+          ? window.TasksView.formatTaskMessageRow(msg)
+          : {
+              fromLabel: typeof msg?.from === "string" ? msg.from : "",
+              bodyText: typeof msg?.body === "string" ? msg.body : "",
+              deliveryLabel:
+                msg?.delivery === "delivered"
+                  ? "Delivered"
+                  : msg?.delivery === "failed"
+                    ? "Failed"
+                    : "Pending",
+              deliveryTitle:
+                msg?.delivery === "failed" && msg?.failureReason
+                  ? String(msg.failureReason)
+                  : "",
+            };
+
+        const row = document.createElement("div");
+        row.className = "task-message-row";
+
+        const rowHeader = document.createElement("div");
+        rowHeader.className = "task-message-row-header";
+
+        const from = document.createElement("span");
+        from.className = "task-message-from";
+        const time = msg?.createdAt
+          ? new Date(msg.createdAt).toLocaleTimeString()
+          : "";
+        from.textContent = time
+          ? `${formatted.fromLabel} · ${time}`
+          : formatted.fromLabel;
+
+        const deliveryClass =
+          msg?.delivery === "delivered" || msg?.delivery === "failed"
+            ? msg.delivery
+            : "pending";
+        const delivery = document.createElement("span");
+        delivery.className = `task-message-delivery task-message-delivery-${deliveryClass}`;
+        delivery.textContent = formatted.deliveryLabel;
+        if (formatted.deliveryTitle) delivery.title = formatted.deliveryTitle;
+
+        rowHeader.append(from, delivery);
+
+        const body = document.createElement("div");
+        body.className = "task-message-body";
+        body.textContent = formatted.bodyText;
+
+        row.append(rowHeader, body);
+        list.appendChild(row);
+      });
+    }
+    section.appendChild(list);
+
+    const compose = document.createElement("div");
+    compose.className = "task-message-compose";
+
+    const target = document.createElement("select");
+    target.className = "task-message-target";
+    [
+      ["worker", "Worker"],
+      ["judge", "Judge"],
+    ].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      target.appendChild(option);
+    });
+    target.value = "worker";
+
+    const input = document.createElement("textarea");
+    input.className = "task-message-input";
+    input.placeholder = "Message the running agent…";
+
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn btn-primary";
+    send.textContent = "Send";
+    send.addEventListener("click", () => {
+      void this.sendTaskMessage(task, target, input, send);
+    });
+
+    compose.append(target, input, send);
+    section.appendChild(compose);
+
+    return section;
+  }
+
+  // POST a new task message, then refresh the timeline. A "delivered"/"failed"
+  // response is still an HTTP success (the message was recorded either way) —
+  // only a "failed" delivery surfaces via setTaskStatus; a request-level error
+  // (bad `to`, empty body, 404) is caught and shown the same way.
+  async sendTaskMessage(task, targetSelect, textarea, sendButton) {
+    if (!task) return;
+    const to = targetSelect?.value === "judge" ? "judge" : "worker";
+    const body = textarea?.value || "";
+    sendButton.disabled = true;
+    try {
+      const payload = await this.fetchTaskJson(
+        `/api/tasks/${encodeURIComponent(task.id)}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ to, body }),
+        },
+      );
+      textarea.value = "";
+      if (payload?.delivery === "failed") {
+        this.setTaskStatus(
+          `Delivery failed: ${payload.reason || "unknown reason"}`,
+        );
+      }
+      await this.refreshTaskMessages();
+    } catch (err) {
+      this.setTaskStatus(
+        err instanceof Error ? err.message : "Failed to send message",
+      );
+    } finally {
+      sendButton.disabled = false;
+    }
+  }
+
   selectTask(taskId) {
     this.taskState.selectedId = taskId || null;
     this.renderTasks();
+    if (this.taskState.selectedId) {
+      void this.refreshTaskMessages();
+    }
   }
 
   getSelectedTask() {

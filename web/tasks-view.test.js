@@ -4,6 +4,8 @@ import {
   tasksTotalCount,
   tasksBadgeStatusClass,
   tasksRenderSignature,
+  formatTaskMessageRow,
+  taskMessagesSignature,
 } from "./tasks-view.js";
 
 test("tasksBoardColumns groups tasks into kanban columns, dropping empties", () => {
@@ -134,5 +136,155 @@ test("tasksRenderSignature tolerates sparse / missing input", () => {
   // board normalizes away from any non-"board" view value identically.
   expect(tasksRenderSignature({ viewMode: "list" })).toBe(
     tasksRenderSignature({ viewMode: "whatever" }),
+  );
+});
+
+// ── S8: task message timeline pure helpers ──────────────────────────────────
+
+test("formatTaskMessageRow maps known from/delivery enums to display strings", () => {
+  expect(
+    formatTaskMessageRow({
+      from: "user",
+      body: "hello",
+      delivery: "delivered",
+    }),
+  ).toEqual({
+    fromLabel: "You",
+    bodyText: "hello",
+    deliveryLabel: "Delivered",
+    deliveryTitle: "",
+  });
+
+  expect(
+    formatTaskMessageRow({
+      from: "judge",
+      body: "looks good",
+      delivery: "pending",
+    }),
+  ).toEqual({
+    fromLabel: "Judge",
+    bodyText: "looks good",
+    deliveryLabel: "Pending",
+    deliveryTitle: "",
+  });
+
+  expect(
+    formatTaskMessageRow({ from: "system", body: "note", delivery: "failed" }),
+  ).toEqual({
+    fromLabel: "System",
+    bodyText: "note",
+    deliveryLabel: "Failed",
+    deliveryTitle: "",
+  });
+});
+
+test("formatTaskMessageRow surfaces failureReason as deliveryTitle only when failed", () => {
+  expect(
+    formatTaskMessageRow({
+      from: "user",
+      body: "hi",
+      delivery: "failed",
+      failureReason: "terminal_not_live",
+    }),
+  ).toEqual({
+    fromLabel: "You",
+    bodyText: "hi",
+    deliveryLabel: "Failed",
+    deliveryTitle: "terminal_not_live",
+  });
+
+  // A failureReason on a non-failed message never leaks into deliveryTitle.
+  expect(
+    formatTaskMessageRow({
+      from: "user",
+      body: "hi",
+      delivery: "delivered",
+      failureReason: "stale_field",
+    }).deliveryTitle,
+  ).toBe("");
+});
+
+test("formatTaskMessageRow falls back to raw from string / 'Pending' delivery for unknown enums", () => {
+  expect(
+    formatTaskMessageRow({ from: "worker", body: "x", delivery: "weird" }),
+  ).toEqual({
+    fromLabel: "worker",
+    bodyText: "x",
+    deliveryLabel: "Pending",
+    deliveryTitle: "",
+  });
+});
+
+test("formatTaskMessageRow tolerates missing/junk input", () => {
+  expect(formatTaskMessageRow(null)).toEqual({
+    fromLabel: "",
+    bodyText: "",
+    deliveryLabel: "Pending",
+    deliveryTitle: "",
+  });
+  expect(formatTaskMessageRow(undefined)).toEqual({
+    fromLabel: "",
+    bodyText: "",
+    deliveryLabel: "Pending",
+    deliveryTitle: "",
+  });
+  expect(formatTaskMessageRow({})).toEqual({
+    fromLabel: "",
+    bodyText: "",
+    deliveryLabel: "Pending",
+    deliveryTitle: "",
+  });
+});
+
+test("taskMessagesSignature is stable for identical id/delivery/body-length, varies on change", () => {
+  const base = [
+    { id: "m1", delivery: "pending", body: "hello" },
+    { id: "m2", delivery: "delivered", body: "world!" },
+  ];
+  const sig = taskMessagesSignature(base);
+  // A different body with the SAME length dedupes (spec: length, not content).
+  expect(sig).toBe(
+    taskMessagesSignature([
+      { id: "m1", delivery: "pending", body: "howdy" },
+      { id: "m2", delivery: "delivered", body: "world!" },
+    ]),
+  );
+  // A delivery-state transition changes the signature.
+  expect(sig).not.toBe(
+    taskMessagesSignature([
+      { id: "m1", delivery: "delivered", body: "hello" },
+      { id: "m2", delivery: "delivered", body: "world!" },
+    ]),
+  );
+  // A body-length change changes the signature.
+  expect(sig).not.toBe(
+    taskMessagesSignature([
+      { id: "m1", delivery: "pending", body: "hello!" },
+      { id: "m2", delivery: "delivered", body: "world!" },
+    ]),
+  );
+  // An id change changes the signature.
+  expect(sig).not.toBe(
+    taskMessagesSignature([
+      { id: "m1x", delivery: "pending", body: "hello" },
+      { id: "m2", delivery: "delivered", body: "world!" },
+    ]),
+  );
+});
+
+test("taskMessagesSignature returns null on non-array input", () => {
+  expect(taskMessagesSignature(null)).toBeNull();
+  expect(taskMessagesSignature(undefined)).toBeNull();
+  expect(taskMessagesSignature("nope")).toBeNull();
+  expect(taskMessagesSignature({})).toBeNull();
+});
+
+test("taskMessagesSignature tolerates junk entries inside an array", () => {
+  expect(taskMessagesSignature([null, undefined, {}])).toBe(
+    JSON.stringify([
+      { id: null, delivery: "", len: 0 },
+      { id: null, delivery: "", len: 0 },
+      { id: null, delivery: "", len: 0 },
+    ]),
   );
 });
