@@ -8,6 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { getAgentHarness } from "./services/agent-harnesses";
 
 export type TaskProvider = "codex" | "claude";
 export type TaskStatus =
@@ -134,11 +135,20 @@ function normalizeProvider(
   fallback: TaskProvider,
   allowedProviders: TaskProvider[],
 ): TaskProvider {
-  const provider = value === "claude" || value === "codex" ? value : fallback;
-  if (!allowedProviders.includes(provider)) {
+  // Missing/empty falls back to the default; an EXPLICIT id must resolve to
+  // an enabled registry harness AND pass the configured allow-list (D2:
+  // unknown or disabled ids are rejected server-side, never coerced).
+  const provider =
+    value === undefined || value === null || value === ""
+      ? fallback
+      : String(value);
+  if (
+    !getAgentHarness(provider) ||
+    !allowedProviders.includes(provider as TaskProvider)
+  ) {
     throw new TaskRunnerError(`Task provider is not enabled: ${provider}`, 400);
   }
-  return provider;
+  return provider as TaskProvider;
 }
 
 function normalizeChecks(
@@ -336,7 +346,11 @@ function buildPromptCommand(
   provider: TaskProvider,
   promptFile: string,
 ): string {
-  return `${provider} "$(cat ${shellQuote(promptFile)})"`;
+  const harness = getAgentHarness(provider);
+  if (!harness) {
+    throw new TaskRunnerError(`Task provider is not enabled: ${provider}`, 400);
+  }
+  return harness.buildPromptCommand(promptFile);
 }
 
 export function buildWorkerCommand(task: TaskRecord): string {
