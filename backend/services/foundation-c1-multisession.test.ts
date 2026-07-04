@@ -60,7 +60,7 @@ test("foundation C1b: authorizeTerminalWrite", async () => {
   state.db
     .query(
       `INSERT INTO users (id, email, display_name, role, created_at, updated_at)
-     VALUES (?, ?, ?, 'user', ?, ?)`,
+     VALUES (?, ?, ?, 'member', ?, ?)`,
     )
     .run(
       "user_guest",
@@ -154,6 +154,20 @@ test("foundation C1b: terminal events and sequence log", async () => {
   const remainingEvents = listTerminalEventsAfter(state.db, termId, evId1);
   expect(remainingEvents.length).toBe(1);
   expect(remainingEvents[0].id).toBe(evId2);
+
+  // B6 D-B6-1: kinds filter — the reconnect delta replay asks for state
+  // events only, and a stale lastEventId below purged output ids must still
+  // return only the requested kinds.
+  const stateOnly = listTerminalEventsAfter(state.db, termId, 0, {
+    kinds: ["state"],
+  });
+  expect(stateOnly.length).toBe(1);
+  expect(stateOnly[0].id).toBe(evId2);
+  expect(stateOnly[0].kind).toBe("state");
+
+  const limited = listTerminalEventsAfter(state.db, termId, 0, { limit: 1 });
+  expect(limited.length).toBe(1);
+  expect(limited[0].id).toBe(evId1);
 
   state.db.close();
 });

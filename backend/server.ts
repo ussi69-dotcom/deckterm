@@ -2480,7 +2480,9 @@ function appendScrollback(terminalId: string, data: string) {
   const term = terminals.get(terminalId);
   if (!term) return;
 
-  appendTerminalRuntimeEvent(terminalId, "output", { data });
+  // B6 D-B6-1: output bytes are no longer persisted to terminal_events (the
+  // per-chunk INSERT was the root cause of unbounded DB growth); the capped
+  // in-memory scrollback below + tmux capture-pane are the replay sources.
 
   const chunks = data.split(/(?<=\n)/g);
   for (const chunk of chunks) {
@@ -3306,39 +3308,27 @@ async function completeTmuxReconnectReplay(
   reconnectState.replaying = true;
   reconnectState.pendingReady = true;
   try {
-    // Attempt delta replay if lastEventId is provided
+    // Best-effort metadata delta replay (B6 D-B6-1): `output` events are no
+    // longer persisted, so `lastEventId` only replays low-volume `state`
+    // events and must NEVER suppress the capture/scrollback replay below —
+    // screen content always comes from capture, not the event log.
     if (ws.data.type === "terminal" && ws.data.lastEventId !== null) {
       const state = await getFoundationState();
       const events = listTerminalEventsAfter(
         state.db,
         terminalId,
         ws.data.lastEventId,
+        { kinds: ["state"] },
       );
-      if (events.length > 0) {
-        for (const ev of events) {
-          if (ev.kind === "output" && ev.data) {
-            if (ws.data.protocol === "v2") {
-              ws.send(
-                JSON.stringify({
-                  type: "terminal_event",
-                  kind: "output",
-                  data: ev.data,
-                }),
-              );
-            } else {
-              ws.send(ev.data);
-            }
-          } else if (ev.kind === "state" && ev.dataJson) {
-            ws.send(JSON.stringify({ type: "terminal_state", ...ev.dataJson }));
-          }
+      for (const ev of events) {
+        if (ev.kind === "state" && ev.dataJson) {
+          ws.send(JSON.stringify({ type: "terminal_state", ...ev.dataJson }));
         }
+      }
+      if (events.length > 0) {
         debug(
-          `[reconnect] Delta-replayed ${events.length} events after ${ws.data.lastEventId} for ${terminalId}`,
+          `[reconnect] Delta-replayed ${events.length} state events after ${ws.data.lastEventId} for ${terminalId}`,
         );
-        sendReconnectLifecycle(ws, "replay-complete", {
-          requiresRedraw: false,
-        });
-        return;
       }
     }
 

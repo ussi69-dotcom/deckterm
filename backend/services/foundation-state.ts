@@ -955,21 +955,34 @@ export function listTerminalEventsAfter(
   db: Database,
   terminalId: string,
   lastEventId: number,
-  limit = 1000,
+  options: { limit?: number; kinds?: TerminalEventKind[] } = {},
 ): RecordedTerminalEvent[] {
   const safeLastEventId = Number.isFinite(lastEventId)
     ? Math.max(0, Math.floor(lastEventId))
     : 0;
-  const safeLimit = Math.max(1, Math.min(10_000, Math.floor(limit)));
+  const safeLimit = Math.max(
+    1,
+    Math.min(10_000, Math.floor(options.limit ?? 1000)),
+  );
+  const kinds = options.kinds ?? null;
+  const kindFilter =
+    kinds && kinds.length > 0
+      ? ` AND kind IN (${kinds.map(() => "?").join(", ")})`
+      : "";
   const rows = db
     .query(
       `SELECT id, terminal_id, kind, data_blob, data_json, created_at
        FROM terminal_events
-       WHERE terminal_id = ? AND id > ?
+       WHERE terminal_id = ? AND id > ?${kindFilter}
        ORDER BY id ASC
        LIMIT ?`,
     )
-    .all(terminalId, safeLastEventId, safeLimit) as Array<{
+    .all(
+      terminalId,
+      safeLastEventId,
+      ...(kinds && kinds.length > 0 ? kinds : []),
+      safeLimit,
+    ) as Array<{
     id: number;
     terminal_id: string;
     kind: TerminalEventKind;
