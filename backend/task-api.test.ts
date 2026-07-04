@@ -126,6 +126,25 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const listed = await listRes.json();
   expect(listed.map((task: { id: string }) => task.id)).toContain(created.id);
 
+  // S3 (Traycer patterns): the harness listing rides the same auth surface.
+  // Availability depends on the machine, so assert ids/shape only — enabled
+  // harnesses exactly (claude, codex), disabled ones never exposed.
+  const harnessesRes = await app.fetch(
+    new Request("http://deckterm.test/api/harnesses"),
+  );
+  expect(harnessesRes.status).toBe(200);
+  const { harnesses } = await harnessesRes.json();
+  expect(harnesses.map((h: { id: string }) => h.id).sort()).toEqual([
+    "claude",
+    "codex",
+  ]);
+  for (const harness of harnesses) {
+    expect(typeof harness.label).toBe("string");
+    expect(typeof harness.available).toBe("boolean");
+    expect("version" in harness).toBe(true);
+    expect("error" in harness).toBe(true);
+  }
+
   const checksRes = await app.fetch(
     new Request(`http://deckterm.test/api/tasks/${created.id}/run-checks`, {
       method: "POST",

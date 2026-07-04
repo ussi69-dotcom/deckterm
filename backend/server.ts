@@ -56,6 +56,7 @@ import {
   runWalCheckpoint,
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
+import { listHarnessSummaries } from "./services/agent-harnesses";
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
@@ -5051,6 +5052,14 @@ export function createWebApp() {
   app.get("/api/tasks", async (c) => {
     const { ownerId } = getCurrentUser(c);
     return c.json(await taskRunner.listTasks(ownerId));
+  });
+
+  // S3 (Traycer patterns): enabled harnesses + availability for the task
+  // form. Same auth shape as GET /api/tasks; summaries are probe results
+  // (60s cached), disabled harnesses never appear.
+  app.get("/api/harnesses", async (c) => {
+    getCurrentUser(c);
+    return c.json({ harnesses: await listHarnessSummaries() });
   });
 
   app.post("/api/tasks", async (c) => {
