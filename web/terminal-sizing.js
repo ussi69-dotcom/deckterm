@@ -107,6 +107,12 @@ function normalizeTerminalGrid({
 const DEFAULT_MIN_PANEL_CELL_HEIGHT = 20;
 const DEFAULT_MIN_PANEL_ROWS = 24;
 
+// IDE bottom terminal panel gets its own, much smaller row floor: it behaves
+// like a VS Code integrated terminal (routinely a handful of rows), not a
+// full-bleed/split tiled terminal tile — the invariant DEFAULT_MIN_PANEL_ROWS
+// above protects a different UI (bug A3c) and must stay untouched.
+const IDE_MIN_PANEL_ROWS = 6;
+
 // Pure pixel-height floor for a terminal panel that must fit at least
 // `minRows` rows at the given cell height, plus any non-terminal chrome
 // (borders, internal padding) the caller measured around it. Never throws on
@@ -163,6 +169,7 @@ const TerminalSizing = {
   DEFAULT_TERMINAL_COLS,
   DEFAULT_TERMINAL_ROWS,
   DEFAULT_MIN_PANEL_ROWS,
+  IDE_MIN_PANEL_ROWS,
   predictInitialTilePixels,
   estimateTerminalGrid,
   normalizeTerminalGrid,
@@ -182,6 +189,7 @@ if (typeof exports !== "undefined") {
   exports.DEFAULT_TERMINAL_COLS = DEFAULT_TERMINAL_COLS;
   exports.DEFAULT_TERMINAL_ROWS = DEFAULT_TERMINAL_ROWS;
   exports.DEFAULT_MIN_PANEL_ROWS = DEFAULT_MIN_PANEL_ROWS;
+  exports.IDE_MIN_PANEL_ROWS = IDE_MIN_PANEL_ROWS;
   exports.predictInitialTilePixels = predictInitialTilePixels;
   exports.estimateTerminalGrid = estimateTerminalGrid;
   exports.normalizeTerminalGrid = normalizeTerminalGrid;

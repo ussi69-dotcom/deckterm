@@ -486,6 +486,33 @@
         </section>
       </div>
 
+      <div
+        id="settings-sheet"
+        class="settings-sheet hidden"
+        aria-hidden="true"
+      >
+        <div class="settings-sheet-backdrop"></div>
+        <section
+          class="settings-sheet-shell"
+          role="dialog"
+          aria-modal="false"
+          aria-labelledby="settings-sheet-title"
+        >
+          <div class="settings-sheet-header">
+            <h3 id="settings-sheet-title">Settings</h3>
+            <button
+              id="settings-sheet-close"
+              class="btn-icon"
+              title="Close settings"
+              aria-label="Close settings"
+            >
+              <i data-lucide="x"></i>
+            </button>
+          </div>
+          <div id="settings-sheet-body" class="settings-sheet-body"></div>
+        </section>
+      </div>
+
       <!-- Workspace area: terminal tiles + floating surface windows layer -->
       <div id="workspace-area">
         <!-- Terminal container - tiles created dynamically by TileManager -->

@@ -24,6 +24,7 @@ import {
   resetActionLayoutState,
   saveActionLayoutState,
   saveRecentWorkspaceEntries,
+  shouldShowMobileActionBar,
   upsertRecentWorkspaceEntry,
   unpinLayoutAction,
   validateActionLayoutState,
@@ -376,6 +377,25 @@ test("reorderLayoutAction moves a pinned action within the same surface", () => 
   expect(next.desktopPinned).not.toEqual(desktopDefaults);
 });
 
+// --- shouldShowMobileActionBar (bug: empty-mobile-action-bar) -------------
+
+test("mobile action bar hides once every pinned action is unpinned", () => {
+  expect(shouldShowMobileActionBar([])).toBe(false);
+  expect(shouldShowMobileActionBar()).toBe(false);
+});
+
+test("mobile action bar shows again as soon as one action is pinned", () => {
+  expect(shouldShowMobileActionBar(["paste"])).toBe(true);
+  expect(shouldShowMobileActionBar(["files", "git", "paste"])).toBe(true);
+});
+
+test("mobile action bar decision ignores the non-removable 'more' slot", () => {
+  // Callers are expected to pass pinned ids only (already excluding "more"),
+  // but the helper must not be fooled into showing the bar for a pinned list
+  // that is only the non-removable slot leaking through.
+  expect(shouldShowMobileActionBar(["more"])).toBe(false);
+});
+
 test("desktop and mobile density tiers scale differently", () => {
   expect(getDesktopActionDensityTier(3)).toBe("normal");
   expect(getDesktopActionDensityTier(4)).toBe("compact");
@@ -559,7 +579,8 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(12);
+  expect(overflow).toHaveLength(13);
+  expect(overflow).toContain("palette");
   expect(overflow).toContain("setup");
   expect(overflow).toContain("settings");
   expect(overflow).toContain("dock-sessions");

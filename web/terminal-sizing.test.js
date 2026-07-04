@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  IDE_MIN_PANEL_ROWS,
   clampPanelHeightPercent,
   estimateTerminalGrid,
   minPanelHeightPx,
@@ -135,6 +136,23 @@ test("minPanelHeightPx ignores a non-finite/negative cellHeight and uses the fal
 
 test("minPanelHeightPx defaults minRows to 24 when omitted", () => {
   expect(minPanelHeightPx({ cellHeight: 20 })).toBe(20 * 24);
+});
+
+// --- IDE_MIN_PANEL_ROWS (IDE bottom panel gets its own, smaller floor) -----
+
+test("IDE_MIN_PANEL_ROWS is much smaller than the tiled-terminal invariant", () => {
+  expect(IDE_MIN_PANEL_ROWS).toBeLessThan(24);
+  expect(IDE_MIN_PANEL_ROWS).toBeGreaterThan(0);
+});
+
+test("minPanelHeightPx honors IDE_MIN_PANEL_ROWS when passed explicitly", () => {
+  expect(
+    minPanelHeightPx({
+      cellHeight: 21,
+      minRows: IDE_MIN_PANEL_ROWS,
+      chrome: 0,
+    }),
+  ).toBe(21 * IDE_MIN_PANEL_ROWS);
 });
 
 // --- clampPanelHeightPercent (bug A3c: default + drag-min share one clamp) -

@@ -10,6 +10,7 @@ const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
   desktopPrimary: Object.freeze(["files", "git", "palette", "more"]),
   mobilePrimary: Object.freeze(["files", "git", "paste", "more"]),
   overflow: Object.freeze([
+    "palette",
     "setup",
     "settings",
     "tasks",
@@ -418,6 +419,17 @@ function reorderLayoutAction(state, mode, actionId, targetIndex) {
   });
 }
 
+// Mobile action bar has one non-removable slot ("more") that always renders
+// its own button, so `actionIds.length === 0` never happens even when the
+// user unpins every customizable action (bug: empty-mobile-action-bar). The
+// bar should collapse to nothing (reclaiming --mobile-action-bar-height) once
+// there is nothing left to pin — the caller passes the PINNED ids only
+// (already excluding "more"), so an empty list is the real "nothing to show"
+// signal.
+function shouldShowMobileActionBar(pinnedActionIds = []) {
+  return uniqueActionIds(pinnedActionIds).length > 0;
+}
+
 function getActionDensityTier(mode, pinnedCount) {
   const count = Math.max(0, Number(pinnedCount) || 0);
   const normalizedMode = normalizeCwd(mode).toLowerCase();
@@ -678,6 +690,7 @@ const NavigationSurfaceModule = {
   resetActionLayoutState,
   saveActionLayoutState,
   saveRecentWorkspaceEntries,
+  shouldShowMobileActionBar,
   sortRecentWorkspaceEntries,
   limitRecentWorkspaceEntries,
   normalizeRecentWorkspaceEntries,
@@ -727,6 +740,7 @@ if (typeof exports !== "undefined") {
   exports.resetActionLayoutState = resetActionLayoutState;
   exports.saveActionLayoutState = saveActionLayoutState;
   exports.saveRecentWorkspaceEntries = saveRecentWorkspaceEntries;
+  exports.shouldShowMobileActionBar = shouldShowMobileActionBar;
   exports.sortRecentWorkspaceEntries = sortRecentWorkspaceEntries;
   exports.limitRecentWorkspaceEntries = limitRecentWorkspaceEntries;
   exports.normalizeRecentWorkspaceEntries = normalizeRecentWorkspaceEntries;

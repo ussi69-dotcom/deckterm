@@ -2380,6 +2380,17 @@ body.touch-input-mode .xterm .composition-view.active {
     transparent;
 }
 
+/* #file-explorer-list also carries the shared `.file-list` class (used by a
+ * separate, smaller directory-picker widget) which caps max-height at 50vh
+ * with a 300px min-height at equal specificity — since it comes later in the
+ * cascade it would otherwise win and cap the Explorer's list well short of
+ * the full sheet/panel height it's meant to fill. Override by ID so this
+ * element's own intended sizing always wins regardless of source order. */
+#file-explorer-list {
+  max-height: none;
+  min-height: 0;
+}
+
 .file-explorer-empty {
   display: flex;
   flex-direction: column;
@@ -3009,6 +3020,10 @@ body.touch-input-mode .xterm .composition-view.active {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* Without an explicit line-height, the browser rounds the flex-row line
+     box down to a whole pixel (~16px for this 14px font), clipping glyphs
+     that sit low in their ink box (e.g. underscores) almost entirely. */
+  line-height: 18px;
 }
 
 .file-item .file-size {
@@ -3323,6 +3338,68 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
 * {
   scrollbar-width: auto;
   scrollbar-color: var(--text-muted) var(--bg-secondary);
+}
+
+/* =============================================================================
+   LANDSCAPE-PHONE CHROME OVERRIDE (bug: landscape-phone-gets-desktop-chrome)
+
+   The MOBILE RESPONSIVE block below is keyed purely on viewport width
+   (max-width: 768px), which a phone in landscape slips past — e.g. 844x390
+   is wider than the breakpoint but is still a touch device with no hover
+   capability. app.js stamps body.chrome-mobile whenever
+   getActiveChromeMode() resolves to "mobile" (smallScreen OR
+   platformDetector.isMobile — the latter ORs in isCoarsePointer && noHover
+   independent of width), so mirror the subset of the width-based rules below
+   that switch the toolbar from desktop to touch chrome. This is additive:
+   the width-based rules stay as-is for narrow desktop *windows* (a mouse
+   user resizing their browser also gets body.chrome-mobile, so both paths
+   agree there), and fine-pointer desktops never get the class at any width.
+   ============================================================================= */
+
+body.chrome-mobile .toolbar-toggle {
+  display: flex;
+}
+
+body.chrome-mobile .toolbar-row-1 {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 8px;
+}
+
+body.chrome-mobile .toolbar-row-2 {
+  display: none;
+}
+
+body.chrome-mobile .desktop-primary-actions {
+  display: none;
+}
+
+body.chrome-mobile .toolbar {
+  flex-wrap: wrap;
+  height: auto;
+}
+
+body.chrome-mobile .mobile-action-bar {
+  display: grid;
+  grid-template-columns: repeat(
+    var(--mobile-action-bar-columns, 4),
+    minmax(0, 1fr)
+  );
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px));
+  background: linear-gradient(
+    180deg,
+    rgba(22, 27, 34, 0.98),
+    rgba(13, 17, 23, 0.98)
+  );
+  border-top: 1px solid var(--border-primary);
+  box-shadow: 0 -14px 32px rgba(0, 0, 0, 0.28);
+}
+
+body.chrome-mobile .mobile-action-bar[hidden] {
+  display: none !important;
 }
 
 /* =============================================================================
@@ -3914,13 +3991,22 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
-  flex: 1;
+  /* .panel-header is only used by the Git panel, whose header also has a
+     .git-branch label that needs to be the one flexible/truncating element
+     (see below) — keep the "Git" title at its natural width instead of
+     letting it compete for space and starve the branch label to 0px. */
+  flex: 0 0 auto;
 }
 
 .git-branch {
   font-size: 12px;
   color: var(--accent-blue);
   font-family: "JetBrains Mono", monospace;
+  flex: 1 1 auto;
+  min-width: 40px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .panel-refresh,
@@ -4247,7 +4333,10 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   left: 8px;
   right: 8px;
   padding: 8px 12px;
-  background: rgba(248, 81, 73, 0.15);
+  /* Solid (not translucent) so it never reads as garbled/overlapping text
+     when it sits on top of live terminal rows — a near-opaque background
+     used to let scrollback bleed through underneath it. */
+  background: #2b0f0e;
   border: 1px solid var(--accent-red);
   border-radius: 6px;
   font-size: 12px;
@@ -4255,6 +4344,7 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   z-index: 50;
   display: none;
   pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 
 .size-warning.visible {
@@ -4945,6 +5035,30 @@ body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
   border-radius: 3px;
   font-family: "JetBrains Mono", monospace;
   font-size: 9px;
+}
+
+/* Touch devices: bump the git panel's header sync icons and Diff/Timeline/
+   Working-Tree/Staged/Commit tab strip up to a real tap target (Apple HIG /
+   WCAG 2.5.5 ~44px), and drop the keyboard-shortcut hint row entirely since
+   it's meaningless without a hardware keyboard and only eats space. */
+@media (pointer: coarse) {
+  .panel-refresh,
+  .panel-close,
+  .git-sync-btn {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 8px;
+  }
+
+  .git-diff-mode,
+  .git-right-view {
+    min-height: 40px;
+    padding: 8px 12px;
+  }
+
+  .git-shortcuts {
+    display: none;
+  }
 }
 
 /* Utility classes */
@@ -6703,6 +6817,14 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-shell {
   transform: none;
 }
 
+/* The IDE sidebar has its own "EXPLORER" activity-bar title; hide the
+   standalone explorer's own modal header (kicker/title/close button) the
+   same way the terminal-mode surface window does above, so it doesn't
+   render duplicated inside the IDE sidebar. */
+body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
+  display: none;
+}
+
 /* =============================================================================
    GIT SOURCE CONTROL (Phase 2) — VS Code-style changes tree + diff editor
    ============================================================================= */
@@ -7053,6 +7175,53 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-shell {
   color: var(--text-muted);
 }
 
+/* Narrow viewports (mobile Settings sheet, or a squeezed narrow window):
+   the fixed 180px sidebar + minmax(160px, 30%) env-row key column leave the
+   main content/value column only a sliver of width, which forces
+   word-break: break-word text down to one letter per line. Stack the
+   sidebar above the content and the env key/value/desc rows into a single
+   column so nothing is forced narrower than it can read. */
+@media (max-width: 767px) {
+  .settings-panel {
+    flex-direction: column;
+  }
+
+  .settings-sidebar {
+    flex: 0 0 auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    overflow-y: visible;
+    border-right: none;
+    border-bottom: 1px solid var(--border-primary);
+    padding: 6px 8px;
+  }
+
+  .settings-category-btn {
+    white-space: nowrap;
+    border-left: none;
+    border-bottom: 2px solid transparent;
+  }
+
+  .settings-category-btn.active {
+    border-left-color: transparent;
+    border-bottom-color: var(--color-accent, var(--accent-blue));
+  }
+
+  .settings-env-row {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+  }
+
+  .settings-env-value {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .settings-env-desc {
+    grid-row: 3;
+  }
+}
+
 /* ── Users admin category (B3-S5) — minimal functional styling; polish is D6. */
 
 .users-admin-host {
@@ -7284,4 +7453,80 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-shell {
   flex-wrap: wrap;
   gap: 6px;
   align-items: center;
+}
+
+/* =============================================================================
+   SETTINGS MOBILE SHEET — full-screen host for Settings on mobile / narrow
+   desktop, mirroring the .file-explorer fixed-overlay + backdrop pattern
+   (there is no windowed-surfaces path off-desktop, so Settings needs its own
+   static, positioned host the way Files/Git already have).
+   ============================================================================= */
+
+.settings-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 580;
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 0;
+}
+
+.settings-sheet.hidden {
+  display: none;
+}
+
+.settings-sheet-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(3, 7, 12, 0.7);
+}
+
+.settings-sheet-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  pointer-events: auto;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.settings-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 16px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  flex: 0 0 auto;
+}
+
+.settings-sheet-header h3 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.settings-sheet-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (min-width: 768px) {
+  .settings-sheet-shell {
+    width: min(720px, calc(100vw - 32px));
+    height: calc(100vh - var(--toolbar-height) - 28px);
+    margin: calc(var(--toolbar-height) + 12px) 16px 16px auto;
+    border: 1px solid rgba(48, 54, 61, 0.92);
+    border-radius: 24px;
+    box-shadow:
+      0 24px 60px rgba(0, 0, 0, 0.45),
+      0 0 0 1px rgba(255, 255, 255, 0.03) inset;
+  }
 }

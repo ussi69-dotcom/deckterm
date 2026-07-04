@@ -352,7 +352,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
   }),
   palette: Object.freeze({
     label: "Palette",
-    icon: "more-horizontal",
+    icon: "search",
     action: "palette",
     desktopId: "command-palette-trigger",
     toolsId: "tools-sheet-palette",
@@ -1993,12 +1993,26 @@ class ExtraKeysManager {
     this.updateVisibility();
 
     // Restore the persisted secondary-row collapsed state (default: expanded).
+    // settingsStore's cache is empty until settingsReady resolves (a server
+    // round-trip), so applying it synchronously here always reads the
+    // fallback on a fresh browser/profile — apply now (so there's no flash
+    // of the wrong state once localStorage IS warm) and re-apply once
+    // settingsReady resolves in case the synchronous read missed a
+    // server-persisted value.
     this.setExtraKeysRow2Collapsed(
       Boolean(
         this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
       ),
       { persist: false },
     );
+    void this.tm?.settingsReady?.then(() => {
+      this.setExtraKeysRow2Collapsed(
+        Boolean(
+          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+        ),
+        { persist: false },
+      );
+    });
 
     // Setup toggle button handler
     document
@@ -2108,8 +2122,17 @@ class ExtraKeysManager {
   }
 
   loadVisibilityState() {
-    // On mobile, always start visible (managed by keyboard)
-    if (platformDetector.isMobile) return true;
+    // Mobile respects the same persisted terminal.extraKeysVisible pref as
+    // desktop (bug: extra-keys-visibility-pref-ignored-on-mobile) — but its
+    // OWN default is visible=true (an on-screen keyboard row a mobile user
+    // can't otherwise get to), unlike the desktop schema default of hidden.
+    // Read the raw store value with that mobile-specific fallback instead of
+    // going through the schema default (false), which is desktop-oriented.
+    if (platformDetector.isMobile) {
+      return Boolean(
+        this.tm?.settingsStore?.get("terminal.extraKeysVisible", true) ?? true,
+      );
+    }
 
     // On desktop, read the canonical terminal.extraKeysVisible from the store
     // (schema default: hidden). No legacy localStorage read — migration owns it.
@@ -2128,11 +2151,21 @@ class ExtraKeysManager {
   applyVisibility(visible) {
     this.visible = Boolean(visible);
     this.updateVisibility();
+    // Showing/hiding the row (and its ⋯ toggle) changes how much vertical
+    // space the terminal has. The container-height calc in
+    // handleViewportResize is otherwise only re-run on the next
+    // visualViewport resize/scroll event — trigger it now so a toggle (e.g.
+    // via the More-sheet action) reclaims/consumes the freed space
+    // synchronously, same as setExtraKeysRow2Collapsed already does.
+    this.tm?.handleViewportResize?.();
   }
 
   setVisible(visible) {
     // Persist through the settings runtime/store; the side effect applies it.
-    if (platformDetector.isDesktop && this.tm?.settingsRuntime) {
+    // Both platforms route through the same terminal.extraKeysVisible pref
+    // now (bug: extra-keys-visibility-pref-ignored-on-mobile) — only the
+    // DEFAULT differs by platform (see loadVisibilityState).
+    if (this.tm?.settingsRuntime) {
       this.tm.settingsRuntime.apply(
         "terminal.extraKeysVisible",
         Boolean(visible),
@@ -2140,9 +2173,7 @@ class ExtraKeysManager {
       return;
     }
     this.applyVisibility(visible);
-    if (platformDetector.isDesktop) {
-      this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
-    }
+    this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
   }
 
   toggle() {
@@ -2178,30 +2209,35 @@ class ExtraKeysManager {
         Boolean(collapsed),
       );
     }
+    // The container-height calc that accounts for the extra-keys row (see
+    // handleViewportResize) is otherwise only re-run on the next
+    // visualViewport resize/scroll event. Trigger it immediately so a
+    // row-2 collapse/expand while the on-screen keyboard is already open
+    // reclaims/consumes the freed vertical space right away, not on the
+    // next keyboard toggle.
+    this.tm?.handleViewportResize?.();
   }
 
-  // Called by viewport resize handler for mobile keyboard
-  // On mobile, extra keys should ALWAYS stay visible (just repositioned)
+  // Called by viewport resize handler for mobile keyboard. Mobile no longer
+  // forces visibility here (bug: extra-keys-visibility-pref-ignored-on-mobile)
+  // — the keyboard opening only REPOSITIONS the row (handleViewportResize's
+  // own inline-style bottom offset, applied unconditionally regardless of
+  // this.visible). Whether the row shows at all is governed solely by the
+  // persisted terminal.extraKeysVisible pref now, same as desktop, so a user
+  // who explicitly hid it (via Settings or the More-sheet action) stays hidden
+  // across keyboard open/close.
   showForKeyboard() {
-    if (platformDetector.isMobile) {
-      this.visible = true;
-      this.updateVisibility();
-    }
+    // No-op: see comment above.
   }
 
   hideForKeyboard() {
-    // On mobile, DO NOT hide extra keys when keyboard closes
-    // They should remain visible at the bottom of the screen
-    // Only hide on desktop if user explicitly toggled them off
+    // Desktop: extra keys were only ever shown transiently for the keyboard,
+    // so hide again once it closes if the user hasn't explicitly enabled them.
     if (platformDetector.isDesktop) {
       this.visible = false;
       this.updateVisibility();
     }
-    // On mobile, keep extra keys visible
-    if (platformDetector.isMobile) {
-      this.visible = true;
-      this.updateVisibility();
-    }
+    // Mobile: keep whatever the persisted pref says — do NOT force back on.
   }
 }
 
@@ -5298,8 +5334,28 @@ class TerminalManager {
     document.addEventListener("click", this.handleSurfaceActionClick);
   }
 
+  // Width alone (smallScreen) misses a phone in landscape — e.g. 844x390 is
+  // >=768px wide but is still a touch device with no hover, so
+  // platformDetector.isMobile is true (it ORs in isCoarsePointer && noHover
+  // independent of width). Consult both so a landscape phone gets mobile
+  // chrome while a narrow desktop *window* still does too (bug:
+  // landscape-phone-gets-desktop-chrome). isWindowedSurfaces() already makes
+  // the same isMobile check for Files/Git/Tasks/Editor; this keeps the
+  // toolbar/action-bar chrome decision consistent with it.
   getActiveChromeMode() {
-    return platformDetector.smallScreen ? "mobile" : "desktop";
+    return platformDetector.smallScreen || platformDetector.isMobile
+      ? "mobile"
+      : "desktop";
+  }
+
+  // Stamps body.chrome-mobile so CSS can key off the SAME mobile decision as
+  // getActiveChromeMode() (isMobile OR smallScreen) instead of only the
+  // width-based @media breakpoints, which a landscape phone slips past.
+  syncChromeModeClass() {
+    document.body.classList.toggle(
+      "chrome-mobile",
+      this.getActiveChromeMode() === "mobile",
+    );
   }
 
   getActionButtonConfig(actionId) {
@@ -5409,13 +5465,31 @@ class TerminalManager {
     root.dataset.density = density;
 
     if (surface === "mobile-primary") {
-      const isEmpty = actionIds.length === 0;
+      // actionIds always includes the non-removable "more" slot (see
+      // getPrimaryActionIds), so actionIds.length is never 0 even when every
+      // pin has been removed — check the PINNED ids only (bug:
+      // empty-mobile-action-bar). Pure decision lives in navigationSurface so
+      // it's covered without a DOM.
+      const pinnedActionIds = actionIds.filter((id) => id !== "more");
+      const wasHidden = root.hidden;
+      const isEmpty = !(
+        this.navigationSurface.shouldShowMobileActionBar?.(pinnedActionIds) ??
+        pinnedActionIds.length > 0
+      );
       root.hidden = isEmpty;
       root.setAttribute("aria-hidden", isEmpty ? "true" : "false");
       root.style.setProperty(
         "--mobile-action-bar-columns",
         String(actionIds.length || 1),
       );
+      // Hiding/showing the bar changes how much vertical space the
+      // terminal/extra-keys have (--mobile-action-bar-height reclaimed) —
+      // xterm's pixel-fit needs an explicit resize pass, CSS reflow alone
+      // won't trigger it (mirrors ExtraKeysManager's row-2 collapse doing
+      // the same via handleViewportResize).
+      if (wasHidden !== isEmpty) {
+        this.handleViewportResize?.();
+      }
     }
 
     actionIds.forEach((actionId) => {
@@ -5729,6 +5803,7 @@ class TerminalManager {
   }
 
   renderActionSurfaces() {
+    this.syncChromeModeClass();
     this.renderPrimaryActionBar(
       document.getElementById("desktop-primary-actions"),
       "desktop",
@@ -6246,12 +6321,25 @@ class TerminalManager {
     document.documentElement.style.setProperty("--color-accent", color);
   }
 
-  // Side effect for terminal.extraKeysVisible (value coerced to bool). Delegates
-  // to ExtraKeysManager without re-persisting. Mobile keeps its own always-on
-  // behavior, so this only re-applies desktop visibility.
+  // Side effect for terminal.extraKeysVisible (value coerced to bool).
+  // Delegates to ExtraKeysManager without re-persisting. Fires from both an
+  // explicit toggle (settingsRuntime.apply — value is already persisted) AND
+  // the startup settingsRuntime.applyAll() sweep, which resolves an UNSET key
+  // to the schema default (false, desktop-oriented). Mobile's own default is
+  // true (see ExtraKeysManager.loadVisibilityState) — so on mobile, only
+  // apply when the key is actually persisted; otherwise leave whatever
+  // loadVisibilityState() already resolved synchronously untouched, instead
+  // of letting the schema default clobber it to hidden on a fresh session.
   applyExtraKeysVisible(visible) {
     if (!this.extraKeys) return;
-    if (platformDetector.isMobile) return;
+    if (platformDetector.isMobile) {
+      const UNSET = Symbol("unset");
+      const persisted = this.settingsStore?.get(
+        "terminal.extraKeysVisible",
+        UNSET,
+      );
+      if (persisted === UNSET) return;
+    }
     this.extraKeys.applyVisibility(Boolean(visible));
   }
 
@@ -6271,7 +6359,6 @@ class TerminalManager {
       this.editorTabs.openSettings();
       return;
     }
-    // Terminal mode: use the existing SurfaceWindow path.
     if (!this.settingsManager) {
       this.settingsManager = new SettingsManager({
         settingsStore: this.settingsStore,
@@ -6280,6 +6367,7 @@ class TerminalManager {
     }
     const content = this.settingsManager.buildContent();
     if (this.isWindowedSurfaces()) {
+      // Desktop: the existing SurfaceWindow path.
       await this.openSurfaceWindow("settings", {
         title: "Settings",
         icon: "⚙",
@@ -6289,9 +6377,48 @@ class TerminalManager {
         minHeightPx: 360,
         onClose: () => this.surfaceWindowManager?.close("settings"),
       });
+    } else {
+      // Mobile (or a narrow desktop window where windowed surfaces are off):
+      // there is no floating-window host, so host the same detached content
+      // in the static full-screen sheet (mirrors openFileExplorer/
+      // openGitPanel's mobile-sheet fallback). releaseSurfaceWindowContent
+      // reparents the content out of any SurfaceWindow body it was
+      // previously mounted in (e.g. after a desktop->mobile resize).
+      this.releaseSurfaceWindowContent("settings", content);
+      const body = document.getElementById("settings-sheet-body");
+      if (body && content && content.parentElement !== body) {
+        body.appendChild(content);
+      }
+      this.openSettingsSheet();
     }
     await this.settingsManager.render();
     this.syncSurfaceButtonState();
+  }
+
+  // Static mobile sheet host for Settings (index.html #settings-sheet) —
+  // the counterpart to FileExplorerController's own show()/hidden-class
+  // toggling, which Settings has no equivalent controller for.
+  openSettingsSheet() {
+    const sheet = document.getElementById("settings-sheet");
+    if (!sheet) return;
+    sheet.classList.remove("hidden");
+    sheet.setAttribute("aria-hidden", "false");
+    if (!sheet.dataset.wired) {
+      sheet.dataset.wired = "1";
+      document
+        .getElementById("settings-sheet-close")
+        ?.addEventListener("click", () => this.closeSettingsSheet());
+      sheet
+        .querySelector(".settings-sheet-backdrop")
+        ?.addEventListener("click", () => this.closeSettingsSheet());
+    }
+  }
+
+  closeSettingsSheet() {
+    const sheet = document.getElementById("settings-sheet");
+    if (!sheet) return;
+    sheet.classList.add("hidden");
+    sheet.setAttribute("aria-hidden", "true");
   }
 
   setSetupStatus(message) {
@@ -9160,7 +9287,13 @@ class TerminalManager {
   // No-op on desktop (isWindowedSurfaces() true) and a no-op per surface that
   // isn't open (each close path already tolerates being called when closed).
   reconcileSurfaceWindowsForViewport() {
-    if (this.isWindowedSurfaces()) return;
+    if (this.isWindowedSurfaces()) {
+      // Growing past the desktop breakpoint: close the mobile Settings sheet
+      // (its terminal-mode counterpart of a SurfaceWindow) so it isn't left
+      // open/stuck underneath the now-available windowed surfaces.
+      this.closeSettingsSheet?.();
+      return;
+    }
     this.closeFileExplorer?.();
     this.closeGitPanel?.();
     this.surfaceWindowManager?.close("tasks");
@@ -9237,21 +9370,26 @@ class TerminalManager {
     });
   }
 
-  // Pixel floor for the IDE terminal panel's height so it always fits the
-  // invariant minimum of 24 rows (bug A3c) — computed from live cell metrics
-  // when a terminal is mounted, falling back to a conservative estimate
-  // otherwise (see measureTerminalCellSize). `chrome` accounts for the
-  // panel's border-top plus the terminal's own vertical padding
-  // (TERMINAL_PADDING_Y), PLUS one extra cell of headroom: the renderer's
-  // row-fit floors against real tile chrome that measurement can't see
-  // (observed ~10px beyond padding+border), and without the margin the floor
-  // lands exactly one row short (23 rows, live-measured at 1440x900).
+  // Pixel floor for the IDE terminal panel's height. Unlike the tiled/floating
+  // terminal invariant of 24 rows (bug A3c, which protects a different UI —
+  // see DEFAULT_MIN_PANEL_ROWS), the IDE bottom panel behaves like a VS Code
+  // integrated terminal, so it uses the much smaller IDE_MIN_PANEL_ROWS floor
+  // instead — otherwise the pixel floor eats far more height than the sash's
+  // own 15% minimum (DOCK_MIN_HEIGHT_PCT), capping editor/Settings growth.
+  // Computed from live cell metrics when a terminal is mounted, falling back
+  // to a conservative estimate otherwise (see measureTerminalCellSize).
+  // `chrome` accounts for the panel's border-top plus the terminal's own
+  // vertical padding (TERMINAL_PADDING_Y), PLUS one extra cell of headroom:
+  // the renderer's row-fit floors against real tile chrome that measurement
+  // can't see (observed ~10px beyond padding+border), and without the margin
+  // the floor lands exactly one row short (live-measured at 1440x900).
   getIdeTerminalPanelMinHeightPx() {
     const cellMetrics = this.measureTerminalCellSize();
     const cellHeight = cellMetrics?.cellHeight || 0;
     return (
       window.TerminalSizing?.minPanelHeightPx?.({
         cellHeight,
+        minRows: window.TerminalSizing?.IDE_MIN_PANEL_ROWS,
         chrome: TERMINAL_PADDING_Y + 1 + Math.ceil(cellHeight || 20),
       }) ?? 0
     );
@@ -9848,9 +9986,16 @@ class TerminalManager {
   // Entering IDE mode (after reparent): the `body.ide-mode` class (set by the
   // controller) docks the terminal container to the bottom panel via CSS only —
   // no PTY touch. Close the terminal-mode settings SurfaceWindow if open so
-  // there aren't two settings UIs simultaneously (Codex fix 7).
+  // there aren't two settings UIs simultaneously (Codex fix 7). "files" is
+  // handled separately (reparented into the sidebar, not closed) — every
+  // OTHER floating surface window (tasks/git/editor) is closed here too:
+  // those windows are positioned relative to the whole viewport, so left
+  // open they'd float on top of the freshly-painted IDE shell, visually
+  // disconnected from it.
   onEnterIdeMode() {
-    this.surfaceWindowManager?.close("settings");
+    ["settings", "tasks", "git", "editor"].forEach((id) =>
+      this.surfaceWindowManager?.close(id),
+    );
     // The scrollback-search overlay is positioned relative to the active
     // terminal's tile, which the IDE reflow can detach/resize mid-session —
     // close it rather than let it float over stale geometry (bug A2).
@@ -11599,24 +11744,32 @@ class TerminalManager {
           // until something else happened to repaint (bug A3a).
           t.terminal.refresh(0, Math.max(0, t.terminal.rows - 1));
 
-          // Match compact chrome behavior to the same width-based breakpoint as CSS.
-          // A narrow layout should not inherit desktop-only minimum-size warnings
-          // just because the device lacks touch input.
+          // Match compact chrome behavior to the SAME mobile decision as the
+          // toolbar/action-bar chrome swap (getActiveChromeMode / chrome-mobile),
+          // not just the width-based smallScreen check. A landscape phone (e.g.
+          // 844x390) gets mobile chrome via isMobile even though it isn't
+          // smallScreen by width alone — it must not be held to the desktop
+          // 60x16 threshold with the warning left un-suppressed.
           const cols = t.terminal.cols;
           const rows = t.terminal.rows;
-          const usesCompactLayout = platformDetector.smallScreen;
+          const usesCompactLayout = this.getActiveChromeMode() === "mobile";
           const minCols = usesCompactLayout ? 40 : 60;
           const minRows = usesCompactLayout ? 12 : 16;
           const isTooSmall = cols < minCols || rows < minRows;
 
           // Hide the warning for compact layouts where the bottom action bar
-          // is expected, and for the bottom dock where a short terminal strip
-          // is the whole point.
+          // is expected, for the bottom dock where a short terminal strip is
+          // the whole point, and for the IDE mode bottom panel — its fixed
+          // activity-bar + sidebar chrome routinely squeezes the main column
+          // below 60 cols at ordinary desktop widths even though the
+          // resulting terminal is perfectly usable (same class of
+          // "intentionally short/narrow docked panel" as sessionsDocked).
           const sessionsDocked =
             document.body.classList.contains("sessions-docked");
+          const ideDocked = document.body.classList.contains("ide-mode");
           if (t.sizeWarning) {
             const showWarning =
-              isTooSmall && !usesCompactLayout && !sessionsDocked;
+              isTooSmall && !usesCompactLayout && !sessionsDocked && !ideDocked;
             t.sizeWarning.classList.toggle("visible", showWarning);
             if (showWarning) {
               // Keep the warning copy honest — render the ACTUAL thresholds
