@@ -51,6 +51,10 @@ const B2_OS_MAPPINGS_MIGRATION = 6;
 // audit rows don't have to be written unboundedly under probing, while exact
 // evidence (count + first/last seen) survives restarts (§4.3, Codex #11).
 const B2_ISOLATION_DENY_COUNTERS_MIGRATION = 7;
+// B6: auditable bookkeeping for retention/prune runs — cadence is derived from
+// the last successful run per job, and "did the destructive cleanup run, when,
+// with what result" has a durable answer (plan D-B6-5, Codex #4).
+const B6_RETENTION_RUNS_MIGRATION = 8;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -296,6 +300,18 @@ export function migrateFoundationDb(db: Database): void {
       last_request_id TEXT,
       PRIMARY KEY (actor_user_id, actor_source, surface, reason)
     );
+
+    CREATE TABLE IF NOT EXISTS retention_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+      detail TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_retention_runs_job_finished
+      ON retention_runs(job, finished_at);
   `);
 
   const c3Existing = db
@@ -349,6 +365,17 @@ export function migrateFoundationDb(db: Database): void {
     db.query(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(B2_ISOLATION_DENY_COUNTERS_MIGRATION, new Date().toISOString());
+  }
+
+  // Migration 8 (B6): `retention_runs` is created by the boot DDL above
+  // (brand-new table, no rebuild); this only records the marker.
+  const b6RetentionExisting = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(B6_RETENTION_RUNS_MIGRATION);
+  if (!b6RetentionExisting) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(B6_RETENTION_RUNS_MIGRATION, new Date().toISOString());
   }
 }
 

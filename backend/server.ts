@@ -49,6 +49,13 @@ import {
   resolveTmuxSessionNamespace,
 } from "./tmux-session-names";
 import {
+  getLastSuccessfulRunAt,
+  RETENTION_JOB_PRUNE,
+  RETENTION_JOB_WAL_CHECKPOINT,
+  runRetentionPrune,
+  runWalCheckpoint,
+} from "./services/retention";
+import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
   createInvitedUser,
@@ -8188,6 +8195,54 @@ export async function startWebServer(host: string, port: number) {
 
   setInterval(cleanupIdleTerminals, 5 * 60 * 1000);
   setInterval(reapDetachedSessions, 15 * 60 * 1000);
+
+  // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
+  // durable `retention_runs` bookkeeping, so cadence survives restarts and a
+  // daily-restarted service still prunes daily and checkpoints weekly. No
+  // VACUUM anywhere in-process (I12).
+  const RETENTION_DISABLED = process.env.DECKTERM_RETENTION_DISABLED === "1";
+  const EVENT_RETENTION_DAYS = parseInt(
+    process.env.DECKTERM_EVENT_RETENTION_DAYS || "30",
+    10,
+  );
+  const SESSION_RETENTION_DAYS = parseInt(
+    process.env.DECKTERM_SESSION_RETENTION_DAYS || "30",
+    10,
+  );
+  const retentionTick = async () => {
+    if (RETENTION_DISABLED) return;
+    try {
+      const state = await getFoundationState();
+      const now = new Date();
+      const lastPrune = getLastSuccessfulRunAt(state.db, RETENTION_JOB_PRUNE);
+      if (!lastPrune || now.getTime() - lastPrune.getTime() > 24 * 3600_000) {
+        const result = await runRetentionPrune(state.db, {
+          eventTtlDays: EVENT_RETENTION_DAYS,
+          endedSessionTtlDays: SESSION_RETENTION_DAYS,
+          liveTerminalIds: new Set(terminals.keys()),
+          now,
+        });
+        console.log(
+          `[retention] prune completed: output=${result.outputEventsPurged} expired=${result.expiredEventsPruned} endedSessions=${result.endedSessionsPruned}`,
+        );
+      }
+      const lastCheckpoint = getLastSuccessfulRunAt(
+        state.db,
+        RETENTION_JOB_WAL_CHECKPOINT,
+      );
+      if (
+        !lastCheckpoint ||
+        now.getTime() - lastCheckpoint.getTime() > 7 * 24 * 3600_000
+      ) {
+        runWalCheckpoint(state.db, now);
+        console.log(`[retention] wal_checkpoint(TRUNCATE) completed`);
+      }
+    } catch (err) {
+      console.error(`[retention] tick failed:`, err);
+    }
+  };
+  setInterval(retentionTick, 60 * 60 * 1000);
+  setTimeout(retentionTick, 60 * 1000);
 
   process.on("SIGINT", () => {
     for (const term of terminals.values()) {
