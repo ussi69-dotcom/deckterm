@@ -97,6 +97,15 @@ green; `tsc` and smoke e2e are hard CI gates; deploy gate restored.
 The architecture track. **B1 is the program's keystone design doc** and ships together with E1
 (security model). B2 is the gnarliest slice — Opus/Fable codes it, Codex reviews per-slice.
 
+> **TRACK B COMPLETE 2026-07-04 (M1).** B6+B7 landed (plan + delivery record with all M1
+> evidence in `2026-07-04-b6-b7-retention-limits.md`; E3 runbook shipped as
+> `docs/upgrade-and-backup-runbook.md`): output events retired from the DB hot path
+> (migration 8, retention scheduler, live purge of 352,908 rows, dev DB 136 MB → 5 MB),
+> `backup-state.sh` + `db-maintenance --vacuum` + restore rehearsal, per-user rate limits +
+> session-policy seam (`policy.*` settings prefix reserved for C3). Full unit suite + smoke
+> e2e + live visual green on 4174. Next: M1 promotion PR `dev` → `main`, then Track C (C1
+> OIDC first).
+>
 > **Progress:** B5 done (`c48d85e`), B1+E1 done (`ff6dc21`), **B3 done 2026-07-03**
 > (`5bb4ad8`…`2889e7f`, plan + delivery record in
 > `2026-07-03-b3-user-provisioning-roles-revocation.md` — migration 5, roles/precedence,

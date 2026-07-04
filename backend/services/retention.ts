@@ -2,12 +2,14 @@
  * B6 — retention/pruning for foundation state (plan
  * docs/plans/2026-07-04-b6-b7-retention-limits.md, B1 design §3.1).
  *
- * Structural separation (invariants I1/I2): this module knows exactly three
- * table names — `terminal_events`, `terminal_sessions`, `retention_runs` —
- * and exposes no way to point it at anything else. Audit pruning does not
- * exist here by design: it requires C2's export-gated flow. Recordings (C4)
- * are likewise out of reach. Brokered capture dirs on disk belong to the
- * broker GC / C4 policy, never to this module (D-B6-6).
+ * Structural separation (invariants I1/I2): this module DELETES from exactly
+ * two tables — `terminal_events` and `terminal_sessions` — plus its own
+ * `retention_runs` bookkeeping, and exposes no way to point the destructive
+ * path at anything else. It never prunes/deletes `audit_events` (it only
+ * APPENDS an allow row there via `writeAuditEvent`, I10); audit pruning does
+ * not exist here by design — it requires C2's export-gated flow. Recordings
+ * (C4) are out of reach entirely. Brokered capture dirs on disk belong to
+ * the broker GC / C4 policy, never to this module (D-B6-6).
  *
  * The destructive work is chunked with an event-loop yield between chunks —
  * the foundation DB is a single in-process connection, so the failure mode
@@ -186,14 +188,27 @@ export async function runRetentionPrune(
       eventCutoff,
       sessionCutoff,
     };
+    // Durable record FIRST (Codex pre-final #4): `retention_runs` is the
+    // authoritative evidence of what a prune deleted. The audit row is a
+    // best-effort mirror AFTER it — an audit-write failure must not rewrite
+    // a genuinely completed destructive run as 'failed'. (A crash mid-delete
+    // leaves the run row 'running' — the honest signal that a prune started;
+    // the chunked predicates make the next run resume idempotently.)
     finishRun(db, runId, "completed", counts);
-    writeAuditEvent(db, {
-      action: "retention.prune",
-      resourceType: "foundation_state",
-      decision: "allow",
-      data: counts,
-      now,
-    });
+    try {
+      writeAuditEvent(db, {
+        action: "retention.prune",
+        resourceType: "foundation_state",
+        decision: "allow",
+        data: counts,
+        now,
+      });
+    } catch (err) {
+      console.error(
+        `[retention] audit mirror for prune run ${runId} failed (run row is the durable record):`,
+        err,
+      );
+    }
     return {
       outputEventsPurged,
       expiredEventsPruned,

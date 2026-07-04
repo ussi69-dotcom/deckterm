@@ -168,8 +168,10 @@ finished_at TEXT, status TEXT, detail TEXT)` — D-B6-5.
 
 From program Appendix A.2 + B1 §3:
 
-- I1. The pruner operates on `terminal_events`/`terminal_sessions` only — never `audit_events`,
-  never (future) `recordings`, never files outside the DB. Structural, not an `if`.
+- I1. The pruner DELETES only from `terminal_events`/`terminal_sessions` (+ its own
+  `retention_runs` bookkeeping) — it never prunes/deletes `audit_events` (it only appends
+  allow rows there, I10), never (future) `recordings`, never files outside the DB.
+  Structural, not an `if`. (Wording per Codex pre-final #3.)
 - I2. Audit pruning is impossible before C2's export exists (not implemented, module refuses).
 - I3. No behavior change for live sessions: rows for live/in-memory terminals are never pruned;
   `status!='ended'` rows are never pruned regardless of age.
@@ -184,8 +186,10 @@ From program Appendix A.2 + B1 §3:
 - I8. All new env knobs documented in `.env.example` + README table; defaults preserve current
   observable behavior for a single-user install (same limits as today).
 - I9. `bun x tsc --noEmit` green; new tests wired into `test:unit` (explicit file list).
-- I10. Every prune run writes an audit row (action `retention.prune`, counts, decision allow)
-  and a `retention_runs` row — retention itself must be auditable.
+- I10. Every prune run records its counts durably in `retention_runs` (completed BEFORE the
+  audit write — a crash or audit failure cannot erase the evidence of a completed
+  destructive run; a crash mid-delete leaves the run row `running`), then mirrors an audit
+  row (action `retention.prune`, counts, decision allow) best-effort. (Codex pre-final #4.)
 - I11. `lastEventId` delta replay never suppresses capture replay; `output` stays a legal
   event kind at the state layer (Codex #1).
 - I12. No automatic VACUUM anywhere; purge is chunked with event-loop yields (Codex #3).
@@ -221,3 +225,32 @@ D-B6-5; (5) pruner keeps hands off brokered capture dirs — confirmed → D-B6-
 server-side only, bucket TTL sweep, cheap checks first → D-B7-1; (7) **blocker:** no
 `policy.*` via actor-scoped self-service settings; seam + env only, prefix reserved/rejected
 → D-B7-2/I13; (8) M1 evidence checklist added → §4. **Post-incorporation: cleared to code.**
+
+## 6. Delivery record (2026-07-04)
+
+Commits on `feature/b6-b7-retention-limits` → `dev`: `49e8e90` (plan + E3 runbook), `d28f743`
+(B6-S1), `5c8d222` (B6-S2+S3), `abe6d0d` (B7). B6-S3 coded by a Sonnet subagent against the
+brief; everything else on the main loop; every diff reviewed against §3 invariants.
+
+**M1 evidence (all verified live on dev 4174, 2026-07-04 ~01:00 UTC):**
+
+- (a) Soak: 200 lines of live terminal output produced **0 new `terminal_events` rows**
+  (count 172 → 172); unit soak (257 chunked deletions across 3 chunks) green.
+- (b) WAL bounded: `wal_checkpoint(TRUNCATE)` job ran → WAL 4.2 MB → 8 KB.
+- (c) Purge idempotence: second prune run deletes 0 (unit-tested); live first run purged
+  **352,908 output rows + 13,397 expired events + 40 ended sessions** (audit + retention_runs
+  rows recorded); operator `db-maintenance --vacuum` shrank the DB **136 MB → 5.0 MB**.
+- (d) Reconnect: page reload replays screen content via capture (marker test in browser);
+  smoke e2e 21/21 incl. all reconnect specs.
+- (e) Legacy suite green: full `test:unit` (684+ tests) with service env stripped — the 11
+  fails seen with inherited `CF_ACCESS_REQUIRED=1` are the documented env-inheritance
+  phantom (CLAUDE.md), reproduced identically on the base commit.
+- (f) Rate-limit fairness/backstop/sweep: unit-tested (terminal-rate-limiter.test.ts).
+- (g) Unauthenticated: actor gate unchanged, runs before the limiter (no route change).
+- (h) `policy.*` settings write → 400, key not stored (foundation-settings.test.ts).
+- (i) Brokered capture dirs: retention module has no filesystem access at all.
+- Backup + restore rehearsal per runbook §5: `backup-state.sh` on live dev → restored copy
+  passes `integrity_check`, migrations 1–8 present, user rows intact.
+- Migration 8 applied on live dev at restart; `bun x tsc --noEmit` green.
+- Visual: desktop classic + IDE, mobile 390px (`scrollWidth` 390 — A4 invariant holds),
+  fresh output clean after extreme resizes.

@@ -14,9 +14,11 @@ import {
   chmodSync,
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   statSync,
   unlinkSync,
 } from "node:fs";
@@ -72,27 +74,37 @@ function sha256OfFile(path: string): string {
   return createHash("sha256").update(data).digest("hex");
 }
 
+function rejectSymlink(path: string, label: string): void {
+  if (lstatSync(path).isSymbolicLink()) {
+    throw new Error(`${label} is a symlink — refusing: ${path}`);
+  }
+}
+
+// Exact-shape matching (Codex pre-final #1): a file is part of a backup set
+// only if its name is EXACTLY `deckterm-<ts>.db` / `.manifest.json` /
+// `.audit-anchor.log` — `deckterm-<ts>.manual.db` and other lookalikes are
+// never pruned.
+const BACKUP_DB_RE = /^deckterm-(\d{8}T\d{6}Z)\.db$/;
+const BACKUP_MANIFEST_RE = /^deckterm-(\d{8}T\d{6}Z)\.manifest\.json$/;
+const BACKUP_ANCHOR_RE = /^deckterm-(\d{8}T\d{6}Z)\.audit-anchor\.log$/;
+
 function isBackupDbFile(name: string): boolean {
-  return (
-    name.startsWith(DB_GLOB_PREFIX) &&
-    name.endsWith(DB_GLOB_SUFFIX) &&
-    !name.endsWith(MANIFEST_GLOB_SUFFIX) &&
-    !name.endsWith(ANCHOR_GLOB_SUFFIX)
-  );
+  return BACKUP_DB_RE.test(name);
 }
 
 function isBackupManifestFile(name: string): boolean {
-  return name.startsWith(DB_GLOB_PREFIX) && name.endsWith(MANIFEST_GLOB_SUFFIX);
+  return BACKUP_MANIFEST_RE.test(name);
 }
 
 function isBackupAnchorFile(name: string): boolean {
-  return name.startsWith(DB_GLOB_PREFIX) && name.endsWith(ANCHOR_GLOB_SUFFIX);
+  return BACKUP_ANCHOR_RE.test(name);
 }
 
 function extractTimestamp(name: string): string | null {
-  if (!name.startsWith(DB_GLOB_PREFIX)) return null;
-  const rest = name.slice(DB_GLOB_PREFIX.length);
-  const match = rest.match(/^(\d{8}T\d{6}Z)\./);
+  const match =
+    name.match(BACKUP_DB_RE) ??
+    name.match(BACKUP_MANIFEST_RE) ??
+    name.match(BACKUP_ANCHOR_RE);
   return match ? match[1] : null;
 }
 
@@ -157,10 +169,22 @@ export async function runBackup(
   if (!existsSync(sourceDb)) {
     throw new Error(`DeckTerm state DB not found at ${sourceDb}`);
   }
+  // Symlink hardening (Codex pre-final #2): the DB, the anchor log, and the
+  // backups dir must be regular entries directly inside the real state dir —
+  // a symlinked `backups/` or `deckterm.db` must not redirect reads/writes/
+  // prunes elsewhere.
+  rejectSymlink(sourceDb, "state DB");
 
   const backupsDir = join(stateDir, BACKUPS_DIR_NAME);
   if (!existsSync(backupsDir)) {
     mkdirSync(backupsDir, { recursive: true, mode: 0o700 });
+  }
+  rejectSymlink(backupsDir, "backups directory");
+  const realStateDir = realpathSync(stateDir);
+  if (realpathSync(backupsDir) !== join(realStateDir, BACKUPS_DIR_NAME)) {
+    throw new Error(
+      `backups directory does not resolve under the state dir: ${backupsDir}`,
+    );
   }
   chmodSync(backupsDir, 0o700);
 
@@ -200,6 +224,7 @@ export async function runBackup(
 
   let anchorCopied = false;
   if (existsSync(anchorSrc)) {
+    rejectSymlink(anchorSrc, "audit anchor log");
     copyFileSync(anchorSrc, anchorDestPath);
     chmodSync(anchorDestPath, 0o600);
     anchorCopied = true;

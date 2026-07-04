@@ -132,10 +132,20 @@ test("runBackup prunes to keep only the newest N sets and never touches unrelate
   db.close();
 
   const backupsDir = join(stateDir, "backups");
-  // Plant a decoy file before any backup runs; the dir doesn't exist yet so create it first.
+  // Plant decoy files before any backup runs; the dir doesn't exist yet so create it first.
   const { mkdirSync } = await import("node:fs");
   mkdirSync(backupsDir, { recursive: true });
   writeFileSync(join(backupsDir, "keep-me.txt"), "do not delete me");
+  // Codex pre-final #1: lookalikes that share the prefix/suffix but are not
+  // an exact backup-set filename must never be pruned.
+  writeFileSync(
+    join(backupsDir, "deckterm-20200101T000000Z.manual.db"),
+    "operator's manual copy",
+  );
+  writeFileSync(
+    join(backupsDir, "deckterm-notes.manifest.json"),
+    "not a backup manifest",
+  );
 
   const keep = 7;
   const runTimestamps = Array.from(
@@ -148,8 +158,15 @@ test("runBackup prunes to keep only the newest N sets and never touches unrelate
     results.push(await runBackup({ stateDir, keep, now }));
   }
 
-  // Decoy file must survive every prune pass.
+  // Decoy files must survive every prune pass — including exact-shape
+  // lookalikes older than every kept set.
   expect(existsSync(join(backupsDir, "keep-me.txt"))).toBe(true);
+  expect(
+    existsSync(join(backupsDir, "deckterm-20200101T000000Z.manual.db")),
+  ).toBe(true);
+  expect(existsSync(join(backupsDir, "deckterm-notes.manifest.json"))).toBe(
+    true,
+  );
 
   // Only the newest 7 of the 9 backup sets should remain.
   const remaining = results.slice(2); // oldest 2 pruned
@@ -207,5 +224,41 @@ test("runBackup throws a clear error when the source DB is missing", async () =>
 
   await expect(runBackup({ stateDir, now: new Date() })).rejects.toThrow(
     /deckterm\.db/,
+  );
+});
+
+test("runBackup refuses symlinked DB, backups dir, and anchor log", async () => {
+  const { mkdirSync, symlinkSync } = await import("node:fs");
+
+  // Symlinked backups dir → refuse.
+  const stateA = createTempStateDir();
+  createStateDb(stateA).close();
+  const elsewhereA = createTempStateDir();
+  symlinkSync(elsewhereA, join(stateA, "backups"));
+  await expect(runBackup({ stateDir: stateA, now: new Date() })).rejects.toThrow(
+    /symlink/,
+  );
+
+  // Symlinked source DB → refuse.
+  const stateB = createTempStateDir();
+  const realDbHome = createTempStateDir();
+  createStateDb(realDbHome).close();
+  symlinkSync(join(realDbHome, "deckterm.db"), join(stateB, "deckterm.db"));
+  await expect(runBackup({ stateDir: stateB, now: new Date() })).rejects.toThrow(
+    /symlink/,
+  );
+
+  // Symlinked audit-anchor.log → refuse (DB itself is fine).
+  const stateC = createTempStateDir();
+  createStateDb(stateC).close();
+  const anchorHome = createTempStateDir();
+  writeFileSync(join(anchorHome, "real-anchor.log"), "anchor");
+  symlinkSync(
+    join(anchorHome, "real-anchor.log"),
+    join(stateC, "audit-anchor.log"),
+  );
+  mkdirSync(join(stateC, "backups"), { recursive: true });
+  await expect(runBackup({ stateDir: stateC, now: new Date() })).rejects.toThrow(
+    /symlink/,
   );
 });
