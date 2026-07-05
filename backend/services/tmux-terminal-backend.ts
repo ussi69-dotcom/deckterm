@@ -296,11 +296,26 @@ export class TmuxTerminalBackend implements TerminalBackend {
   ): Promise<{ pipePath: string; pipeOffset: number }> {
     await mkdir(this.pipeDir, { recursive: true });
     const pipePath = this.getPipePath(sessionName);
-    const pipeProc = await this.spawnTmux(
-      ["pipe-pane", "-o", "-t", sessionName, `cat >> ${pipePath}`],
+    // `pipe-pane -o` TOGGLES on tmux 3.4: a second call closes an open pipe.
+    // Since this runs on both create() and attach(), the pipe used to end up
+    // CLOSED after any create→attach sequence, silently dropping every
+    // shell-integration marker in tmux mode (S9 spike finding). Only arm the
+    // pipe when the pane reports none is open.
+    const checkProc = await this.spawnTmux(
+      ["display-message", "-p", "-t", sessionName, "#{pane_pipe}"],
       { stdout: "pipe", stderr: "pipe" },
     );
-    await pipeProc.exited;
+    const pipeState = (
+      await new Response((checkProc as any).stdout).text()
+    ).trim();
+    await checkProc.exited;
+    if (pipeState !== "1") {
+      const pipeProc = await this.spawnTmux(
+        ["pipe-pane", "-o", "-t", sessionName, `cat >> ${pipePath}`],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      await pipeProc.exited;
+    }
 
     try {
       return { pipePath, pipeOffset: (await stat(pipePath)).size };
