@@ -449,6 +449,16 @@ class TasksViewController {
     const checks = (task.checks || [])
       .map((c) => `<li>${this.esc(c.label)}: ${this.esc(c.command)}</li>`)
       .join("");
+    // A phase that is already running disables its own trigger (and Start
+    // while ANY phase runs) so the primary button reflects reality instead
+    // of offering a second worker for a running task.
+    const running =
+      statusText === "worker-running" ||
+      statusText === "checks-running" ||
+      statusText === "judge-running";
+    const startDisabled = running || statusText === "complete";
+    const checksDisabled = running;
+    const judgeDisabled = running;
     detail.innerHTML = `
       <div class="ide-tasks-detail-header">
         <span class="ide-tasks-detail-title" title="${this.esc(title)}">${this.esc(title)}</span>
@@ -457,9 +467,9 @@ class TasksViewController {
       <div class="ide-tasks-detail-meta" title="${this.esc(meta)}">${this.esc(meta)}</div>
       <ul class="ide-tasks-checks">${checks || "<li>No checks</li>"}</ul>
       <div class="ide-tasks-detail-actions">
-        <button type="button" class="ide-tasks-detail-action primary" data-task-action="start">Start Worker</button>
-        <button type="button" class="ide-tasks-detail-action" data-task-action="checks">Run Checks</button>
-        <button type="button" class="ide-tasks-detail-action" data-task-action="judge">Run Judge</button>
+        <button type="button" class="ide-tasks-detail-action primary" data-task-action="start"${startDisabled ? " disabled" : ""}>Start Worker</button>
+        <button type="button" class="ide-tasks-detail-action" data-task-action="checks"${checksDisabled ? " disabled" : ""}>Run Checks</button>
+        <button type="button" class="ide-tasks-detail-action" data-task-action="judge"${judgeDisabled ? " disabled" : ""}>Run Judge</button>
       </div>`;
   }
 

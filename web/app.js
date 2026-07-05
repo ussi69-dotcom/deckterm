@@ -5596,7 +5596,7 @@ class TerminalManager {
     );
   }
 
-  tabCopyStageFits(tab, stage) {
+  tabCopyStageFits(tab, stage, slack = 0) {
     const copy = tab?.querySelector(".tab-copy");
     const label = tab?.querySelector(".tab-label");
     const meta = tab?.querySelector(".tab-meta");
@@ -5605,14 +5605,14 @@ class TerminalManager {
     if (!copy || !label) return true;
 
     if (stage === "truncated") {
-      return copy.getBoundingClientRect().width >= 72;
+      return copy.getBoundingClientRect().width >= 72 + slack;
     }
 
-    const labelFits = label.scrollWidth <= label.clientWidth + 1;
+    const labelFits = label.scrollWidth <= label.clientWidth + 1 - slack;
     const secondary =
       meta && !meta.hidden ? meta : badge && !badge.hidden ? badge : null;
     const secondaryFits =
-      !secondary || secondary.scrollWidth <= secondary.clientWidth + 1;
+      !secondary || secondary.scrollWidth <= secondary.clientWidth + 1 - slack;
     if (!labelFits || !secondaryFits) {
       return false;
     }
@@ -5627,8 +5627,21 @@ class TerminalManager {
       ? secondary.getBoundingClientRect()
       : labelRect;
 
-    return Math.max(labelRect.right, secondaryRect.right) <= closeRect.left + 1;
+    return (
+      Math.max(labelRect.right, secondaryRect.right) <=
+      closeRect.left + 1 - slack
+    );
   }
+
+  // Copy-fit stage order, roomiest first. Index comparisons drive the
+  // hysteresis below.
+  static TAB_COPY_FIT_STATES = [
+    "roomy",
+    "compact",
+    "wrapped",
+    "truncated",
+    "cramped",
+  ];
 
   syncDesktopTabCopyFit(tab) {
     if (!tab) return false;
@@ -5656,6 +5669,21 @@ class TerminalManager {
       tab.dataset.copyFit = nextState;
       if (!this.tabCopyStageFits(tab, nextState)) {
         nextState = "cramped";
+      }
+    }
+
+    // Hysteresis: borderline measurements would otherwise flip-flop a tab
+    // between adjacent stages on successive syncs (each flip re-truncates
+    // labels — visible flicker). Upgrading to a ROOMIER stage requires the
+    // fit to pass with headroom; downgrades (content stopped fitting) apply
+    // immediately.
+    const order = TerminalManager.TAB_COPY_FIT_STATES;
+    const prevIdx = order.indexOf(previous);
+    const nextIdx = order.indexOf(nextState);
+    if (prevIdx !== -1 && nextIdx !== -1 && nextIdx < prevIdx) {
+      tab.dataset.copyFit = nextState;
+      if (!this.tabCopyStageFits(tab, nextState, 12)) {
+        nextState = previous;
       }
     }
 
@@ -6881,7 +6909,14 @@ class TerminalManager {
 
   async refreshTasks({ selectedId = this.taskState.selectedId } = {}) {
     const panel = this.getTaskPanel();
-    if (!panel || panel.classList.contains("hidden")) return;
+    // Refresh when ANY task surface is live: the classic panel OR the IDE
+    // sidebar tasks view. The old hidden-panel-only guard made every refresh
+    // a no-op in IDE mode (the classic panel is hidden there), so the
+    // sidebar rendered stale statuses forever — Start Worker kept showing
+    // "ready" until the user left the IDE.
+    const ideTasksMounted = Boolean(document.querySelector(".ide-tasks-view"));
+    const panelVisible = Boolean(panel && !panel.classList.contains("hidden"));
+    if (!panelVisible && !ideTasksMounted) return;
     this.taskState.loading = true;
     this.setTaskStatus("Loading tasks...");
     try {
@@ -7176,6 +7211,12 @@ class TerminalManager {
 
     const actions = document.createElement("div");
     actions.className = "task-actions";
+    // Mirror the IDE sidebar: a running phase disables its trigger so the
+    // primary button reflects the live status.
+    const taskRunning =
+      task.status === "worker-running" ||
+      task.status === "checks-running" ||
+      task.status === "judge-running";
     [
       ["start", "Start Worker"],
       ["checks", "Run Checks"],
@@ -7186,6 +7227,8 @@ class TerminalManager {
       button.className = action === "start" ? "btn btn-primary" : "btn";
       button.dataset.taskAction = action;
       button.textContent = label;
+      button.disabled =
+        taskRunning || (action === "start" && task.status === "complete");
       actions.appendChild(button);
     });
 
@@ -9589,6 +9632,8 @@ class TerminalManager {
     // docking modes never overwrite each other.
     this.ideDockHeightPct =
       window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
+    // IDE sidebar width in px; null = the CSS default. Restored below.
+    this.ideSidebarWidthPx = null;
     this.dockSash = document.getElementById("dock-sash");
     this.dockSash?.addEventListener("pointerdown", (e) =>
       this.startDockSashDrag(e),
@@ -9611,6 +9656,13 @@ class TerminalManager {
           this.ideDockHeightPct;
       }
       this.applyIdeDockHeight();
+      const sidebarStored = Number(
+        this.settingsStore?.get("ide.sidebarWidth", null),
+      );
+      if (Number.isFinite(sidebarStored) && sidebarStored > 0) {
+        this.ideSidebarWidthPx = this.clampIdeSidebarWidth(sidebarStored);
+      }
+      this.applyIdeSidebarWidth();
     });
   }
 
@@ -9667,6 +9719,66 @@ class TerminalManager {
     this.applyIdeDockHeight();
     window.dispatchEvent(new Event("resize"));
     this.settingsStore?.set("dock.ide", { heightPct: this.ideDockHeightPct });
+  }
+
+  // --- IDE sidebar width (right-edge sash) ----------------------------------
+  // Persisted separately (ide.sidebarWidth, px) from dock.ide so the two
+  // writers can never clobber each other. Null = the CSS default (280px).
+
+  clampIdeSidebarWidth(px) {
+    const max = Math.min(640, Math.floor((window.innerWidth || 1280) * 0.5));
+    return Math.min(Math.max(Math.round(px), 180), Math.max(180, max));
+  }
+
+  applyIdeSidebarWidth() {
+    const root = document.documentElement;
+    if (Number.isFinite(this.ideSidebarWidthPx)) {
+      root.style.setProperty(
+        "--ide-sidebar-width",
+        `${Math.round(this.ideSidebarWidthPx)}px`,
+      );
+    } else {
+      root.style.removeProperty("--ide-sidebar-width");
+    }
+  }
+
+  startIdeSidebarSashDrag(e) {
+    e.preventDefault();
+    const sidebar = this.ideShell?.sidebarEl;
+    if (!sidebar) return;
+    const rect = sidebar.getBoundingClientRect();
+    const sash = this.ideShell?.sidebarSashEl;
+    sash?.classList.add("dragging");
+    const apply = (clientX) => {
+      this.ideSidebarWidthPx = this.clampIdeSidebarWidth(clientX - rect.left);
+      this.applyIdeSidebarWidth();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientX);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("ide.sidebarWidth", this.ideSidebarWidthPx);
+      // Same drag-end settle as the terminal sash (bug A3b): explicitly
+      // refit every visible terminal instead of relying on the debounced
+      // synthetic resize.
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+  }
+
+  resetIdeSidebarSash() {
+    this.ideSidebarWidthPx = null;
+    this.applyIdeSidebarWidth();
+    window.dispatchEvent(new Event("resize"));
+    this.settingsStore?.set("ide.sidebarWidth", null);
   }
 
   applyDockState({ persist = true } = {}) {
@@ -9742,6 +9854,10 @@ class TerminalManager {
       // resets it to the default height.
       startTerminalSashDrag: (e) => this.startIdeTerminalSashDrag(e),
       resetTerminalSash: () => this.resetIdeTerminalSash(),
+      // Resize the sidebar by dragging its right-edge sash; double-click
+      // resets to the default width.
+      startSidebarSashDrag: (e) => this.startIdeSidebarSashDrag(e),
+      resetSidebarSash: () => this.resetIdeSidebarSash(),
     });
     this.initEditorTabs();
     this.initScmView();
@@ -11979,6 +12095,8 @@ class TerminalManager {
       t.fitFrame = requestAnimationFrame(() => {
         t.fitFrame = 0;
         try {
+          const prevCols = t.terminal?.cols;
+          const prevRows = t.terminal?.rows;
           this.fitTerminalState(t);
           // fitTerminalState only recomputes cols/rows and tells the PTY —
           // it does NOT repaint the buffer. Every other resize path in this
@@ -12026,7 +12144,12 @@ class TerminalManager {
           // Always send resize - terminal will work even if small
           this.scheduleResize(id);
 
-          this.showDimensionOverlay(id);
+          // Only flash the ColsxRows overlay when the GRID actually changed —
+          // sub-cell container jitter (toolbar reflow, badge updates, 1px
+          // sash noise) used to storm every visible terminal with overlays.
+          if (t.terminal.cols !== prevCols || t.terminal.rows !== prevRows) {
+            this.showDimensionOverlay(id);
+          }
         } catch (err) {
           if (DEBUG) dbg("resizeObserver error", { id, err });
         }

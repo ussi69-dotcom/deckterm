@@ -410,6 +410,16 @@ class IdeShellController {
       typeof options.resetTerminalSash === "function"
         ? options.resetTerminalSash
         : null;
+    // Sidebar right-edge sash: drag to resize, double-click to reset. The app
+    // owns the drag math + persistence (mirrors the terminal sash contract).
+    this.startSidebarSashDragFn =
+      typeof options.startSidebarSashDrag === "function"
+        ? options.startSidebarSashDrag
+        : null;
+    this.resetSidebarSashFn =
+      typeof options.resetSidebarSash === "function"
+        ? options.resetSidebarSash
+        : null;
 
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
@@ -465,6 +475,7 @@ class IdeShellController {
     // never overlap the activity bar / sidebar.
     this.mainColumnEl = null;
     this.terminalSashEl = null;
+    this.sidebarSashEl = null;
 
     // True while the shell is actually rendered (IDE presentation active).
     this.rendered = false;
@@ -900,6 +911,23 @@ class IdeShellController {
     sidebar.appendChild(sidebarBody);
     sidebar.appendChild(secondaryBody);
     sidebar.appendChild(detachedHint);
+    // Right-edge sash: absolutely positioned inside the sidebar so no grid
+    // change is needed; hidden with the sidebar when collapsed.
+    const sidebarSash = this.doc.createElement("div");
+    sidebarSash.className = "ide-sidebar-sash";
+    sidebarSash.setAttribute("role", "separator");
+    sidebarSash.setAttribute("aria-orientation", "vertical");
+    sidebarSash.title = "Drag to resize the sidebar";
+    if (this.startSidebarSashDragFn) {
+      sidebarSash.addEventListener("pointerdown", (e) =>
+        this.startSidebarSashDragFn(e),
+      );
+    }
+    if (this.resetSidebarSashFn) {
+      sidebarSash.addEventListener("dblclick", () => this.resetSidebarSashFn());
+    }
+    sidebar.appendChild(sidebarSash);
+    this.sidebarSashEl = sidebarSash;
     this.popOutBtnEl = popOutBtn;
     this.sidebarTitleEl = sidebarTitle;
     this.secondaryBodyEl = secondaryBody;
