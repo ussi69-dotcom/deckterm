@@ -7,6 +7,10 @@ const GIT_COMMAND_TIMEOUT_MS = 3_000;
 const WORKTREE_CACHE_TTL_MS = 5_000;
 const SHELL_MARKER_PREFIX = "\x1b]9;9;deckterm;";
 const SHELL_MARKER_SUFFIX = "\x07";
+const TOOL_MARKER_MAX_PAYLOAD_LENGTH = 2048;
+const TOOL_MARKER_NAME_RE = /^[A-Za-z][\w.-]{0,63}$/;
+const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const SUMMARY_LINE_MAX_LENGTH = 80;
 
 const PORT_PATTERNS = [
   /\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{2,5})\b/gi,
@@ -63,7 +67,8 @@ export type ShellIntegrationEvent =
   | { type: "running-start" }
   | { type: "running-done"; exitCode: number | null }
   | { type: "agent-start"; agentName: AgentName }
-  | { type: "agent-done"; agentName: AgentName; exitCode: number | null };
+  | { type: "agent-done"; agentName: AgentName; exitCode: number | null }
+  | { type: "tool-used"; name: string; summary: string };
 
 type WorktreeDetector = (cwd: string) => Promise<boolean>;
 
@@ -110,6 +115,40 @@ function stripTerminalControlSequences(input: string): string {
     .replace(CSI_SEQUENCE_RE, "")
     .replace(C1_SEQUENCE_RE, "")
     .replace(CONTROL_CHARS_RE, "");
+}
+
+// Ported from Traycer's tool-input-summary normalization (Apache 2.0).
+// See THIRD_PARTY_NOTICES.md.
+export function toSummaryLine(input: string): string {
+  const collapsed = stripTerminalControlSequences(input)
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (collapsed.length <= SUMMARY_LINE_MAX_LENGTH) {
+    return collapsed;
+  }
+
+  return `${collapsed.slice(0, SUMMARY_LINE_MAX_LENGTH - 1)}…`;
+}
+
+function parseToolMarkerPayload(
+  payload: string,
+): { type: "tool-used"; name: string; summary: string } | null {
+  const parts = payload.split(";");
+  if (parts.length !== 3) return null;
+
+  const [, name, base64Summary] = parts;
+  if (!name || !TOOL_MARKER_NAME_RE.test(name)) return null;
+  if (!BASE64_RE.test(base64Summary)) return null;
+
+  let decoded: string;
+  try {
+    decoded = Buffer.from(base64Summary, "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+
+  return { type: "tool-used", name, summary: toSummaryLine(decoded) };
 }
 
 export function classifyAgentOutputPhase(
@@ -429,6 +468,19 @@ export function parseShellIntegrationChunk(
           agentName: normalizedAgentName,
           exitCode,
         });
+      } else {
+        output += input.slice(
+          prefixIndex,
+          suffixIndex + SHELL_MARKER_SUFFIX.length,
+        );
+      }
+    } else if (payload.startsWith("tool;")) {
+      const toolEvent =
+        payload.length <= TOOL_MARKER_MAX_PAYLOAD_LENGTH
+          ? parseToolMarkerPayload(payload)
+          : null;
+      if (toolEvent) {
+        events.push(toolEvent);
       } else {
         output += input.slice(
           prefixIndex,
