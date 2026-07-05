@@ -116,6 +116,33 @@ keeps zero new auth surface.
   ST terminator behavior, fragmentation across chunks, controlling-tty availability inside
   hooks, and any tmux options required. Fail → Phase 3 stops, fallback (HTTP ingest +
   per-terminal tokens) goes to the backlog as a separate design.
+
+  **S9 RESULT (2026-07-05): PASS on the tmux backend (deployed default); raw-backend
+  hooks limited.** Empirically on 4174 + an ephemeral raw instance:
+  - **tmux (`TMUX_BACKEND=1`)**: markers written to `/dev/tty` by nested and
+    doubly-nested children (hook depth) arrive RAW and intact through `pipe-pane`
+    into the parser. Both BEL- and ST-terminated sequences transport unmodified;
+    400 ms-fragmented markers arrive in order (parser carry reassembles — already
+    unit-tested). No extra tmux options needed (`allow-passthrough` irrelevant;
+    `pipe-pane` sees pre-screen raw output).
+  - **CRITICAL pre-existing bug found and fixed:** on tmux 3.4 `pipe-pane -o`
+    TOGGLES — the backend's create→attach sequence opened then immediately closed
+    the pipe, so shell-integration markers were silently dropped in tmux mode
+    (also degrading S6's primary agent-done trigger). `ensurePipeCapture` now
+    checks `#{pane_pipe}` and only arms when no pipe is open.
+  - **raw backend (`TMUX_BACKEND=0`)**: stdout-emitted markers parse end-to-end
+    (verified `agent;claude;start` sets agentName), but `Bun.Terminal` spawns
+    without a controlling tty — `open("/dev/tty")` fails (EXNIO) even though
+    stdin IS the pty. Hook-style `/dev/tty` emission therefore does NOT work on
+    the raw backend. Accepted: Phase 3 hook telemetry requires `TMUX_BACKEND=1`
+    (deployed default); document in the hook snippet + README. A raw-backend
+    ctty fix (setsid/TIOCSCTTY) is upstream-dependent and out of scope.
+  - **Parser only recognizes the BEL terminator** (`SHELL_MARKER_SUFFIX`) — S10
+    and the hook emitter MUST use BEL, not ST.
+  - The polled tmux runtime heuristics can override a bare marker's agentName
+    when no matching process exists — irrelevant for real agents (process tree
+    agrees), noted for test design.
+
 - **Trust model:** tool markers are forgeable by any process in the terminal — exactly
   like today's `agent;start/done` markers. They are **display-only, untrusted data**:
   never drive authz or task transitions, size-capped before base64 decode, tool name

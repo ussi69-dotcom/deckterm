@@ -150,6 +150,45 @@ test("createTask rejects providers outside the configured allow-list", async () 
   ).rejects.toMatchObject({ status: 400 });
 });
 
+test("createTask rejects explicit unknown or registry-disabled provider ids", async () => {
+  const projectRoot = await createTempDir();
+  const stateDir = await createTempDir();
+  const runner = createTaskRunner({
+    stateDir,
+    resolveAllowedPath: async (value) =>
+      value === projectRoot ? projectRoot : null,
+    runCommand: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+  });
+
+  // Unknown id: no silent fallback — the registry rejects it server-side.
+  await expect(
+    runner.createTask(
+      {
+        title: "Unknown provider",
+        description: "Reject unknown ids.",
+        projectRoot,
+        workerProvider: "gpt5" as never,
+        useWorktree: false,
+      },
+      { ownerId: "user-1" },
+    ),
+  ).rejects.toMatchObject({ status: 400 });
+
+  // Disabled registry harness (data-only): rejected the same way.
+  await expect(
+    runner.createTask(
+      {
+        title: "Disabled provider",
+        description: "Reject disabled harnesses.",
+        projectRoot,
+        judgeProvider: "opencode" as never,
+        useWorktree: false,
+      },
+      { ownerId: "user-1" },
+    ),
+  ).rejects.toMatchObject({ status: 400 });
+});
+
 test("createTask can isolate work in a generated git worktree", async () => {
   const projectRoot = await createTempDir();
   const stateDir = await createTempDir();

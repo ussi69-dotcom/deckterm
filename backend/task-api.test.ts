@@ -126,6 +126,25 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const listed = await listRes.json();
   expect(listed.map((task: { id: string }) => task.id)).toContain(created.id);
 
+  // S3 (Traycer patterns): the harness listing rides the same auth surface.
+  // Availability depends on the machine, so assert ids/shape only — enabled
+  // harnesses exactly (claude, codex), disabled ones never exposed.
+  const harnessesRes = await app.fetch(
+    new Request("http://deckterm.test/api/harnesses"),
+  );
+  expect(harnessesRes.status).toBe(200);
+  const { harnesses } = await harnessesRes.json();
+  expect(harnesses.map((h: { id: string }) => h.id).sort()).toEqual([
+    "claude",
+    "codex",
+  ]);
+  for (const harness of harnesses) {
+    expect(typeof harness.label).toBe("string");
+    expect(typeof harness.available).toBe("boolean");
+    expect("version" in harness).toBe(true);
+    expect("error" in harness).toBe(true);
+  }
+
   const checksRes = await app.fetch(
     new Request(`http://deckterm.test/api/tasks/${created.id}/run-checks`, {
       method: "POST",
@@ -135,4 +154,49 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   const checked = await checksRes.json();
   expect(checked.status).toBe("needs-judge");
   expect(checked.lastCheckRun.success).toBe(true);
+
+  // S7 (Traycer patterns): task messages. No live agent terminal exists in
+  // this test, so delivery must be recorded as failed — while the message
+  // itself is created with the sanitized body as its canonical form.
+  const badMsgRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ to: "nowhere", body: "hi" }),
+    }),
+  );
+  expect(badMsgRes.status).toBe(400);
+
+  const msgRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        to: "worker",
+        body: "please \x1b[31mfocus\x1b[0m on\x07 the tests",
+      }),
+    }),
+  );
+  expect(msgRes.status).toBe(200);
+  const posted = await msgRes.json();
+  expect(posted.delivery).toBe("failed");
+  // The task is not in worker-running here, so the role gate fires before
+  // any terminal lookup.
+  expect(posted.reason).toBe("role_not_active");
+  expect(posted.message.from).toBe("user");
+  expect(posted.message.body).toBe("please focus on the tests");
+  expect(posted.message.delivery).toBe("failed");
+
+  const msgListRes = await app.fetch(
+    new Request(`http://deckterm.test/api/tasks/${created.id}/messages`),
+  );
+  expect(msgListRes.status).toBe(200);
+  const { messages } = await msgListRes.json();
+  expect(messages).toHaveLength(1);
+  expect(messages[0].id).toBe(posted.message.id);
+
+  const foreignMsgRes = await app.fetch(
+    new Request("http://deckterm.test/api/tasks/nonexistent-task/messages"),
+  );
+  expect(foreignMsgRes.status).toBe(404);
 });

@@ -8,6 +8,16 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { getAgentHarness } from "./services/agent-harnesses";
+import { writeTaskFileAtomic } from "./task-file-io";
+import {
+  appendTaskMessageEvent,
+  readVerdictFile,
+  renderWorkerPrompt,
+  sanitizeMessageBody,
+  taskMessagesPath,
+  workerPromptPath,
+} from "./task-messages";
 
 export type TaskProvider = "codex" | "claude";
 export type TaskStatus =
@@ -66,6 +76,10 @@ export interface TaskRecord {
   taskDir: string;
   terminalId: string | null;
   judgeTerminalId: string | null;
+  // D4 verdict loop: 0-based worker round + the last round whose verdict was
+  // processed (idempotency marker). Legacy records normalize to 0/null on load.
+  round: number;
+  processedVerdictAtRound: number | null;
   lastCheckRun: {
     startedAt: string;
     finishedAt: string;
@@ -134,11 +148,20 @@ function normalizeProvider(
   fallback: TaskProvider,
   allowedProviders: TaskProvider[],
 ): TaskProvider {
-  const provider = value === "claude" || value === "codex" ? value : fallback;
-  if (!allowedProviders.includes(provider)) {
+  // Missing/empty falls back to the default; an EXPLICIT id must resolve to
+  // an enabled registry harness AND pass the configured allow-list (D2:
+  // unknown or disabled ids are rejected server-side, never coerced).
+  const provider =
+    value === undefined || value === null || value === ""
+      ? fallback
+      : String(value);
+  if (
+    !getAgentHarness(provider) ||
+    !allowedProviders.includes(provider as TaskProvider)
+  ) {
     throw new TaskRunnerError(`Task provider is not enabled: ${provider}`, 400);
   }
-  return provider;
+  return provider as TaskProvider;
 }
 
 function normalizeChecks(
@@ -313,8 +336,11 @@ function renderChecksFile(checks: Required<VerificationCommand>[]): string {
 }
 
 function renderJudgePromptFile(
-  task: Pick<TaskRecord, "title" | "description">,
+  task: Pick<TaskRecord, "title" | "description" | "taskDir" | "round">,
 ): string {
+  const round =
+    Number.isInteger(task.round) && task.round >= 0 ? task.round : 0;
+  const verdictPath = join(task.taskDir, `verdict-r${round}.json`);
   return [
     `# Judge Prompt: ${task.title}`,
     "",
@@ -324,6 +350,22 @@ function renderJudgePromptFile(
     "## Original Task",
     "",
     task.description,
+    "",
+    "## Mandatory Final Step",
+    "",
+    `You are judging round ${round}. As your FINAL action, write your verdict to exactly this file:`,
+    "",
+    "```",
+    verdictPath,
+    "```",
+    "",
+    `The file must contain a single JSON object with exactly this shape, where "round" MUST be the number ${round} and "verdict" MUST be one of "PASS", "NEEDS_WORK", or "BLOCKED":`,
+    "",
+    "```json",
+    `{"round": ${round}, "verdict": "NEEDS_WORK", "summary": "<short reasoning for the worker>"}`,
+    "```",
+    "",
+    "Do not skip this step: the task pipeline reads this file to decide what happens next.",
     "",
   ].join("\n");
 }
@@ -336,18 +378,29 @@ function buildPromptCommand(
   provider: TaskProvider,
   promptFile: string,
 ): string {
-  return `${provider} "$(cat ${shellQuote(promptFile)})"`;
+  const harness = getAgentHarness(provider);
+  if (!harness) {
+    throw new TaskRunnerError(`Task provider is not enabled: ${provider}`, 400);
+  }
+  return harness.buildPromptCommand(promptFile);
 }
 
 export function buildWorkerCommand(task: TaskRecord): string {
+  // Round 0 reads TASK.md (byte-identical to the pre-verdict-loop command,
+  // guarded by golden tests); later rounds read the server-rendered
+  // WORKER_PROMPT.md carrying the previous judge feedback (D4).
+  const promptFile =
+    Number.isInteger(task.round) && task.round > 0
+      ? workerPromptPath(task.taskDir)
+      : task.controlFiles.taskFile;
   return [
     `export DECKTERM_TASK_ID=${shellQuote(task.id)}`,
     `export DECKTERM_TASK_FILE=${shellQuote(task.controlFiles.taskFile)}`,
     `export DECKTERM_TODO_FILE=${shellQuote(task.controlFiles.todoFile)}`,
     `export DECKTERM_CHECKS_FILE=${shellQuote(task.controlFiles.checksFile)}`,
     `echo "DeckTerm task: ${task.title.replace(/"/g, '\\"')}"`,
-    `echo "Task file: ${task.controlFiles.taskFile}"`,
-    buildPromptCommand(task.workerProvider, task.controlFiles.taskFile),
+    `echo "Task file: ${promptFile}"`,
+    buildPromptCommand(task.workerProvider, promptFile),
   ].join("\n");
 }
 
@@ -369,6 +422,36 @@ export function createTaskRunner(options: TaskRunnerOptions) {
   const allowedProviders: TaskProvider[] = options.allowedProviders?.length
     ? options.allowedProviders
     : ["codex", "claude"];
+  const maxRounds =
+    Number.isInteger(options.maxRounds) && (options.maxRounds as number) >= 1
+      ? (options.maxRounds as number)
+      : 5;
+
+  // Per-task promise-chain mutex: serializes every task mutation
+  // (start/exit/verdict/message) so duplicate triggers — agent-done plus the
+  // terminal-exit fallback firing for the same completion — cannot interleave
+  // load-mutate-save cycles. Callers RE-LOAD the task inside the critical
+  // section; state read before the lock is treated as a hint only.
+  const taskLocks = new Map<string, Promise<unknown>>();
+  async function runExclusive<T>(
+    taskId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prev = taskLocks.get(taskId) ?? Promise.resolve();
+    const run = prev.then(fn, fn);
+    const guard = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    taskLocks.set(taskId, guard);
+    try {
+      return await run;
+    } finally {
+      if (taskLocks.get(taskId) === guard) {
+        taskLocks.delete(taskId);
+      }
+    }
+  }
 
   async function findTaskJsonPath(
     ownerId: string,
@@ -401,6 +484,13 @@ export function createTaskRunner(options: TaskRunnerOptions) {
   async function hydrateTask(task: TaskRecord): Promise<TaskRecord> {
     return {
       ...task,
+      // Legacy records (pre-verdict-loop) lack the round fields.
+      round: Number.isInteger(task.round) && task.round >= 0 ? task.round : 0,
+      processedVerdictAtRound:
+        Number.isInteger(task.processedVerdictAtRound) &&
+        (task.processedVerdictAtRound as number) >= 0
+          ? task.processedVerdictAtRound
+          : null,
       rounds: await readJsonLines(task.controlFiles.roundsFile),
     };
   }
@@ -511,6 +601,83 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     return worktreeDir;
   }
 
+  // D4 verdict processing — MUST run inside runExclusive on a freshly loaded
+  // task. Exact ordering (Codex v2 HIGH 1): snapshot judgedRound → idempotency
+  // bail → read the per-round verdict file → apply transitions → mark
+  // processedVerdictAtRound → only then increment round on NEEDS_WORK-continue
+  // (marking after incrementing would skip the next round's verdict).
+  // Returns null when there is no valid verdict for the judged round (missing,
+  // malformed, round-mismatched, or already processed) — the caller then
+  // applies the legacy no-verdict fallback.
+  async function applyJudgeVerdict(
+    task: TaskRecord,
+    terminalId: string,
+  ): Promise<TaskRecord | null> {
+    const judgedRound = task.round;
+    if (task.processedVerdictAtRound === judgedRound) return null;
+    const verdict = readVerdictFile(task.taskDir, judgedRound);
+    if (!verdict) return null;
+
+    let continueRound = false;
+    if (verdict.verdict === "PASS") {
+      task.status = "complete";
+    } else if (verdict.verdict === "BLOCKED") {
+      task.status = "needs-user";
+    } else if (judgedRound + 1 < maxRounds) {
+      // NEEDS_WORK with rounds remaining: hand the judge feedback to the next
+      // worker round via the server-rendered prompt + an internal judge
+      // message (D1: judge→worker feedback is a server event, not HTTP).
+      const feedback = sanitizeMessageBody(verdict.summary || "");
+      writeTaskFileAtomic(
+        workerPromptPath(task.taskDir),
+        renderWorkerPrompt({
+          task: { title: task.title, description: task.description },
+          feedback,
+          round: judgedRound + 1,
+        }),
+      );
+      // Deterministic id: if saveTask fails after this append and the
+      // trigger retries, the re-appended event folds into the same message
+      // instead of duplicating it (Codex S6 review, MED). An append failure
+      // is logged but not fatal — WORKER_PROMPT.md (written above, throws on
+      // failure) is the functional feedback channel; this event only feeds
+      // the message timeline.
+      const feedbackRecorded = appendTaskMessageEvent(
+        taskMessagesPath(task.taskDir),
+        {
+          type: "message-created",
+          id: `judge-feedback-r${judgedRound}`,
+          at: new Date().toISOString(),
+          from: "judge",
+          to: "worker",
+          body: feedback,
+        },
+      );
+      if (!feedbackRecorded) {
+        console.error(
+          `Task ${task.id}: failed to record judge feedback message for round ${judgedRound}`,
+        );
+      }
+      task.status = "ready";
+      continueRound = true;
+    } else {
+      task.status = "needs-user";
+    }
+
+    task.processedVerdictAtRound = judgedRound;
+    if (continueRound) {
+      task.round = judgedRound + 1;
+    }
+    await appendJsonLine(task.controlFiles.roundsFile, {
+      type: "verdict",
+      at: new Date().toISOString(),
+      terminalId,
+      status: task.status,
+      results: { round: judgedRound, verdict: verdict.verdict },
+    });
+    return saveTask(task);
+  }
+
   return {
     async createTask(
       input: {
@@ -587,6 +754,8 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         taskDir,
         terminalId: null,
         judgeTerminalId: null,
+        round: 0,
+        processedVerdictAtRound: null,
         lastCheckRun: null,
         createdAt: now,
         updatedAt: now,
@@ -616,13 +785,35 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     ): Promise<TaskRecord | null> {
       if (!terminalId) return null;
       const tasks = await scanOwnerTasks(ownerId);
-      for (const task of tasks) {
+      const candidate = tasks.find(
+        (task) =>
+          (task.terminalId === terminalId &&
+            task.status === "worker-running") ||
+          (task.judgeTerminalId === terminalId &&
+            task.status === "judge-running"),
+      );
+      if (!candidate) return null;
+      return runExclusive(candidate.id, async () => {
+        let task: TaskRecord;
+        try {
+          task = await loadTask(candidate.id, ownerId);
+        } catch {
+          return null; // deleted while queued behind the lock
+        }
         const isWorkerExit =
           task.terminalId === terminalId && task.status === "worker-running";
         const isJudgeExit =
           task.judgeTerminalId === terminalId &&
           task.status === "judge-running";
-        if (!isWorkerExit && !isJudgeExit) continue;
+        if (!isWorkerExit && !isJudgeExit) return null;
+        if (isJudgeExit) {
+          // Fallback verdict trigger: the judge terminal died (or has no
+          // shell integration). If a valid verdict for the current round is
+          // on disk, process it; otherwise fall through to the legacy
+          // needs-user path, byte-identical to the pre-verdict-loop behavior.
+          const processed = await applyJudgeVerdict(task, terminalId);
+          if (processed) return processed;
+        }
         task.status = "needs-user";
         await appendJsonLine(task.controlFiles.roundsFile, {
           type: isWorkerExit ? "worker-exited" : "judge-exited",
@@ -630,8 +821,56 @@ export function createTaskRunner(options: TaskRunnerOptions) {
           terminalId,
         });
         return saveTask(task);
-      }
-      return null;
+      });
+    },
+
+    // Primary verdict trigger (D1): the shell-integration `agent-done` edge.
+    // Accepted ONLY for the task's recorded judgeTerminalId while the task is
+    // judge-running AND the finishing agent matches the task's judgeProvider
+    // (Codex v2 HIGH 3 — a worker or unrelated agent finishing in that
+    // terminal must not trigger verdict processing). Idempotent under the
+    // per-task mutex; safe to double-fire alongside handleTerminalExit.
+    async handleJudgeCompletion(
+      ownerId: string,
+      terminalId: string,
+      agentName: string,
+    ): Promise<TaskRecord | null> {
+      if (!terminalId || !agentName) return null;
+      const tasks = await scanOwnerTasks(ownerId);
+      const candidate = tasks.find(
+        (task) =>
+          task.judgeTerminalId === terminalId &&
+          task.status === "judge-running",
+      );
+      if (!candidate || candidate.judgeProvider !== agentName) return null;
+      return runExclusive(candidate.id, async () => {
+        let task: TaskRecord;
+        try {
+          task = await loadTask(candidate.id, ownerId);
+        } catch {
+          return null;
+        }
+        if (
+          task.judgeTerminalId !== terminalId ||
+          task.status !== "judge-running" ||
+          task.judgeProvider !== agentName
+        ) {
+          return null;
+        }
+        const processed = await applyJudgeVerdict(task, terminalId);
+        if (processed) return processed;
+        // Judge finished without a valid verdict for this round: same
+        // needs-user semantics as today's no-verdict exit path, recorded as
+        // its own event type (the terminal is still alive here).
+        task.status = "needs-user";
+        await appendJsonLine(task.controlFiles.roundsFile, {
+          type: "judge-done",
+          at: new Date().toISOString(),
+          terminalId,
+          status: task.status,
+        });
+        return saveTask(task);
+      });
     },
 
     async getTask(id: string, actor: ActorContext): Promise<TaskRecord> {
@@ -694,15 +933,17 @@ export function createTaskRunner(options: TaskRunnerOptions) {
       actor: ActorContext,
       terminalId: string,
     ): Promise<TaskRecord> {
-      const task = await loadTask(id, actor.ownerId);
-      task.terminalId = terminalId;
-      task.status = "worker-running";
-      await appendJsonLine(task.controlFiles.roundsFile, {
-        type: "worker-started",
-        at: new Date().toISOString(),
-        terminalId,
+      return runExclusive(id, async () => {
+        const task = await loadTask(id, actor.ownerId);
+        task.terminalId = terminalId;
+        task.status = "worker-running";
+        await appendJsonLine(task.controlFiles.roundsFile, {
+          type: "worker-started",
+          at: new Date().toISOString(),
+          terminalId,
+        });
+        return saveTask(task);
       });
-      return saveTask(task);
     },
 
     async markJudgeStarted(
@@ -710,15 +951,24 @@ export function createTaskRunner(options: TaskRunnerOptions) {
       actor: ActorContext,
       terminalId: string,
     ): Promise<TaskRecord> {
-      const task = await loadTask(id, actor.ownerId);
-      task.judgeTerminalId = terminalId;
-      task.status = "judge-running";
-      await appendJsonLine(task.controlFiles.roundsFile, {
-        type: "judge-started",
-        at: new Date().toISOString(),
-        terminalId,
+      return runExclusive(id, async () => {
+        const task = await loadTask(id, actor.ownerId);
+        // Freshness: a verdict file left over from an aborted judge attempt
+        // (or pre-created by another agent) must never satisfy THIS attempt —
+        // strict round matching alone can't prove freshness (Codex S6
+        // review, HIGH). rm handles symlinks by removing the link itself.
+        await rm(join(task.taskDir, `verdict-r${task.round}.json`), {
+          force: true,
+        });
+        task.judgeTerminalId = terminalId;
+        task.status = "judge-running";
+        await appendJsonLine(task.controlFiles.roundsFile, {
+          type: "judge-started",
+          at: new Date().toISOString(),
+          terminalId,
+        });
+        return saveTask(task);
       });
-      return saveTask(task);
     },
 
     async runChecks(id: string, actor: ActorContext): Promise<TaskRecord> {
@@ -767,8 +1017,12 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         timeoutMs: 10_000,
       }).catch(() => ({ exitCode: 1, stdout: "", stderr: "" }));
 
+      // Render the base prompt fresh (not from the file on disk): the judge
+      // route overwrites judgePromptFile with THIS composed output, so
+      // re-reading it would accumulate git/check sections across rounds and
+      // pin the verdict path to a stale round.
       return [
-        await readFile(task.controlFiles.judgePromptFile, "utf8"),
+        renderJudgePromptFile(task),
         "## Git Status",
         "",
         "```",
@@ -796,5 +1050,9 @@ export function createTaskRunner(options: TaskRunnerOptions) {
 
     buildWorkerCommand,
     buildJudgeCommand,
+
+    // Expose the per-task mutex so route-level task mutations (e.g. message
+    // creation/delivery in S7) serialize with start/exit/verdict processing.
+    withTaskLock: runExclusive,
   };
 }

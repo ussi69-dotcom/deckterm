@@ -291,16 +291,58 @@ export class TmuxTerminalBackend implements TerminalBackend {
     return join(this.pipeDir, `${sessionName}.log`);
   }
 
+  // Serializes check-and-arm per session: two concurrent ensurePipeCapture
+  // calls could both read pane_pipe=0 and both run the TOGGLING `pipe-pane
+  // -o`, closing the pipe the first call just opened (Codex Phase-3 review).
+  private pipeArmLocks = new Map<string, Promise<unknown>>();
+
   private async ensurePipeCapture(
+    sessionName: string,
+  ): Promise<{ pipePath: string; pipeOffset: number }> {
+    const prev = this.pipeArmLocks.get(sessionName) ?? Promise.resolve();
+    const run = prev.then(
+      () => this.ensurePipeCaptureLocked(sessionName),
+      () => this.ensurePipeCaptureLocked(sessionName),
+    );
+    const guard = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.pipeArmLocks.set(sessionName, guard);
+    try {
+      return await run;
+    } finally {
+      if (this.pipeArmLocks.get(sessionName) === guard) {
+        this.pipeArmLocks.delete(sessionName);
+      }
+    }
+  }
+
+  private async ensurePipeCaptureLocked(
     sessionName: string,
   ): Promise<{ pipePath: string; pipeOffset: number }> {
     await mkdir(this.pipeDir, { recursive: true });
     const pipePath = this.getPipePath(sessionName);
-    const pipeProc = await this.spawnTmux(
-      ["pipe-pane", "-o", "-t", sessionName, `cat >> ${pipePath}`],
+    // `pipe-pane -o` TOGGLES on tmux 3.4: a second call closes an open pipe.
+    // Since this runs on both create() and attach(), the pipe used to end up
+    // CLOSED after any create→attach sequence, silently dropping every
+    // shell-integration marker in tmux mode (S9 spike finding). Only arm the
+    // pipe when the pane reports none is open.
+    const checkProc = await this.spawnTmux(
+      ["display-message", "-p", "-t", sessionName, "#{pane_pipe}"],
       { stdout: "pipe", stderr: "pipe" },
     );
-    await pipeProc.exited;
+    const pipeState = (
+      await new Response((checkProc as any).stdout).text()
+    ).trim();
+    await checkProc.exited;
+    if (pipeState !== "1") {
+      const pipeProc = await this.spawnTmux(
+        ["pipe-pane", "-o", "-t", sessionName, `cat >> ${pipePath}`],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      await pipeProc.exited;
+    }
 
     try {
       return { pipePath, pipeOffset: (await stat(pipePath)).size };

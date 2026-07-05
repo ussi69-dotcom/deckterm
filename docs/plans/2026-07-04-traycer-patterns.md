@@ -1,6 +1,6 @@
 # Traycer Patterns — Implementation Plan (tiered delivery)
 
-Date: 2026-07-04 · Design: `2026-07-04-traycer-patterns-design.md` (v3) · Status: v4 — validated, Codex READY
+Date: 2026-07-04 · Design: `2026-07-04-traycer-patterns-design.md` (v3) · Status: **IMPLEMENTED 2026-07-05** (all phases; S9 spike PASSED on tmux backend — see design doc §D3; per-slice Codex on S6/S7 + integrated passes after Phase 2 and Phase 3, all findings fixed)
 
 Execution mode: **tiered delivery, Path A (sequential)** — multiple slices touch
 `server.ts`/`task-runner.ts`, so slices dispatch one at a time; the orchestrator (Opus main

@@ -56,6 +56,18 @@ import {
   runWalCheckpoint,
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
+import { listHarnessSummaries } from "./services/agent-harnesses";
+import { writeTaskFileAtomic } from "./task-file-io";
+import {
+  buildPointerLine,
+  readTaskMessages,
+  renderInboxFile,
+  appendTaskMessageEvent,
+  sanitizeMessageBody,
+  taskInboxDir,
+  taskMessagesPath,
+  type TaskMessageEvent,
+} from "./task-messages";
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
@@ -198,6 +210,10 @@ type Terminal = {
   agentState: "thinking" | "responding" | null;
   agentHasUserPrompt: boolean;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
+  // S11: display-only ring of recent tool-used marker events (untrusted,
+  // forgeable in-band data — never feeds transitions or authz).
+  recentTools: Array<{ name: string; summary: string; at: number }>;
+  toolRate: { windowStart: number; count: number };
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
   tmuxPipePath: string | null;
@@ -437,6 +453,35 @@ function notifyTerminalExit(ownerId: string, terminalId: string) {
     }
   }
 }
+
+// Bridge for shell-integration `agent-done` edges (an agent finished while
+// its terminal keeps running) — the primary verdict trigger for the task
+// runner's judge loop (D1); terminal exit stays the fallback. A single
+// mutable slot, NOT a grow-only listener list: createWebApp() can run more
+// than once per process (tests), and stacked bridges would fan one edge out
+// to multiple runner instances whose per-task mutexes don't cover each other
+// (Codex S6 review). The most recently created app wins.
+type AgentDoneBridge = (
+  ownerId: string,
+  terminalId: string,
+  agentName: string,
+) => void;
+let agentDoneBridge: AgentDoneBridge | null = null;
+function setAgentDoneBridge(bridge: AgentDoneBridge) {
+  agentDoneBridge = bridge;
+}
+function notifyAgentDone(
+  ownerId: string,
+  terminalId: string,
+  agentName: string,
+) {
+  if (!agentDoneBridge) return;
+  try {
+    agentDoneBridge(ownerId, terminalId, agentName);
+  } catch (err) {
+    debug("Agent done bridge failed:", err);
+  }
+}
 const terminalSockets = new Map<string, Set<ServerWebSocket<WsData>>>();
 type TerminalReconnectState = {
   pendingReady: boolean;
@@ -519,6 +564,31 @@ function broadcastTerminalState(term: Terminal) {
   }
 }
 
+// S11: record a tool-used marker event into the terminal's display-only ring.
+// Untrusted in-band data: capped ring (last 50), per-terminal flood limit
+// (fixed 1s window, max 20 — excess events dropped). Never drives task
+// transitions, authz, or persisted state (deliberately NOT in
+// broadcastTerminalState, whose payload lands in B6-retained state events).
+const RECENT_TOOLS_MAX = 50;
+const TOOL_EVENTS_PER_WINDOW = 20;
+const TOOL_EVENT_WINDOW_MS = 1000;
+function recordToolEvent(
+  term: Terminal,
+  event: { name: string; summary: string },
+) {
+  const now = Date.now();
+  if (now - term.toolRate.windowStart >= TOOL_EVENT_WINDOW_MS) {
+    term.toolRate.windowStart = now;
+    term.toolRate.count = 0;
+  }
+  if (term.toolRate.count >= TOOL_EVENTS_PER_WINDOW) return;
+  term.toolRate.count += 1;
+  term.recentTools.push({ name: event.name, summary: event.summary, at: now });
+  if (term.recentTools.length > RECENT_TOOLS_MAX) {
+    term.recentTools.splice(0, term.recentTools.length - RECENT_TOOLS_MAX);
+  }
+}
+
 function applyParsedShellIntegrationState(
   term: Terminal,
   parsed: ReturnType<typeof parseShellIntegrationChunk>,
@@ -570,6 +640,17 @@ function applyParsedShellIntegrationState(
   }
   if (stateChanged) {
     broadcastTerminalState(term);
+  }
+
+  // Surface agent-done edges (agent finished, terminal still alive) to
+  // subscribers — the task runner validates terminal id + provider + verdict
+  // file before acting, so this stays a plain notification.
+  for (const event of parsed.events) {
+    if (event.type === "agent-done") {
+      notifyAgentDone(term.ownerId, term.id, event.agentName);
+    } else if (event.type === "tool-used") {
+      recordToolEvent(term, event);
+    }
   }
 
   if (emitOutput && parsed.output) {
@@ -2697,6 +2778,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     lastExitCode: term.lastExitCode,
     agentName: term.agentName,
     agentState: term.agentState,
+    recentTools: term.recentTools,
     backendMode: getBackendMode(),
     supportsLinkedView: supportsLinkedView(term),
     sharedSessionKey: term.sessionName || null,
@@ -3643,6 +3725,8 @@ async function createManagedTerminal({
     agentState: initialRuntimeState?.agentState || null,
     agentHasUserPrompt: Boolean(initialRuntimeState?.agentName),
     agentRespondingTimer: null,
+    recentTools: [],
+    toolRate: { windowStart: 0, count: 0 },
     shellIntegrationCarry: "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
@@ -3878,11 +3962,66 @@ export function createWebApp() {
     allowedProviders: DECKTERM_TASK_PROVIDERS,
   });
 
+  // Audit trail for automatic task transitions (security invariant 3: the
+  // verdict-processing result is auditable). Best-effort — an audit failure
+  // must not break the transition itself.
+  const auditTaskTransition = (
+    ownerId: string,
+    action: string,
+    terminalId: string,
+    task: {
+      id: string;
+      status: string;
+      processedVerdictAtRound: number | null;
+    },
+  ) => {
+    getFoundationState()
+      .then((state) => {
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action,
+          resourceType: "task",
+          resourceId: task.id,
+          decision: "allow",
+          data: {
+            terminalId,
+            status: task.status,
+            processedVerdictAtRound: task.processedVerdictAtRound,
+          },
+        });
+      })
+      .catch((err) => debug("Task transition audit failed:", err));
+  };
+
   // Advance worker/judge tasks when their agent terminal exits.
   onTerminalExit((ownerId, terminalId) => {
     taskRunner
       .handleTerminalExit(ownerId, terminalId)
+      .then((task) => {
+        if (task) {
+          auditTaskTransition(ownerId, "task.terminal-exit", terminalId, task);
+        }
+      })
       .catch((err) => debug("Task terminal-exit sync failed:", err));
+  });
+
+  // Primary judge-verdict trigger: the judge agent finished while its
+  // terminal keeps running (persistent shell). The runner enforces the
+  // provider-matched judge-terminal edge + per-round verdict identity.
+  setAgentDoneBridge((ownerId, terminalId, agentName) => {
+    taskRunner
+      .handleJudgeCompletion(ownerId, terminalId, agentName)
+      .then((task) => {
+        if (task) {
+          auditTaskTransition(
+            ownerId,
+            "task.judge-completion",
+            terminalId,
+            task,
+          );
+        }
+      })
+      .catch((err) => debug("Task judge-completion sync failed:", err));
   });
 
   app.onError((err, c) => {
@@ -5053,6 +5192,14 @@ export function createWebApp() {
     return c.json(await taskRunner.listTasks(ownerId));
   });
 
+  // S3 (Traycer patterns): enabled harnesses + availability for the task
+  // form. Same auth shape as GET /api/tasks; summaries are probe results
+  // (60s cached), disabled harnesses never appear.
+  app.get("/api/harnesses", async (c) => {
+    getCurrentUser(c);
+    return c.json({ harnesses: await listHarnessSummaries() });
+  });
+
   app.post("/api/tasks", async (c) => {
     const { ownerId } = getCurrentUser(c);
     const body = await c.req.json().catch(() => ({}));
@@ -5110,6 +5257,202 @@ export function createWebApp() {
       return c.json(
         await taskRunner.updateTask(c.req.param("id"), { ownerId }, body),
       );
+    } catch (err) {
+      return taskErrorResponse(c, err);
+    }
+  });
+
+  // S7 (Traycer patterns): task messages. GET folds the append-only event
+  // log; POST creates a user-originated message (from is ALWAYS "user" —
+  // judge feedback is an internal server event, never HTTP) and attempts
+  // pointer-only delivery into the task's recorded agent terminal. D1:
+  // message bodies NEVER enter the PTY — only the fixed, server-built,
+  // shell-inert pointer line naming the inbox file.
+  app.get("/api/tasks/:id/messages", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    // Design invariant 1: task-MESSAGE routes carry the isolation deny on
+    // both verbs (unlike the older read-only task routes) — this is a new
+    // surface and inherits B4's task denial wholesale.
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
+    try {
+      const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
+      return c.json({
+        messages: readTaskMessages(taskMessagesPath(task.taskDir)),
+      });
+    } catch (err) {
+      return taskErrorResponse(c, err);
+    }
+  });
+
+  app.post("/api/tasks/:id/messages", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
+    const body = await c.req.json().catch(() => ({}));
+    try {
+      // Ownership gate first: foreign/missing tasks 404 like every task route.
+      const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
+      const to = body?.to === "worker" || body?.to === "judge" ? body.to : null;
+      const sanitized =
+        typeof body?.body === "string" ? sanitizeMessageBody(body.body) : "";
+      if (!to || !sanitized.trim()) {
+        return c.json(
+          { error: "Message requires to: worker|judge and a non-empty body" },
+          400,
+        );
+      }
+
+      // Create + deliver under the per-task mutex so the recorded terminal
+      // ids can't shift mid-sequence (serializes with start/exit/verdict).
+      const result = await taskRunner.withTaskLock(task.id, async () => {
+        const fresh = await taskRunner.getTask(task.id, { ownerId });
+        const msgId = crypto.randomUUID();
+        const at = new Date().toISOString();
+        const inboxDir = taskInboxDir(fresh.taskDir);
+        const inboxPath = join(inboxDir, `${msgId}.md`);
+        await mkdir(inboxDir, { recursive: true });
+        writeTaskFileAtomic(
+          inboxPath,
+          renderInboxFile({ id: msgId, from: "user", body: sanitized, at }),
+        );
+        // The created event must be durable BEFORE anything touches a PTY —
+        // a delivered pointer naming a message the log never recorded would
+        // be an unauditable injection (Codex integrated pass, HIGH).
+        const createdRecorded = appendTaskMessageEvent(
+          taskMessagesPath(fresh.taskDir),
+          {
+            type: "message-created",
+            id: msgId,
+            at,
+            from: "user",
+            to,
+            body: sanitized,
+          },
+        );
+        if (!createdRecorded) {
+          return {
+            msgId,
+            to,
+            delivered: false,
+            reason: "event_log_failed",
+            recorded: false,
+            targetTerminalId: null as string | null,
+            bodyBytes: Buffer.byteLength(sanitized, "utf8"),
+            taskDir: fresh.taskDir,
+          };
+        }
+
+        // Target provenance: terminal ids come from the task record ONLY.
+        const targetTerminalId =
+          to === "worker" ? fresh.terminalId : fresh.judgeTerminalId;
+        const expectedAgent =
+          to === "worker" ? fresh.workerProvider : fresh.judgeProvider;
+        const roleActive =
+          to === "worker"
+            ? fresh.status === "worker-running"
+            : fresh.status === "judge-running";
+        const target = targetTerminalId
+          ? terminals.get(targetTerminalId)
+          : undefined;
+        let delivered = false;
+        let reason: string | null = null;
+        if (!roleActive) {
+          // A recorded terminal id can outlive its phase (an old judge
+          // terminal still hosting an agent while the worker runs) — the
+          // task's status decides which role is live, not the terminal
+          // (Codex integrated pass, HIGH).
+          reason = "role_not_active";
+        } else if (!targetTerminalId) {
+          reason = "no_target_terminal";
+        } else if (!target) {
+          reason = "terminal_not_live";
+        } else if (target.ownerId !== ownerId) {
+          reason = "owner_mismatch";
+        } else if (
+          !expectedAgent ||
+          !target.agentName ||
+          target.agentName !== expectedAgent
+        ) {
+          // Live telemetry must show the expected agent running RIGHT NOW —
+          // otherwise the pointer would land on a shell prompt (it is inert
+          // there, but delivery must still be reported as failed).
+          reason = "agent_not_running";
+        } else {
+          try {
+            target.terminal.write(buildPointerLine("user", inboxPath));
+            delivered = true;
+          } catch (err) {
+            // PTY closed between the lookup and the write: a failed delivery,
+            // not a route error (the message itself is already recorded).
+            debug("Task message PTY write failed:", err);
+            reason = "terminal_write_failed";
+          }
+        }
+        const outcome: TaskMessageEvent = delivered
+          ? {
+              type: "message-delivered",
+              id: msgId,
+              at: new Date().toISOString(),
+              terminalId: targetTerminalId as string,
+            }
+          : {
+              type: "message-delivery-failed",
+              id: msgId,
+              at: new Date().toISOString(),
+              reason: reason || "undeliverable",
+            };
+        if (!appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), outcome)) {
+          // The message stays "pending" in the fold; the audit row below
+          // still records the true outcome.
+          debug("Task message outcome append failed for", msgId);
+        }
+        return {
+          msgId,
+          to,
+          delivered,
+          reason,
+          recorded: true,
+          targetTerminalId,
+          bodyBytes: Buffer.byteLength(sanitized, "utf8"),
+          taskDir: fresh.taskDir,
+        };
+      });
+
+      // Audit every outcome (invariant 3): never the body, only its size.
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "task.message",
+        resourceType: "task",
+        resourceId: task.id,
+        decision: result.delivered ? "allow" : "deny",
+        reason: result.reason,
+        data: {
+          taskId: task.id,
+          from: "user",
+          to: result.to,
+          targetTerminalId: result.targetTerminalId,
+          delivery: result.delivered ? "delivered" : "failed",
+          bodyBytes: result.bodyBytes,
+        },
+      });
+
+      if (result.recorded === false) {
+        // The event log rejected the append (symlinked/replaced file): the
+        // message was NOT recorded and nothing was delivered.
+        return c.json({ error: "Failed to record task message" }, 500);
+      }
+
+      const message =
+        readTaskMessages(taskMessagesPath(result.taskDir)).find(
+          (entry) => entry.id === result.msgId,
+        ) || null;
+      return c.json({
+        message,
+        delivery: result.delivered ? "delivered" : "failed",
+        reason: result.reason,
+      });
     } catch (err) {
       return taskErrorResponse(c, err);
     }
