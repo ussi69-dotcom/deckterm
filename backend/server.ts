@@ -210,6 +210,10 @@ type Terminal = {
   agentState: "thinking" | "responding" | null;
   agentHasUserPrompt: boolean;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
+  // S11: display-only ring of recent tool-used marker events (untrusted,
+  // forgeable in-band data — never feeds transitions or authz).
+  recentTools: Array<{ name: string; summary: string; at: number }>;
+  toolRate: { windowStart: number; count: number };
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
   tmuxPipePath: string | null;
@@ -560,6 +564,31 @@ function broadcastTerminalState(term: Terminal) {
   }
 }
 
+// S11: record a tool-used marker event into the terminal's display-only ring.
+// Untrusted in-band data: capped ring (last 50), per-terminal flood limit
+// (fixed 1s window, max 20 — excess events dropped). Never drives task
+// transitions, authz, or persisted state (deliberately NOT in
+// broadcastTerminalState, whose payload lands in B6-retained state events).
+const RECENT_TOOLS_MAX = 50;
+const TOOL_EVENTS_PER_WINDOW = 20;
+const TOOL_EVENT_WINDOW_MS = 1000;
+function recordToolEvent(
+  term: Terminal,
+  event: { name: string; summary: string },
+) {
+  const now = Date.now();
+  if (now - term.toolRate.windowStart >= TOOL_EVENT_WINDOW_MS) {
+    term.toolRate.windowStart = now;
+    term.toolRate.count = 0;
+  }
+  if (term.toolRate.count >= TOOL_EVENTS_PER_WINDOW) return;
+  term.toolRate.count += 1;
+  term.recentTools.push({ name: event.name, summary: event.summary, at: now });
+  if (term.recentTools.length > RECENT_TOOLS_MAX) {
+    term.recentTools.splice(0, term.recentTools.length - RECENT_TOOLS_MAX);
+  }
+}
+
 function applyParsedShellIntegrationState(
   term: Terminal,
   parsed: ReturnType<typeof parseShellIntegrationChunk>,
@@ -619,6 +648,8 @@ function applyParsedShellIntegrationState(
   for (const event of parsed.events) {
     if (event.type === "agent-done") {
       notifyAgentDone(term.ownerId, term.id, event.agentName);
+    } else if (event.type === "tool-used") {
+      recordToolEvent(term, event);
     }
   }
 
@@ -2747,6 +2778,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     lastExitCode: term.lastExitCode,
     agentName: term.agentName,
     agentState: term.agentState,
+    recentTools: term.recentTools,
     backendMode: getBackendMode(),
     supportsLinkedView: supportsLinkedView(term),
     sharedSessionKey: term.sessionName || null,
@@ -3693,6 +3725,8 @@ async function createManagedTerminal({
     agentState: initialRuntimeState?.agentState || null,
     agentHasUserPrompt: Boolean(initialRuntimeState?.agentName),
     agentRespondingTimer: null,
+    recentTools: [],
+    toolRate: { windowStart: 0, count: 0 },
     shellIntegrationCarry: "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
