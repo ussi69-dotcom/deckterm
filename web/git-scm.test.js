@@ -15,6 +15,18 @@ test("statusLetter follows VS Code letters", () => {
   expect(statusLetter({})).toBe("?");
 });
 
+test("statusLetter returns C for a conflicted file, ahead of every other classification", () => {
+  expect(statusLetter({ conflicted: true, stagedStatus: "U" })).toBe("C");
+  expect(statusLetter({ conflicted: true, status: "UU" })).toBe("C");
+  // conflicted wins even over signals that would otherwise say untracked/renamed.
+  expect(
+    statusLetter({ conflicted: true, status: "??", unstagedStatus: "?" }),
+  ).toBe("C");
+  expect(
+    statusLetter({ conflicted: true, isRenamed: true, stagedStatus: "R" }),
+  ).toBe("C");
+});
+
 test("statusClass maps letters to color classes", () => {
   expect(statusClass("M")).toBe("git-status-modified");
   expect(statusClass("A")).toBe("git-status-added");
@@ -34,6 +46,23 @@ test("groupStatusFiles splits staged / changes / untracked", () => {
   expect(groups.staged.map((f) => f.path)).toEqual(["s.js"]);
   expect(groups.changes.map((f) => f.path)).toEqual(["c.js"]);
   expect(groups.untracked.map((f) => f.path)).toEqual(["u.js"]);
+  expect(groups.merge).toEqual([]);
+});
+
+test("groupStatusFiles puts conflicted files in the merge bucket, ahead of staged/changes/untracked", () => {
+  const groups = groupStatusFiles([
+    { path: "m.js", status: "UU", conflicted: true, section: "merge" },
+    // A conflicted file whose section server-side happened to say "staged"
+    // (e.g. an XY code with a non-"?" first letter) still routes to merge —
+    // `conflicted` wins over `section`.
+    { path: "m2.js", status: "AA", conflicted: true, section: "staged" },
+    { path: "s.js", stagedStatus: "M", section: "staged" },
+    { path: "c.js", unstagedStatus: "M", section: "changes" },
+  ]);
+  expect(groups.merge.map((f) => f.path)).toEqual(["m.js", "m2.js"]);
+  expect(groups.merge.every((f) => f.conflicted === true)).toBe(true);
+  expect(groups.staged.map((f) => f.path)).toEqual(["s.js"]);
+  expect(groups.changes.map((f) => f.path)).toEqual(["c.js"]);
 });
 
 test("syncLabel renders ahead/behind arrows", () => {
@@ -70,5 +99,10 @@ test("diffSources picks original/modified refs per mode", () => {
   expect(diffSources("commit", { path: "a.js" }, "abc123")).toEqual({
     original: { kind: "git-show", ref: "abc123~1" },
     modified: { kind: "git-show", ref: "abc123" },
+  });
+  // conflict mode: ours (STAGE2) vs theirs (STAGE3), regardless of file shape.
+  expect(diffSources("conflict", { path: "m.js", conflicted: true })).toEqual({
+    original: { kind: "git-show", ref: "STAGE2" },
+    modified: { kind: "git-show", ref: "STAGE3" },
   });
 });

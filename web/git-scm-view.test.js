@@ -6,25 +6,33 @@ import {
   GitScmViewController,
 } from "./git-scm-view.js";
 
-test("scmSections returns the three groups in render order with files + actions", () => {
+test("scmSections leads with Merge Changes, then the three existing groups, in render order", () => {
   const groups = {
+    merge: [{ path: "m.js" }],
     staged: [{ path: "a.js" }],
     changes: [{ path: "b.js" }, { path: "c.js" }],
     untracked: [{ path: "d.js" }],
   };
   const sections = scmSections(groups);
   expect(sections.map((s) => s.key)).toEqual([
+    "merge",
     "staged",
     "changes",
     "untracked",
   ]);
-  expect(sections[0].label).toBe("Staged Changes");
-  expect(sections[0].groupAction).toBe("unstage-all");
-  expect(sections[0].mode).toBe("staged");
-  expect(sections[1].groupAction).toBe("stage-all");
-  expect(sections[1].mode).toBe("working");
+  expect(sections[0].label).toBe("Merge Changes");
+  // Merge has no bulk group action — there's no sane "resolve all".
+  expect(sections[0].groupAction).toBeNull();
+  expect(sections[0].mode).toBe("conflict");
+  expect(sections[0].files).toHaveLength(1);
+
+  expect(sections[1].label).toBe("Staged Changes");
+  expect(sections[1].groupAction).toBe("unstage-all");
+  expect(sections[1].mode).toBe("staged");
+  expect(sections[2].groupAction).toBe("stage-all");
   expect(sections[2].mode).toBe("working");
-  expect(sections[1].files).toHaveLength(2);
+  expect(sections[3].mode).toBe("working");
+  expect(sections[2].files).toHaveLength(2);
 });
 
 test("scmSections tolerates a missing / partial groups map", () => {
@@ -33,23 +41,27 @@ test("scmSections tolerates a missing / partial groups map", () => {
   );
   expect(scmSections({}).every((s) => s.files.length === 0)).toBe(true);
   const partial = scmSections({ staged: [{ path: "x" }] });
-  expect(partial[0].files).toHaveLength(1);
-  expect(partial[1].files).toHaveLength(0);
+  const byKey = (key) => partial.find((s) => s.key === key);
+  expect(byKey("merge").files).toHaveLength(0);
+  expect(byKey("staged").files).toHaveLength(1);
+  expect(byKey("changes").files).toHaveLength(0);
 });
 
-test("scmTotalCount sums files across all groups", () => {
+test("scmTotalCount sums files across all groups, including merge", () => {
   expect(
     scmTotalCount({
+      merge: [{ path: "m" }],
       staged: [{ path: "a" }],
       changes: [{ path: "b" }, { path: "c" }],
       untracked: [],
     }),
-  ).toBe(3);
+  ).toBe(4);
   expect(scmTotalCount({})).toBe(0);
   expect(scmTotalCount(undefined)).toBe(0);
 });
 
-test("scmDiffModeForSection maps staged → staged, others → working", () => {
+test("scmDiffModeForSection maps merge → conflict, staged → staged, others → working", () => {
+  expect(scmDiffModeForSection("merge")).toBe("conflict");
   expect(scmDiffModeForSection("staged")).toBe("staged");
   expect(scmDiffModeForSection("changes")).toBe("working");
   expect(scmDiffModeForSection("untracked")).toBe("working");
@@ -544,4 +556,160 @@ test("onSectionsClick switches history scope to file and expands the section", (
   ctl.onSectionsClick(evt);
   expect(ctl.historyScope).toBe("file");
   expect(ctl.collapsed.history).toBe(false);
+});
+
+// ── Merge-conflict accept-button eligibility gate (Track D slice D3 / F9) ──
+//
+// Accept buttons render ONLY for a UU/AA file whose fetched content actually
+// parses into conflict markers. Every other shape — or a UU/AA file with no
+// markers left — gets the badge + a "resolve in terminal" hint, no buttons.
+
+test("renderMergeFileHtml shows the resolve-in-terminal hint (no accept buttons) for a non-UU/AA shape", () => {
+  const { ctl } = makeScmController();
+  const scm = require("./git-scm");
+  const html = ctl.renderMergeFileHtml(
+    { path: "d.txt", status: "DD", conflicted: true },
+    scm,
+  );
+  expect(html).toContain("resolve in terminal");
+  expect(html).not.toContain('data-file-action="accept-current"');
+  expect(html).not.toContain('data-file-action="accept-incoming"');
+  expect(html).not.toContain('data-file-action="accept-both"');
+});
+
+test("renderMergeFileHtml shows the hint (not buttons) for a UU file before eligibility has resolved", () => {
+  const { ctl } = makeScmController();
+  const scm = require("./git-scm");
+  // No fetch has completed yet — getConflictEligibility() returns false
+  // synchronously and kicks off (but doesn't await) an async check.
+  global.fetch = () => new Promise(() => {}); // never resolves in this test
+  try {
+    const html = ctl.renderMergeFileHtml(
+      { path: "u.txt", status: "UU", conflicted: true },
+      scm,
+    );
+    expect(html).toContain("resolve in terminal");
+  } finally {
+    delete global.fetch;
+  }
+});
+
+test("fetchConflictEligibility caches eligible:true when the fetched content parses into conflict markers", async () => {
+  const { ctl } = makeScmController();
+  const conflictText = "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n";
+  global.fetch = async () =>
+    new Response(JSON.stringify({ content: conflictText, mtimeMs: 1 }), {
+      status: 200,
+    });
+  try {
+    await ctl.fetchConflictEligibility(
+      { path: "u.txt", status: "UU" },
+      ctl._conflictGeneration,
+    );
+  } finally {
+    delete global.fetch;
+  }
+  const cached = ctl._conflictEligibility.get("u.txt");
+  expect(cached.eligible).toBe(true);
+  expect(cached.generation).toBe(0);
+});
+
+test("fetchConflictEligibility caches eligible:false when the content has no conflict markers", async () => {
+  const { ctl } = makeScmController();
+  global.fetch = async () =>
+    new Response(JSON.stringify({ content: "plain text\n", mtimeMs: 1 }), {
+      status: 200,
+    });
+  try {
+    await ctl.fetchConflictEligibility(
+      { path: "u.txt", status: "UU" },
+      ctl._conflictGeneration,
+    );
+  } finally {
+    delete global.fetch;
+  }
+  expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
+});
+
+test("fetchConflictEligibility caches eligible:false on a fetch failure (never throws)", async () => {
+  const { ctl } = makeScmController();
+  global.fetch = async () => {
+    throw new Error("network down");
+  };
+  try {
+    await ctl.fetchConflictEligibility(
+      { path: "u.txt", status: "UU" },
+      ctl._conflictGeneration,
+    );
+  } finally {
+    delete global.fetch;
+  }
+  expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
+});
+
+test("getConflictEligibility only kicks off ONE in-flight fetch per path+generation", () => {
+  const { ctl } = makeScmController();
+  let fetchCalls = 0;
+  global.fetch = () => {
+    fetchCalls += 1;
+    return new Promise(() => {}); // never resolves — only the call count matters
+  };
+  try {
+    ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
+    ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
+    ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
+  } finally {
+    delete global.fetch;
+  }
+  expect(fetchCalls).toBe(1);
+});
+
+test("a cached eligibility from a stale generation is ignored (re-checked, not reused)", () => {
+  const { ctl } = makeScmController();
+  ctl._conflictEligibility.set("u.txt", { generation: 0, eligible: true });
+  ctl._conflictGeneration = 1; // status moved on — e.g. the file was re-edited
+  let fetchCalls = 0;
+  global.fetch = () => {
+    fetchCalls += 1;
+    return new Promise(() => {});
+  };
+  try {
+    const result = ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
+    expect(result).toBe(false); // unresolved-for-this-generation → hint, not buttons
+    expect(fetchCalls).toBe(1); // re-checked rather than trusting the stale cache
+  } finally {
+    delete global.fetch;
+  }
+});
+
+test("onTreeClick dispatches accept-current/incoming/both to gm.resolveConflict with ours/theirs/both", async () => {
+  const { ctl, gm } = makeScmController();
+  ctl.refresh = () => {}; // isolate from the full refresh chain
+  const calls = [];
+  gm.resolveConflict = async (path, mode) => {
+    calls.push([path, mode]);
+    return { ok: true };
+  };
+  const makeEvt = (action) => ({
+    target: {
+      closest(sel) {
+        if (sel === ".ide-scm-group-action") return null;
+        if (sel === ".ide-scm-file")
+          return { dataset: { path: "m.txt", section: "merge" } };
+        if (sel === ".ide-scm-file-action")
+          return { dataset: { fileAction: action } };
+        return null;
+      },
+    },
+    stopPropagation() {},
+  });
+  ctl.onTreeClick(makeEvt("accept-current"));
+  ctl.onTreeClick(makeEvt("accept-incoming"));
+  ctl.onTreeClick(makeEvt("accept-both"));
+  await new Promise((r) => setTimeout(r, 0));
+  expect(calls).toEqual([
+    ["m.txt", "ours"],
+    ["m.txt", "theirs"],
+    ["m.txt", "both"],
+  ]);
 });

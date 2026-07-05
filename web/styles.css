@@ -6111,6 +6111,25 @@ body.ide-mode #workspace-area {
   font-weight: 600;
 }
 
+/* Merge Changes group (Track D slice D3) — leads the tree; conflict rows show
+   either accept-current/incoming/both buttons (marker-bearing UU/AA only) or
+   a muted "resolve in terminal" hint for every other shape. */
+.ide-scm-merge-file .ide-scm-file-name {
+  font-weight: 600;
+}
+
+.ide-scm-merge-hint {
+  font-size: 11px;
+  color: var(--text-secondary, #999);
+  font-style: italic;
+  white-space: nowrap;
+  opacity: 0;
+}
+
+.ide-scm-merge-file:hover .ide-scm-merge-hint {
+  opacity: 1;
+}
+
 .ide-scm-sections {
   flex: 0 0 auto;
   border-top: 1px solid var(--border-primary);

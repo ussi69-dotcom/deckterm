@@ -6,6 +6,10 @@
 // VS Code status letter for a /api/git/status file entry.
 function statusLetter(file) {
   if (!file) return "?";
+  // Merge conflict (Track D slice D3) — the server flags any unmerged XY code
+  // (DD/AU/UD/UA/DU/AA/UU) as `conflicted`; this takes priority over every
+  // other classification (a conflicted file is never staged/changes/untracked).
+  if (file.conflicted) return "C";
   const raw = file.status || "";
   if (raw.startsWith("?") || file.unstagedStatus === "?" || file.untracked) {
     return "U";
@@ -34,11 +38,15 @@ function statusClass(letter) {
   }
 }
 
-// Splits status files into the three Source Control groups.
+// Splits status files into the four Source Control groups. `merge` (conflicted
+// files) is checked FIRST — a conflict takes priority over every other
+// classification, mirroring statusLetter()'s precedence (Track D slice D3).
 function groupStatusFiles(files) {
-  const groups = { staged: [], changes: [], untracked: [] };
+  const groups = { merge: [], staged: [], changes: [], untracked: [] };
   for (const file of files || []) {
-    if (file.section === "staged") {
+    if (file.conflicted || file.section === "merge") {
+      groups.merge.push({ ...file, staged: false, conflicted: true });
+    } else if (file.section === "staged") {
       groups.staged.push({ ...file, staged: true });
     } else if (statusLetter(file) === "U") {
       groups.untracked.push({ ...file, staged: false, untracked: true });
@@ -61,6 +69,15 @@ function syncLabel(ahead, behind) {
 // the given mode. Kinds: "git-show" (ref via /api/git/show, INDEX = staged),
 // "worktree" (read from disk via /api/files/content), "empty".
 function diffSources(mode, file, commit) {
+  // Merge conflict (Track D slice D3): ours (index stage 2) vs theirs (index
+  // stage 3), both resolved through the gated /api/git/show STAGE2/STAGE3
+  // sentinels — never the raw working file (which still has conflict markers).
+  if (mode === "conflict") {
+    return {
+      original: { kind: "git-show", ref: "STAGE2" },
+      modified: { kind: "git-show", ref: "STAGE3" },
+    };
+  }
   if (mode === "commit" && commit) {
     return {
       original: { kind: "git-show", ref: `${commit}~1` },

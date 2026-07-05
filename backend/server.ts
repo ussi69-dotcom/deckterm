@@ -7252,6 +7252,13 @@ export function createWebApp() {
     return c.json({ env });
   });
 
+  // Unmerged (conflict) XY codes from `git status --porcelain` (Track D slice
+  // D3). Both sides of a merge conflict — deleted, added, or modified on each
+  // side — get one of these two-letter codes; they must classify as "merge"
+  // BEFORE the ordinary staged/changes split (a raw first-letter check would
+  // otherwise mis-file e.g. "UU" into Staged, since "U" !== "?").
+  const CONFLICT_XY_CODES = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
+
   // GET /api/git/status?cwd=/path/to/repo
   app.get("/api/git/status", async (c) => {
     const cwd = c.req.query("cwd") || process.env.HOME;
@@ -7311,6 +7318,11 @@ export function createWebApp() {
             path = rawPath.substring(renameIdx + renameSep.length).trim();
           }
 
+          // Conflict classification uses the raw (unstripped) XY code — the
+          // codes never contain a space, so this is safe before any trimming —
+          // and takes priority over the staged/changes split (Track D D3).
+          const conflicted = CONFLICT_XY_CODES.has(rawStatus);
+
           return {
             // Backward-compat field
             status: rawStatus.trim(),
@@ -7318,9 +7330,13 @@ export function createWebApp() {
             stagedStatus,
             unstagedStatus,
             isRenamed,
+            conflicted,
             ...(oldPath ? { oldPath } : {}),
-            section:
-              stagedStatus && stagedStatus !== "?" ? "staged" : "changes",
+            section: conflicted
+              ? "merge"
+              : stagedStatus && stagedStatus !== "?"
+                ? "staged"
+                : "changes",
           };
         });
 
@@ -7489,6 +7505,20 @@ export function createWebApp() {
     }
   });
 
+  // Shared `git add -- <paths>` staging step. Used by both /api/git/stage and
+  // /api/git/resolve-stage (Track D slice D3's merge-resolve flow reuses this
+  // exact code path rather than growing a second staging implementation).
+  async function stagePathsInternal(
+    git: GitCwd,
+    paths: string[],
+  ): Promise<{ ok: true } | { ok: false; message: string }> {
+    const result = await runGit(git, ["add", "--", ...paths]);
+    if (!result.ok) {
+      return { ok: false, message: result.stderr.trim() };
+    }
+    return { ok: true };
+  }
+
   // POST /api/git/stage { cwd, paths: string[] }
   app.post("/api/git/stage", async (c) => {
     const body = await c.req.json().catch(() => ({}));
@@ -7504,15 +7534,101 @@ export function createWebApp() {
     }
 
     try {
-      const result = await runGit(g.git, ["add", "--", ...paths]);
+      const result = await stagePathsInternal(g.git, paths);
       if (!result.ok) {
         return c.json(
-          { error: "Git add failed", message: result.stderr.trim() },
+          { error: "Git add failed", message: result.message },
           400,
         );
       }
       return c.json({ ok: true });
     } catch (err) {
+      return c.json({ error: "Git add failed", message: String(err) }, 400);
+    }
+  });
+
+  // POST /api/git/resolve-stage { cwd, paths: string[], resolution: "ours"|"theirs"|"both" }
+  //
+  // Thin staging step for the merge-conflict resolve flow (Track D slice D3).
+  // The file content transform itself already happened client-side
+  // (web/merge-conflicts.js resolveConflicts()) and was written back through
+  // the EXISTING PUT /api/files/content route (atomic, mapped-uid, mtime-
+  // guarded — audited there as file.write). This route only stages the
+  // resolved path(s) via the same `git add` code path /api/git/stage uses, and
+  // writes the explicit `merge.resolve` audit row the plain stage route lacks
+  // (Codex F10): decision (allow/deny), path count + resolution mode — NEVER
+  // file content.
+  app.post("/api/git/resolve-stage", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const { cwd, paths, resolution } = body;
+
+    const g = await resolveGitCwd(c, cwd);
+    if (!g.ok) {
+      return c.json(g.body, { status: g.status as any });
+    }
+
+    const VALID_RESOLUTIONS = new Set(["ours", "theirs", "both"]);
+    const state = await getFoundationState();
+    const actorId = getCurrentUser(c).ownerId;
+    const pathCount = Array.isArray(paths) ? paths.length : 0;
+
+    if (
+      !paths ||
+      !Array.isArray(paths) ||
+      paths.length === 0 ||
+      typeof resolution !== "string" ||
+      !VALID_RESOLUTIONS.has(resolution)
+    ) {
+      writeAuditEvent(state.db, {
+        actorUserId: actorId,
+        action: "merge.resolve",
+        resourceType: "root",
+        decision: "deny",
+        reason: "invalid_request",
+        data: { pathCount, resolution: resolution ?? null },
+      });
+      return c.json(
+        {
+          error: "paths and a valid resolution (ours/theirs/both) are required",
+        },
+        400,
+      );
+    }
+
+    try {
+      const result = await stagePathsInternal(g.git, paths);
+      if (!result.ok) {
+        writeAuditEvent(state.db, {
+          actorUserId: actorId,
+          action: "merge.resolve",
+          resourceType: "root",
+          decision: "deny",
+          reason: "stage_failed",
+          data: { pathCount, resolution },
+        });
+        return c.json(
+          { error: "Git add failed", message: result.message },
+          400,
+        );
+      }
+      writeAuditEvent(state.db, {
+        actorUserId: actorId,
+        action: "merge.resolve",
+        resourceType: "root",
+        decision: "allow",
+        reason: "resolve_stage",
+        data: { pathCount, resolution },
+      });
+      return c.json({ ok: true });
+    } catch (err) {
+      writeAuditEvent(state.db, {
+        actorUserId: actorId,
+        action: "merge.resolve",
+        resourceType: "root",
+        decision: "deny",
+        reason: "error",
+        data: { pathCount, resolution },
+      });
       return c.json({ error: "Git add failed", message: String(err) }, 400);
     }
   });
@@ -8003,8 +8119,19 @@ export function createWebApp() {
     }
 
     // "INDEX" maps to git's :0 (staged content) — used by the diff editor for
-    // working-tree/staged comparisons.
-    const ref = commit === "INDEX" ? ":0" : commit;
+    // working-tree/staged comparisons. "STAGE2"/"STAGE3" map to :2/:3 — the
+    // conflict "ours"/"theirs" stage refs the merge-conflict diff view reads
+    // (Track D slice D3). These are sentinels checked BEFORE the ref regex
+    // above already accepted them as ordinary `[\w\-\/.]+` refnames; the regex
+    // itself is untouched — a dash-led ref is still rejected either way.
+    const ref =
+      commit === "INDEX"
+        ? ":0"
+        : commit === "STAGE2"
+          ? ":2"
+          : commit === "STAGE3"
+            ? ":3"
+            : commit;
 
     try {
       const { output: content, code: exitCode } = await runGit(g.git, [

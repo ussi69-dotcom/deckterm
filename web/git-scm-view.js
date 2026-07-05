@@ -69,6 +69,25 @@ function getScm() {
   return null;
 }
 
+// Resolve the merge-conflicts parser module (browser global OR CommonJS under
+// bun). Returns { parseConflictBlocks, resolveConflicts } or null.
+function getMergeConflicts() {
+  if (
+    typeof window !== "undefined" &&
+    window.MergeConflicts?.parseConflictBlocks
+  ) {
+    return window.MergeConflicts;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./merge-conflicts");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 // Resolve the GitHistoryView module (browser global OR CommonJS under bun).
 // Returns { GitHistoryViewController } or null when not available.
 function getGitHistoryView() {
@@ -90,14 +109,25 @@ function getGitHistoryView() {
 
 // ── Pure helpers (DOM-free, unit-tested) ─────────────────────────────────────
 
-// The three SCM group section descriptors, in render order, with the file list
-// + the group-level action for each. `mode` is the diff mode a file in that
-// group opens with: staged files diff their INDEX (mode "staged"); everything
-// else diffs the working tree (mode "working"). Pure over a grouped-files map
-// (the shape groupStatusFiles returns).
+// The SCM group section descriptors, in render order, with the file list +
+// the group-level action for each. `mode` is the diff mode a file in that
+// group opens with: merge (conflicted) files diff ours/theirs (mode
+// "conflict"); staged files diff their INDEX (mode "staged"); everything else
+// diffs the working tree (mode "working"). Pure over a grouped-files map (the
+// shape groupStatusFiles returns). "Merge Changes" leads (Track D slice D3) —
+// conflicts are the most urgent thing in the tree, VS Code-style. It has no
+// group-level bulk action (there's no sane "resolve all" — each file's
+// eligibility for even a single-file accept action is resolved individually).
 function scmSections(groups) {
   const g = groups || {};
   return [
+    {
+      key: "merge",
+      label: "Merge Changes",
+      files: Array.isArray(g.merge) ? g.merge : [],
+      groupAction: null,
+      mode: "conflict",
+    },
     {
       key: "staged",
       label: "Staged Changes",
@@ -127,9 +157,11 @@ function scmTotalCount(groups) {
   return scmSections(groups).reduce((n, s) => n + s.files.length, 0);
 }
 
-// The diff mode a file opens with given the group it lives in. Staged group →
-// "staged" (diff the INDEX side); Changes/Untracked → "working".
+// The diff mode a file opens with given the group it lives in. Merge → the
+// ours/theirs conflict diff; Staged → "staged" (diff the INDEX side);
+// Changes/Untracked → "working".
 function scmDiffModeForSection(sectionKey) {
+  if (sectionKey === "merge") return "conflict";
   return sectionKey === "staged" ? "staged" : "working";
 }
 
@@ -173,6 +205,21 @@ class GitScmViewController {
     this._historyPath = null;
     // Subscriptions to tear down on unmount.
     this._unsubscribe = null;
+
+    // Merge-conflict accept-button eligibility (Track D slice D3 / Codex F9):
+    // a UU/AA conflict row only gets accept-current/incoming/both buttons when
+    // its FETCHED content actually parses into marker-bearing conflict blocks
+    // (a UU/AA file can be "clean" of markers if the user already hand-edited
+    // it in the terminal). That requires an async fetch + parse, so eligibility
+    // is resolved lazily and cached — keyed by path, tagged with the "merge
+    // status generation" it was resolved for. `_mergeSig` is the merge group's
+    // content signature (path+status); whenever it changes we bump
+    // `_conflictGeneration`, which invalidates every prior cache entry (a
+    // resolve from a superseded status snapshot never renders stale buttons).
+    this._conflictEligibility = new Map(); // path -> { generation, eligible }
+    this._conflictChecksInFlight = new Set(); // "generation:path" in flight
+    this._conflictGeneration = 0;
+    this._mergeSig = null;
   }
 
   get gitManager() {
@@ -420,6 +467,13 @@ class GitScmViewController {
   }
 
   renderTree(groups, scm, errorMessage) {
+    // Remembered so a merge-conflict eligibility resolution (async, arrives
+    // well after render()'s dedupe already latched _renderSig) can re-invoke
+    // renderTree() directly — bypassing that dedupe — with the same inputs.
+    this._lastTreeGroups = groups;
+    this._lastTreeScm = scm;
+    this._lastTreeError = errorMessage || null;
+
     const tree = this.q(".ide-scm-tree");
     if (!tree) return;
     // A status-fetch error (most commonly "Not a git repository") must show a
@@ -437,9 +491,26 @@ class GitScmViewController {
       return;
     }
 
+    // Merge-conflict eligibility cache generation (Track D slice D3): bump
+    // whenever the merge group's path+status set changes, invalidating every
+    // previously-resolved eligibility (a stale "eligible" from a superseded
+    // conflict never lingers once the underlying status snapshot moves on).
+    const mergeSection = sections.find((s) => s.key === "merge");
+    const mergeSig = (mergeSection?.files || [])
+      .map((f) => `${f.path}:${f.status || ""}`)
+      .join(",");
+    if (mergeSig !== this._mergeSig) {
+      this._mergeSig = mergeSig;
+      this._conflictGeneration += 1;
+    }
+
     let html = "";
     for (const section of sections) {
       if (section.files.length === 0) continue;
+      if (section.key === "merge") {
+        html += this.renderMergeGroupHtml(section, scm);
+        continue;
+      }
       const groupGlyph = section.groupAction === "unstage-all" ? "−" : "+";
       const groupTitle =
         section.groupAction === "unstage-all" ? "Unstage all" : "Stage all";
@@ -477,6 +548,103 @@ class GitScmViewController {
         </div>`;
     }
     tree.innerHTML = html;
+  }
+
+  // The "Merge Changes" group: no bulk group action (unlike the other
+  // sections), and every row's actions depend on per-file eligibility (Codex
+  // F9) rather than a uniform stage/discard/open trio.
+  renderMergeGroupHtml(section, scm) {
+    const rows = section.files
+      .map((file) => this.renderMergeFileHtml(file, scm))
+      .join("");
+    return `
+      <div class="ide-scm-group ide-scm-group-merge">
+        <div class="ide-scm-group-header">
+          <span class="ide-scm-group-label">${section.label}</span>
+          <span class="ide-scm-group-count">${section.files.length}</span>
+        </div>
+        <div class="ide-scm-group-items">${rows}</div>
+      </div>`;
+  }
+
+  // A single conflict row. Accept buttons render ONLY when the file's XY
+  // shape is UU/AA AND its fetched content actually parses into conflict
+  // markers (Codex F9) — every other shape (DD/AU/UD/UA/DU, or a UU/AA file
+  // with no markers left) gets the conflict badge + a "resolve in terminal"
+  // hint instead. Eligibility is async (fetch + parse) so it renders "hint"
+  // until resolved, then re-renders once known (see getConflictEligibility).
+  renderMergeFileHtml(file, scm) {
+    const letter = scm.statusLetter(file); // always "C" for a conflicted file
+    const colorClass = scm.statusClass(letter);
+    const fileName = (file.path || "").split("/").pop() || file.path || "";
+    const xy = file.status || "";
+    const checkable = xy === "UU" || xy === "AA";
+    const eligible = checkable && this.getConflictEligibility(file);
+    const actionsHtml = eligible
+      ? `
+              <button type="button" class="ide-scm-file-action" data-file-action="accept-current" title="Accept Current (keep ours)">⇦</button>
+              <button type="button" class="ide-scm-file-action" data-file-action="accept-incoming" title="Accept Incoming (keep theirs)">⇨</button>
+              <button type="button" class="ide-scm-file-action" data-file-action="accept-both" title="Accept Both">⇹</button>`
+      : `
+              <span class="ide-scm-merge-hint" title="Binary conflicts and files over the editor size limit resolve in the terminal">resolve in terminal</span>`;
+    return `
+            <div class="ide-scm-file ide-scm-merge-file" data-path="${this.esc(file.path)}" data-section="merge">
+              <span class="ide-scm-file-name ${colorClass}" title="${this.esc(file.path)}">${this.esc(fileName)}</span>
+              <span class="ide-scm-file-actions">${actionsHtml}</span>
+              <span class="ide-scm-file-status ${colorClass}" title="${this.esc(letter)}">${this.esc(letter)}</span>
+            </div>`;
+  }
+
+  // Resolves (and caches, per merge-status generation) whether `file` is
+  // eligible for accept buttons: its content must actually fetch and parse
+  // into marker-bearing conflict blocks. Returns false (render the "resolve in
+  // terminal" hint) until the async check completes, then triggers a direct
+  // renderTree() re-run (bypassing render()'s signature dedupe, which doesn't
+  // span per-file eligibility) so the row updates in place.
+  getConflictEligibility(file) {
+    const cached = this._conflictEligibility.get(file.path);
+    if (cached && cached.generation === this._conflictGeneration) {
+      return cached.eligible;
+    }
+    const generation = this._conflictGeneration;
+    const inFlightKey = `${generation}:${file.path}`;
+    if (!this._conflictChecksInFlight.has(inFlightKey)) {
+      this._conflictChecksInFlight.add(inFlightKey);
+      void this.fetchConflictEligibility(file, generation).finally(() => {
+        this._conflictChecksInFlight.delete(inFlightKey);
+      });
+    }
+    return false;
+  }
+
+  async fetchConflictEligibility(file, generation) {
+    let eligible = false;
+    try {
+      const cwd = (this.cwd() || "").replace(/\/$/, "");
+      const res = await fetch(
+        `/api/files/content?path=${encodeURIComponent(`${cwd}/${file.path}`)}`,
+      );
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const mc = getMergeConflicts();
+        if (mc && typeof data.content === "string") {
+          const parsed = mc.parseConflictBlocks(data.content);
+          eligible = !!(parsed.ok && parsed.hasConflicts);
+        }
+      }
+    } catch {
+      eligible = false;
+    }
+    this._conflictEligibility.set(file.path, { generation, eligible });
+    // A stale generation (the merge set moved on while this fetch was in
+    // flight) never triggers a render — the cache entry is simply orphaned.
+    if (generation === this._conflictGeneration) {
+      this.renderTree(
+        this._lastTreeGroups,
+        this._lastTreeScm,
+        this._lastTreeError,
+      );
+    }
   }
 
   renderHistory() {
@@ -734,6 +902,21 @@ class GitScmViewController {
         if (file) void gm.discardFile?.(file).then(() => this.render());
       } else if (action === "open") {
         this.openFile(path);
+      } else if (
+        action === "accept-current" ||
+        action === "accept-incoming" ||
+        action === "accept-both"
+      ) {
+        // Merge-conflict resolve (Track D slice D3): a full refresh() (not
+        // just render()) — resolving changes the file's staged status, which
+        // only a re-fetched /api/git/status reflects.
+        const mode =
+          action === "accept-current"
+            ? "ours"
+            : action === "accept-incoming"
+              ? "theirs"
+              : "both";
+        void gm.resolveConflict?.(path, mode).then(() => this.refresh());
       }
       return;
     }

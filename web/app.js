@@ -3477,6 +3477,7 @@ class GitManager {
     // Order must match renderFiles() section order — row data-index points
     // into this list.
     return [
+      ...(this.state.files.merge || []),
       ...this.state.files.staged,
       ...this.state.files.changes,
       ...(this.state.files.untracked || []),
@@ -3486,6 +3487,20 @@ class GitManager {
   renderFiles() {
     const container = this.panel.querySelector("#git-files");
     const sections = [
+      {
+        // Merge conflicts are read-only here (visibility only — accept
+        // actions live in the IDE SCM view; the terminal is the mobile
+        // resolve tool). Without this section a conflicted file, which the
+        // server now classifies as section:"merge", would show NOWHERE in
+        // the classic panel (pre-D3 it mis-showed under Staged).
+        key: "merge",
+        label: "Merge Conflicts",
+        icon: "!",
+        files: this.state.files.merge || [],
+        groupAction: null,
+        groupActionGlyph: "",
+        groupActionTitle: "",
+      },
       {
         key: "staged",
         label: "Staged Changes",
@@ -3520,6 +3535,9 @@ class GitManager {
 
     sections.forEach((section) => {
       const files = section.files;
+      // The merge section is conflict-only visibility: hidden entirely when
+      // there is no conflict (unlike the three permanent groups).
+      if (section.key === "merge" && files.length === 0) return;
       const { html: treeHtml, nextIndex } = this.renderSectionTree(
         files,
         section,
@@ -3534,7 +3552,7 @@ class GitManager {
             <span class="git-file-group-label">${section.label}</span>
             <span class="git-file-group-count">(${files.length})</span>
             ${
-              files.length > 0
+              files.length > 0 && section.groupAction
                 ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
                 : ""
             }
@@ -3810,6 +3828,87 @@ class GitManager {
       await this.refresh();
     } catch (err) {
       console.error("Discard error:", err);
+    }
+  }
+
+  // Resolves a merge conflict for `path` (Track D slice D3): a CLIENT-side
+  // transform of the working file's conflict markers — no new broker argv
+  // surface. Fetch the working content → resolveConflicts() (pure parser,
+  // web/merge-conflicts.js) picks ours/theirs/both → write back through the
+  // EXISTING mtime-guarded PUT /api/files/content (atomic, mapped-uid,
+  // audited there as file.write) → stage the resolved path through the new
+  // POST /api/git/resolve-stage (writes the explicit merge.resolve audit row).
+  // mode: "ours" | "theirs" | "both". Returns { ok, error? }; never throws.
+  async resolveConflict(path, mode) {
+    const cwd = this.state.cwd || this.currentCwd;
+    const absCwd = (cwd || "").replace(/\/$/, "");
+    const abs = `${absCwd}/${path}`;
+    try {
+      const getRes = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      const getData = await getRes.json().catch(() => ({}));
+      if (!getRes.ok || typeof getData.content !== "string") {
+        this.showCommitStatus(
+          formatGitError(getData, "Could not read the conflicted file"),
+          "error",
+        );
+        return { ok: false, error: getData.error };
+      }
+
+      const resolver = window.MergeConflicts?.resolveConflicts;
+      const resolved = resolver ? resolver(getData.content, mode) : null;
+      if (!resolved || !resolved.ok) {
+        const message =
+          resolved?.error ||
+          "Could not parse conflict markers — resolve in the terminal";
+        this.showCommitStatus(message, "error");
+        return { ok: false, error: message };
+      }
+
+      const putRes = await fetch("/api/files/content", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: abs,
+          content: resolved.content,
+          expectedMtimeMs: getData.mtimeMs,
+        }),
+      });
+      const putData = await putRes.json().catch(() => ({}));
+      if (!putRes.ok) {
+        const fallback =
+          putData?.reason === "mtime_conflict"
+            ? "File changed on disk since it was opened — reload and try again"
+            : "Failed to save the resolved file";
+        this.showCommitStatus(formatGitError(putData, fallback), "error");
+        return { ok: false, error: putData?.error };
+      }
+
+      const stageRes = await fetch("/api/git/resolve-stage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths: [path], resolution: mode }),
+      });
+      const stageData = await stageRes.json().catch(() => ({}));
+      if (!stageRes.ok) {
+        this.showCommitStatus(
+          formatGitError(stageData, "Resolved file saved, but staging failed"),
+          "error",
+        );
+        return { ok: false, error: stageData?.error };
+      }
+
+      this.showCommitStatus("Resolved", "success");
+      if (this.state.selectedPath === path) {
+        this.state.selectedPath = null;
+      }
+      await this.refresh();
+      return { ok: true };
+    } catch (err) {
+      console.error("Resolve conflict error:", err);
+      this.showCommitStatus("Resolve failed: network error", "error");
+      return { ok: false, error: String(err) };
     }
   }
 
@@ -10451,6 +10550,13 @@ class TerminalManager {
     if (mode === "commit" && ref.commit) {
       return Promise.all([showAt(`${ref.commit}~1`), showAt(ref.commit)]);
     }
+    if (mode === "conflict") {
+      // Merge conflict (Track D slice D3): ours (index stage 2) vs theirs
+      // (index stage 3) — the gated /api/git/show route maps the STAGE2/
+      // STAGE3 sentinels to git's :2/:3. Never the raw working file, which
+      // still carries the conflict markers.
+      return Promise.all([showAt("STAGE2"), showAt("STAGE3")]);
+    }
     // working tree (default): HEAD vs the on-disk file.
     return Promise.all([showAt("HEAD"), worktree()]);
   }
@@ -10471,7 +10577,15 @@ class TerminalManager {
       commit,
       title:
         title ||
-        `${relPath} (${mode === "staged" ? "Staged" : mode === "commit" ? "Commit" : "Working Tree"})`,
+        `${relPath} (${
+          mode === "staged"
+            ? "Staged"
+            : mode === "commit"
+              ? "Commit"
+              : mode === "conflict"
+                ? "Merge Conflict"
+                : "Working Tree"
+        })`,
     });
   }
 
@@ -10563,6 +10677,9 @@ class TerminalManager {
     } else if (mode === "commit" && r.commit) {
       // commit~1 vs commit.
       probes = [showProbe(`${r.commit}~1`), showProbe(r.commit)];
+    } else if (mode === "conflict") {
+      // Merge conflict: ours (STAGE2 → :2) vs theirs (STAGE3 → :3).
+      probes = [showProbe("STAGE2"), showProbe("STAGE3")];
     } else {
       // working tree (default): HEAD vs the on-disk working file.
       probes = [showProbe("HEAD"), fileProbe()];
