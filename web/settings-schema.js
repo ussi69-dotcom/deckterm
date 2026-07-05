@@ -136,6 +136,21 @@ const SETTINGS_SCHEMA = [
     searchText:
       "default cwd working directory path explorer home folder web dir",
   },
+  {
+    key: "editor.autosave",
+    category: "Files",
+    label: "Autosave",
+    description:
+      "Automatically save an open file after you stop typing (off disables autosave).",
+    type: "select",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "1000", label: "After 1 second" },
+      { value: "5000", label: "After 5 seconds" },
+    ],
+    searchText: "autosave auto save editor debounce interval delay file tab",
+  },
 
   // ── Tasks ───────────────────────────────────────────────────────────────
   {

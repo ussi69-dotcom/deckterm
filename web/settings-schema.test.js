@@ -66,6 +66,17 @@ describe("SETTINGS_SCHEMA shape", () => {
     expect(byKey("workspace.confirmDestructive")).toBeDefined();
     expect(byKey("appearance.accent")).toBeDefined();
   });
+
+  test("editor.autosave defaults to off with a 1s/5s select", () => {
+    const def = byKey("editor.autosave");
+    expect(def).toBeDefined();
+    expect(def.type).toBe("select");
+    expect(def.default).toBe("off");
+    const values = def.options.map((o) =>
+      typeof o === "object" ? o.value : o,
+    );
+    expect(values).toEqual(["off", "1000", "5000"]);
+  });
 });
 
 describe("categoriesOf", () => {

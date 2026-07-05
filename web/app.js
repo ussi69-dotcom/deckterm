@@ -6398,6 +6398,7 @@ class TerminalManager {
           this.applyExtraKeysVisible(value),
         "tasks.view": (value) => this.applyTaskView(value),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
+        "editor.autosave": (value) => this.applyEditorAutosave(value),
       },
     });
     // Settings load + migration are async; apply once they resolve so the store
@@ -6445,6 +6446,20 @@ class TerminalManager {
   applyDefaultCwd(value) {
     const dir = typeof value === "string" ? value : "";
     if (dir) this.setDirectoryValue(dir, { force: true });
+  }
+
+  // Side effect for editor.autosave ("off"|"1000"|"5000"). Live-updates every
+  // currently open editor-tab handle's debounce interval — new tabs pick up
+  // the setting at mount time via mountEditorFileTab. A handle whose last save
+  // failed stays non-autosaving regardless of this call (setAutosaveIntervalMs
+  // only changes the interval, never clears the failed/re-arm state — see
+  // createAutosaveController in file-editor.js).
+  applyEditorAutosave(value) {
+    const ms = window.FileEditorModule?.parseAutosaveMs?.(value) ?? null;
+    this.editorAutosaveMs = ms;
+    for (const handle of this.editorTabHandles?.values() || []) {
+      handle?.setAutosaveIntervalMs?.(ms);
+    }
   }
 
   async openSettings() {
@@ -10203,6 +10218,10 @@ class TerminalManager {
     const key = window.EditorTabs.tabKey(tab);
     const handle = await this.fileEditor.mountInto(hostEl, tab.ref, {
       onEdit: () => this.editorTabs?.model.pin(key),
+      // Seed the initial debounce from the current editor.autosave setting
+      // (applyEditorAutosave keeps every ALREADY-open tab's interval live —
+      // this only covers the mount-time value for a freshly opened tab).
+      autosaveMs: this.editorAutosaveMs ?? null,
     });
     if (!handle) {
       // Load failed (binary / 403 / 404): drop the tab so we don't leave an
