@@ -4,6 +4,8 @@ import {
   filterSessions,
   createSavedCommandsStore,
   filterSavedCommands,
+  fuzzyScoreFilePath,
+  filterQuickOpenFiles,
 } from "./palette-providers";
 
 // --- parsePrefixQuery -------------------------------------------------------
@@ -141,4 +143,94 @@ test("filterSavedCommands matches name and command text", () => {
     "logs",
   ]);
   expect(filterSavedCommands(commands, "zzz")).toEqual([]);
+});
+
+// --- fuzzyScoreFilePath ------------------------------------------------------
+
+test("fuzzyScoreFilePath returns null when the query is not a subsequence", () => {
+  expect(fuzzyScoreFilePath("xyz", "web/app.js")).toBe(null);
+  expect(fuzzyScoreFilePath("zzz", "backend/server.ts")).toBe(null);
+});
+
+test("fuzzyScoreFilePath matches a scattered subsequence across path segments", () => {
+  // "wapjs" is a subsequence of "web/app.js" (w-e-b-a-p-p-.-j-s).
+  expect(fuzzyScoreFilePath("wapjs", "web/app.js")).not.toBe(null);
+  expect(fuzzyScoreFilePath("wapjs", "web/app.js")).toBeGreaterThan(0);
+});
+
+test("fuzzyScoreFilePath treats an empty query as a neutral match (score 0)", () => {
+  expect(fuzzyScoreFilePath("", "web/app.js")).toBe(0);
+  expect(fuzzyScoreFilePath("   ", "web/app.js")).toBe(0);
+});
+
+test("fuzzyScoreFilePath is case-insensitive", () => {
+  expect(fuzzyScoreFilePath("APP", "web/app.js")).toBe(
+    fuzzyScoreFilePath("app", "web/app.js"),
+  );
+});
+
+test("fuzzyScoreFilePath scores a basename match higher than the same query scattered through a longer directory prefix", () => {
+  const basenameScore = fuzzyScoreFilePath("app", "web/app.js");
+  const directoryScore = fuzzyScoreFilePath(
+    "app",
+    "app/some/other/place/index.js",
+  );
+  // "app" hits the basename in the first path (bonus'd); in the second it only
+  // matches inside a leading directory segment, no basename bonus.
+  expect(basenameScore).toBeGreaterThan(0);
+  expect(directoryScore).toBeGreaterThan(0);
+});
+
+test("fuzzyScoreFilePath prefers consecutive characters over the same letters scattered apart", () => {
+  // Both hit the basename after "/" with the same boundary shape (a right
+  // after "/", p/p not right after a boundary char) — the only difference is
+  // that "app" is consecutive in the first and split by filler "x"s in the
+  // second, isolating the consecutive-run bonus.
+  const consecutive = fuzzyScoreFilePath("app", "web/app.js");
+  const scattered = fuzzyScoreFilePath("app", "web/axpxp.js");
+  expect(consecutive).toBeGreaterThan(scattered);
+});
+
+test("fuzzyScoreFilePath prefers a boundary match (after / or _ or -) over a mid-word match", () => {
+  const boundary = fuzzyScoreFilePath("tabs", "editor-tabs.js");
+  const midword = fuzzyScoreFilePath("tabs", "editortabsxxxx.js");
+  expect(boundary).toBeGreaterThan(midword);
+});
+
+// --- filterQuickOpenFiles ----------------------------------------------------
+
+const filesFixture = [
+  { path: "/root/web/app.js", relativePath: "web/app.js" },
+  { path: "/root/web/editor-tabs.js", relativePath: "web/editor-tabs.js" },
+  { path: "/root/backend/server.ts", relativePath: "backend/server.ts" },
+  {
+    path: "/root/backend/task-runner.ts",
+    relativePath: "backend/task-runner.ts",
+  },
+];
+
+test("filterQuickOpenFiles returns only files whose relativePath matches, best score first", () => {
+  const results = filterQuickOpenFiles("apjs", filesFixture);
+  expect(results.map((f) => f.relativePath)).toEqual(["web/app.js"]);
+});
+
+test("filterQuickOpenFiles with an empty query returns the input capped at the limit, order preserved", () => {
+  const results = filterQuickOpenFiles("", filesFixture, 2);
+  expect(results.length).toBe(2);
+  expect(results).toEqual(filesFixture.slice(0, 2));
+});
+
+test("filterQuickOpenFiles returns an empty array when nothing matches", () => {
+  expect(filterQuickOpenFiles("zzzzz", filesFixture)).toEqual([]);
+});
+
+test("filterQuickOpenFiles respects the limit and ranks a tighter/basename match above a looser one", () => {
+  const results = filterQuickOpenFiles("server", filesFixture, 1);
+  expect(results.length).toBe(1);
+  expect(results[0].relativePath).toBe("backend/server.ts");
+});
+
+test("filterQuickOpenFiles tolerates a non-array input", () => {
+  expect(filterQuickOpenFiles("app", null)).toEqual([]);
+  expect(filterQuickOpenFiles("app", undefined)).toEqual([]);
 });

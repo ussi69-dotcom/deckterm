@@ -1,9 +1,10 @@
 const COMMAND_PALETTE_GROUP_ORDER = {
   Actions: 1,
-  Workspaces: 2,
-  Views: 3,
-  Contextual: 4,
-  Other: 5,
+  Files: 2,
+  Workspaces: 3,
+  Views: 4,
+  Contextual: 5,
+  Other: 6,
 };
 
 function getCommandPaletteGroupRank(group) {

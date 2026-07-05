@@ -112,6 +112,10 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// Quick-open (Ctrl+P) file-tree cache TTL — the git branch cache never
+// expires (branch switches invalidate it explicitly), but the tree fetch
+// walks the live filesystem, so it is re-fetched after this window.
+const COMMAND_PALETTE_TREE_TTL_MS = 30000;
 // SurfaceWindow id for the IDE Explorer pop-out (slice 3). Distinct from the
 // terminal-mode "files" window so their persisted geometries don't collide.
 const IDE_EXPLORER_WINDOW_ID = "ide-explorer";
@@ -4897,6 +4901,14 @@ class TerminalManager {
     this.notificationsEnabled = true;
     this.clientInstanceId = this.getOrCreateClientInstanceId();
     this.commandPaletteGitCache = new Map();
+    // Quick-open (Ctrl+P) file tree cache, keyed by cwd. Providers are SYNC
+    // (same constraint as the git cache above), so the tree is prefetched on
+    // palette open (buildCommandPaletteContext) and read back synchronously
+    // from here by the quick-open provider. TTL'd (not cached forever like
+    // the git cache) since the filesystem can change underneath a long-lived
+    // session; keyed by cwd so switching workspaces naturally misses the
+    // cache and refetches rather than needing an explicit invalidation hook.
+    this.commandPaletteTreeCache = new Map();
     this.rightSurface = "none";
     this.taskState = {
       items: [],
@@ -8179,6 +8191,18 @@ class TerminalManager {
     return value.startsWith("/") || value.startsWith("~/");
   }
 
+  // Quick-open activates on a "bare" query: some non-empty text that isn't
+  // one of the other prefix modes (directory jump "/" "~/", session switch
+  // "@", saved command "$") — mirrors how those providers gate on their own
+  // prefix/emptiness rather than overlapping with each other.
+  isPaletteBareQuery(query) {
+    const value = String(query || "").trim();
+    if (!value) return false;
+    if (this.isPaletteDirectoryQuery(value)) return false;
+    if (value.startsWith("@") || value.startsWith("$")) return false;
+    return true;
+  }
+
   async resolvePaletteDirectory(path) {
     const targetPath = String(path || "").trim();
     if (!targetPath) return null;
@@ -8384,6 +8408,13 @@ class TerminalManager {
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
+      {
+        id: "toggle-ide-mode",
+        title: "Toggle IDE Mode",
+        group: "Views",
+        keywords: ["ide", "editor", "mode", "workspace"],
+        run: () => this.toggleIdeMode(),
+      },
     ];
 
     actions.forEach((action) => this.commandPaletteRegistry.register(action));
@@ -8405,6 +8436,36 @@ class TerminalManager {
           run: () => this.goToDirectoryFromPalette(query),
         },
       ];
+    });
+
+    // Quick-open (Ctrl+P default experience) — bare queries fuzzy-match file
+    // paths from the per-cwd cached tree (prefetched in
+    // buildCommandPaletteContext / ensureCommandPaletteTreeContext). The
+    // query is carried as a keyword (same trick as go-to-directory/"@"/"$")
+    // so results survive the registry's own title/keyword scoring; ordering
+    // comes from this provider via descending priority.
+    this.commandPaletteRegistry.registerProvider((context = {}) => {
+      const query = this.getCommandPaletteQuery();
+      if (!this.isPaletteBareQuery(query)) return [];
+
+      const files = Array.isArray(context.quickOpenFiles)
+        ? context.quickOpenFiles
+        : [];
+      const matches = window.PaletteProviders.filterQuickOpenFiles(
+        query,
+        files,
+        50,
+      );
+
+      return matches.map((file, index) => ({
+        id: `quick-open:${file.path}`,
+        title: file.relativePath || file.path,
+        group: "Files",
+        keywords: [query],
+        meta: [file.path],
+        priority: 50 - index,
+        run: () => this.handleExplorerOpenFile(file.path, { pinned: true }),
+      }));
     });
 
     this.commandPaletteRegistry.registerProvider((context = {}) => {
@@ -8477,6 +8538,42 @@ class TerminalManager {
             this.switchGitBranchFromPalette(cwd, branch),
         }),
       );
+
+      // IDE-gated editor-tab commands: only meaningful with the IDE editor
+      // area live and at least one open tab.
+      if (context.isIdeMode && context.hasEditorTabs) {
+        contextualActions.push({
+          id: "close-editor-tab",
+          title: "Close Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "close"],
+          run: () => this.closeActiveEditorTabFromPalette(),
+        });
+        contextualActions.push({
+          id: "next-editor-tab",
+          title: "Next Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "next"],
+          run: () => this.stepActiveEditorTab(1),
+        });
+        contextualActions.push({
+          id: "previous-editor-tab",
+          title: "Previous Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "previous", "prev"],
+          run: () => this.stepActiveEditorTab(-1),
+        });
+      }
+
+      if (this.canOpenTaskBoardTab()) {
+        contextualActions.push({
+          id: "open-task-board-tab",
+          title: "Open Task Board",
+          group: "Contextual",
+          keywords: ["tasks", "board", "kanban", "agent"],
+          run: () => this.openTaskBoardTab(),
+        });
+      }
 
       return contextualActions;
     });
@@ -8690,6 +8787,11 @@ class TerminalManager {
       gitBranches: [],
       currentGitBranch: "",
     };
+    const treeContext = this.commandPaletteTreeCache.get(cwd) || {
+      files: [],
+      truncated: false,
+    };
+    const isIdeMode = this.isIdeModeActive();
 
     return {
       activeId: this.activeId,
@@ -8701,6 +8803,10 @@ class TerminalManager {
       currentGitBranch: gitContext.currentGitBranch || "",
       isGitRepo: Boolean(gitContext.isGitRepo),
       wrapLines: this.wrapLines,
+      quickOpenFiles: treeContext.files || [],
+      quickOpenTruncated: Boolean(treeContext.truncated),
+      isIdeMode,
+      hasEditorTabs: Boolean(isIdeMode && this.editorTabs?.model?.hasTabs()),
     };
   }
 
@@ -8760,10 +8866,48 @@ class TerminalManager {
     }
   }
 
+  // Quick-open file tree: fetch on palette open, cache per-cwd with a 30s TTL
+  // (the palette provider below is SYNC, same constraint as the git cache —
+  // see ensureCommandPaletteGitContext). Keying by cwd means a workspace
+  // switch is a natural cache miss (no separate invalidation hook needed);
+  // the TTL re-fetches a still-cached cwd's tree if it has gone stale.
+  async ensureCommandPaletteTreeContext(cwd) {
+    const nextCwd = String(cwd || "").trim();
+    const empty = { files: [], truncated: false, fetchedAt: 0 };
+    if (!nextCwd) return empty;
+
+    const cached = this.commandPaletteTreeCache.get(nextCwd);
+    if (cached && Date.now() - cached.fetchedAt < COMMAND_PALETTE_TREE_TTL_MS) {
+      return cached;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/files/tree?cwd=${encodeURIComponent(nextCwd)}`,
+      );
+      const data = await res.json().catch(() => ({}));
+      const payload = {
+        files:
+          res.ok && !data.error && Array.isArray(data.files) ? data.files : [],
+        truncated: Boolean(data.truncated),
+        fetchedAt: Date.now(),
+      };
+      this.commandPaletteTreeCache.set(nextCwd, payload);
+      return payload;
+    } catch {
+      const payload = { files: [], truncated: false, fetchedAt: Date.now() };
+      this.commandPaletteTreeCache.set(nextCwd, payload);
+      return payload;
+    }
+  }
+
   async buildCommandPaletteContext() {
     const cwd =
       this.getActiveTerminal()?.cwd || this.getCurrentDirectoryValue() || "";
-    await this.ensureCommandPaletteGitContext(cwd);
+    await Promise.all([
+      this.ensureCommandPaletteGitContext(cwd),
+      this.ensureCommandPaletteTreeContext(cwd),
+    ]);
     return this.getCommandPaletteContext();
   }
 
@@ -10162,6 +10306,30 @@ class TerminalManager {
     this.editorTabs.openTasksBoard();
   }
 
+  // Close the active editor tab (palette command). Goes through
+  // requestCloseKey — the single user-initiated-close chokepoint — so a
+  // dirty file tab still prompts before discarding.
+  closeActiveEditorTabFromPalette() {
+    if (!this.isIdeModeActive() || !this.editorTabs) return;
+    const key = this.editorTabs.model.state.activeKey;
+    if (!key) return;
+    this.editorTabs.requestCloseKey(key);
+  }
+
+  // Activate the next/previous editor tab (direction +1/-1), wrapping around.
+  // No-op with 0 or 1 tabs (nothing to step to).
+  stepActiveEditorTab(direction) {
+    if (!this.isIdeModeActive() || !this.editorTabs) return;
+    const state = this.editorTabs.model.state;
+    const tabs = Array.isArray(state?.tabs) ? state.tabs : [];
+    if (tabs.length < 2) return;
+    const keys = tabs.map((tab) => window.EditorTabs.tabKey(tab));
+    const currentIndex = keys.indexOf(state.activeKey);
+    if (currentIndex < 0) return;
+    const nextIndex = (currentIndex + direction + keys.length) % keys.length;
+    this.editorTabs.model.activate(keys[nextIndex]);
+  }
+
   async mountEditorDiffTab(hostEl, tab) {
     const r = tab.ref || {};
     const key = window.EditorTabs.tabKey(tab);
@@ -10777,6 +10945,19 @@ class TerminalManager {
       if (
         (e.ctrlKey || e.metaKey) &&
         e.shiftKey &&
+        e.key.toLowerCase() === "p"
+      ) {
+        e.preventDefault();
+        this.toggleCommandPalette();
+        return;
+      }
+      // Ctrl+P — quick-open is the default no-prefix palette experience;
+      // opens the SAME palette as Ctrl+Shift+P. preventDefault is essential
+      // here (unlike the shift variant, plain Ctrl/Cmd+P is the browser's
+      // print-dialog shortcut).
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
         e.key.toLowerCase() === "p"
       ) {
         e.preventDefault();

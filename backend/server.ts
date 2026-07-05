@@ -7,7 +7,16 @@ import {
   cloudflareAccess,
   type CloudflareAccessPayload,
 } from "@hono/cloudflare-access";
-import { mkdir, readdir, unlink, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readdir,
+  unlink,
+  stat,
+  writeFile,
+  opendir,
+  lstat,
+  realpath,
+} from "node:fs/promises";
 import {
   readFileSync,
   existsSync,
@@ -2128,6 +2137,148 @@ async function runScopedSearch(opts: {
   }
 
   return { matches: filtered, truncated };
+}
+
+// ── Scoped file-tree walk (GET /api/files/tree) bounds + impl ────────────────
+// Legacy-only surface (denies under OS isolation — brokerizing the walk is a
+// documented fast-follow, not this slice). Threat model mirrors
+// runScopedSearch above: the resolved ROOT is a realpath, every directory is
+// re-realpath'd immediately before recursing into it (closes a TOCTOU window
+// where a directory is swapped for a symlink between classification and
+// traversal), and every RETURNED file path is realpath'd again as an
+// authoritative post-filter. Symlinks are never followed (classified via
+// lstat, dropped if they resolve to anything other than a plain file/dir).
+const TREE_MAX_ENTRIES = 5000; // hard cap on returned files
+const TREE_MAX_DEPTH = 12; // max recursion depth below the root
+const TREE_TIMEOUT_MS = 3000; // hard stop wall-clock budget for the walk
+const TREE_MAX_SCANNED = 50000; // cap on dirents READ (opendir), not just returned
+const TREE_MAX_DIRS = 2000; // cap on directories actually opened/visited
+
+interface ScopedTreeFile {
+  path: string; // absolute, realpath-resolved
+  relativePath: string; // POSIX-style, relative to the walked root
+}
+
+async function walkScopedFileTree(
+  root: string,
+): Promise<{ files: ScopedTreeFile[]; truncated: boolean }> {
+  const files: ScopedTreeFile[] = [];
+  let truncated = false;
+  let scanned = 0;
+  let dirsVisited = 0;
+  const startedAt = Date.now();
+  const isRootOrInside = (p: string) => p === root || p.startsWith(`${root}/`);
+
+  type StackEntry = { dir: string; rel: string; depth: number };
+  const stack: StackEntry[] = [{ dir: root, rel: "", depth: 0 }];
+
+  walk: while (stack.length > 0) {
+    if (Date.now() - startedAt > TREE_TIMEOUT_MS) {
+      truncated = true;
+      break;
+    }
+    if (dirsVisited >= TREE_MAX_DIRS) {
+      truncated = true;
+      break;
+    }
+    const { dir, rel, depth } = stack.pop() as StackEntry;
+    dirsVisited += 1;
+
+    let handle;
+    try {
+      handle = await opendir(dir);
+    } catch {
+      continue; // unreadable / vanished between listing and open — skip
+    }
+
+    try {
+      // Stream entries via the Dir async iterator (never a bulk readdir()
+      // array) so a directory with an enormous fan-out can't spike memory.
+      for await (const dirent of handle) {
+        if (Date.now() - startedAt > TREE_TIMEOUT_MS) {
+          truncated = true;
+          break walk;
+        }
+        if (scanned >= TREE_MAX_SCANNED) {
+          truncated = true;
+          break walk;
+        }
+        scanned += 1;
+
+        const name = dirent.name;
+        if (name.startsWith(".")) continue; // dotfiles + dotdirs skipped
+        if (dirent.isDirectory() && SEARCH_EXCLUDE_DIRS.includes(name))
+          continue;
+
+        const entryPath = join(dir, name);
+        const entryRel = rel ? `${rel}/${name}` : name;
+
+        // Classify via lstat (never follow symlinks — a symlinked file OR
+        // directory is dropped outright rather than traversed/returned).
+        let entryStat;
+        try {
+          entryStat = await lstat(entryPath);
+        } catch {
+          continue; // vanished between opendir and lstat
+        }
+        if (entryStat.isSymbolicLink()) continue;
+
+        if (entryStat.isDirectory()) {
+          if (depth + 1 > TREE_MAX_DEPTH) continue;
+          if (dirsVisited >= TREE_MAX_DIRS) {
+            truncated = true;
+            continue;
+          }
+          // Re-realpath the directory right before recursing: closes the
+          // race where it was swapped for a symlink after the lstat above.
+          let realDir: string;
+          try {
+            realDir = await realpath(entryPath);
+          } catch {
+            continue;
+          }
+          if (!isRootOrInside(realDir)) continue; // raced outside the root
+          stack.push({ dir: realDir, rel: entryRel, depth: depth + 1 });
+          continue;
+        }
+
+        if (entryStat.isFile()) {
+          if (files.length >= TREE_MAX_ENTRIES) {
+            truncated = true;
+            break walk;
+          }
+          files.push({ path: entryPath, relativePath: entryRel });
+        }
+      }
+    } finally {
+      // Bun/Node auto-closes the Dir once the async iterator is exhausted, at
+      // which point close() returns undefined rather than a Promise (instead
+      // of throwing) — a bare `.catch()` chain would blow up on that case, so
+      // wrap in try/await instead.
+      try {
+        await handle.close();
+      } catch {
+        // best-effort; already closed or torn down mid-iteration (break walk)
+      }
+    }
+  }
+
+  // ── Authoritative post-filter (server is the authority on every RETURNED
+  // path, mirrors runScopedSearch): realpath each file again and drop it if
+  // it no longer resolves inside the root (closes any remaining TOCTOU).
+  const finalFiles: ScopedTreeFile[] = [];
+  for (const f of files) {
+    try {
+      const real = await realpath(f.path);
+      if (isRootOrInside(real)) {
+        finalFiles.push({ path: real, relativePath: f.relativePath });
+      }
+    } catch {
+      // vanished before the post-filter — dropped
+    }
+  }
+
+  return { files: finalFiles, truncated };
 }
 
 function resolveFoundationRootIdForPath(
@@ -6425,6 +6576,78 @@ export function createWebApp() {
     });
 
     return c.json({ matches, truncated, requestId });
+  });
+
+  // GET /api/files/tree — bounded recursive FILE enumeration scoped to an
+  // allowed root, feeding the palette's quick-open (Ctrl+P) fuzzy finder.
+  // Legacy-only surface for slice D1: not brokered, so under OS isolation it
+  // denies exactly like /api/files/search (brokerizing the walk is a
+  // documented fast-follow, not this slice). Gate order mirrors search:
+  // denyIfOsIsolationPending FIRST (isolation must be checked before the
+  // filesystem is even realpath-resolved, else the deny would depend on host
+  // permissions rather than being unconditional) → resolveAllowedPath
+  // (realpath + allowlist) → requireFileAccess (capability gate). Every deny
+  // is audited; the allow row logs COUNTS ONLY (no paths, no query — nothing
+  // sensitive to leak into the audit log for a listing endpoint).
+  app.get("/api/files/tree", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const requestedCwd = c.req.query("cwd") || "";
+
+    const TREE_MAX_CWD_LEN = 4096;
+    if (requestedCwd.length > TREE_MAX_CWD_LEN) {
+      return c.json({ error: "cwd too long" }, 400);
+    }
+
+    const treeIsolationDeny = await denyIfOsIsolationPending(c, "files_tree");
+    if (treeIsolationDeny) {
+      return c.json(treeIsolationDeny.body, {
+        status: treeIsolationDeny.status as any,
+      });
+    }
+
+    const resolvedRoot = await resolveAllowedPath(requestedCwd);
+    if (!resolvedRoot) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.tree",
+        resourceType: "root",
+        decision: "deny",
+        reason: "forbidden_root",
+        data: { cwd: requestedCwd },
+      });
+      return c.json({ error: "Forbidden search root" }, 403);
+    }
+
+    const fileAccess = await requireFileAccess(c, resolvedRoot);
+    if (!fileAccess.ok) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.tree",
+        resourceType: "root",
+        decision: "deny",
+        reason: "file_access_denied",
+        data: {},
+      });
+      return c.json(fileAccess.body, { status: fileAccess.status as any });
+    }
+
+    const { files, truncated } = await walkScopedFileTree(resolvedRoot);
+
+    const state = await getFoundationState();
+    const rootId = resolveFoundationRootIdForPath(state, resolvedRoot);
+    writeAuditEvent(state.db, {
+      actorUserId: ownerId,
+      action: "files.tree",
+      resourceType: "root",
+      resourceId: rootId || resolvedRoot,
+      decision: "allow",
+      // DECISION (mirrors files.search): counts only, never the paths.
+      data: { fileCount: files.length, truncated },
+    });
+
+    return c.json({ files, truncated });
   });
 
   // File download
