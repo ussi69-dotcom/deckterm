@@ -5285,6 +5285,12 @@ export function createWebApp() {
     }
   });
 
+  // Gap between the pointer text and its submitting "\r": long enough that
+  // TUI paste-detection heuristics see two separate inputs (a paste, then an
+  // Enter keypress), short enough to be imperceptible. 300ms verified live
+  // against the Claude Code TUI paste window.
+  const POINTER_SUBMIT_DELAY_MS = 300;
+
   app.post("/api/tasks/:id/messages", async (c) => {
     const { ownerId } = getCurrentUser(c);
     const deny = await denyIfOsIsolationUnsupported(c, "tasks");
@@ -5382,6 +5388,20 @@ export function createWebApp() {
           try {
             target.terminal.write(buildPointerLine("user", inboxPath));
             delivered = true;
+            // Submit with a SEPARATE deferred CR: agent TUIs (Claude Code)
+            // treat a text+newline single chunk as a paste (the newline
+            // inserts instead of submitting), so an inline terminator left
+            // the pointer as an unsubmitted composer draft. A lone "\r"
+            // after a beat reads as a real Enter on TUIs and shells alike.
+            // Best-effort: the PTY may close in the gap — the pointer is
+            // already recorded and inert wherever it lands.
+            setTimeout(() => {
+              try {
+                target.terminal.write("\r");
+              } catch {
+                // PTY closed before the submit keystroke — ignore.
+              }
+            }, POINTER_SUBMIT_DELAY_MS);
           } catch (err) {
             // PTY closed between the lookup and the write: a failed delivery,
             // not a route error (the message itself is already recorded).

@@ -242,7 +242,11 @@ export function buildPointerLine(
   // pathological state-dir path must not break out of the quoting (same
   // escape as task-runner's shellQuote).
   const quoted = `'${String(inboxPath).replace(/'/g, "'\\''")}'`;
-  return ` # deckterm task message from ${from} — read: cat ${quoted}\n`;
+  // NO trailing terminator: agent TUIs (Claude Code) treat a text+newline
+  // single PTY chunk as a paste — the CR/LF inserts a newline instead of
+  // submitting, so the pointer sat in the composer as a draft the agent
+  // never saw. The delivery layer submits with a separate deferred "\r".
+  return ` # deckterm task message from ${from} — read: cat ${quoted}`;
 }
 
 export interface VerdictFile {

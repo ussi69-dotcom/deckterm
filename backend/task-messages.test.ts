@@ -266,17 +266,23 @@ describe("readVerdictFile", () => {
 });
 
 describe("buildPointerLine", () => {
+  // NO trailing terminator: agent TUIs (Claude Code) treat a text+newline
+  // single PTY chunk as a paste — the CR/LF inserts a newline instead of
+  // submitting, and the pointer sat in the composer as a draft the agent
+  // never saw (found live in a real claude TUI, 2026-07-05). The delivery
+  // layer submits with a SEPARATE deferred "\r" write, which both TUIs and
+  // shells read as a real Enter keypress.
   test("matches the exact expected string for a sample path", () => {
     const line = buildPointerLine("judge", "/home/deploy/.deckterm/inbox.md");
     expect(line).toBe(
-      " # deckterm task message from judge — read: cat '/home/deploy/.deckterm/inbox.md'\n",
+      " # deckterm task message from judge — read: cat '/home/deploy/.deckterm/inbox.md'",
     );
   });
 
   test("contains no unquoted shell metacharacters outside the single-quoted path", () => {
     const line = buildPointerLine("user", "/tmp/some/path.md");
     expect(line).toMatch(
-      /^ # deckterm task message from (user|judge|system) — read: cat '[^']*'\n$/,
+      /^ # deckterm task message from (user|judge|system) — read: cat '[^']*'$/,
     );
   });
 
@@ -287,7 +293,7 @@ describe("buildPointerLine", () => {
   test("escapes a single quote embedded in the path", () => {
     const line = buildPointerLine("user", "/tmp/it's/x.md");
     expect(line).toBe(
-      " # deckterm task message from user — read: cat '/tmp/it'\\''s/x.md'\n",
+      " # deckterm task message from user — read: cat '/tmp/it'\\''s/x.md'",
     );
   });
 });
