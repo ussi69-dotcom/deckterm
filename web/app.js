@@ -147,6 +147,21 @@ const DEBUG = location.search.includes("debug=1");
 const dbg = (...args) => {
   if (DEBUG) console.log("[deckterm]", ...args);
 };
+
+// WebGL2 capability probe for the `terminal.renderer` "auto" setting — cached
+// after the first call so it only runs once per page load, not once per
+// terminal. A throwaway canvas never gets attached to the DOM.
+let _cachedWebgl2ProbeResult = null;
+function probeWebgl2Support() {
+  if (_cachedWebgl2ProbeResult !== null) return _cachedWebgl2ProbeResult;
+  try {
+    const canvas = document.createElement("canvas");
+    _cachedWebgl2ProbeResult = Boolean(canvas.getContext("webgl2"));
+  } catch {
+    _cachedWebgl2ProbeResult = false;
+  }
+  return _cachedWebgl2ProbeResult;
+}
 const TerminalColors =
   window.TerminalColors ||
   (() => {
@@ -6399,6 +6414,7 @@ class TerminalManager {
         "tasks.view": (value) => this.applyTaskView(value),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
+        "terminal.renderer": (value) => this.applyRendererSetting(value),
       },
     });
     // Settings load + migration are async; apply once they resolve so the store
@@ -6459,6 +6475,28 @@ class TerminalManager {
     this.editorAutosaveMs = ms;
     for (const handle of this.editorTabHandles?.values() || []) {
       handle?.setAutosaveIntervalMs?.(ms);
+    }
+  }
+
+  // Side effect for terminal.renderer ("auto"|"default"). Switching TO
+  // "default" tears down every currently loaded WebGL addon immediately
+  // (cheap: dispose + fall back to xterm's default renderer). Switching to
+  // "auto" is intentionally a no-op for terminals that already exist —
+  // retrofitting a live terminal onto WebGL is non-trivial (re-fit/re-render
+  // plumbing) and out of scope here; it only takes effect for new terminals
+  // created after the switch (see setupTerminalRenderer).
+  applyRendererSetting(value) {
+    if (value !== "default") return;
+    for (const [, t] of this.terminals) {
+      if (!t.webglAddon) continue;
+      const addon = t.webglAddon;
+      try {
+        addon.dispose();
+      } catch (err) {
+        if (DEBUG) dbg("webglAddon.dispose (setting switch) error", { err });
+      }
+      t.webglAddon = null;
+      if (t.terminal?._webglAddon === addon) t.terminal._webglAddon = null;
     }
   }
 
@@ -11246,6 +11284,7 @@ class TerminalManager {
 
     const terminal = this.createXtermInstance();
     terminal.open(element);
+    const webglAddon = this.setupTerminalRenderer(id, terminal);
     const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
     const fitAddon = terminal._fitAddon;
@@ -11318,6 +11357,7 @@ class TerminalManager {
     this.terminals.set(id, {
       terminal,
       fitAddon,
+      webglAddon,
       ws,
       element,
       overlay,
@@ -11815,6 +11855,22 @@ class TerminalManager {
     terminal._fitAddon = fitAddon;
     terminal._searchAddon = searchAddon;
 
+    // Unicode11: correct wide-char (CJK/emoji) column metrics. Always on,
+    // independent of the terminal.renderer setting. Guarded so a missing
+    // vendor script degrades gracefully instead of crashing terminal creation.
+    if (typeof window.Unicode11Addon !== "undefined") {
+      try {
+        terminal.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+        terminal.unicode.activeVersion = "11";
+      } catch (err) {
+        console.warn("[terminal] Failed to load Unicode11 addon", err);
+      }
+    } else {
+      console.warn(
+        "[terminal] Unicode11Addon vendor script not loaded; using default unicode version",
+      );
+    }
+
     // OSC52 clipboard support (xterm.js 6.0+)
     if (terminal.parser?.registerOscHandler) {
       terminal.parser.registerOscHandler(52, (data) => {
@@ -11867,6 +11923,67 @@ class TerminalManager {
     });
 
     return terminal;
+  }
+
+  // GPU renderer wiring for the `terminal.renderer` setting (auto|default).
+  // Called once per terminal, right after terminal.open(). Returns the loaded
+  // WebglAddon instance (to be tracked as termData.webglAddon) or null when
+  // the addon was not loaded — leaving xterm 5.3.0's default renderer active,
+  // exactly as before this setting existed.
+  //
+  // "default": never loads the addon (byte-identical to pre-existing
+  // behavior — the addon script is never even evaluated into behavior).
+  // "auto" (also the fallback for unset/unknown values): loads the addon only
+  // when a cached, once-per-page WebGL2 probe succeeded. Any failure while
+  // constructing/loading the addon disposes it and falls back to default.
+  setupTerminalRenderer(id, terminal) {
+    const setting =
+      this.settingsStore?.get("terminal.renderer", "auto") ?? "auto";
+    const probeResult = probeWebgl2Support();
+    const plan =
+      window.TerminalRenderer?.decideRendererPlan?.(setting, probeResult) || {};
+    if (!plan.loadWebgl) return null;
+
+    if (typeof window.WebglAddon === "undefined") {
+      console.warn(
+        "[terminal-renderer] WebglAddon vendor script not loaded; using default renderer",
+      );
+      return null;
+    }
+
+    let webglAddon = null;
+    try {
+      webglAddon = new window.WebglAddon.WebglAddon();
+      terminal.loadAddon(webglAddon);
+      webglAddon.onContextLoss(() => {
+        try {
+          webglAddon.dispose();
+        } catch (err) {
+          if (DEBUG)
+            dbg("[renderer] webgl dispose-on-context-loss error", { id, err });
+        }
+        const t = this.terminals.get(id);
+        if (t) t.webglAddon = null;
+        if (terminal._webglAddon === webglAddon) terminal._webglAddon = null;
+        console.warn(
+          `[terminal-renderer] WebGL context lost for terminal ${id}; fell back to default renderer`,
+        );
+      });
+    } catch (err) {
+      console.warn(
+        "[terminal-renderer] Failed to load WebGL addon, using default renderer",
+        err,
+      );
+      try {
+        webglAddon?.dispose?.();
+      } catch {
+        // Already in a bad state — nothing more to clean up.
+      }
+      return null;
+    }
+
+    terminal._webglAddon = webglAddon;
+    return webglAddon;
   }
 
   createOverlay(parentElement) {
@@ -12483,6 +12600,7 @@ class TerminalManager {
 
       const terminal = this.createXtermInstance();
       terminal.open(element);
+      const webglAddon = this.setupTerminalRenderer(id, terminal);
       const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
       const fitAddon = terminal._fitAddon;
@@ -12551,6 +12669,7 @@ class TerminalManager {
       this.terminals.set(id, {
         terminal,
         fitAddon,
+        webglAddon,
         ws,
         element,
         overlay,
@@ -12931,6 +13050,16 @@ class TerminalManager {
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
+    // The webgl addon must be disposed BEFORE terminal.dispose() — disposing
+    // it after the terminal is gone throws in some xterm versions.
+    if (t.webglAddon) {
+      try {
+        t.webglAddon.dispose();
+      } catch (err) {
+        if (DEBUG) dbg("webglAddon.dispose error", { id, err });
+      }
+      t.webglAddon = null;
+    }
     try {
       t.terminal?.dispose?.();
     } catch (err) {

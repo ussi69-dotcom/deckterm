@@ -70,6 +70,21 @@ const SETTINGS_SCHEMA = [
     searchText: "extra keys bar mobile toolbar esc tab arrows ctrl",
   },
   {
+    key: "terminal.renderer",
+    category: "Terminal",
+    label: "Renderer",
+    description:
+      "GPU-accelerated WebGL rendering when supported, or the built-in renderer.",
+    type: "select",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Auto (GPU when available)" },
+      { value: "default", label: "Default" },
+    ],
+    searchText:
+      "renderer webgl gpu acceleration canvas fallback performance rendering",
+  },
+  {
     key: "terminal.scrollbackLimit",
     category: "Terminal",
     label: "Scrollback limit",

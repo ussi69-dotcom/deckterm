@@ -77,6 +77,17 @@ describe("SETTINGS_SCHEMA shape", () => {
     );
     expect(values).toEqual(["off", "1000", "5000"]);
   });
+
+  test("terminal.renderer defaults to auto with an auto/default select", () => {
+    const def = byKey("terminal.renderer");
+    expect(def).toBeDefined();
+    expect(def.type).toBe("select");
+    expect(def.default).toBe("auto");
+    const values = def.options.map((o) =>
+      typeof o === "object" ? o.value : o,
+    );
+    expect(values).toEqual(["auto", "default"]);
+  });
 });
 
 describe("categoriesOf", () => {
