@@ -5236,6 +5236,11 @@ export function createWebApp() {
   // shell-inert pointer line naming the inbox file.
   app.get("/api/tasks/:id/messages", async (c) => {
     const { ownerId } = getCurrentUser(c);
+    // Design invariant 1: task-MESSAGE routes carry the isolation deny on
+    // both verbs (unlike the older read-only task routes) — this is a new
+    // surface and inherits B4's task denial wholesale.
+    const deny = await denyIfOsIsolationUnsupported(c, "tasks");
+    if (deny) return c.json(deny.body, deny.status);
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
       return c.json({
@@ -5277,26 +5282,54 @@ export function createWebApp() {
           inboxPath,
           renderInboxFile({ id: msgId, from: "user", body: sanitized, at }),
         );
-        appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), {
-          type: "message-created",
-          id: msgId,
-          at,
-          from: "user",
-          to,
-          body: sanitized,
-        });
+        // The created event must be durable BEFORE anything touches a PTY —
+        // a delivered pointer naming a message the log never recorded would
+        // be an unauditable injection (Codex integrated pass, HIGH).
+        const createdRecorded = appendTaskMessageEvent(
+          taskMessagesPath(fresh.taskDir),
+          {
+            type: "message-created",
+            id: msgId,
+            at,
+            from: "user",
+            to,
+            body: sanitized,
+          },
+        );
+        if (!createdRecorded) {
+          return {
+            msgId,
+            to,
+            delivered: false,
+            reason: "event_log_failed",
+            recorded: false,
+            targetTerminalId: null as string | null,
+            bodyBytes: Buffer.byteLength(sanitized, "utf8"),
+            taskDir: fresh.taskDir,
+          };
+        }
 
         // Target provenance: terminal ids come from the task record ONLY.
         const targetTerminalId =
           to === "worker" ? fresh.terminalId : fresh.judgeTerminalId;
         const expectedAgent =
           to === "worker" ? fresh.workerProvider : fresh.judgeProvider;
+        const roleActive =
+          to === "worker"
+            ? fresh.status === "worker-running"
+            : fresh.status === "judge-running";
         const target = targetTerminalId
           ? terminals.get(targetTerminalId)
           : undefined;
         let delivered = false;
         let reason: string | null = null;
-        if (!targetTerminalId) {
+        if (!roleActive) {
+          // A recorded terminal id can outlive its phase (an old judge
+          // terminal still hosting an agent while the worker runs) — the
+          // task's status decides which role is live, not the terminal
+          // (Codex integrated pass, HIGH).
+          reason = "role_not_active";
+        } else if (!targetTerminalId) {
           reason = "no_target_terminal";
         } else if (!target) {
           reason = "terminal_not_live";
@@ -5312,8 +5345,15 @@ export function createWebApp() {
           // there, but delivery must still be reported as failed).
           reason = "agent_not_running";
         } else {
-          target.terminal.write(buildPointerLine("user", inboxPath));
-          delivered = true;
+          try {
+            target.terminal.write(buildPointerLine("user", inboxPath));
+            delivered = true;
+          } catch (err) {
+            // PTY closed between the lookup and the write: a failed delivery,
+            // not a route error (the message itself is already recorded).
+            debug("Task message PTY write failed:", err);
+            reason = "terminal_write_failed";
+          }
         }
         const outcome: TaskMessageEvent = delivered
           ? {
@@ -5328,12 +5368,17 @@ export function createWebApp() {
               at: new Date().toISOString(),
               reason: reason || "undeliverable",
             };
-        appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), outcome);
+        if (!appendTaskMessageEvent(taskMessagesPath(fresh.taskDir), outcome)) {
+          // The message stays "pending" in the fold; the audit row below
+          // still records the true outcome.
+          debug("Task message outcome append failed for", msgId);
+        }
         return {
           msgId,
           to,
           delivered,
           reason,
+          recorded: true,
           targetTerminalId,
           bodyBytes: Buffer.byteLength(sanitized, "utf8"),
           taskDir: fresh.taskDir,
@@ -5358,6 +5403,12 @@ export function createWebApp() {
           bodyBytes: result.bodyBytes,
         },
       });
+
+      if (result.recorded === false) {
+        // The event log rejected the append (symlinked/replaced file): the
+        // message was NOT recorded and nothing was delivered.
+        return c.json({ error: "Failed to record task message" }, 500);
+      }
 
       const message =
         readTaskMessages(taskMessagesPath(result.taskDir)).find(

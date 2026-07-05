@@ -638,15 +638,26 @@ export function createTaskRunner(options: TaskRunnerOptions) {
       );
       // Deterministic id: if saveTask fails after this append and the
       // trigger retries, the re-appended event folds into the same message
-      // instead of duplicating it (Codex S6 review, MED).
-      appendTaskMessageEvent(taskMessagesPath(task.taskDir), {
-        type: "message-created",
-        id: `judge-feedback-r${judgedRound}`,
-        at: new Date().toISOString(),
-        from: "judge",
-        to: "worker",
-        body: feedback,
-      });
+      // instead of duplicating it (Codex S6 review, MED). An append failure
+      // is logged but not fatal — WORKER_PROMPT.md (written above, throws on
+      // failure) is the functional feedback channel; this event only feeds
+      // the message timeline.
+      const feedbackRecorded = appendTaskMessageEvent(
+        taskMessagesPath(task.taskDir),
+        {
+          type: "message-created",
+          id: `judge-feedback-r${judgedRound}`,
+          at: new Date().toISOString(),
+          from: "judge",
+          to: "worker",
+          body: feedback,
+        },
+      );
+      if (!feedbackRecorded) {
+        console.error(
+          `Task ${task.id}: failed to record judge feedback message for round ${judgedRound}`,
+        );
+      }
       task.status = "ready";
       continueRound = true;
     } else {

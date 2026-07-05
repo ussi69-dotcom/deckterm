@@ -180,7 +180,9 @@ test("task API creates a supervised task and runs checks for the anonymous owner
   expect(msgRes.status).toBe(200);
   const posted = await msgRes.json();
   expect(posted.delivery).toBe("failed");
-  expect(posted.reason).toBe("no_target_terminal");
+  // The task is not in worker-running here, so the role gate fires before
+  // any terminal lookup.
+  expect(posted.reason).toBe("role_not_active");
   expect(posted.message.from).toBe("user");
   expect(posted.message.body).toBe("please focus on the tests");
   expect(posted.message.delivery).toBe("failed");

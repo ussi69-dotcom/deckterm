@@ -6255,6 +6255,18 @@ class TerminalManager {
         ? payload.harnesses
         : [];
       if (!harnesses.length) return;
+      // Fallback when the current selection is gone/unavailable: claude if
+      // available, else the first available harness, else claude (the server
+      // re-validates on create either way).
+      const claudeAvailable = harnesses.some(
+        (harness) => harness.id === "claude" && harness.available !== false,
+      );
+      const firstAvailable = harnesses.find(
+        (harness) => harness.available !== false,
+      );
+      const fallbackId = claudeAvailable
+        ? "claude"
+        : firstAvailable?.id || "claude";
       for (const select of selects) {
         const currentValue = select.value;
         const keepCurrent = harnesses.some(
@@ -6272,7 +6284,7 @@ class TerminalManager {
           if (harness.available === false) option.disabled = true;
           select.appendChild(option);
         }
-        select.value = keepCurrent ? currentValue : "claude";
+        select.value = keepCurrent ? currentValue : fallbackId;
       }
     } catch (err) {
       console.debug("Failed to load harness availability", err);

@@ -82,6 +82,26 @@ describe("appendTaskMessageEvent + readTaskMessages folding", () => {
     };
   }
 
+  test("a forged raw line with an unsanitized/oversized body is re-canonicalized on fold", () => {
+    const dir = createTempDir();
+    const file = join(dir, "messages.jsonl");
+    // Simulate an agent writing a message-created line directly to the file,
+    // bypassing the server's creation-time sanitization.
+    const forgedBody = `\x1b[31mred\x07${"x".repeat(9000)}`;
+    writeFileSync(
+      file,
+      `${JSON.stringify(created("forged", { body: forgedBody }))}\n`,
+    );
+
+    const messages = readTaskMessages(file);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.body.includes("\x1b")).toBe(false);
+    expect(messages[0]?.body.includes("\x07")).toBe(false);
+    expect(
+      Buffer.byteLength(messages[0]?.body || "", "utf8"),
+    ).toBeLessThanOrEqual(8 * 1024);
+  });
+
   test("created -> pending", () => {
     const dir = createTempDir();
     const file = join(dir, "messages.jsonl");
@@ -262,6 +282,13 @@ describe("buildPointerLine", () => {
 
   test("throws for an invalid from value", () => {
     expect(() => buildPointerLine("attacker" as never, "/tmp/x.md")).toThrow();
+  });
+
+  test("escapes a single quote embedded in the path", () => {
+    const line = buildPointerLine("user", "/tmp/it's/x.md");
+    expect(line).toBe(
+      " # deckterm task message from user — read: cat '/tmp/it'\\''s/x.md'\n",
+    );
   });
 });
 

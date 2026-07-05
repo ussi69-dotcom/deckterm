@@ -176,7 +176,10 @@ export function readTaskMessages(
         id: event.id,
         from: event.from,
         to: event.to,
-        body: event.body,
+        // The file lives in an agent-writable dir: a forged line could carry
+        // an unsanitized/oversized body, so the canonical-form guarantee is
+        // re-enforced on fold (idempotent for server-written events).
+        body: sanitizeMessageBody(event.body),
         createdAt: event.at,
         delivery: "pending",
       };
@@ -235,7 +238,11 @@ export function buildPointerLine(
   if (!isTaskMessageFrom(from)) {
     throw new Error(`buildPointerLine: invalid from value: ${String(from)}`);
   }
-  return ` # deckterm task message from ${from} — read: cat '${inboxPath}'\n`;
+  // The path is server-built, but defense-in-depth: a single quote in a
+  // pathological state-dir path must not break out of the quoting (same
+  // escape as task-runner's shellQuote).
+  const quoted = `'${String(inboxPath).replace(/'/g, "'\\''")}'`;
+  return ` # deckterm task message from ${from} — read: cat ${quoted}\n`;
 }
 
 export interface VerdictFile {
