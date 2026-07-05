@@ -6452,6 +6452,44 @@ body.ide-mode #workspace-area {
   background: var(--accent-blue-hover, #1177bb);
 }
 
+/* --- Task Board editor tab (full-width board variant of the Tasks view) ---
+   The board-variant root reuses the sidebar markup; here the kanban columns
+   become side-by-side lanes with their own scroll instead of stacking. */
+.ide-tasks-board-view .ide-tasks-actions {
+  padding: 8px 12px;
+}
+
+.ide-tasks-board-view .ide-tasks-list.board {
+  flex-direction: row;
+  align-items: stretch;
+  gap: 12px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.ide-tasks-board-view .ide-tasks-column {
+  flex: 0 0 260px;
+  min-width: 220px;
+  max-width: 320px;
+  min-height: 0;
+  overflow-y: auto;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--border-primary);
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(255, 255, 255, 0.03));
+}
+
+.ide-tasks-board-view .ide-tasks-column-label {
+  font-size: 12px;
+  padding: 2px 4px 6px;
+}
+
+.ide-tasks-board-view .ide-tasks-detail {
+  max-height: 35%;
+}
+
 /* --- Search sidebar view (IDE shell, slice 7) --- */
 .ide-search-view {
   display: flex;

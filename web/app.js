@@ -9919,6 +9919,10 @@ class TerminalManager {
       // Settings body: build the settings content element and render it into
       // the tab body host. No teardown — settings state lives in settingsStore.
       mountSettingsBody: (hostEl) => this.mountEditorSettingsTab(hostEl),
+      // Task Board body: a full-width board-variant Tasks view (backlog
+      // 2026-07-05 — the kanban board gets the editor area, the sidebar stays
+      // the quick-selection list).
+      mountTasksBody: (hostEl) => this.mountEditorTasksTab(hostEl),
       onActiveBodyMeasure: () => this.refreshActiveEditorTab(),
       // Destroy the live CodeMirror view/handle when a tab body is torn down.
       onBodyTeardown: (key) => {
@@ -10127,6 +10131,35 @@ class TerminalManager {
     const content = this.settingsManager.buildContent();
     hostEl.appendChild(content);
     await this.settingsManager.render();
+  }
+
+  // Mount the full-width Task Board into the editor-area tab body: a second
+  // TasksViewController instance in the "board" variant. It shares the live
+  // taskState + operations on this manager (its own poll subscription is torn
+  // down via the editorTabHandles destroy hook when the tab closes).
+  mountEditorTasksTab(hostEl) {
+    if (!window.TasksView?.TasksViewController) return;
+    const view = new window.TasksView.TasksViewController({
+      document,
+      getTaskManager: () => this,
+      variant: "board",
+    });
+    view.mount(hostEl);
+    this.editorTabHandles?.set("tasks:board", {
+      destroy: () => view.dispose(),
+      refresh: () => {},
+    });
+  }
+
+  // Can the Task Board editor tab open right now? (IDE mode with live tabs.)
+  canOpenTaskBoardTab() {
+    return Boolean(this.isIdeModeActive() && this.editorTabs);
+  }
+
+  // Open (or focus) the singleton Task Board editor tab.
+  openTaskBoardTab() {
+    if (!this.canOpenTaskBoardTab()) return;
+    this.editorTabs.openTasksBoard();
   }
 
   async mountEditorDiffTab(hostEl, tab) {
