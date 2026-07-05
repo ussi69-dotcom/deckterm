@@ -4,6 +4,7 @@ import {
   blendWorkspaceColors,
   getWorkspaceSignalDescriptors,
   getPrimaryWorkspaceSignal,
+  formatRecentToolsTooltip,
 } from "./terminal-colors";
 
 test("hashCwdToColor is stable", () => {
@@ -99,4 +100,60 @@ test("getPrimaryWorkspaceSignal keeps cwd color behavior deterministic", () => {
   expect(first).toEqual(second);
   expect(first.color).toBe(hashCwdToColor("/srv/worktrees/api"));
   expect(first.primarySignal).toBeNull();
+});
+
+test("formatRecentToolsTooltip formats last-N lines in order, most recent last", () => {
+  const recentTools = [
+    { name: "Read", summary: "app.js", at: 1 },
+    { name: "Edit", summary: "app.js", at: 2 },
+    { name: "Bash", summary: "ls -la", at: 3 },
+    { name: "Grep", summary: "foo", at: 4 },
+    { name: "Write", summary: "bar.txt", at: 5 },
+    { name: "Bash", summary: "npm test", at: 6 },
+  ];
+  expect(formatRecentToolsTooltip(recentTools)).toBe(
+    [
+      "Edit · app.js",
+      "Bash · ls -la",
+      "Grep · foo",
+      "Write · bar.txt",
+      "Bash · npm test",
+    ].join("\n"),
+  );
+});
+
+test("formatRecentToolsTooltip renders name-only when summary is empty", () => {
+  expect(formatRecentToolsTooltip([{ name: "Bash", summary: "", at: 1 }])).toBe(
+    "Bash",
+  );
+});
+
+test("formatRecentToolsTooltip skips entries without a string name", () => {
+  const recentTools = [
+    { name: "Bash", summary: "ls", at: 1 },
+    { summary: "no name", at: 2 },
+    { name: 42, summary: "not a string name", at: 3 },
+    { name: "Grep", summary: "ok", at: 4 },
+  ];
+  expect(formatRecentToolsTooltip(recentTools)).toBe(
+    ["Bash · ls", "Grep · ok"].join("\n"),
+  );
+});
+
+test("formatRecentToolsTooltip returns empty string for empty/non-array input", () => {
+  expect(formatRecentToolsTooltip([])).toBe("");
+  expect(formatRecentToolsTooltip(null)).toBe("");
+  expect(formatRecentToolsTooltip(undefined)).toBe("");
+  expect(formatRecentToolsTooltip("not-an-array")).toBe("");
+});
+
+test("formatRecentToolsTooltip respects a custom limit", () => {
+  const recentTools = [
+    { name: "One", summary: "", at: 1 },
+    { name: "Two", summary: "", at: 2 },
+    { name: "Three", summary: "", at: 3 },
+  ];
+  expect(formatRecentToolsTooltip(recentTools, { limit: 2 })).toBe(
+    ["Two", "Three"].join("\n"),
+  );
 });

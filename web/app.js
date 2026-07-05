@@ -8971,6 +8971,9 @@ class TerminalManager {
           terminal.isWorktree = Boolean(next.isWorktree);
           terminal.backendMode = next.backendMode || null;
           terminal.supportsLinkedView = Boolean(next.supportsLinkedView);
+          terminal.recentTools = Array.isArray(next.recentTools)
+            ? next.recentTools
+            : [];
           const hasClientCwd =
             typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
           if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
@@ -9083,6 +9086,7 @@ class TerminalManager {
       : terminals.find((terminal) => terminal.agentState) || null;
     const agentName = agentTerminal?.agentName || null;
     const agentState = agentTerminal?.agentState || null;
+    const recentTools = agentTerminal?.recentTools || [];
     const isWorktree = terminals.some((terminal) =>
       Boolean(terminal.isWorktree),
     );
@@ -9124,6 +9128,7 @@ class TerminalManager {
       running,
       agentName,
       agentState,
+      recentTools,
       ports,
       isWorktree,
       descriptors,
@@ -9162,7 +9167,14 @@ class TerminalManager {
     } else {
       lines.push("Signals: none");
     }
-    return lines.join("\n");
+    let tooltip = lines.join("\n");
+    const toolsTooltip = window.TerminalColors?.formatRecentToolsTooltip?.(
+      snapshot.recentTools,
+    );
+    if (toolsTooltip) {
+      tooltip += `\n\nRecent tools:\n${toolsTooltip}`;
+    }
+    return tooltip;
   }
 
   applyWorkspaceSignals(tab, snapshot) {
@@ -10968,6 +10980,7 @@ class TerminalManager {
       agentState: null,
       ports: [],
       isWorktree: false,
+      recentTools: [],
       backendMode,
       supportsLinkedView,
       tabNum,
@@ -12193,6 +12206,7 @@ class TerminalManager {
         agentState: null,
         ports: [],
         isWorktree: false,
+        recentTools: [],
         backendMode: terminalInfo.backendMode || null,
         supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
         tabNum,

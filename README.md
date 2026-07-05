@@ -103,6 +103,41 @@ nginx, systemd, and firewall guidance, see
 - Codex and Claude sessions can surface `Codex` / `Codex Responding` style labels
 - Port and worktree hints are also surfaced in workspace metadata
 
+### Agent tool telemetry (opt-in)
+
+Each terminal can carry a small, display-only ring buffer (last 50) of recent
+agent tool activity, shown in the workspace tab's tooltip alongside the
+existing agent/running/port/worktree signals — for example `Bash · ls -la`.
+This is opt-in: nothing is captured unless you wire up the emitter script as
+a Claude Code hook.
+
+Add a `PreToolUse` hook in your Claude Code `settings.json` that pipes the
+hook payload into `scripts/deckterm-agent-hook.sh`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/deckterm/scripts/deckterm-agent-hook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+The script writes a terminal OSC marker (`\033]9;9;deckterm;tool;...\007`)
+to `/dev/tty` and always exits 0, so it never blocks the tool call. It only
+works when the session is attached to a controlling terminal — that means
+the **tmux terminal backend** (`TMUX_BACKEND=1`, the deployed default). The
+raw backend has no controlling tty, so the marker is silently dropped there.
+
 ## Security and Access
 
 DeckTerm supports Cloudflare Access JWT validation and trusted origins. Production should be treated as a protected internal tool, not a public terminal exposed directly to the internet.
