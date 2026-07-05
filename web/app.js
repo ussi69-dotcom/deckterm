@@ -9489,7 +9489,11 @@ class TerminalManager {
     const { workspaceId } = this.getActiveWorkspaceContext();
     if (this.fileExplorer && workspaceId) {
       if (this.fileExplorer.currentWorkspaceId !== workspaceId) {
-        this.fileExplorer.openForWorkspace(workspaceId, cwd);
+        // reveal:false — changing the working dir must navigate the explorer,
+        // not pop it open (regression: Browse/toolbar commit opened Files).
+        this.fileExplorer.openForWorkspace(workspaceId, cwd, null, {
+          reveal: false,
+        });
       }
       await this.fileExplorer.loadDir(cwd, workspaceId);
     }
