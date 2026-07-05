@@ -17,6 +17,9 @@
   --accent-orange: #d29922;
   --btn-green: #238636;
   --btn-green-hover: #2ea043;
+  /* Consistent keyboard-focus ring token (reuses --accent-blue) — see
+     :focus-visible rules across palette/SCM/tasks/settings, Track D6. */
+  --focus-ring: var(--accent-blue);
   --toolbar-height: 48px;
   --toolbar-overlay-offset: 48px;
   --mobile-action-bar-height: 76px;
@@ -1635,6 +1638,12 @@ body.touch-input-mode .xterm .composition-view.active {
   border-color: rgba(88, 166, 255, 0.5);
 }
 
+.task-form input:focus-visible,
+.task-form textarea:focus-visible,
+.task-form select:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
 .task-form-row {
   align-items: stretch;
 }
@@ -1653,6 +1662,12 @@ body.touch-input-mode .xterm .composition-view.active {
 .task-checkbox input {
   width: auto;
   height: auto;
+  accent-color: var(--accent-blue);
+}
+
+.task-checkbox input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 .task-status {
@@ -1686,6 +1701,11 @@ body.touch-input-mode .xterm .composition-view.active {
 .task-item.active {
   border-color: rgba(88, 166, 255, 0.38);
   background: rgba(88, 166, 255, 0.08);
+}
+
+.task-item:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 /* Session Manager (drawer) rows: tappable card + contextual action button. */
@@ -2759,6 +2779,12 @@ body.touch-input-mode .xterm .composition-view.active {
   box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.12);
 }
 
+#command-palette-input:focus-visible {
+  box-shadow:
+    0 0 0 3px rgba(88, 166, 255, 0.12),
+    0 0 0 2px var(--focus-ring);
+}
+
 .command-palette-results {
   display: flex;
   flex-direction: column;
@@ -2806,6 +2832,11 @@ body.touch-input-mode .xterm .composition-view.active {
 .command-palette-item.selected {
   border-color: rgba(88, 166, 255, 0.4);
   background: rgba(88, 166, 255, 0.12);
+}
+
+.command-palette-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
 }
 
 .command-palette-item-title {
@@ -4135,6 +4166,12 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   color: var(--text-primary);
 }
 
+.git-file-diff:focus-visible,
+.git-file-stage:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
 .git-diff {
   max-height: 300px;
   overflow-y: auto;
@@ -4177,6 +4214,10 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   border-color: var(--accent-blue);
 }
 
+.git-commit textarea:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
 .git-commit .btn-primary {
   width: 100%;
   padding: 10px;
@@ -4194,8 +4235,17 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   background: var(--btn-green-hover);
 }
 
+.git-commit .btn-primary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .muted {
-  color: var(--text-muted);
+  /* text-secondary, not text-muted: this class carries real empty/loading
+     messages (Files/Git "No changes", "Loading…", etc.) that need to be
+     readable — text-muted falls short of 4.5:1 on these panel backgrounds
+     (Track D6 contrast pass). */
+  color: var(--text-secondary);
   font-size: 12px;
   text-align: center;
   padding: 20px;
@@ -4920,6 +4970,11 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   cursor: default;
 }
 
+.git-sync-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
 /* Amend toggle in the commit area */
 .git-amend {
   display: inline-flex;
@@ -4933,6 +4988,12 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 
 .git-amend input {
   margin: 0;
+  accent-color: var(--accent-blue);
+}
+
+.git-amend input:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
 /* Stash list */
@@ -5046,6 +5107,10 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 .git-commit-area textarea:focus {
   outline: none;
   border-color: var(--accent-blue);
+}
+
+.git-commit-area textarea:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .git-shortcuts {
@@ -6975,7 +7040,8 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   visibility: hidden;
 }
 .git-file:hover .git-file-actions,
-.git-file.selected .git-file-actions {
+.git-file.selected .git-file-actions,
+.git-file:focus-within .git-file-actions {
   visibility: visible;
 }
 .git-file-open,
@@ -6993,6 +7059,11 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+.git-file-open:focus-visible,
+.git-file-discard:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
 
 /* Group header action (stage all / unstage all) */
 .git-file-group-header {
@@ -7009,12 +7080,17 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   font-size: 13px;
   cursor: pointer;
 }
-.git-file-group-header:hover .git-group-action {
+.git-file-group-header:hover .git-group-action,
+.git-file-group-header:focus-within .git-group-action {
   visibility: visible;
 }
 .git-group-action:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+.git-group-action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 /* Sync (ahead/behind) label in the panel header */
@@ -7085,6 +7161,11 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   border-left-color: var(--color-accent, var(--accent-blue));
 }
 
+.settings-category-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
 .settings-main {
   flex: 1;
   min-width: 0;
@@ -7112,6 +7193,10 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 .settings-search-input:focus {
   outline: none;
   border-color: var(--color-accent, var(--accent-blue));
+}
+
+.settings-search-input:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
 }
 
 .settings-list {
@@ -7182,6 +7267,10 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   border-color: var(--color-accent, var(--accent-blue));
 }
 
+.settings-control:focus-visible {
+  box-shadow: 0 0 0 2px var(--focus-ring);
+}
+
 .settings-number {
   width: 88px;
 }
@@ -7195,15 +7284,74 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   min-width: 140px;
 }
 
+/* Custom-drawn toggle switch (track + thumb) for schema `toggle` controls —
+   replaces the bare OS checkbox with a shape consistent with the rest of the
+   settings UI, using only existing theme tokens (Track D6, QA P2). Base
+   .settings-control gives font/color/background/border/padding that don't
+   apply to a checkbox's own box, so appearance:none + an explicit box model
+   fully replaces them here. */
 .settings-toggle {
-  width: 18px;
-  height: 18px;
-  accent-color: var(--color-accent, var(--accent-blue));
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 36px;
+  height: 20px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  background: var(--bg-tertiary);
   cursor: pointer;
+  flex: 0 0 auto;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.settings-toggle::before {
+  content: "";
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text-secondary);
+  transition:
+    transform 0.15s ease,
+    background 0.15s ease;
+}
+
+.settings-toggle:hover {
+  border-color: var(--border-hover);
+}
+
+.settings-toggle:checked {
+  background: var(--color-accent, var(--accent-blue));
+  border-color: var(--color-accent, var(--accent-blue));
+}
+
+.settings-toggle:checked::before {
+  transform: translateX(16px);
+  background: var(--bg-primary);
+}
+
+.settings-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.settings-toggle:focus-visible {
+  outline: none;
+  box-shadow:
+    0 0 0 2px var(--bg-primary),
+    0 0 0 4px var(--focus-ring);
 }
 
 .settings-empty {
-  color: var(--text-muted);
+  /* text-secondary, not text-muted — same contrast rationale as .muted
+     above (Track D6). */
+  color: var(--text-secondary);
   font-size: 13px;
   padding: 12px 0;
 }
