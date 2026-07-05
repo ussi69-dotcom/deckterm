@@ -24,8 +24,15 @@ fi
 
 # Keep only characters the DeckTerm parser accepts in a tool name.
 tool_name="$(printf '%s' "$tool_name" | tr -cd 'A-Za-z0-9_.-' | cut -c1-64)"
-[ -n "$tool_name" ] || tool_name="Tool"
+# The parser requires a leading letter.
+case "$tool_name" in
+  [A-Za-z]*) ;;
+  *) tool_name="Tool" ;;
+esac
 
+# Truncate BEFORE encoding so the full tool;<name>;<b64> payload stays
+# under the backend's 2KB pre-decode cap (1400 chars -> ~1868 b64).
+summary="$(printf '%s' "$summary" | cut -c1-1400)"
 b64="$(printf '%s' "$summary" | base64 | tr -d '\n')"
 
 if [ -w /dev/tty ]; then

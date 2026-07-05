@@ -165,11 +165,14 @@ test("parseShellIntegrationChunk passes through tool markers with the wrong part
 });
 
 test("parseShellIntegrationChunk passes through tool markers with invalid base64", () => {
-  const marker = RAW_TOOL_MARKER("tool;Bash;not_base64!!!");
-  const result = parseShellIntegrationChunk(marker);
-
-  expect(result.events).toEqual([]);
-  expect(result.output).toBe(marker);
+  // Bad charset AND bad group lengths ("A", "AAA" — Buffer would forgive
+  // these, but parity demands they pass through as malformed).
+  for (const bad of ["not_base64!!!", "A", "AAA", "AAAAA", "AA=A"]) {
+    const marker = RAW_TOOL_MARKER(`tool;Bash;${bad}`);
+    const result = parseShellIntegrationChunk(marker);
+    expect(result.events).toEqual([]);
+    expect(result.output).toBe(marker);
+  }
 });
 
 test("parseShellIntegrationChunk emits a tool-used event once a fragmented marker completes", () => {

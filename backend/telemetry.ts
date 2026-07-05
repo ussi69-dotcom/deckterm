@@ -9,7 +9,11 @@ const SHELL_MARKER_PREFIX = "\x1b]9;9;deckterm;";
 const SHELL_MARKER_SUFFIX = "\x07";
 const TOOL_MARKER_MAX_PAYLOAD_LENGTH = 2048;
 const TOOL_MARKER_NAME_RE = /^[A-Za-z][\w.-]{0,63}$/;
-const BASE64_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+// Strict grouped base64 (length multiple of 4, valid padding):
+// Buffer.from(..., "base64") is forgiving, and a lax check would swallow
+// malformed markers as events instead of passing them through byte-identically.
+const BASE64_RE =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const SUMMARY_LINE_MAX_LENGTH = 80;
 
 const PORT_PATTERNS = [
