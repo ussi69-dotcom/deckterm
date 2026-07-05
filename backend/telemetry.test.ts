@@ -6,6 +6,7 @@ import {
   inferPolledTmuxAgentState,
   parseShellIntegrationChunk,
   resolveAgentOutputState,
+  toSummaryLine,
   type ShellIntegrationParseState,
 } from "./telemetry";
 
@@ -15,6 +16,9 @@ const AGENT_START = (name: string) =>
   `\x1b]9;9;deckterm;agent;${name};start\x07`;
 const AGENT_DONE = (name: string, code: number) =>
   `\x1b]9;9;deckterm;agent;${name};done;${code}\x07`;
+const TOOL_MARKER = (name: string, summary: string) =>
+  `\x1b]9;9;deckterm;tool;${name};${Buffer.from(summary, "utf8").toString("base64")}\x07`;
+const RAW_TOOL_MARKER = (payload: string) => `\x1b]9;9;deckterm;${payload}\x07`;
 
 test("parseShellIntegrationChunk emits running start and strips marker text", () => {
   const result = parseShellIntegrationChunk(`${START}hello`);
@@ -93,6 +97,125 @@ test("parseShellIntegrationChunk tracks active agent markers", () => {
     agentName: null,
     agentState: null,
   });
+});
+
+test("parseShellIntegrationChunk emits a tool-used event for a well-formed tool marker", () => {
+  const result = parseShellIntegrationChunk(
+    `${TOOL_MARKER("Bash", "ls -la /tmp")}hello`,
+  );
+
+  expect(result.output).toBe("hello");
+  expect(result.events).toEqual([
+    { type: "tool-used", name: "Bash", summary: "ls -la /tmp" },
+  ]);
+  expect(result.state).toEqual({
+    carry: "",
+    running: false,
+    lastExitCode: null,
+    agentName: null,
+    agentState: null,
+  });
+});
+
+test("parseShellIntegrationChunk normalizes multiline/control-char tool summaries to a single line", () => {
+  const summary = "line1\nline2\x1b[31m  lots   of \t space";
+  const result = parseShellIntegrationChunk(TOOL_MARKER("Read", summary));
+
+  expect(result.events).toEqual([
+    { type: "tool-used", name: "Read", summary: "line1 line2 lots of space" },
+  ]);
+});
+
+test("parseShellIntegrationChunk caps long tool summaries at 80 chars with an ellipsis", () => {
+  const longSummary = "x".repeat(120);
+  const result = parseShellIntegrationChunk(TOOL_MARKER("Grep", longSummary));
+
+  expect(result.events).toHaveLength(1);
+  const event = result.events[0];
+  if (event.type !== "tool-used") throw new Error("expected tool-used event");
+  expect(event.summary).toHaveLength(80);
+  expect(event.summary.endsWith("…")).toBe(true);
+  expect(event.summary.slice(0, 79)).toBe("x".repeat(79));
+});
+
+test("parseShellIntegrationChunk passes through tool markers with an invalid name", () => {
+  for (const badName of ["9bad", "has space", "a".repeat(65)]) {
+    const marker = TOOL_MARKER(badName, "irrelevant");
+    const result = parseShellIntegrationChunk(marker);
+    expect(result.events).toEqual([]);
+    expect(result.output).toBe(marker);
+  }
+});
+
+test("parseShellIntegrationChunk passes through an oversize tool marker payload", () => {
+  const marker = RAW_TOOL_MARKER(`tool;Bash;${"A".repeat(3000)}`);
+  const result = parseShellIntegrationChunk(marker);
+
+  expect(result.events).toEqual([]);
+  expect(result.output).toBe(marker);
+});
+
+test("parseShellIntegrationChunk passes through tool markers with the wrong part count", () => {
+  for (const payload of ["tool;OnlyName", "tool;A;B;C"]) {
+    const marker = RAW_TOOL_MARKER(payload);
+    const result = parseShellIntegrationChunk(marker);
+    expect(result.events).toEqual([]);
+    expect(result.output).toBe(marker);
+  }
+});
+
+test("parseShellIntegrationChunk passes through tool markers with invalid base64", () => {
+  // Bad charset AND bad group lengths ("A", "AAA" — Buffer would forgive
+  // these, but parity demands they pass through as malformed).
+  for (const bad of ["not_base64!!!", "A", "AAA", "AAAAA", "AA=A"]) {
+    const marker = RAW_TOOL_MARKER(`tool;Bash;${bad}`);
+    const result = parseShellIntegrationChunk(marker);
+    expect(result.events).toEqual([]);
+    expect(result.output).toBe(marker);
+  }
+});
+
+test("parseShellIntegrationChunk emits a tool-used event once a fragmented marker completes", () => {
+  const marker = TOOL_MARKER("Bash", "ls -la /tmp");
+  const splitAt = Math.floor(marker.length / 2);
+
+  const first = parseShellIntegrationChunk(marker.slice(0, splitAt));
+  expect(first.events).toEqual([]);
+  expect(first.output).toBe("");
+  expect(first.state.carry.length).toBeGreaterThan(0);
+
+  const second = parseShellIntegrationChunk(marker.slice(splitAt), first.state);
+  expect(second.events).toEqual([
+    { type: "tool-used", name: "Bash", summary: "ls -la /tmp" },
+  ]);
+  expect(second.output).toBe("");
+  expect(second.state.carry).toBe("");
+});
+
+test("parseShellIntegrationChunk leaves markerless output byte-identical", () => {
+  const input = "just some regular terminal output\nwith no markers at all\n";
+  const result = parseShellIntegrationChunk(input);
+
+  expect(result.output).toBe(input);
+  expect(result.events).toEqual([]);
+  expect(result.state).toEqual({
+    carry: "",
+    running: false,
+    lastExitCode: null,
+    agentName: null,
+    agentState: null,
+  });
+});
+
+test("toSummaryLine strips control sequences, collapses whitespace, and caps at 80 chars", () => {
+  expect(toSummaryLine("hello   world")).toBe("hello world");
+  expect(toSummaryLine("line1\nline2\x1b[31m  lots   of \t space")).toBe(
+    "line1 line2 lots of space",
+  );
+
+  const capped = toSummaryLine("y".repeat(200));
+  expect(capped).toHaveLength(80);
+  expect(capped.endsWith("…")).toBe(true);
 });
 
 test("classifyAgentOutputPhase treats codex spinner title updates as thinking", () => {

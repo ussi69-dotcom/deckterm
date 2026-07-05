@@ -121,6 +121,21 @@ function getWorkspaceSignalDescriptors({
   return descriptors;
 }
 
+function formatRecentToolsTooltip(recentTools, { limit = 5 } = {}) {
+  if (!Array.isArray(recentTools) || recentTools.length === 0) return "";
+  const valid = recentTools.filter(
+    (entry) => entry && typeof entry.name === "string" && entry.name,
+  );
+  if (valid.length === 0) return "";
+  const recent = valid.slice(-limit);
+  return recent
+    .map((entry) => {
+      const summary = typeof entry.summary === "string" ? entry.summary : "";
+      return summary ? `${entry.name} · ${summary}` : entry.name;
+    })
+    .join("\n");
+}
+
 function getPrimaryWorkspaceSignal({
   running = false,
   busy = false,
@@ -151,6 +166,7 @@ if (typeof window !== "undefined") {
     hexToRgba,
     getWorkspaceSignalDescriptors,
     getPrimaryWorkspaceSignal,
+    formatRecentToolsTooltip,
   };
 }
 
@@ -161,6 +177,7 @@ if (typeof module !== "undefined" && module.exports) {
     hexToRgba,
     getWorkspaceSignalDescriptors,
     getPrimaryWorkspaceSignal,
+    formatRecentToolsTooltip,
   };
 }
 
@@ -170,4 +187,5 @@ if (typeof exports !== "undefined") {
   exports.hexToRgba = hexToRgba;
   exports.getWorkspaceSignalDescriptors = getWorkspaceSignalDescriptors;
   exports.getPrimaryWorkspaceSignal = getPrimaryWorkspaceSignal;
+  exports.formatRecentToolsTooltip = formatRecentToolsTooltip;
 }

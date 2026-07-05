@@ -154,6 +154,27 @@ test("openForWorkspace chooses docked on desktop and overlay on mobile", () => {
   expect(mobile.isOpen).toBe(true);
 });
 
+test("openForWorkspace with reveal:false targets the workspace without opening", () => {
+  const { controller } = createController();
+
+  controller.openForWorkspace("ws-1", "/tmp/workspace-1", null, {
+    reveal: false,
+  });
+
+  expect(controller.currentWorkspaceId).toBe("ws-1");
+  expect(controller.getWorkspacePath("ws-1")).toBe("/tmp/workspace-1");
+  expect(controller.isOpen).toBe(false);
+
+  // An explorer the user already opened stays open.
+  controller.openForWorkspace("ws-1", "/tmp/workspace-1");
+  expect(controller.isOpen).toBe(true);
+  controller.openForWorkspace("ws-2", "/tmp/workspace-2", null, {
+    reveal: false,
+  });
+  expect(controller.isOpen).toBe(true);
+  expect(controller.currentWorkspaceId).toBe("ws-2");
+});
+
 test("currentPathByWorkspace stores separate paths", () => {
   const { controller } = createController();
 

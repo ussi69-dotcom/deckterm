@@ -258,6 +258,16 @@ body {
   padding: 6px 10px;
 }
 
+/* Desktop tab layouts: CONSTANT tab height. Copy-fit stages switch between a
+   one-row (inline) and a two-row (stacked label+badge) anatomy — without a
+   pinned height the whole toolbar grew/shrank with the tallest tab on every
+   stage flip and the reflow cascaded into terminal refits below. Pin every
+   desktop tab to the two-row height; contents center vertically. */
+.tabs[data-layout] .tab {
+  min-height: 52px;
+  box-sizing: border-box;
+}
+
 .tab:hover {
   background: var(--bg-hover);
 }
@@ -400,6 +410,23 @@ body {
 
 .tab-signal-badge[hidden] {
   display: none;
+}
+
+/* Desktop tab layouts: the signal badge keeps a CONSTANT slot. Toggling it
+   with display:none (and letting its text width vary) shifted the label's
+   available space on every agent thinking/responding flip — tabs flickered,
+   the toolbar height jumped in stacked mode, and the reflow cascaded into
+   terminal refits (dimension-overlay storms). Reserve the slot when hidden
+   and pin the width so geometry never depends on signal state. Mobile keeps
+   the compact collapse (data-layout is only set in desktop chrome). */
+.tabs[data-layout] .tab-signal-badge {
+  width: 64px;
+  flex: 0 0 64px;
+}
+
+.tabs[data-layout] .tab-signal-badge[hidden] {
+  display: inline-flex;
+  visibility: hidden;
 }
 
 .tab[data-mode="read"] {
@@ -5694,13 +5721,33 @@ body.ide-mode #workspace-area {
 }
 
 .ide-sidebar {
-  width: 280px;
+  width: var(--ide-sidebar-width, 280px);
   min-width: 180px;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  position: relative;
   background: var(--bg-secondary, #252526);
   border-right: 1px solid var(--border-primary);
+}
+
+/* Right-edge drag handle to resize the sidebar (drag) / reset it (dblclick).
+   Absolutely positioned over the border so the grid never changes; the
+   collapsed sidebar hides it together with everything else. */
+.ide-sidebar-sash {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 6;
+  background: transparent;
+}
+
+.ide-sidebar-sash:hover,
+.ide-sidebar-sash.dragging {
+  background: rgba(88, 166, 255, 0.35);
 }
 
 .ide-sidebar-header {

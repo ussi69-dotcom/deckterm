@@ -4902,6 +4902,8 @@ class TerminalManager {
       items: [],
       selectedId: null,
       loading: false,
+      messages: [],
+      messagesTaskId: null,
     };
     this.setupState = {
       report: null,
@@ -5594,7 +5596,7 @@ class TerminalManager {
     );
   }
 
-  tabCopyStageFits(tab, stage) {
+  tabCopyStageFits(tab, stage, slack = 0) {
     const copy = tab?.querySelector(".tab-copy");
     const label = tab?.querySelector(".tab-label");
     const meta = tab?.querySelector(".tab-meta");
@@ -5603,14 +5605,14 @@ class TerminalManager {
     if (!copy || !label) return true;
 
     if (stage === "truncated") {
-      return copy.getBoundingClientRect().width >= 72;
+      return copy.getBoundingClientRect().width >= 72 + slack;
     }
 
-    const labelFits = label.scrollWidth <= label.clientWidth + 1;
+    const labelFits = label.scrollWidth <= label.clientWidth + 1 - slack;
     const secondary =
       meta && !meta.hidden ? meta : badge && !badge.hidden ? badge : null;
     const secondaryFits =
-      !secondary || secondary.scrollWidth <= secondary.clientWidth + 1;
+      !secondary || secondary.scrollWidth <= secondary.clientWidth + 1 - slack;
     if (!labelFits || !secondaryFits) {
       return false;
     }
@@ -5625,8 +5627,21 @@ class TerminalManager {
       ? secondary.getBoundingClientRect()
       : labelRect;
 
-    return Math.max(labelRect.right, secondaryRect.right) <= closeRect.left + 1;
+    return (
+      Math.max(labelRect.right, secondaryRect.right) <=
+      closeRect.left + 1 - slack
+    );
   }
+
+  // Copy-fit stage order, roomiest first. Index comparisons drive the
+  // hysteresis below.
+  static TAB_COPY_FIT_STATES = [
+    "roomy",
+    "compact",
+    "wrapped",
+    "truncated",
+    "cramped",
+  ];
 
   syncDesktopTabCopyFit(tab) {
     if (!tab) return false;
@@ -5654,6 +5669,21 @@ class TerminalManager {
       tab.dataset.copyFit = nextState;
       if (!this.tabCopyStageFits(tab, nextState)) {
         nextState = "cramped";
+      }
+    }
+
+    // Hysteresis: borderline measurements would otherwise flip-flop a tab
+    // between adjacent stages on successive syncs (each flip re-truncates
+    // labels — visible flicker). Upgrading to a ROOMIER stage requires the
+    // fit to pass with headroom; downgrades (content stopped fitting) apply
+    // immediately.
+    const order = TerminalManager.TAB_COPY_FIT_STATES;
+    const prevIdx = order.indexOf(previous);
+    const nextIdx = order.indexOf(nextState);
+    if (prevIdx !== -1 && nextIdx !== -1 && nextIdx < prevIdx) {
+      tab.dataset.copyFit = nextState;
+      if (!this.tabCopyStageFits(tab, nextState, 12)) {
+        nextState = previous;
       }
     }
 
@@ -6229,10 +6259,64 @@ class TerminalManager {
       rootInput.value = this.getCurrentDirectoryValue() || "";
     }
     await this.refreshTasks();
+    await this.refreshHarnessOptions();
     if (focusTitle) {
       panel.querySelector("#task-title")?.focus();
     }
     this.syncSurfaceButtonState();
+  }
+
+  // Rebuild the worker/judge provider selects from live availability probes.
+  // Best-effort only: on any failure the static claude/codex options baked
+  // into index.html remain untouched as the no-JS/failure fallback.
+  async refreshHarnessOptions() {
+    const panel = this.getTaskPanel();
+    if (!panel) return;
+    const selects = [
+      panel.querySelector("#task-worker-provider"),
+      panel.querySelector("#task-judge-provider"),
+    ].filter(Boolean);
+    if (!selects.length) return;
+    try {
+      const payload = await this.fetchTaskJson("/api/harnesses");
+      const harnesses = Array.isArray(payload?.harnesses)
+        ? payload.harnesses
+        : [];
+      if (!harnesses.length) return;
+      // Fallback when the current selection is gone/unavailable: claude if
+      // available, else the first available harness, else claude (the server
+      // re-validates on create either way).
+      const claudeAvailable = harnesses.some(
+        (harness) => harness.id === "claude" && harness.available !== false,
+      );
+      const firstAvailable = harnesses.find(
+        (harness) => harness.available !== false,
+      );
+      const fallbackId = claudeAvailable
+        ? "claude"
+        : firstAvailable?.id || "claude";
+      for (const select of selects) {
+        const currentValue = select.value;
+        const keepCurrent = harnesses.some(
+          (harness) =>
+            harness.id === currentValue && harness.available !== false,
+        );
+        while (select.firstChild) select.removeChild(select.firstChild);
+        for (const harness of harnesses) {
+          const option = document.createElement("option");
+          option.value = harness.id;
+          option.textContent =
+            harness.available === false
+              ? `${harness.label} (unavailable)`
+              : harness.label;
+          if (harness.available === false) option.disabled = true;
+          select.appendChild(option);
+        }
+        select.value = keepCurrent ? currentValue : fallbackId;
+      }
+    } catch (err) {
+      console.debug("Failed to load harness availability", err);
+    }
   }
 
   closeTaskPanel() {
@@ -6825,7 +6909,14 @@ class TerminalManager {
 
   async refreshTasks({ selectedId = this.taskState.selectedId } = {}) {
     const panel = this.getTaskPanel();
-    if (!panel || panel.classList.contains("hidden")) return;
+    // Refresh when ANY task surface is live: the classic panel OR the IDE
+    // sidebar tasks view. The old hidden-panel-only guard made every refresh
+    // a no-op in IDE mode (the classic panel is hidden there), so the
+    // sidebar rendered stale statuses forever — Start Worker kept showing
+    // "ready" until the user left the IDE.
+    const ideTasksMounted = Boolean(document.querySelector(".ide-tasks-view"));
+    const panelVisible = Boolean(panel && !panel.classList.contains("hidden"));
+    if (!panelVisible && !ideTasksMounted) return;
     this.taskState.loading = true;
     this.setTaskStatus("Loading tasks...");
     try {
@@ -6839,12 +6930,39 @@ class TerminalManager {
           : this.taskState.items[0]?.id || null;
       this.renderTasks();
       this.setTaskStatus("");
+      if (this.taskState.selectedId) {
+        await this.refreshTaskMessages();
+      }
     } catch (err) {
       this.setTaskStatus(
         err instanceof Error ? err.message : "Failed to load tasks",
       );
     } finally {
       this.taskState.loading = false;
+    }
+  }
+
+  // S8 (Traycer patterns): fetch the message timeline for the currently
+  // selected task and re-render the detail panel. Guards against a stale
+  // response landing after the selection changed mid-flight (checked BEFORE
+  // writing to taskState, not just before the re-render) — a slow fetch for
+  // task A must never overwrite messages while task B is now selected.
+  // Failures are non-fatal: the last-known message list stays on screen.
+  async refreshTaskMessages() {
+    const taskId = this.taskState.selectedId;
+    if (!taskId) return;
+    try {
+      const payload = await this.fetchTaskJson(
+        `/api/tasks/${encodeURIComponent(taskId)}/messages`,
+      );
+      if (this.taskState.selectedId !== taskId) return;
+      this.taskState.messages = Array.isArray(payload?.messages)
+        ? payload.messages
+        : [];
+      this.taskState.messagesTaskId = taskId;
+      this.renderTaskDetail(this.getSelectedTask());
+    } catch (err) {
+      console.debug("Failed to load task messages", err);
     }
   }
 
@@ -7093,6 +7211,12 @@ class TerminalManager {
 
     const actions = document.createElement("div");
     actions.className = "task-actions";
+    // Mirror the IDE sidebar: a running phase disables its trigger so the
+    // primary button reflects the live status.
+    const taskRunning =
+      task.status === "worker-running" ||
+      task.status === "checks-running" ||
+      task.status === "judge-running";
     [
       ["start", "Start Worker"],
       ["checks", "Run Checks"],
@@ -7103,13 +7227,16 @@ class TerminalManager {
       button.className = action === "start" ? "btn btn-primary" : "btn";
       button.dataset.taskAction = action;
       button.textContent = label;
+      button.disabled =
+        taskRunning || (action === "start" && task.status === "complete");
       actions.appendChild(button);
     });
 
     const checkOutput = this.renderTaskCheckOutput(task);
     const rounds = this.renderTaskRounds(task);
+    const messages = this.renderTaskMessages(task);
 
-    detail.append(header, meta, checks, checkOutput, rounds, actions);
+    detail.append(header, meta, checks, checkOutput, rounds, messages, actions);
   }
 
   renderTaskCheckOutput(task) {
@@ -7179,9 +7306,157 @@ class TerminalManager {
     return section;
   }
 
+  // S8 (Traycer patterns): message timeline + compose box for the selected
+  // task. Messages live on this.taskState.messages (only valid when
+  // messagesTaskId matches the task being painted — a stale set from a prior
+  // selection is never shown). createElement/textContent only: message
+  // bodies are user/judge-originated text, never innerHTML.
+  renderTaskMessages(task) {
+    const section = document.createElement("section");
+    section.className = "task-messages";
+    const title = document.createElement("h4");
+    title.textContent = "Messages";
+    section.appendChild(title);
+
+    const messages =
+      this.taskState.messagesTaskId === task.id ? this.taskState.messages : [];
+
+    const list = document.createElement("div");
+    list.className = "task-message-list";
+    if (!messages.length) {
+      const empty = document.createElement("div");
+      empty.className = "task-detail-meta";
+      empty.textContent = "No messages yet";
+      list.appendChild(empty);
+    } else {
+      messages.forEach((msg) => {
+        const formatted = window.TasksView?.formatTaskMessageRow
+          ? window.TasksView.formatTaskMessageRow(msg)
+          : {
+              fromLabel: typeof msg?.from === "string" ? msg.from : "",
+              bodyText: typeof msg?.body === "string" ? msg.body : "",
+              deliveryLabel:
+                msg?.delivery === "delivered"
+                  ? "Delivered"
+                  : msg?.delivery === "failed"
+                    ? "Failed"
+                    : "Pending",
+              deliveryTitle:
+                msg?.delivery === "failed" && msg?.failureReason
+                  ? String(msg.failureReason)
+                  : "",
+            };
+
+        const row = document.createElement("div");
+        row.className = "task-message-row";
+
+        const rowHeader = document.createElement("div");
+        rowHeader.className = "task-message-row-header";
+
+        const from = document.createElement("span");
+        from.className = "task-message-from";
+        const time = msg?.createdAt
+          ? new Date(msg.createdAt).toLocaleTimeString()
+          : "";
+        from.textContent = time
+          ? `${formatted.fromLabel} · ${time}`
+          : formatted.fromLabel;
+
+        const deliveryClass =
+          msg?.delivery === "delivered" || msg?.delivery === "failed"
+            ? msg.delivery
+            : "pending";
+        const delivery = document.createElement("span");
+        delivery.className = `task-message-delivery task-message-delivery-${deliveryClass}`;
+        delivery.textContent = formatted.deliveryLabel;
+        if (formatted.deliveryTitle) delivery.title = formatted.deliveryTitle;
+
+        rowHeader.append(from, delivery);
+
+        const body = document.createElement("div");
+        body.className = "task-message-body";
+        body.textContent = formatted.bodyText;
+
+        row.append(rowHeader, body);
+        list.appendChild(row);
+      });
+    }
+    section.appendChild(list);
+
+    const compose = document.createElement("div");
+    compose.className = "task-message-compose";
+
+    const target = document.createElement("select");
+    target.className = "task-message-target";
+    [
+      ["worker", "Worker"],
+      ["judge", "Judge"],
+    ].forEach(([value, label]) => {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label;
+      target.appendChild(option);
+    });
+    target.value = "worker";
+
+    const input = document.createElement("textarea");
+    input.className = "task-message-input";
+    input.placeholder = "Message the running agent…";
+
+    const send = document.createElement("button");
+    send.type = "button";
+    send.className = "btn btn-primary";
+    send.textContent = "Send";
+    send.addEventListener("click", () => {
+      void this.sendTaskMessage(task, target, input, send);
+    });
+
+    compose.append(target, input, send);
+    section.appendChild(compose);
+
+    return section;
+  }
+
+  // POST a new task message, then refresh the timeline. A "delivered"/"failed"
+  // response is still an HTTP success (the message was recorded either way) —
+  // only a "failed" delivery surfaces via setTaskStatus; a request-level error
+  // (bad `to`, empty body, 404) is caught and shown the same way.
+  async sendTaskMessage(task, targetSelect, textarea, sendButton) {
+    if (!task) return;
+    const to = targetSelect?.value === "judge" ? "judge" : "worker";
+    const body = textarea?.value || "";
+    sendButton.disabled = true;
+    try {
+      const payload = await this.fetchTaskJson(
+        `/api/tasks/${encodeURIComponent(task.id)}/messages`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ to, body }),
+        },
+      );
+      textarea.value = "";
+      if (payload?.delivery === "failed") {
+        this.setTaskStatus(
+          `Delivery failed: ${payload.reason || "unknown reason"}`,
+        );
+      }
+      await this.refreshTaskMessages();
+    } catch (err) {
+      this.setTaskStatus(
+        err instanceof Error ? err.message : "Failed to send message",
+      );
+    } finally {
+      sendButton.disabled = false;
+    }
+  }
+
   selectTask(taskId) {
     this.taskState.selectedId = taskId || null;
     this.renderTasks();
+    if (this.taskState.selectedId) {
+      void this.refreshTaskMessages();
+    }
   }
 
   getSelectedTask() {
@@ -8739,6 +9014,9 @@ class TerminalManager {
           terminal.isWorktree = Boolean(next.isWorktree);
           terminal.backendMode = next.backendMode || null;
           terminal.supportsLinkedView = Boolean(next.supportsLinkedView);
+          terminal.recentTools = Array.isArray(next.recentTools)
+            ? next.recentTools
+            : [];
           const hasClientCwd =
             typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
           if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
@@ -8851,6 +9129,7 @@ class TerminalManager {
       : terminals.find((terminal) => terminal.agentState) || null;
     const agentName = agentTerminal?.agentName || null;
     const agentState = agentTerminal?.agentState || null;
+    const recentTools = agentTerminal?.recentTools || [];
     const isWorktree = terminals.some((terminal) =>
       Boolean(terminal.isWorktree),
     );
@@ -8892,6 +9171,7 @@ class TerminalManager {
       running,
       agentName,
       agentState,
+      recentTools,
       ports,
       isWorktree,
       descriptors,
@@ -8930,7 +9210,14 @@ class TerminalManager {
     } else {
       lines.push("Signals: none");
     }
-    return lines.join("\n");
+    let tooltip = lines.join("\n");
+    const toolsTooltip = window.TerminalColors?.formatRecentToolsTooltip?.(
+      snapshot.recentTools,
+    );
+    if (toolsTooltip) {
+      tooltip += `\n\nRecent tools:\n${toolsTooltip}`;
+    }
+    return tooltip;
   }
 
   applyWorkspaceSignals(tab, snapshot) {
@@ -9202,7 +9489,11 @@ class TerminalManager {
     const { workspaceId } = this.getActiveWorkspaceContext();
     if (this.fileExplorer && workspaceId) {
       if (this.fileExplorer.currentWorkspaceId !== workspaceId) {
-        this.fileExplorer.openForWorkspace(workspaceId, cwd);
+        // reveal:false — changing the working dir must navigate the explorer,
+        // not pop it open (regression: Browse/toolbar commit opened Files).
+        this.fileExplorer.openForWorkspace(workspaceId, cwd, null, {
+          reveal: false,
+        });
       }
       await this.fileExplorer.loadDir(cwd, workspaceId);
     }
@@ -9345,6 +9636,8 @@ class TerminalManager {
     // docking modes never overwrite each other.
     this.ideDockHeightPct =
       window.SurfaceWindows?.DOCK_DEFAULT_HEIGHT_PCT || 35;
+    // IDE sidebar width in px; null = the CSS default. Restored below.
+    this.ideSidebarWidthPx = null;
     this.dockSash = document.getElementById("dock-sash");
     this.dockSash?.addEventListener("pointerdown", (e) =>
       this.startDockSashDrag(e),
@@ -9367,6 +9660,13 @@ class TerminalManager {
           this.ideDockHeightPct;
       }
       this.applyIdeDockHeight();
+      const sidebarStored = Number(
+        this.settingsStore?.get("ide.sidebarWidth", null),
+      );
+      if (Number.isFinite(sidebarStored) && sidebarStored > 0) {
+        this.ideSidebarWidthPx = this.clampIdeSidebarWidth(sidebarStored);
+      }
+      this.applyIdeSidebarWidth();
     });
   }
 
@@ -9423,6 +9723,66 @@ class TerminalManager {
     this.applyIdeDockHeight();
     window.dispatchEvent(new Event("resize"));
     this.settingsStore?.set("dock.ide", { heightPct: this.ideDockHeightPct });
+  }
+
+  // --- IDE sidebar width (right-edge sash) ----------------------------------
+  // Persisted separately (ide.sidebarWidth, px) from dock.ide so the two
+  // writers can never clobber each other. Null = the CSS default (280px).
+
+  clampIdeSidebarWidth(px) {
+    const max = Math.min(640, Math.floor((window.innerWidth || 1280) * 0.5));
+    return Math.min(Math.max(Math.round(px), 180), Math.max(180, max));
+  }
+
+  applyIdeSidebarWidth() {
+    const root = document.documentElement;
+    if (Number.isFinite(this.ideSidebarWidthPx)) {
+      root.style.setProperty(
+        "--ide-sidebar-width",
+        `${Math.round(this.ideSidebarWidthPx)}px`,
+      );
+    } else {
+      root.style.removeProperty("--ide-sidebar-width");
+    }
+  }
+
+  startIdeSidebarSashDrag(e) {
+    e.preventDefault();
+    const sidebar = this.ideShell?.sidebarEl;
+    if (!sidebar) return;
+    const rect = sidebar.getBoundingClientRect();
+    const sash = this.ideShell?.sidebarSashEl;
+    sash?.classList.add("dragging");
+    const apply = (clientX) => {
+      this.ideSidebarWidthPx = this.clampIdeSidebarWidth(clientX - rect.left);
+      this.applyIdeSidebarWidth();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientX);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("ide.sidebarWidth", this.ideSidebarWidthPx);
+      // Same drag-end settle as the terminal sash (bug A3b): explicitly
+      // refit every visible terminal instead of relying on the debounced
+      // synthetic resize.
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+  }
+
+  resetIdeSidebarSash() {
+    this.ideSidebarWidthPx = null;
+    this.applyIdeSidebarWidth();
+    window.dispatchEvent(new Event("resize"));
+    this.settingsStore?.set("ide.sidebarWidth", null);
   }
 
   applyDockState({ persist = true } = {}) {
@@ -9498,6 +9858,10 @@ class TerminalManager {
       // resets it to the default height.
       startTerminalSashDrag: (e) => this.startIdeTerminalSashDrag(e),
       resetTerminalSash: () => this.resetIdeTerminalSash(),
+      // Resize the sidebar by dragging its right-edge sash; double-click
+      // resets to the default width.
+      startSidebarSashDrag: (e) => this.startIdeSidebarSashDrag(e),
+      resetSidebarSash: () => this.resetIdeSidebarSash(),
     });
     this.initEditorTabs();
     this.initScmView();
@@ -10736,6 +11100,7 @@ class TerminalManager {
       agentState: null,
       ports: [],
       isWorktree: false,
+      recentTools: [],
       backendMode,
       supportsLinkedView,
       tabNum,
@@ -11734,6 +12099,8 @@ class TerminalManager {
       t.fitFrame = requestAnimationFrame(() => {
         t.fitFrame = 0;
         try {
+          const prevCols = t.terminal?.cols;
+          const prevRows = t.terminal?.rows;
           this.fitTerminalState(t);
           // fitTerminalState only recomputes cols/rows and tells the PTY —
           // it does NOT repaint the buffer. Every other resize path in this
@@ -11781,7 +12148,12 @@ class TerminalManager {
           // Always send resize - terminal will work even if small
           this.scheduleResize(id);
 
-          this.showDimensionOverlay(id);
+          // Only flash the ColsxRows overlay when the GRID actually changed —
+          // sub-cell container jitter (toolbar reflow, badge updates, 1px
+          // sash noise) used to storm every visible terminal with overlays.
+          if (t.terminal.cols !== prevCols || t.terminal.rows !== prevRows) {
+            this.showDimensionOverlay(id);
+          }
         } catch (err) {
           if (DEBUG) dbg("resizeObserver error", { id, err });
         }
@@ -11961,6 +12333,7 @@ class TerminalManager {
         agentState: null,
         ports: [],
         isWorktree: false,
+        recentTools: [],
         backendMode: terminalInfo.backendMode || null,
         supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
         tabNum,

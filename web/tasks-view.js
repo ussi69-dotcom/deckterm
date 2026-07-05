@@ -143,6 +143,65 @@ function tasksRenderSignature({ tasks, selectedId, viewMode, status } = {}) {
   }
 }
 
+// Display labels for a task message's `from` field (S8: task detail message
+// timeline). Unknown/missing values fall back to the raw string so a future
+// `from` enum value still renders something sane instead of "undefined".
+const TASK_MESSAGE_FROM_LABELS = {
+  user: "You",
+  judge: "Judge",
+  system: "System",
+};
+
+// Display labels for a task message's `delivery` field. Unknown/missing
+// values fall back to "Pending" (mirrors the backend's default state for a
+// message that hasn't been delivered yet).
+const TASK_MESSAGE_DELIVERY_LABELS = {
+  pending: "Pending",
+  delivered: "Delivered",
+  failed: "Failed",
+};
+
+// Map a raw task-message record to plain display strings for the timeline row
+// (fromLabel/bodyText/deliveryLabel/deliveryTitle). Pure + DOM-free: callers
+// paint these via textContent/title, never innerHTML — this helper never
+// produces markup, only text. `deliveryTitle` carries the failure reason (for
+// a `title` attribute tooltip) and is "" for any non-failed delivery. Pure.
+function formatTaskMessageRow(msg) {
+  const m = msg && typeof msg === "object" ? msg : {};
+  const from = typeof m.from === "string" ? m.from : "";
+  const fromLabel = TASK_MESSAGE_FROM_LABELS[from] || from;
+  const bodyText = typeof m.body === "string" ? m.body : "";
+  const deliveryKey = TASK_MESSAGE_DELIVERY_LABELS[m.delivery]
+    ? m.delivery
+    : "pending";
+  const deliveryLabel = TASK_MESSAGE_DELIVERY_LABELS[deliveryKey];
+  const deliveryTitle =
+    deliveryKey === "failed" && m.failureReason ? String(m.failureReason) : "";
+  return { fromLabel, bodyText, deliveryLabel, deliveryTitle };
+}
+
+// A cheap content signature over a task's message list, so the detail panel
+// can skip re-rendering the messages section when a refresh returns the same
+// data (mirrors tasksRenderSignature above). Spans id+delivery+body length per
+// message — a body EDIT would be unusual (messages are append-only) but a
+// length change still catches it; content itself is deliberately left out to
+// keep the signature cheap. Returns null on non-array input so a caller can
+// tell "nothing to compare" apart from a real signature. Pure.
+function taskMessagesSignature(messages) {
+  if (!Array.isArray(messages)) return null;
+  try {
+    return JSON.stringify(
+      messages.map((m) => ({
+        id: m?.id ?? null,
+        delivery: m?.delivery ?? "",
+        len: typeof m?.body === "string" ? m.body.length : 0,
+      })),
+    );
+  } catch {
+    return null;
+  }
+}
+
 // ── DOM controller (browser-only) ────────────────────────────────────────────
 
 // Options:
@@ -390,6 +449,16 @@ class TasksViewController {
     const checks = (task.checks || [])
       .map((c) => `<li>${this.esc(c.label)}: ${this.esc(c.command)}</li>`)
       .join("");
+    // A phase that is already running disables its own trigger (and Start
+    // while ANY phase runs) so the primary button reflects reality instead
+    // of offering a second worker for a running task.
+    const running =
+      statusText === "worker-running" ||
+      statusText === "checks-running" ||
+      statusText === "judge-running";
+    const startDisabled = running || statusText === "complete";
+    const checksDisabled = running;
+    const judgeDisabled = running;
     detail.innerHTML = `
       <div class="ide-tasks-detail-header">
         <span class="ide-tasks-detail-title" title="${this.esc(title)}">${this.esc(title)}</span>
@@ -398,9 +467,9 @@ class TasksViewController {
       <div class="ide-tasks-detail-meta" title="${this.esc(meta)}">${this.esc(meta)}</div>
       <ul class="ide-tasks-checks">${checks || "<li>No checks</li>"}</ul>
       <div class="ide-tasks-detail-actions">
-        <button type="button" class="ide-tasks-detail-action primary" data-task-action="start">Start Worker</button>
-        <button type="button" class="ide-tasks-detail-action" data-task-action="checks">Run Checks</button>
-        <button type="button" class="ide-tasks-detail-action" data-task-action="judge">Run Judge</button>
+        <button type="button" class="ide-tasks-detail-action primary" data-task-action="start"${startDisabled ? " disabled" : ""}>Start Worker</button>
+        <button type="button" class="ide-tasks-detail-action" data-task-action="checks"${checksDisabled ? " disabled" : ""}>Run Checks</button>
+        <button type="button" class="ide-tasks-detail-action" data-task-action="judge"${judgeDisabled ? " disabled" : ""}>Run Judge</button>
       </div>`;
   }
 
@@ -481,6 +550,8 @@ const TasksViewModule = {
   tasksTotalCount,
   tasksBadgeStatusClass,
   tasksRenderSignature,
+  formatTaskMessageRow,
+  taskMessagesSignature,
   TasksViewController,
 };
 
@@ -497,5 +568,7 @@ if (typeof exports !== "undefined") {
   exports.tasksTotalCount = tasksTotalCount;
   exports.tasksBadgeStatusClass = tasksBadgeStatusClass;
   exports.tasksRenderSignature = tasksRenderSignature;
+  exports.formatTaskMessageRow = formatTaskMessageRow;
+  exports.taskMessagesSignature = taskMessagesSignature;
   exports.TasksViewController = TasksViewController;
 }

@@ -1,6 +1,38 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-06-16 viz sekce 0z**
+> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+
+## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
+
+Kompletní implementace plánu `docs/plans/2026-07-04-traycer-patterns.md`
+(tiered delivery Path A: Sonnet kóduje scoped slices, orchestrátor diff-review,
+Codex per-slice na S6/S7 + integrované passy po fázi 2 a 3 — všechny nálezy opraveny).
+
+**Fáze 1 — harness registry:** `backend/services/agent-harnesses.ts` (claude/codex
+enabled, opencode/gemini data-only; fixed-argv `--version` probe, 60s cache),
+task-runner deleguje validaci providerů (unknown/disabled → 400), `GET /api/harnesses`,
+task form ukazuje živou dostupnost (`(unavailable)` disabled options).
+
+**Fáze 2 — worker↔judge verdict loop + zprávy:** `verdict-r<N>.json` per-round
+(soudce má cestu+schéma v promptu), zpracování pod per-task mutexem s přesným
+D4 orderingem — PASS→complete, BLOCKED→needs-user, NEEDS_WORK→další kolo přes
+`WORKER_PROMPT.md` s feedbackem (`maxRounds` konečně vynucen). Trigger: shell-integration
+`agent-done` edge + terminal-exit fallback, idempotentní. `GET/POST /api/tasks/:id/messages`
+— těla sanitizovaná při vzniku, doručení POUZE pointer-line do PTY (shell-inert komentář),
+role-active gate, audit každého výsledku. Nové fd-safe IO primitivum `task-file-io.ts`
+(O_NOFOLLOW+fstat, atomic write přes dir-fd) pro všechna čtení/zápisy v agent-writable
+adresářích. UI: message timeline + compose v task detailu.
+
+**Fáze 3 — strukturovaná tool telemetrie (S9 spike PASSED):** parser grammar
+`tool;<name>;<b64>` (2KB cap před dekódem, strict validace, Traycer `toSummaryLine`
+port — attribution v `THIRD_PARTY_NOTICES.md`), per-terminal `recentTools` ring
+(50, 20/s flood drop, display-only), tooltip v signal badge, opt-in PreToolUse hook
+`scripts/deckterm-agent-hook.sh` (vyžaduje `TMUX_BACKEND=1` — raw backend nemá ctty).
+
+**Kritický vedlejší nález (S9):** tmux 3.4 `pipe-pane -o` TOGGLUJE — create→attach
+sekvence pipe zavírala, takže shell-integration markery v tmux módu tiše mizely.
+Opraveno (`#{pane_pipe}` check + per-session lock). Dev systemd unit dostal
+`~/.local/bin` do PATH (probe `claude` binárky).
 
 ## 0z. Delta 2026-06-16 — VS Code-grade workspace HOTOVÝ (fáze 2 + 3 + 4)
 

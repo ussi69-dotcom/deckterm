@@ -842,12 +842,15 @@ class FileExplorerController {
     return el;
   }
 
-  openForWorkspace(workspaceId, cwd = "", mode = null) {
+  openForWorkspace(workspaceId, cwd = "", mode = null, options = {}) {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return null;
 
     this.currentWorkspaceId = normalizedWorkspaceId;
-    this.isOpen = true;
+    // reveal:false retargets the explorer (workspace/root/path bookkeeping)
+    // without forcing it visible — a committed cwd change must not pop the
+    // explorer open, only navigate it for whenever the user opens it.
+    if (options.reveal !== false) this.isOpen = true;
     this.mode = this.resolveMode(mode);
 
     const rememberedPath =
