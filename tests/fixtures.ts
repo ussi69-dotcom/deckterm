@@ -250,6 +250,28 @@ export async function getActiveTerminalTile(page: Page) {
 }
 
 /**
+ * Read the ACTIVE terminal's visible text renderer-independently via the
+ * xterm buffer API. Since Track D2 the default renderer is WebGL — text is
+ * painted to a canvas and `.xterm-rows` DOM stays EMPTY, so any spec that
+ * asserts on `.xterm-rows` textContent silently sees "" under WebGL. Use
+ * this instead.
+ */
+export async function readActiveTerminalText(page: Page): Promise<string> {
+  return page.evaluate(() => {
+    const tm = (window as any).terminalManager;
+    const t = tm?.terminals?.get?.(tm?.activeId)?.terminal;
+    if (!t) return "";
+    const buf = t.buffer?.active;
+    if (!buf) return "";
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      lines.push(buf.getLine(i)?.translateToString(true) || "");
+    }
+    return lines.join("\n");
+  });
+}
+
+/**
  * Get the visible/active xterm container
  */
 export async function getVisibleXterm(page: Page) {

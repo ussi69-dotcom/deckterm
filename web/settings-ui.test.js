@@ -76,6 +76,23 @@ test("buildControlDescriptor coerces toggles to booleans", () => {
   expect(buildControlDescriptor(toggleDef, 1).value).toBe(true);
 });
 
+// Snapshot of the full descriptor the DOM layer (app.js SettingsManager)
+// renders a toggle control from — the custom track/thumb checkbox styling
+// added in Track D6 binds its checked state straight off `descriptor.value`,
+// so this locks the shape/typing that visual contract depends on.
+test("buildControlDescriptor toggle descriptor shape matches the render contract", () => {
+  const desc = buildControlDescriptor(toggleDef, true);
+  expect(desc).toEqual({
+    key: "terminal.wrapLines",
+    type: "toggle",
+    label: "Wrap long lines",
+    description: "Soft-wrap output.",
+    category: "Terminal",
+    value: true,
+  });
+  expect(typeof desc.value).toBe("boolean");
+});
+
 test("buildControlDescriptor exposes select options and validates the value", () => {
   const desc = buildControlDescriptor(selectDef, "inline");
   expect(desc.value).toBe("inline");

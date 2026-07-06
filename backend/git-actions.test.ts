@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -103,6 +104,78 @@ function post(path: string, body: unknown) {
       body: JSON.stringify(body),
     }),
   );
+}
+
+function queryAudit(
+  where: string,
+  ...params: unknown[]
+): Array<Record<string, unknown>> {
+  const db = new Database(join(stateDir, "deckterm.db"), { readonly: true });
+  try {
+    return db
+      .query(`select * from audit_events where ${where}`)
+      .all(...(params as any[])) as Array<Record<string, unknown>>;
+  } finally {
+    db.close();
+  }
+}
+
+// ── Merge-conflict classification & merge-resolve flow (Track D slice D3) ──
+
+// Writes a raw git blob and returns its hash.
+async function hashBlob(cwd: string, content: string): Promise<string> {
+  const proc = Bun.spawn(["git", "hash-object", "-w", "--stdin"], {
+    cwd,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.write(content);
+  proc.stdin.end();
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) throw new Error(`hash-object failed: ${err}`);
+  return out.trim();
+}
+
+// Fabricates an unmerged index entry for `path` with the given (stage,
+// content) pairs — no real `git merge` needed, so every XY conflict shape
+// (including the hard-to-reproduce ones like DD/AU/UA/UD/DU) is directly
+// constructible. The stage→XY mapping was verified empirically against real
+// git (1.3.x): stage1 only → DD, stage2 only → AU, stage3 only → UA,
+// stage2+3 → AA, stage1+2 → UD, stage1+3 → DU, stage1+2+3 → UU.
+async function setIndexStages(
+  cwd: string,
+  path: string,
+  stages: Array<{ stage: 1 | 2 | 3; content: string }>,
+): Promise<void> {
+  try {
+    await git(cwd, "rm", "--cached", "-f", "--ignore-unmatch", "--", path);
+  } catch {
+    // no pre-existing entry — fine.
+  }
+  const lines: string[] = [];
+  for (const s of stages) {
+    const hash = await hashBlob(cwd, s.content);
+    lines.push(`100644 ${hash} ${s.stage}\t${path}`);
+  }
+  const proc = Bun.spawn(["git", "update-index", "--index-info"], {
+    cwd,
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  proc.stdin.write(lines.join("\n") + "\n");
+  proc.stdin.end();
+  const [, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) throw new Error(`update-index --index-info failed: ${err}`);
 }
 
 test("status reports upstream ahead/behind", async () => {
@@ -436,4 +509,254 @@ test("commit-files rejects a dash-led commit ref (argv flag smuggling)", async (
     ),
   );
   expect(res.status).toBe(400);
+});
+
+test("status classifies every conflict XY shape as conflicted:true / section:merge", async () => {
+  const shapes: Array<{
+    path: string;
+    xy: string;
+    stages: Array<{ stage: 1 | 2 | 3; content: string }>;
+  }> = [
+    {
+      path: "conflict-dd.txt",
+      xy: "DD",
+      stages: [{ stage: 1, content: "base\n" }],
+    },
+    {
+      path: "conflict-au.txt",
+      xy: "AU",
+      stages: [{ stage: 2, content: "ours\n" }],
+    },
+    {
+      path: "conflict-ua.txt",
+      xy: "UA",
+      stages: [{ stage: 3, content: "theirs\n" }],
+    },
+    {
+      path: "conflict-aa.txt",
+      xy: "AA",
+      stages: [
+        { stage: 2, content: "ours\n" },
+        { stage: 3, content: "theirs\n" },
+      ],
+    },
+    {
+      path: "conflict-ud.txt",
+      xy: "UD",
+      stages: [
+        { stage: 1, content: "base\n" },
+        { stage: 2, content: "ours\n" },
+      ],
+    },
+    {
+      path: "conflict-du.txt",
+      xy: "DU",
+      stages: [
+        { stage: 1, content: "base\n" },
+        { stage: 3, content: "theirs\n" },
+      ],
+    },
+    {
+      path: "conflict-uu.txt",
+      xy: "UU",
+      stages: [
+        { stage: 1, content: "base\n" },
+        { stage: 2, content: "ours\n" },
+        { stage: 3, content: "theirs\n" },
+      ],
+    },
+  ];
+
+  for (const shape of shapes) {
+    await setIndexStages(repo, shape.path, shape.stages);
+  }
+
+  try {
+    const res = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+      ),
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as any;
+    for (const shape of shapes) {
+      const entry = (data.files as any[]).find((f) => f.path === shape.path);
+      expect(entry).toBeTruthy();
+      expect(entry.status).toBe(shape.xy);
+      expect(entry.conflicted).toBe(true);
+      expect(entry.section).toBe("merge");
+    }
+  } finally {
+    // Clean up every fabricated index entry so later tests (and the shared
+    // `repo`) see a clean working tree again.
+    for (const shape of shapes) {
+      await git(
+        repo,
+        "rm",
+        "--cached",
+        "-f",
+        "--ignore-unmatch",
+        "--",
+        shape.path,
+      );
+      await rm(join(repo, shape.path), { force: true });
+    }
+  }
+});
+
+test("status classifies a real (git merge) conflict as UU/conflicted/section:merge", async () => {
+  const conflictFile = "real-conflict.txt";
+  await writeFile(join(repo, conflictFile), "shared base\n");
+  await git(repo, "add", conflictFile);
+  await git(repo, "commit", "-m", "add real-conflict base");
+
+  await git(repo, "checkout", "-b", "conflict-branch");
+  await writeFile(join(repo, conflictFile), "branch change\n");
+  await git(repo, "commit", "-am", "branch edits real-conflict");
+
+  await git(repo, "checkout", "main");
+  await writeFile(join(repo, conflictFile), "main change\n");
+  await git(repo, "commit", "-am", "main edits real-conflict");
+
+  // A conflicting merge exits non-zero — spawn directly rather than through
+  // the `git()` helper (which throws on a non-zero exit).
+  const mergeProc = Bun.spawn(["git", "merge", "conflict-branch"], {
+    cwd: repo,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  await Promise.all([
+    new Response(mergeProc.stdout).text(),
+    new Response(mergeProc.stderr).text(),
+    mergeProc.exited,
+  ]);
+
+  try {
+    const res = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+      ),
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as any;
+    const entry = (data.files as any[]).find((f) => f.path === conflictFile);
+    expect(entry).toBeTruthy();
+    expect(entry.status).toBe("UU");
+    expect(entry.conflicted).toBe(true);
+    expect(entry.section).toBe("merge");
+  } finally {
+    // Abort the merge and drop the temp branch so later assertions (and the
+    // shared `repo`) see the same clean `main` they expect.
+    await git(repo, "merge", "--abort");
+    await git(repo, "branch", "-D", "conflict-branch");
+  }
+});
+
+test("show resolves STAGE2 (ours) and STAGE3 (theirs) content for a conflicted path", async () => {
+  await setIndexStages(repo, "stage-refs.txt", [
+    { stage: 1, content: "base\n" },
+    { stage: 2, content: "ours content\n" },
+    { stage: 3, content: "theirs content\n" },
+  ]);
+  try {
+    const oursRes = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=STAGE2&path=stage-refs.txt`,
+      ),
+    );
+    expect(oursRes.status).toBe(200);
+    expect(((await oursRes.json()) as any).content).toBe("ours content\n");
+
+    const theirsRes = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=STAGE3&path=stage-refs.txt`,
+      ),
+    );
+    expect(theirsRes.status).toBe(200);
+    expect(((await theirsRes.json()) as any).content).toBe("theirs content\n");
+  } finally {
+    await git(
+      repo,
+      "rm",
+      "--cached",
+      "-f",
+      "--ignore-unmatch",
+      "--",
+      "stage-refs.txt",
+    );
+    await rm(join(repo, "stage-refs.txt"), { force: true });
+  }
+});
+
+test("show still rejects a dash-led ref even though STAGE2/STAGE3 sentinels are now accepted", async () => {
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/show?cwd=${encodeURIComponent(repo)}&commit=-STAGE2&path=a.txt`,
+    ),
+  );
+  expect(res.status).toBe(400);
+});
+
+test("resolve-stage stages the resolved path and writes an allow merge.resolve audit row (no file content)", async () => {
+  await setIndexStages(repo, "resolve-me.txt", [
+    { stage: 1, content: "base\n" },
+    { stage: 2, content: "ours content\n" },
+    { stage: 3, content: "theirs content\n" },
+  ]);
+  await writeFile(join(repo, "resolve-me.txt"), "ours content\n");
+
+  try {
+    const before = queryAudit("action = 'merge.resolve'").length;
+    const res = await post("/api/git/resolve-stage", {
+      cwd: repo,
+      paths: ["resolve-me.txt"],
+      resolution: "ours",
+    });
+    expect(res.status).toBe(200);
+
+    // The path is staged (no longer unmerged) — `git status --porcelain`
+    // reports a plain staged-add for it, not a conflict code.
+    const statusOut = await git(
+      repo,
+      "status",
+      "--porcelain",
+      "resolve-me.txt",
+    );
+    expect(statusOut.trim().startsWith("A ")).toBe(true);
+
+    const rows = queryAudit("action = 'merge.resolve'");
+    expect(rows.length).toBe(before + 1);
+    const row = rows[rows.length - 1] as any;
+    expect(row.decision).toBe("allow");
+    const data = JSON.parse(row.data_json);
+    expect(data.pathCount).toBe(1);
+    expect(data.resolution).toBe("ours");
+    // Never the file content.
+    expect(JSON.stringify(data)).not.toContain("ours content");
+  } finally {
+    await git(
+      repo,
+      "rm",
+      "--cached",
+      "-f",
+      "--ignore-unmatch",
+      "--",
+      "resolve-me.txt",
+    );
+    await rm(join(repo, "resolve-me.txt"), { force: true });
+  }
+});
+
+test("resolve-stage denies (audits deny, 400) an invalid resolution mode", async () => {
+  const before = queryAudit("action = 'merge.resolve'").length;
+  const res = await post("/api/git/resolve-stage", {
+    cwd: repo,
+    paths: ["whatever.txt"],
+    resolution: "banana",
+  });
+  expect(res.status).toBe(400);
+  const rows = queryAudit("action = 'merge.resolve'");
+  expect(rows.length).toBe(before + 1);
+  const row = rows[rows.length - 1] as any;
+  expect(row.decision).toBe("deny");
 });

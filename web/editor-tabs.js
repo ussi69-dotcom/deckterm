@@ -28,6 +28,7 @@ const EDITOR_TABS_SCHEMA_VERSION = 3;
 const TAB_FILE = "file";
 const TAB_DIFF = "diff";
 const TAB_SETTINGS = "settings";
+const TAB_TASKS = "tasks";
 
 // ── Pure tab model (DOM-free, unit-tested) ───────────────────────────────────
 
@@ -74,6 +75,17 @@ function makeSettingsTab() {
   };
 }
 
+// A tasks-board tab. SINGLETON, always pinned, no file ref — same shape as the
+// settings tab. Descriptor: {type:"tasks"}. Renders the full-width task board.
+function makeTasksTab() {
+  return {
+    type: TAB_TASKS,
+    ref: null,
+    pinned: true,
+    preview: false,
+  };
+}
+
 // Stable identity for a tab. File tabs key on their absolute path; diff tabs key
 // on the (relPath, mode, cwd, commit) tuple so the same file's working vs staged
 // vs a specific commit are DISTINCT tabs.
@@ -82,6 +94,10 @@ function tabKey(tab) {
   if (tab.type === TAB_SETTINGS) {
     // Type-namespaced key so it can never collide with a file named "settings".
     return "settings:global";
+  }
+  if (tab.type === TAB_TASKS) {
+    // Type-namespaced like settings — never collides with a file named "tasks".
+    return "tasks:board";
   }
   if (tab.type === TAB_DIFF) {
     const r = tab.ref || {};
@@ -203,6 +219,9 @@ function toDescriptor(tab) {
   if (tab?.type === TAB_SETTINGS) {
     return { type: TAB_SETTINGS };
   }
+  if (tab?.type === TAB_TASKS) {
+    return { type: TAB_TASKS };
+  }
   if (tab?.type === TAB_DIFF) {
     const r = tab.ref || {};
     return {
@@ -260,6 +279,10 @@ function reviveDescriptor(raw) {
   if (raw.type === TAB_SETTINGS) {
     // Settings tab: no probe needed, no file ref — just revive it.
     return makeSettingsTab();
+  }
+  if (raw.type === TAB_TASKS) {
+    // Tasks-board tab: no probe needed, no file ref — just revive it.
+    return makeTasksTab();
   }
   if (raw.type === TAB_DIFF) {
     const r = raw.ref || {};
@@ -325,8 +348,10 @@ function migrateEditorTabsState(store) {
 async function filterRestoredTabs(restored, canOpen) {
   const s = normalizeState(restored);
   const survivors = [];
-  // Deduplication guard for singleton settings tab (Codex fix 5: at most ONE).
+  // Deduplication guard for the singleton settings/tasks tabs (Codex fix 5:
+  // at most ONE of each).
   let settingsRestored = false;
+  let tasksRestored = false;
   for (const tab of s.tabs) {
     // Settings tabs: type-scoped, no probe needed (Codex fix 1).
     if (tab.type === TAB_SETTINGS) {
@@ -335,6 +360,14 @@ async function filterRestoredTabs(restored, canOpen) {
         settingsRestored = true;
       }
       // Drop any duplicate settings descriptors silently.
+      continue;
+    }
+    // Tasks-board tab: same probeless singleton treatment as settings.
+    if (tab.type === TAB_TASKS) {
+      if (!tasksRestored) {
+        survivors.push(tab);
+        tasksRestored = true;
+      }
       continue;
     }
     // File/diff tabs: probe through the capability layer.
@@ -413,6 +446,21 @@ class EditorTabsModel {
     });
   }
 
+  // Open (or focus) the singleton tasks-board tab. Same preview-slot-free
+  // semantics as openSettings.
+  openTasksBoard() {
+    const key = "tasks:board";
+    const existingIdx = findTabIndex(this.state.tabs, key);
+    if (existingIdx >= 0) {
+      return this.setState(activateTab(this.state, key));
+    }
+    const tab = makeTasksTab();
+    return this.setState({
+      tabs: [...this.state.tabs, tab],
+      activeKey: key,
+    });
+  }
+
   activeTab() {
     return (
       this.state.tabs.find((t) => tabKey(t) === this.state.activeKey) || null
@@ -469,6 +517,10 @@ class EditorTabsController {
     this.mountDiffBody =
       typeof options.mountDiffBody === "function"
         ? options.mountDiffBody
+        : null;
+    this.mountTasksBody =
+      typeof options.mountTasksBody === "function"
+        ? options.mountTasksBody
         : null;
     this.mountSettingsBody =
       typeof options.mountSettingsBody === "function"
@@ -606,6 +658,12 @@ class EditorTabsController {
     this.model.openSettings();
   }
 
+  // Open (or focus) the singleton tasks-board tab (mirrors openSettings).
+  openTasksBoard() {
+    this.ensureScaffold();
+    this.model.openTasksBoard();
+  }
+
   // Restore a pre-filtered state (after revalidation) without firing the app
   // persistence hook in a loop — set directly then render.
   restoreState(state) {
@@ -664,6 +722,7 @@ class EditorTabsController {
       if (tab.preview) el.classList.add("preview");
       if (tab.type === TAB_DIFF) el.classList.add("is-diff");
       if (tab.type === TAB_SETTINGS) el.classList.add("is-settings");
+      if (tab.type === TAB_TASKS) el.classList.add("is-tasks");
       el.setAttribute("aria-selected", key === activeKey ? "true" : "false");
 
       if (tab.type === TAB_DIFF) {
@@ -731,6 +790,8 @@ class EditorTabsController {
       try {
         if (tab.type === TAB_SETTINGS) {
           if (this.mountSettingsBody) await this.mountSettingsBody(bodyEl);
+        } else if (tab.type === TAB_TASKS) {
+          if (this.mountTasksBody) await this.mountTasksBody(bodyEl);
         } else if (tab.type === TAB_DIFF) {
           if (this.mountDiffBody) await this.mountDiffBody(bodyEl, tab);
         } else if (this.mountFileBody) {
@@ -863,6 +924,7 @@ class EditorTabsController {
 // Default tab label: file basename, or the diff's relPath basename, or "Settings".
 function defaultLabel(tab) {
   if (tab?.type === TAB_SETTINGS) return "Settings";
+  if (tab?.type === TAB_TASKS) return "Task Board";
   if (tab?.type === TAB_DIFF) {
     const rel = tab.ref?.relPath || "";
     return basename(rel) || "diff";
@@ -872,6 +934,7 @@ function defaultLabel(tab) {
 
 function fullTitle(tab) {
   if (tab?.type === TAB_SETTINGS) return "Settings";
+  if (tab?.type === TAB_TASKS) return "Task Board";
   if (tab?.type === TAB_DIFF) {
     return tab.ref?.title || tab.ref?.relPath || "diff";
   }
@@ -892,9 +955,11 @@ const EditorTabs = {
   TAB_FILE,
   TAB_DIFF,
   TAB_SETTINGS,
+  TAB_TASKS,
   makeFileTab,
   makeDiffTab,
   makeSettingsTab,
+  makeTasksTab,
   tabKey,
   findTabIndex,
   openTab,
@@ -923,9 +988,11 @@ if (typeof exports !== "undefined") {
   exports.TAB_FILE = TAB_FILE;
   exports.TAB_DIFF = TAB_DIFF;
   exports.TAB_SETTINGS = TAB_SETTINGS;
+  exports.TAB_TASKS = TAB_TASKS;
   exports.makeFileTab = makeFileTab;
   exports.makeDiffTab = makeDiffTab;
   exports.makeSettingsTab = makeSettingsTab;
+  exports.makeTasksTab = makeTasksTab;
   exports.tabKey = tabKey;
   exports.findTabIndex = findTabIndex;
   exports.openTab = openTab;

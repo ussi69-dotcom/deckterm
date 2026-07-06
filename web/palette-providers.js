@@ -94,11 +94,102 @@ function filterSavedCommands(commands, text) {
   });
 }
 
+// Quick-open (Ctrl+P) fuzzy matcher — a pure subsequence scorer over a file's
+// relativePath. Returns null when `query` is NOT a subsequence of `path`
+// (case-insensitive); otherwise a positive-or-zero score where HIGHER is a
+// better match. Bonuses (roughly VS Code / fzf style):
+//   - basename bonus: characters matched after the last "/" score higher —
+//     a query should prefer matching the filename over its directory.
+//   - boundary bonus: a character matched right at the start of the string or
+//     right after a path/word separator (/ _ - . space) scores higher — this
+//     rewards matching the START of a segment over a mid-word hit.
+//   - consecutive bonus: a run of consecutively-matched characters scores
+//     increasingly higher than the same characters scattered apart.
+// An empty (or whitespace-only) query is a neutral match — score 0 — so
+// callers can use it to mean "show everything, unranked".
+function fuzzyScoreFilePath(query, path) {
+  const q = normalize(query).trim();
+  const target = String(path || "");
+  if (!q) return 0;
+
+  const lower = target.toLowerCase();
+  const lastSlash = lower.lastIndexOf("/");
+  const basenameStart = lastSlash + 1; // 0 when there is no "/"
+  const BOUNDARY_CHARS = new Set(["/", "-", "_", ".", " "]);
+  const CONSECUTIVE_CAP = 5;
+
+  let qi = 0;
+  let score = 0;
+  let consecutiveRun = 0;
+  let lastMatchIndex = -1;
+
+  for (let ti = 0; ti < lower.length && qi < q.length; ti++) {
+    if (lower[ti] !== q[qi]) {
+      continue;
+    }
+
+    let charScore = 1;
+    if (ti >= basenameStart) charScore += 3;
+
+    const prevChar = ti > 0 ? lower[ti - 1] : "";
+    const isBoundary = ti === 0 || BOUNDARY_CHARS.has(prevChar);
+    if (isBoundary) charScore += 2;
+
+    if (lastMatchIndex === ti - 1) {
+      consecutiveRun += 1;
+      charScore += Math.min(consecutiveRun, CONSECUTIVE_CAP);
+    } else {
+      consecutiveRun = 0;
+    }
+
+    score += charScore;
+    lastMatchIndex = ti;
+    qi += 1;
+  }
+
+  if (qi < q.length) return null; // not a subsequence — no match
+
+  // Tiny penalty for longer paths so tighter matches win ties.
+  score -= target.length * 0.01;
+
+  return score;
+}
+
+// Rank `files` (each `{path, relativePath}`, or a bare path string) against
+// `query` via fuzzyScoreFilePath over relativePath, best match first, capped
+// at `limit`. An empty query returns the input as-is (capped), unranked —
+// mirrors filterSessions/filterSavedCommands' "no text = show all" behavior.
+function filterQuickOpenFiles(query, files, limit = 50) {
+  const list = Array.isArray(files) ? files : [];
+  const q = normalize(query).trim();
+
+  if (!q) {
+    return list.slice(0, limit);
+  }
+
+  const scored = [];
+  for (const file of list) {
+    const relativePath =
+      typeof file === "string" ? file : file?.relativePath || file?.path;
+    const score = fuzzyScoreFilePath(q, relativePath);
+    if (score === null) continue;
+    scored.push({ file, score, relativePath: String(relativePath || "") });
+  }
+
+  scored.sort(
+    (a, b) => b.score - a.score || a.relativePath.localeCompare(b.relativePath),
+  );
+
+  return scored.slice(0, limit).map((entry) => entry.file);
+}
+
 const PaletteProviders = {
   parsePrefixQuery,
   filterSessions,
   createSavedCommandsStore,
   filterSavedCommands,
+  fuzzyScoreFilePath,
+  filterQuickOpenFiles,
 };
 
 if (typeof window !== "undefined") {
@@ -114,4 +205,6 @@ if (typeof exports !== "undefined") {
   exports.filterSessions = filterSessions;
   exports.createSavedCommandsStore = createSavedCommandsStore;
   exports.filterSavedCommands = filterSavedCommands;
+  exports.fuzzyScoreFilePath = fuzzyScoreFilePath;
+  exports.filterQuickOpenFiles = filterQuickOpenFiles;
 }

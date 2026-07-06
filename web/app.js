@@ -112,6 +112,10 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// Quick-open (Ctrl+P) file-tree cache TTL — the git branch cache never
+// expires (branch switches invalidate it explicitly), but the tree fetch
+// walks the live filesystem, so it is re-fetched after this window.
+const COMMAND_PALETTE_TREE_TTL_MS = 30000;
 // SurfaceWindow id for the IDE Explorer pop-out (slice 3). Distinct from the
 // terminal-mode "files" window so their persisted geometries don't collide.
 const IDE_EXPLORER_WINDOW_ID = "ide-explorer";
@@ -143,6 +147,21 @@ const DEBUG = location.search.includes("debug=1");
 const dbg = (...args) => {
   if (DEBUG) console.log("[deckterm]", ...args);
 };
+
+// WebGL2 capability probe for the `terminal.renderer` "auto" setting — cached
+// after the first call so it only runs once per page load, not once per
+// terminal. A throwaway canvas never gets attached to the DOM.
+let _cachedWebgl2ProbeResult = null;
+function probeWebgl2Support() {
+  if (_cachedWebgl2ProbeResult !== null) return _cachedWebgl2ProbeResult;
+  try {
+    const canvas = document.createElement("canvas");
+    _cachedWebgl2ProbeResult = Boolean(canvas.getContext("webgl2"));
+  } catch {
+    _cachedWebgl2ProbeResult = false;
+  }
+  return _cachedWebgl2ProbeResult;
+}
 const TerminalColors =
   window.TerminalColors ||
   (() => {
@@ -3458,6 +3477,7 @@ class GitManager {
     // Order must match renderFiles() section order — row data-index points
     // into this list.
     return [
+      ...(this.state.files.merge || []),
       ...this.state.files.staged,
       ...this.state.files.changes,
       ...(this.state.files.untracked || []),
@@ -3467,6 +3487,20 @@ class GitManager {
   renderFiles() {
     const container = this.panel.querySelector("#git-files");
     const sections = [
+      {
+        // Merge conflicts are read-only here (visibility only — accept
+        // actions live in the IDE SCM view; the terminal is the mobile
+        // resolve tool). Without this section a conflicted file, which the
+        // server now classifies as section:"merge", would show NOWHERE in
+        // the classic panel (pre-D3 it mis-showed under Staged).
+        key: "merge",
+        label: "Merge Conflicts",
+        icon: "!",
+        files: this.state.files.merge || [],
+        groupAction: null,
+        groupActionGlyph: "",
+        groupActionTitle: "",
+      },
       {
         key: "staged",
         label: "Staged Changes",
@@ -3501,6 +3535,9 @@ class GitManager {
 
     sections.forEach((section) => {
       const files = section.files;
+      // The merge section is conflict-only visibility: hidden entirely when
+      // there is no conflict (unlike the three permanent groups).
+      if (section.key === "merge" && files.length === 0) return;
       const { html: treeHtml, nextIndex } = this.renderSectionTree(
         files,
         section,
@@ -3515,7 +3552,7 @@ class GitManager {
             <span class="git-file-group-label">${section.label}</span>
             <span class="git-file-group-count">(${files.length})</span>
             ${
-              files.length > 0
+              files.length > 0 && section.groupAction
                 ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
                 : ""
             }
@@ -3791,6 +3828,87 @@ class GitManager {
       await this.refresh();
     } catch (err) {
       console.error("Discard error:", err);
+    }
+  }
+
+  // Resolves a merge conflict for `path` (Track D slice D3): a CLIENT-side
+  // transform of the working file's conflict markers — no new broker argv
+  // surface. Fetch the working content → resolveConflicts() (pure parser,
+  // web/merge-conflicts.js) picks ours/theirs/both → write back through the
+  // EXISTING mtime-guarded PUT /api/files/content (atomic, mapped-uid,
+  // audited there as file.write) → stage the resolved path through the new
+  // POST /api/git/resolve-stage (writes the explicit merge.resolve audit row).
+  // mode: "ours" | "theirs" | "both". Returns { ok, error? }; never throws.
+  async resolveConflict(path, mode) {
+    const cwd = this.state.cwd || this.currentCwd;
+    const absCwd = (cwd || "").replace(/\/$/, "");
+    const abs = `${absCwd}/${path}`;
+    try {
+      const getRes = await fetch(
+        `/api/files/content?path=${encodeURIComponent(abs)}`,
+      );
+      const getData = await getRes.json().catch(() => ({}));
+      if (!getRes.ok || typeof getData.content !== "string") {
+        this.showCommitStatus(
+          formatGitError(getData, "Could not read the conflicted file"),
+          "error",
+        );
+        return { ok: false, error: getData.error };
+      }
+
+      const resolver = window.MergeConflicts?.resolveConflicts;
+      const resolved = resolver ? resolver(getData.content, mode) : null;
+      if (!resolved || !resolved.ok) {
+        const message =
+          resolved?.error ||
+          "Could not parse conflict markers — resolve in the terminal";
+        this.showCommitStatus(message, "error");
+        return { ok: false, error: message };
+      }
+
+      const putRes = await fetch("/api/files/content", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          path: abs,
+          content: resolved.content,
+          expectedMtimeMs: getData.mtimeMs,
+        }),
+      });
+      const putData = await putRes.json().catch(() => ({}));
+      if (!putRes.ok) {
+        const fallback =
+          putData?.reason === "mtime_conflict"
+            ? "File changed on disk since it was opened — reload and try again"
+            : "Failed to save the resolved file";
+        this.showCommitStatus(formatGitError(putData, fallback), "error");
+        return { ok: false, error: putData?.error };
+      }
+
+      const stageRes = await fetch("/api/git/resolve-stage", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cwd, paths: [path], resolution: mode }),
+      });
+      const stageData = await stageRes.json().catch(() => ({}));
+      if (!stageRes.ok) {
+        this.showCommitStatus(
+          formatGitError(stageData, "Resolved file saved, but staging failed"),
+          "error",
+        );
+        return { ok: false, error: stageData?.error };
+      }
+
+      this.showCommitStatus("Resolved", "success");
+      if (this.state.selectedPath === path) {
+        this.state.selectedPath = null;
+      }
+      await this.refresh();
+      return { ok: true };
+    } catch (err) {
+      console.error("Resolve conflict error:", err);
+      this.showCommitStatus("Resolve failed: network error", "error");
+      return { ok: false, error: String(err) };
     }
   }
 
@@ -4897,6 +5015,14 @@ class TerminalManager {
     this.notificationsEnabled = true;
     this.clientInstanceId = this.getOrCreateClientInstanceId();
     this.commandPaletteGitCache = new Map();
+    // Quick-open (Ctrl+P) file tree cache, keyed by cwd. Providers are SYNC
+    // (same constraint as the git cache above), so the tree is prefetched on
+    // palette open (buildCommandPaletteContext) and read back synchronously
+    // from here by the quick-open provider. TTL'd (not cached forever like
+    // the git cache) since the filesystem can change underneath a long-lived
+    // session; keyed by cwd so switching workspaces naturally misses the
+    // cache and refetches rather than needing an explicit invalidation hook.
+    this.commandPaletteTreeCache = new Map();
     this.rightSurface = "none";
     this.taskState = {
       items: [],
@@ -6386,6 +6512,8 @@ class TerminalManager {
           this.applyExtraKeysVisible(value),
         "tasks.view": (value) => this.applyTaskView(value),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
+        "editor.autosave": (value) => this.applyEditorAutosave(value),
+        "terminal.renderer": (value) => this.applyRendererSetting(value),
       },
     });
     // Settings load + migration are async; apply once they resolve so the store
@@ -6433,6 +6561,42 @@ class TerminalManager {
   applyDefaultCwd(value) {
     const dir = typeof value === "string" ? value : "";
     if (dir) this.setDirectoryValue(dir, { force: true });
+  }
+
+  // Side effect for editor.autosave ("off"|"1000"|"5000"). Live-updates every
+  // currently open editor-tab handle's debounce interval — new tabs pick up
+  // the setting at mount time via mountEditorFileTab. A handle whose last save
+  // failed stays non-autosaving regardless of this call (setAutosaveIntervalMs
+  // only changes the interval, never clears the failed/re-arm state — see
+  // createAutosaveController in file-editor.js).
+  applyEditorAutosave(value) {
+    const ms = window.FileEditorModule?.parseAutosaveMs?.(value) ?? null;
+    this.editorAutosaveMs = ms;
+    for (const handle of this.editorTabHandles?.values() || []) {
+      handle?.setAutosaveIntervalMs?.(ms);
+    }
+  }
+
+  // Side effect for terminal.renderer ("auto"|"default"). Switching TO
+  // "default" tears down every currently loaded WebGL addon immediately
+  // (cheap: dispose + fall back to xterm's default renderer). Switching to
+  // "auto" is intentionally a no-op for terminals that already exist —
+  // retrofitting a live terminal onto WebGL is non-trivial (re-fit/re-render
+  // plumbing) and out of scope here; it only takes effect for new terminals
+  // created after the switch (see setupTerminalRenderer).
+  applyRendererSetting(value) {
+    if (value !== "default") return;
+    for (const [, t] of this.terminals) {
+      if (!t.webglAddon) continue;
+      const addon = t.webglAddon;
+      try {
+        addon.dispose();
+      } catch (err) {
+        if (DEBUG) dbg("webglAddon.dispose (setting switch) error", { err });
+      }
+      t.webglAddon = null;
+      if (t.terminal?._webglAddon === addon) t.terminal._webglAddon = null;
+    }
   }
 
   async openSettings() {
@@ -8179,6 +8343,18 @@ class TerminalManager {
     return value.startsWith("/") || value.startsWith("~/");
   }
 
+  // Quick-open activates on a "bare" query: some non-empty text that isn't
+  // one of the other prefix modes (directory jump "/" "~/", session switch
+  // "@", saved command "$") — mirrors how those providers gate on their own
+  // prefix/emptiness rather than overlapping with each other.
+  isPaletteBareQuery(query) {
+    const value = String(query || "").trim();
+    if (!value) return false;
+    if (this.isPaletteDirectoryQuery(value)) return false;
+    if (value.startsWith("@") || value.startsWith("$")) return false;
+    return true;
+  }
+
   async resolvePaletteDirectory(path) {
     const targetPath = String(path || "").trim();
     if (!targetPath) return null;
@@ -8384,6 +8560,13 @@ class TerminalManager {
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
+      {
+        id: "toggle-ide-mode",
+        title: "Toggle IDE Mode",
+        group: "Views",
+        keywords: ["ide", "editor", "mode", "workspace"],
+        run: () => this.toggleIdeMode(),
+      },
     ];
 
     actions.forEach((action) => this.commandPaletteRegistry.register(action));
@@ -8405,6 +8588,36 @@ class TerminalManager {
           run: () => this.goToDirectoryFromPalette(query),
         },
       ];
+    });
+
+    // Quick-open (Ctrl+P default experience) — bare queries fuzzy-match file
+    // paths from the per-cwd cached tree (prefetched in
+    // buildCommandPaletteContext / ensureCommandPaletteTreeContext). The
+    // query is carried as a keyword (same trick as go-to-directory/"@"/"$")
+    // so results survive the registry's own title/keyword scoring; ordering
+    // comes from this provider via descending priority.
+    this.commandPaletteRegistry.registerProvider((context = {}) => {
+      const query = this.getCommandPaletteQuery();
+      if (!this.isPaletteBareQuery(query)) return [];
+
+      const files = Array.isArray(context.quickOpenFiles)
+        ? context.quickOpenFiles
+        : [];
+      const matches = window.PaletteProviders.filterQuickOpenFiles(
+        query,
+        files,
+        50,
+      );
+
+      return matches.map((file, index) => ({
+        id: `quick-open:${file.path}`,
+        title: file.relativePath || file.path,
+        group: "Files",
+        keywords: [query],
+        meta: [file.path],
+        priority: 50 - index,
+        run: () => this.handleExplorerOpenFile(file.path, { pinned: true }),
+      }));
     });
 
     this.commandPaletteRegistry.registerProvider((context = {}) => {
@@ -8477,6 +8690,42 @@ class TerminalManager {
             this.switchGitBranchFromPalette(cwd, branch),
         }),
       );
+
+      // IDE-gated editor-tab commands: only meaningful with the IDE editor
+      // area live and at least one open tab.
+      if (context.isIdeMode && context.hasEditorTabs) {
+        contextualActions.push({
+          id: "close-editor-tab",
+          title: "Close Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "close"],
+          run: () => this.closeActiveEditorTabFromPalette(),
+        });
+        contextualActions.push({
+          id: "next-editor-tab",
+          title: "Next Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "next"],
+          run: () => this.stepActiveEditorTab(1),
+        });
+        contextualActions.push({
+          id: "previous-editor-tab",
+          title: "Previous Editor Tab",
+          group: "Contextual",
+          keywords: ["editor", "tab", "previous", "prev"],
+          run: () => this.stepActiveEditorTab(-1),
+        });
+      }
+
+      if (this.canOpenTaskBoardTab()) {
+        contextualActions.push({
+          id: "open-task-board-tab",
+          title: "Open Task Board",
+          group: "Contextual",
+          keywords: ["tasks", "board", "kanban", "agent"],
+          run: () => this.openTaskBoardTab(),
+        });
+      }
 
       return contextualActions;
     });
@@ -8690,6 +8939,11 @@ class TerminalManager {
       gitBranches: [],
       currentGitBranch: "",
     };
+    const treeContext = this.commandPaletteTreeCache.get(cwd) || {
+      files: [],
+      truncated: false,
+    };
+    const isIdeMode = this.isIdeModeActive();
 
     return {
       activeId: this.activeId,
@@ -8701,6 +8955,10 @@ class TerminalManager {
       currentGitBranch: gitContext.currentGitBranch || "",
       isGitRepo: Boolean(gitContext.isGitRepo),
       wrapLines: this.wrapLines,
+      quickOpenFiles: treeContext.files || [],
+      quickOpenTruncated: Boolean(treeContext.truncated),
+      isIdeMode,
+      hasEditorTabs: Boolean(isIdeMode && this.editorTabs?.model?.hasTabs()),
     };
   }
 
@@ -8760,10 +9018,48 @@ class TerminalManager {
     }
   }
 
+  // Quick-open file tree: fetch on palette open, cache per-cwd with a 30s TTL
+  // (the palette provider below is SYNC, same constraint as the git cache —
+  // see ensureCommandPaletteGitContext). Keying by cwd means a workspace
+  // switch is a natural cache miss (no separate invalidation hook needed);
+  // the TTL re-fetches a still-cached cwd's tree if it has gone stale.
+  async ensureCommandPaletteTreeContext(cwd) {
+    const nextCwd = String(cwd || "").trim();
+    const empty = { files: [], truncated: false, fetchedAt: 0 };
+    if (!nextCwd) return empty;
+
+    const cached = this.commandPaletteTreeCache.get(nextCwd);
+    if (cached && Date.now() - cached.fetchedAt < COMMAND_PALETTE_TREE_TTL_MS) {
+      return cached;
+    }
+
+    try {
+      const res = await fetch(
+        `/api/files/tree?cwd=${encodeURIComponent(nextCwd)}`,
+      );
+      const data = await res.json().catch(() => ({}));
+      const payload = {
+        files:
+          res.ok && !data.error && Array.isArray(data.files) ? data.files : [],
+        truncated: Boolean(data.truncated),
+        fetchedAt: Date.now(),
+      };
+      this.commandPaletteTreeCache.set(nextCwd, payload);
+      return payload;
+    } catch {
+      const payload = { files: [], truncated: false, fetchedAt: Date.now() };
+      this.commandPaletteTreeCache.set(nextCwd, payload);
+      return payload;
+    }
+  }
+
   async buildCommandPaletteContext() {
     const cwd =
       this.getActiveTerminal()?.cwd || this.getCurrentDirectoryValue() || "";
-    await this.ensureCommandPaletteGitContext(cwd);
+    await Promise.all([
+      this.ensureCommandPaletteGitContext(cwd),
+      this.ensureCommandPaletteTreeContext(cwd),
+    ]);
     return this.getCommandPaletteContext();
   }
 
@@ -9919,6 +10215,10 @@ class TerminalManager {
       // Settings body: build the settings content element and render it into
       // the tab body host. No teardown — settings state lives in settingsStore.
       mountSettingsBody: (hostEl) => this.mountEditorSettingsTab(hostEl),
+      // Task Board body: a full-width board-variant Tasks view (backlog
+      // 2026-07-05 — the kanban board gets the editor area, the sidebar stays
+      // the quick-selection list).
+      mountTasksBody: (hostEl) => this.mountEditorTasksTab(hostEl),
       onActiveBodyMeasure: () => this.refreshActiveEditorTab(),
       // Destroy the live CodeMirror view/handle when a tab body is torn down.
       onBodyTeardown: (key) => {
@@ -10055,6 +10355,10 @@ class TerminalManager {
     const key = window.EditorTabs.tabKey(tab);
     const handle = await this.fileEditor.mountInto(hostEl, tab.ref, {
       onEdit: () => this.editorTabs?.model.pin(key),
+      // Seed the initial debounce from the current editor.autosave setting
+      // (applyEditorAutosave keeps every ALREADY-open tab's interval live —
+      // this only covers the mount-time value for a freshly opened tab).
+      autosaveMs: this.editorAutosaveMs ?? null,
     });
     if (!handle) {
       // Load failed (binary / 403 / 404): drop the tab so we don't leave an
@@ -10129,6 +10433,59 @@ class TerminalManager {
     await this.settingsManager.render();
   }
 
+  // Mount the full-width Task Board into the editor-area tab body: a second
+  // TasksViewController instance in the "board" variant. It shares the live
+  // taskState + operations on this manager (its own poll subscription is torn
+  // down via the editorTabHandles destroy hook when the tab closes).
+  mountEditorTasksTab(hostEl) {
+    if (!window.TasksView?.TasksViewController) return;
+    const view = new window.TasksView.TasksViewController({
+      document,
+      getTaskManager: () => this,
+      variant: "board",
+    });
+    view.mount(hostEl);
+    this.editorTabHandles?.set("tasks:board", {
+      destroy: () => view.dispose(),
+      refresh: () => {},
+    });
+  }
+
+  // Can the Task Board editor tab open right now? (IDE mode with live tabs.)
+  canOpenTaskBoardTab() {
+    return Boolean(this.isIdeModeActive() && this.editorTabs);
+  }
+
+  // Open (or focus) the singleton Task Board editor tab.
+  openTaskBoardTab() {
+    if (!this.canOpenTaskBoardTab()) return;
+    this.editorTabs.openTasksBoard();
+  }
+
+  // Close the active editor tab (palette command). Goes through
+  // requestCloseKey — the single user-initiated-close chokepoint — so a
+  // dirty file tab still prompts before discarding.
+  closeActiveEditorTabFromPalette() {
+    if (!this.isIdeModeActive() || !this.editorTabs) return;
+    const key = this.editorTabs.model.state.activeKey;
+    if (!key) return;
+    this.editorTabs.requestCloseKey(key);
+  }
+
+  // Activate the next/previous editor tab (direction +1/-1), wrapping around.
+  // No-op with 0 or 1 tabs (nothing to step to).
+  stepActiveEditorTab(direction) {
+    if (!this.isIdeModeActive() || !this.editorTabs) return;
+    const state = this.editorTabs.model.state;
+    const tabs = Array.isArray(state?.tabs) ? state.tabs : [];
+    if (tabs.length < 2) return;
+    const keys = tabs.map((tab) => window.EditorTabs.tabKey(tab));
+    const currentIndex = keys.indexOf(state.activeKey);
+    if (currentIndex < 0) return;
+    const nextIndex = (currentIndex + direction + keys.length) % keys.length;
+    this.editorTabs.model.activate(keys[nextIndex]);
+  }
+
   async mountEditorDiffTab(hostEl, tab) {
     const r = tab.ref || {};
     const key = window.EditorTabs.tabKey(tab);
@@ -10193,6 +10550,13 @@ class TerminalManager {
     if (mode === "commit" && ref.commit) {
       return Promise.all([showAt(`${ref.commit}~1`), showAt(ref.commit)]);
     }
+    if (mode === "conflict") {
+      // Merge conflict (Track D slice D3): ours (index stage 2) vs theirs
+      // (index stage 3) — the gated /api/git/show route maps the STAGE2/
+      // STAGE3 sentinels to git's :2/:3. Never the raw working file, which
+      // still carries the conflict markers.
+      return Promise.all([showAt("STAGE2"), showAt("STAGE3")]);
+    }
     // working tree (default): HEAD vs the on-disk file.
     return Promise.all([showAt("HEAD"), worktree()]);
   }
@@ -10213,7 +10577,15 @@ class TerminalManager {
       commit,
       title:
         title ||
-        `${relPath} (${mode === "staged" ? "Staged" : mode === "commit" ? "Commit" : "Working Tree"})`,
+        `${relPath} (${
+          mode === "staged"
+            ? "Staged"
+            : mode === "commit"
+              ? "Commit"
+              : mode === "conflict"
+                ? "Merge Conflict"
+                : "Working Tree"
+        })`,
     });
   }
 
@@ -10305,12 +10677,20 @@ class TerminalManager {
     } else if (mode === "commit" && r.commit) {
       // commit~1 vs commit.
       probes = [showProbe(`${r.commit}~1`), showProbe(r.commit)];
+    } else if (mode === "conflict") {
+      // Merge conflict: ours (STAGE2 → :2) vs theirs (STAGE3 → :3).
+      probes = [showProbe("STAGE2"), showProbe("STAGE3")];
     } else {
       // working tree (default): HEAD vs the on-disk working file.
       probes = [showProbe("HEAD"), fileProbe()];
     }
 
     const results = await Promise.all(probes);
+    // Conflict diffs are meaningful with a single existing stage (UD/DU/AU/UA
+    // — one side deleted/absent renders ours-vs-empty; showAt() already
+    // substitutes "" for a missing stage). Only a conflict with NO stage at
+    // all (DD) has nothing to show. Every other mode needs both sides.
+    if (mode === "conflict") return results.some(Boolean);
     return results.every(Boolean);
   }
 
@@ -10750,6 +11130,19 @@ class TerminalManager {
         this.toggleCommandPalette();
         return;
       }
+      // Ctrl+P — quick-open is the default no-prefix palette experience;
+      // opens the SAME palette as Ctrl+Shift+P. preventDefault is essential
+      // here (unlike the shift variant, plain Ctrl/Cmd+P is the browser's
+      // print-dialog shortcut).
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        !e.shiftKey &&
+        e.key.toLowerCase() === "p"
+      ) {
+        e.preventDefault();
+        this.toggleCommandPalette();
+        return;
+      }
       if (this.isCommandPaletteOpen()) {
         return;
       }
@@ -11013,6 +11406,7 @@ class TerminalManager {
 
     const terminal = this.createXtermInstance();
     terminal.open(element);
+    const webglAddon = this.setupTerminalRenderer(id, terminal);
     const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
     const fitAddon = terminal._fitAddon;
@@ -11085,6 +11479,7 @@ class TerminalManager {
     this.terminals.set(id, {
       terminal,
       fitAddon,
+      webglAddon,
       ws,
       element,
       overlay,
@@ -11582,6 +11977,22 @@ class TerminalManager {
     terminal._fitAddon = fitAddon;
     terminal._searchAddon = searchAddon;
 
+    // Unicode11: correct wide-char (CJK/emoji) column metrics. Always on,
+    // independent of the terminal.renderer setting. Guarded so a missing
+    // vendor script degrades gracefully instead of crashing terminal creation.
+    if (typeof window.Unicode11Addon !== "undefined") {
+      try {
+        terminal.loadAddon(new window.Unicode11Addon.Unicode11Addon());
+        terminal.unicode.activeVersion = "11";
+      } catch (err) {
+        console.warn("[terminal] Failed to load Unicode11 addon", err);
+      }
+    } else {
+      console.warn(
+        "[terminal] Unicode11Addon vendor script not loaded; using default unicode version",
+      );
+    }
+
     // OSC52 clipboard support (xterm.js 6.0+)
     if (terminal.parser?.registerOscHandler) {
       terminal.parser.registerOscHandler(52, (data) => {
@@ -11634,6 +12045,67 @@ class TerminalManager {
     });
 
     return terminal;
+  }
+
+  // GPU renderer wiring for the `terminal.renderer` setting (auto|default).
+  // Called once per terminal, right after terminal.open(). Returns the loaded
+  // WebglAddon instance (to be tracked as termData.webglAddon) or null when
+  // the addon was not loaded — leaving xterm 5.3.0's default renderer active,
+  // exactly as before this setting existed.
+  //
+  // "default": never loads the addon (byte-identical to pre-existing
+  // behavior — the addon script is never even evaluated into behavior).
+  // "auto" (also the fallback for unset/unknown values): loads the addon only
+  // when a cached, once-per-page WebGL2 probe succeeded. Any failure while
+  // constructing/loading the addon disposes it and falls back to default.
+  setupTerminalRenderer(id, terminal) {
+    const setting =
+      this.settingsStore?.get("terminal.renderer", "auto") ?? "auto";
+    const probeResult = probeWebgl2Support();
+    const plan =
+      window.TerminalRenderer?.decideRendererPlan?.(setting, probeResult) || {};
+    if (!plan.loadWebgl) return null;
+
+    if (typeof window.WebglAddon === "undefined") {
+      console.warn(
+        "[terminal-renderer] WebglAddon vendor script not loaded; using default renderer",
+      );
+      return null;
+    }
+
+    let webglAddon = null;
+    try {
+      webglAddon = new window.WebglAddon.WebglAddon();
+      terminal.loadAddon(webglAddon);
+      webglAddon.onContextLoss(() => {
+        try {
+          webglAddon.dispose();
+        } catch (err) {
+          if (DEBUG)
+            dbg("[renderer] webgl dispose-on-context-loss error", { id, err });
+        }
+        const t = this.terminals.get(id);
+        if (t) t.webglAddon = null;
+        if (terminal._webglAddon === webglAddon) terminal._webglAddon = null;
+        console.warn(
+          `[terminal-renderer] WebGL context lost for terminal ${id}; fell back to default renderer`,
+        );
+      });
+    } catch (err) {
+      console.warn(
+        "[terminal-renderer] Failed to load WebGL addon, using default renderer",
+        err,
+      );
+      try {
+        webglAddon?.dispose?.();
+      } catch {
+        // Already in a bad state — nothing more to clean up.
+      }
+      return null;
+    }
+
+    terminal._webglAddon = webglAddon;
+    return webglAddon;
   }
 
   createOverlay(parentElement) {
@@ -12250,6 +12722,7 @@ class TerminalManager {
 
       const terminal = this.createXtermInstance();
       terminal.open(element);
+      const webglAddon = this.setupTerminalRenderer(id, terminal);
       const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
       const fitAddon = terminal._fitAddon;
@@ -12318,6 +12791,7 @@ class TerminalManager {
       this.terminals.set(id, {
         terminal,
         fitAddon,
+        webglAddon,
         ws,
         element,
         overlay,
@@ -12698,6 +13172,16 @@ class TerminalManager {
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
+    // The webgl addon must be disposed BEFORE terminal.dispose() — disposing
+    // it after the terminal is gone throws in some xterm versions.
+    if (t.webglAddon) {
+      try {
+        t.webglAddon.dispose();
+      } catch (err) {
+        if (DEBUG) dbg("webglAddon.dispose error", { id, err });
+      }
+      t.webglAddon = null;
+    }
     try {
       t.terminal?.dispose?.();
     } catch (err) {

@@ -20,6 +20,17 @@ const EDITOR_LANGUAGES = {
   html: "html",
   htm: "html",
   css: "css",
+  yaml: "yaml",
+  yml: "yaml",
+  xml: "xml",
+  svg: "xml",
+  sql: "sql",
+  c: "cpp",
+  h: "cpp",
+  cpp: "cpp",
+  hpp: "cpp",
+  rs: "rust",
+  go: "go",
 };
 
 const BINARY_EXTENSIONS = new Set([
@@ -82,6 +93,99 @@ function headOriginalFor(showResponse, isTracked) {
   if (!showResponse || !showResponse.ok) return null;
   if (typeof showResponse.content !== "string") return null;
   return showResponse.content;
+}
+
+// Autosave setting values are the raw settings-schema strings ("off", "1000",
+// "5000") — this is the one place that turns that into a debounce interval.
+// Any other value (missing, unrecognized, non-numeric) is treated as "off" so
+// a bad/legacy stored value can never spin up silent background saves.
+function parseAutosaveMs(rawValue) {
+  if (rawValue === "off" || rawValue === null || rawValue === undefined) {
+    return null;
+  }
+  const n = Number(rawValue);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+// Debounced-save engine for one editor tab. Pure/DOM-free and driven entirely
+// through the injected `save` + `schedule`/`cancel` (mirrors the injectable
+// scheduler in settings-store.js so both are deterministically unit-testable
+// without real timers).
+//
+// Contract (plan §3 CRITICAL INVARIANTS):
+//   - notifyChange() is a no-op whenever autosave is off (intervalMs is
+//     null/0) OR the last save attempt failed — a file that failed its last
+//     save is NEVER autosaved again until a manual save succeeds.
+//   - The scheduled save always goes through the SAME `save` callback the
+//     caller wires to the tab-handle's save() (expectedMtimeMs optimistic
+//     locking + 409 conflict UI are whatever that function already does —
+//     this controller only decides WHEN to call it, never how).
+//   - notifySaved(ok) lets a save triggered from anywhere (manual Ctrl+S,
+//     click, or this controller's own timer) update the failed state, so a
+//     successful manual save always re-arms autosave.
+function createAutosaveController({
+  save,
+  intervalMs = null,
+  schedule = (fn, ms) => setTimeout(fn, ms),
+  cancel = (id) => clearTimeout(id),
+} = {}) {
+  let timer = null;
+  let failed = false;
+
+  function isEnabled() {
+    return Number.isFinite(intervalMs) && intervalMs > 0;
+  }
+
+  function stop() {
+    if (timer !== null) {
+      cancel(timer);
+      timer = null;
+    }
+  }
+
+  async function run() {
+    timer = null;
+    if (failed || typeof save !== "function") return;
+    const ok = await save();
+    failed = !ok;
+  }
+
+  function notifyChange() {
+    if (!isEnabled() || failed) return;
+    stop();
+    timer = schedule(() => {
+      void run();
+    }, intervalMs);
+  }
+
+  // Called after ANY save of this tab resolves (autosave-triggered or
+  // manual) so both paths share the same failed/armed state.
+  function notifySaved(ok) {
+    failed = !ok;
+    if (ok) stop();
+  }
+
+  function setIntervalMs(next) {
+    intervalMs = next;
+    if (!isEnabled()) stop();
+  }
+
+  function dispose() {
+    stop();
+  }
+
+  return {
+    notifyChange,
+    notifySaved,
+    setIntervalMs,
+    dispose,
+    get failed() {
+      return failed;
+    },
+    get enabled() {
+      return isEnabled();
+    },
+  };
 }
 
 class FileEditor {
@@ -159,6 +263,13 @@ class FileEditor {
         event.preventDefault();
         void this.save();
       } else if (event.key === "Escape") {
+        // The CodeMirror search panel (@codemirror/search) also binds Escape
+        // to close ITSELF, and — since it doesn't stop propagation — the
+        // keydown still bubbles up here. Without this guard the first Escape
+        // while the find bar is focused would close the panel AND the whole
+        // editor modal in the same keystroke. Let the panel own Escape while
+        // it's open; the modal's Escape-to-close resumes once it's gone.
+        if (modal.querySelector(".cm-search")) return;
         event.preventDefault();
         this.close();
       }
@@ -242,6 +353,12 @@ class FileEditor {
       python: () => cm.python(),
       html: () => cm.html(),
       css: () => cm.css(),
+      yaml: () => cm.yaml(),
+      xml: () => cm.xml(),
+      sql: () => cm.sql(),
+      cpp: () => cm.cpp(),
+      rust: () => cm.rust(),
+      go: () => cm.go(),
     };
     return new cm.EditorView({
       state: cm.EditorState.create({
@@ -250,6 +367,29 @@ class FileEditor {
           ...(Array.isArray(extraKeymaps) && extraKeymaps.length
             ? [cm.keymap.of(extraKeymaps)]
             : []),
+          // In-editor search (Mod-f). basicSetup already bundles
+          // @codemirror/search's own default Mod-f binding (opens the same
+          // panel) but WITHOUT stopping propagation, so it would also let the
+          // document-level terminal-scrollback-search handler (app.js, plain
+          // Ctrl+F) fire for the same keystroke. Declaring our own binding
+          // here — BEFORE basicSetup in the array, same ordering as the
+          // extraKeymaps save binding above — makes it win ("keymaps
+          // specified early... get checked first", @codemirror/view) and
+          // `stopPropagation: true` keeps the keystroke from bubbling past
+          // this view's DOM, so it only ever fires while THIS editor is
+          // focused and never shadows the terminal shortcut when it isn't.
+          cm.keymap.of([
+            {
+              key: "Mod-f",
+              preventDefault: true,
+              stopPropagation: true,
+              run: (view) => {
+                cm.openSearchPanel(view);
+                return true;
+              },
+            },
+          ]),
+          cm.highlightSelectionMatches(),
           cm.basicSetup,
           cm.keymap.of([cm.indentWithTab]),
           cm.oneDark,
@@ -311,9 +451,12 @@ class FileEditor {
   //   { view, save(), refresh(), destroy() }  (or null when the load failed —
   //   the caller silently drops the tab).
   // `onEdit` fires on the first edit so the tab controller can pin the preview.
+  // `autosaveMs` is the initial debounce interval from the editor.autosave
+  // setting (null/0 = off; see parseAutosaveMs) — the caller can change it
+  // live via the returned handle's setAutosaveIntervalMs.
   // Each mounted tab owns its OWN view + current pointer (the modal's this.view
   // / this.current stay reserved for the modal path).
-  async mountInto(hostEl, path, { onEdit } = {}) {
+  async mountInto(hostEl, path, { onEdit, autosaveMs = null } = {}) {
     if (!hostEl) return null;
     const loaded = await this.loadFile(path, { silent: true });
     if (!loaded) return null;
@@ -331,6 +474,16 @@ class FileEditor {
     // the focused editor tab and never steals the shortcut from a terminal, the
     // modal, or the explorer.
     const handleRef = { handle: null };
+    // Debounced autosave — always goes through handle.save() (whatever the
+    // CURRENT one is, including any wrapper a caller installs, e.g. the
+    // "Saved ✓" toast in app.js's mountEditorFileTab), so it gets the exact
+    // same expectedMtimeMs optimistic-locking + 409-conflict-UI behavior as a
+    // manual save. See createAutosaveController for the off/failed-save
+    // invariants.
+    const autosave = createAutosaveController({
+      save: () => handleRef.handle?.save?.(),
+      intervalMs: autosaveMs,
+    });
     const view = this.buildEditorView(
       cm,
       hostEl,
@@ -342,6 +495,7 @@ class FileEditor {
           edited = true;
           if (typeof onEdit === "function") onEdit();
         }
+        autosave.notifyChange();
       },
       [
         {
@@ -382,18 +536,22 @@ class FileEditor {
             this.alertImpl(
               "The file changed on disk since you opened it. Close the tab and reopen to pick up the new content (your version stays in this tab until then).",
             );
+            autosave.notifySaved(false);
             return false;
           }
           if (!res.ok) {
             const denial = window.AccessDenied?.describeAccessDenied(body);
             this.alertImpl(denial?.text || body.error || "Save failed");
+            autosave.notifySaved(false);
             return false;
           }
           current.mtimeMs = body.mtimeMs;
           edited = false;
+          autosave.notifySaved(true);
           return true;
         } catch {
           this.alertImpl("Save failed");
+          autosave.notifySaved(false);
           return false;
         }
       },
@@ -406,7 +564,12 @@ class FileEditor {
           // best-effort
         }
       },
+      // Live-update the autosave debounce interval (editor.autosave setting
+      // changed while this tab is open). null/0 turns autosave off for this
+      // tab and cancels any pending scheduled save.
+      setAutosaveIntervalMs: (ms) => autosave.setIntervalMs(ms),
       destroy: () => {
+        autosave.dispose();
         try {
           view.destroy();
         } catch {
@@ -478,6 +641,8 @@ const FileEditorModule = {
   detectEditorLanguage,
   isProbablyEditable,
   headOriginalFor,
+  parseAutosaveMs,
+  createAutosaveController,
   FileEditor,
 };
 
@@ -493,5 +658,7 @@ if (typeof exports !== "undefined") {
   exports.detectEditorLanguage = detectEditorLanguage;
   exports.isProbablyEditable = isProbablyEditable;
   exports.headOriginalFor = headOriginalFor;
+  exports.parseAutosaveMs = parseAutosaveMs;
+  exports.createAutosaveController = createAutosaveController;
   exports.FileEditor = FileEditor;
 }

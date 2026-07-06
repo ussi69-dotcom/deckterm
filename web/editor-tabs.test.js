@@ -4,9 +4,11 @@ import {
   TAB_FILE,
   TAB_DIFF,
   TAB_SETTINGS,
+  TAB_TASKS,
   makeFileTab,
   makeDiffTab,
   makeSettingsTab,
+  makeTasksTab,
   tabKey,
   findTabIndex,
   openTab,
@@ -862,4 +864,115 @@ test("EditorTabsController.openSettings opens singleton, second call focuses not
   );
   expect(settingsTabs).toHaveLength(1);
   expect(controller.model.state.activeKey).toBe("settings:global");
+});
+
+// ── Task Board tab (backlog: tasks board in the main editor area) ────────────
+
+// tabKey namespacing: tasks key must NEVER collide with a file named "tasks".
+test("tabKey for tasks is namespaced and never collides with a file path", () => {
+  const tasksTab = makeTasksTab();
+  expect(tabKey(tasksTab)).toBe("tasks:board");
+  expect(tabKey(tasksTab)).not.toBe(tabKey(makeFileTab("tasks")));
+  expect(tabKey(tasksTab)).not.toBe(tabKey(makeSettingsTab()));
+});
+
+// makeTasksTab builds a pinned, non-preview singleton.
+test("makeTasksTab builds a pinned non-preview tasks descriptor", () => {
+  const tab = makeTasksTab();
+  expect(tab.type).toBe(TAB_TASKS);
+  expect(tab.pinned).toBe(true);
+  expect(tab.preview).toBe(false);
+  expect(tab.ref).toBe(null);
+});
+
+// EditorTabsModel.openTasksBoard: second open focuses, doesn't duplicate.
+test("EditorTabsModel.openTasksBoard opens a pinned tasks tab (singleton)", () => {
+  const model = new EditorTabsModel();
+  model.openTasksBoard();
+  expect(model.state.tabs).toHaveLength(1);
+  expect(model.state.tabs[0].type).toBe(TAB_TASKS);
+  expect(model.state.activeKey).toBe("tasks:board");
+
+  model.open(makeFileTab("/a", { preview: false }));
+  expect(model.state.tabs).toHaveLength(2);
+  model.openTasksBoard();
+  expect(model.state.tabs.filter((t) => t.type === TAB_TASKS)).toHaveLength(1);
+  expect(model.state.activeKey).toBe("tasks:board");
+});
+
+// openTasksBoard NEVER touches the preview slot (mirrors openSettings).
+test("EditorTabsModel.openTasksBoard never clears/replaces the existing preview slot", () => {
+  const model = new EditorTabsModel();
+  model.open(makeFileTab("/preview.js", { preview: true }));
+  const previewKey = tabKey(makeFileTab("/preview.js"));
+
+  model.openTasksBoard();
+  const preview = model.state.tabs.find((t) => tabKey(t) === previewKey);
+  expect(preview).toBeTruthy();
+  expect(preview?.preview).toBe(true);
+  expect(model.state.tabs).toHaveLength(2);
+  expect(model.state.activeKey).toBe("tasks:board");
+});
+
+// serialize emits {type:"tasks"} with no extra fields; round-trips.
+test("serializeTabs emits {type:'tasks'} for a tasks tab and it round-trips", () => {
+  const model = new EditorTabsModel();
+  model.openTasksBoard();
+  const ser = serializeTabs(model.state);
+  expect(ser.tabs).toHaveLength(1);
+  expect(ser.tabs[0]).toEqual({ type: "tasks" });
+
+  const restored = deserializeTabs(ser);
+  expect(restored.tabs).toHaveLength(1);
+  expect(restored.tabs[0].type).toBe(TAB_TASKS);
+  expect(restored.tabs[0].pinned).toBe(true);
+});
+
+// Restore filter is type-scoped: tasks passes WITHOUT a probe + de-dups.
+test("filterRestoredTabs restores at most one tasks tab without calling canOpen", async () => {
+  const restored = {
+    tabs: [makeTasksTab(), makeTasksTab()],
+    activeKey: "tasks:board",
+  };
+  let probeCallCount = 0;
+  const canOpen = async () => {
+    probeCallCount += 1;
+    return true;
+  };
+  const survived = await filterRestoredTabs(restored, canOpen);
+  expect(probeCallCount).toBe(0);
+  expect(survived.tabs).toHaveLength(1);
+  expect(survived.tabs[0].type).toBe(TAB_TASKS);
+  expect(survived.activeKey).toBe("tasks:board");
+});
+
+// Tasks tab singleton via EditorTabsController.openTasksBoard() + mount hook.
+test("EditorTabsController.openTasksBoard opens singleton and mounts via mountTasksBody", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  let mounts = 0;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: () => areaEl,
+    placeholderEl: () => null,
+    mountTasksBody: async () => {
+      mounts += 1;
+    },
+  });
+
+  controller.openTasksBoard();
+  expect(controller.model.state.tabs).toHaveLength(1);
+  expect(controller.model.state.tabs[0].type).toBe(TAB_TASKS);
+  expect(controller.model.state.activeKey).toBe("tasks:board");
+  await controller.renderActiveBody();
+  expect(mounts).toBe(1);
+
+  // Second open focuses, no duplicate, no re-mount (body is cached).
+  controller.openTasksBoard();
+  await controller.renderActiveBody();
+  expect(
+    controller.model.state.tabs.filter((t) => t.type === TAB_TASKS),
+  ).toHaveLength(1);
+  expect(mounts).toBe(1);
 });

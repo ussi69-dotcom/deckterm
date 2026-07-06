@@ -15,6 +15,12 @@ export { markdown } from "@codemirror/lang-markdown";
 export { python } from "@codemirror/lang-python";
 export { html } from "@codemirror/lang-html";
 export { css } from "@codemirror/lang-css";
+export { yaml } from "@codemirror/lang-yaml";
+export { xml } from "@codemirror/lang-xml";
+export { sql } from "@codemirror/lang-sql";
+export { cpp } from "@codemirror/lang-cpp";
+export { rust } from "@codemirror/lang-rust";
+export { go } from "@codemirror/lang-go";
 export { oneDark } from "@codemirror/theme-one-dark";
 export {
   MergeView,
@@ -22,3 +28,8 @@ export {
   goToNextChunk,
   goToPreviousChunk,
 } from "@codemirror/merge";
+export {
+  searchKeymap,
+  highlightSelectionMatches,
+  openSearchPanel,
+} from "@codemirror/search";

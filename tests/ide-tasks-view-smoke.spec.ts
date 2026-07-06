@@ -55,7 +55,7 @@ test("IDE Tasks view mounts, tears down on switch-away, re-mounts on switch-back
     };
   });
   expect(registered.hasTasksView).toBe(true);
-  expect(registered.viewIds).toEqual(["explorer", "scm", "tasks"]);
+  expect(registered.viewIds).toEqual(["explorer", "scm", "tasks", "search"]);
 
   // Enter IDE mode (real toolbar path).
   await page.evaluate(() => {
@@ -67,8 +67,16 @@ test("IDE Tasks view mounts, tears down on switch-away, re-mounts on switch-back
     { timeout: 5000 },
   );
 
-  // Click the Tasks activity-bar icon.
-  await page.click('.ide-activity-item[data-view="tasks"]');
+  // Click the Tasks activity-bar icon. layout.activeView persists server-side
+  // and clicking the ALREADY-active icon toggles the sidebar collapsed — when
+  // Tasks is already the active view, IDE-enter mounted it and no click is
+  // needed (otherwise this spec flakes against a dirty local instance).
+  const activeView = await page.evaluate(() =>
+    (window as any).terminalManager?.ideShell?.activeView?.(),
+  );
+  if (activeView !== "tasks") {
+    await page.click('.ide-activity-item[data-view="tasks"]');
+  }
   await page.waitForFunction(
     () => Boolean(document.querySelector(".ide-tasks-view")),
     { timeout: 5000 },

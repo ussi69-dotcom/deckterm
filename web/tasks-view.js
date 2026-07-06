@@ -108,6 +108,19 @@ function tasksBadgeStatusClass(status) {
   return TASKS_BADGE_STATUS_TOKENS.has(status) ? status : "unknown";
 }
 
+// Which layout a Tasks view instance renders. Pure decision seam:
+//   - the "board" variant (the editor-area Task Board tab) ALWAYS renders the
+//     board — a full-width kanban is the tab's whole point.
+//   - the sidebar variant renders the compact LIST whenever the manager can
+//     open a board tab (`hasBoardTab`) — the sidebar stays the quick-selection
+//     list and the board lives in the editor area (backlog 2026-07-05).
+//   - legacy fallback (no board tab available): the shared persisted mode.
+function tasksViewRenderMode({ variant, hasBoardTab, sharedMode } = {}) {
+  if (variant === "board") return "board";
+  if (hasBoardTab) return "list";
+  return sharedMode === "board" ? "board" : "list";
+}
+
 // A cheap content signature over EVERYTHING the Tasks view paints, so identical
 // re-renders (e.g. a self-induced poll that returns the same tasks) can be
 // skipped — mirrors git-scm-view's renderSignature dedupe. Spans each task's
@@ -208,10 +221,13 @@ function taskMessagesSignature(messages) {
 //   document        the DOM document (defaults to global document)
 //   getTaskManager  () => the live TerminalManager (owns taskState + ops)
 //   pollIntervalMs  live-refresh poll cadence while mounted (default 15000)
+//   variant         "sidebar" (default) — the IDE activity-bar view;
+//                   "board" — the full-width editor-area Task Board tab
 class TasksViewController {
   constructor(options = {}) {
     this.doc =
       options.document || (typeof document !== "undefined" ? document : null);
+    this.variant = options.variant === "board" ? "board" : "sidebar";
     this.getTaskManagerFn =
       typeof options.getTaskManager === "function"
         ? options.getTaskManager
@@ -250,7 +266,10 @@ class TasksViewController {
     if (this.root) this.unmount();
     this.container = container;
     const root = this.doc.createElement("div");
-    root.className = "ide-tasks-view";
+    root.className =
+      this.variant === "board"
+        ? "ide-tasks-view ide-tasks-board-view"
+        : "ide-tasks-view";
     root.innerHTML = this.skeletonHtml();
     container.appendChild(root);
     this.root = root;
@@ -318,11 +337,16 @@ class TasksViewController {
   // ── Render ───────────────────────────────────────────────────────────────────
 
   skeletonHtml() {
+    // The board-tab variant IS the board — no list/board affordance there.
+    const viewBtn =
+      this.variant === "board"
+        ? ""
+        : '<button type="button" class="ide-tasks-action" data-action="view" title="Toggle list / board"></button>';
     return `
       <div class="ide-tasks-actions">
         <button type="button" class="ide-tasks-action" data-action="new" title="New task">+ Task</button>
         <span class="ide-tasks-actions-spacer"></span>
-        <button type="button" class="ide-tasks-action" data-action="view" title="Toggle list / board"></button>
+        ${viewBtn}
         <button type="button" class="ide-tasks-action" data-action="refresh" title="Refresh">&#x21bb;</button>
       </div>
       <div class="ide-tasks-status"></div>
@@ -341,11 +365,27 @@ class TasksViewController {
     return resolveEscapeHtml()(text);
   }
 
+  // Can the manager open the full-width Task Board editor tab right now?
+  // (IDE mode with live editor tabs.) Decides both the sidebar layout (list
+  // only) and what the "Board" button does.
+  hasBoardTab() {
+    const tm = this.taskManager;
+    return typeof tm?.openTaskBoardTab === "function" && tm.canOpenTaskBoardTab
+      ? Boolean(tm.canOpenTaskBoardTab())
+      : false;
+  }
+
   viewMode() {
     const tm = this.taskManager;
-    return tm && typeof tm.getTaskViewMode === "function"
-      ? tm.getTaskViewMode()
-      : "list";
+    const sharedMode =
+      tm && typeof tm.getTaskViewMode === "function"
+        ? tm.getTaskViewMode()
+        : "list";
+    return tasksViewRenderMode({
+      variant: this.variant,
+      hasBoardTab: this.hasBoardTab(),
+      sharedMode,
+    });
   }
 
   render() {
@@ -363,10 +403,18 @@ class TasksViewController {
     if (sig !== null && sig === this._renderSig) return;
     this._renderSig = sig;
 
-    // Reflect the view-mode toggle label.
+    // Reflect the view button: with a board tab available it OPENS the
+    // full-width board in the editor area; legacy fallback toggles in place.
     const viewBtn = this.q('[data-action="view"]');
-    if (viewBtn)
-      viewBtn.textContent = viewMode === "board" ? "☰ List" : "▦ Board";
+    if (viewBtn) {
+      if (this.hasBoardTab()) {
+        viewBtn.textContent = "▦ Board";
+        viewBtn.title = "Open board in the editor area";
+      } else {
+        viewBtn.textContent = viewMode === "board" ? "☰ List" : "▦ Board";
+        viewBtn.title = "Toggle list / board";
+      }
+    }
 
     const statusEl = this.q(".ide-tasks-status");
     if (statusEl) statusEl.textContent = status;
@@ -526,7 +574,11 @@ class TasksViewController {
         void this.refresh();
         break;
       case "view":
-        if (typeof tm.toggleTaskViewMode === "function") {
+        // IDE with editor tabs live: the sidebar stays a list; "Board" opens
+        // the full-width Task Board tab. Legacy fallback: in-place toggle.
+        if (this.hasBoardTab()) {
+          tm.openTaskBoardTab();
+        } else if (typeof tm.toggleTaskViewMode === "function") {
           tm.toggleTaskViewMode();
           this.render();
         }
@@ -549,6 +601,7 @@ const TasksViewModule = {
   tasksBoardColumns,
   tasksTotalCount,
   tasksBadgeStatusClass,
+  tasksViewRenderMode,
   tasksRenderSignature,
   formatTaskMessageRow,
   taskMessagesSignature,
@@ -567,6 +620,7 @@ if (typeof exports !== "undefined") {
   exports.tasksBoardColumns = tasksBoardColumns;
   exports.tasksTotalCount = tasksTotalCount;
   exports.tasksBadgeStatusClass = tasksBadgeStatusClass;
+  exports.tasksViewRenderMode = tasksViewRenderMode;
   exports.tasksRenderSignature = tasksRenderSignature;
   exports.formatTaskMessageRow = formatTaskMessageRow;
   exports.taskMessagesSignature = taskMessagesSignature;

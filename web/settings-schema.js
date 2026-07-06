@@ -70,6 +70,21 @@ const SETTINGS_SCHEMA = [
     searchText: "extra keys bar mobile toolbar esc tab arrows ctrl",
   },
   {
+    key: "terminal.renderer",
+    category: "Terminal",
+    label: "Renderer",
+    description:
+      "GPU-accelerated WebGL rendering when supported, or the built-in renderer.",
+    type: "select",
+    default: "auto",
+    options: [
+      { value: "auto", label: "Auto (GPU when available)" },
+      { value: "default", label: "Default" },
+    ],
+    searchText:
+      "renderer webgl gpu acceleration canvas fallback performance rendering",
+  },
+  {
     key: "terminal.scrollbackLimit",
     category: "Terminal",
     label: "Scrollback limit",
@@ -135,6 +150,21 @@ const SETTINGS_SCHEMA = [
     default: "",
     searchText:
       "default cwd working directory path explorer home folder web dir",
+  },
+  {
+    key: "editor.autosave",
+    category: "Files",
+    label: "Autosave",
+    description:
+      "Automatically save an open file after you stop typing (off disables autosave).",
+    type: "select",
+    default: "off",
+    options: [
+      { value: "off", label: "Off" },
+      { value: "1000", label: "After 1 second" },
+      { value: "5000", label: "After 5 seconds" },
+    ],
+    searchText: "autosave auto save editor debounce interval delay file tab",
   },
 
   // ── Tasks ───────────────────────────────────────────────────────────────

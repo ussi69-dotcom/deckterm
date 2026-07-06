@@ -247,7 +247,21 @@ class LegacyFsExecutor implements FsExecutor {
     expectedMode?: number,
   ): Promise<void> {
     // Atomic tmp-in-same-dir + rename (matches the editor-save route's prior
-    // behavior; the brokered helper does the same fd-safely).
+    // behavior; the brokered helper does the same fd-safely). `expectedMode`
+    // (D4 — replace-in-files) is honored via chmod on the tmp file BEFORE the
+    // rename, so the final file's permission bits match what the caller
+    // observed at stat time even though writeFile() itself would otherwise
+    // create the tmp file with the process umask's default mode.
+    //
+    // legacyOwnerNote: this executor is a SINGLE service account (today's
+    // legacy, pre-isolation model) — every file it writes is already owned by
+    // that one account, so there is no cross-user OWNER to preserve; the
+    // brokered executor's fs helper instead runs the write AS the mapped
+    // user (preserving that user's real ownership) via an atomic, inode-
+    // pinned commit (nlink==1 + RENAME_EXCHANGE verify). Legacy callers that
+    // surface this asymmetry to a client should label it (e.g. a
+    // `legacyOwnerNote` response field) rather than imply ownership is
+    // actively preserved here.
     const p = this.abs(root, relPath);
     const tmp = join(
       dirname(p),

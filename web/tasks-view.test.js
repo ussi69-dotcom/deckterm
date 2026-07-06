@@ -3,6 +3,7 @@ import {
   tasksBoardColumns,
   tasksTotalCount,
   tasksBadgeStatusClass,
+  tasksViewRenderMode,
   tasksRenderSignature,
   formatTaskMessageRow,
   taskMessagesSignature,
@@ -287,4 +288,45 @@ test("taskMessagesSignature tolerates junk entries inside an array", () => {
       { id: null, delivery: "", len: 0 },
     ]),
   );
+});
+
+// ── tasksViewRenderMode (board tab vs sidebar list vs legacy toggle) ─────────
+
+test("tasksViewRenderMode: board variant always renders the board", () => {
+  expect(tasksViewRenderMode({ variant: "board" })).toBe("board");
+  expect(
+    tasksViewRenderMode({
+      variant: "board",
+      hasBoardTab: false,
+      sharedMode: "list",
+    }),
+  ).toBe("board");
+});
+
+test("tasksViewRenderMode: sidebar stays a list when the board tab is available", () => {
+  expect(
+    tasksViewRenderMode({
+      variant: "sidebar",
+      hasBoardTab: true,
+      sharedMode: "board",
+    }),
+  ).toBe("list");
+});
+
+test("tasksViewRenderMode: legacy fallback follows the shared persisted mode", () => {
+  expect(
+    tasksViewRenderMode({
+      variant: "sidebar",
+      hasBoardTab: false,
+      sharedMode: "board",
+    }),
+  ).toBe("board");
+  expect(
+    tasksViewRenderMode({
+      variant: "sidebar",
+      hasBoardTab: false,
+      sharedMode: "list",
+    }),
+  ).toBe("list");
+  expect(tasksViewRenderMode({})).toBe("list");
 });
