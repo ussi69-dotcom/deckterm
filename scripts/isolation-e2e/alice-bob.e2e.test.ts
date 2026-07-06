@@ -416,15 +416,78 @@ describe("git network", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 9 · Search denied (deferred fast-follow)
+// 9 · Search — brokered under isolation (Track D4 delivered the deferred
+// fast-follow: /api/files/search now runs the broker `search` profile as the
+// mapped uid instead of denying os_isolation_pending).
 // ---------------------------------------------------------------------------
 describe("search", () => {
-  test("alice search is denied os_isolation_pending, no content", async () => {
+  test("alice search runs brokered in her own home (200) and finds her file", async () => {
+    // e2e-note.txt ("alice-was-here") is written by the files suite above.
     const res = await h.fetchAs(PERSONAS.alice, "/api/files/search", {
       method: "POST",
       headers: jsonHeaders,
-      body: JSON.stringify({ cwd: ALICE_HOME, query: "SECRET" }),
+      body: JSON.stringify({ cwd: ALICE_HOME, query: "alice-was-here" }),
     });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    const parsed = JSON.parse(body);
+    expect(
+      parsed.matches.some((m: { path: string }) =>
+        m.path.endsWith("/e2e-note.txt"),
+      ),
+    ).toBe(true);
+    expect(body).not.toContain(BOB_SECRET_MARKER);
+  });
+
+  test("alice search never surfaces secret-shaped files, even her own", async () => {
+    const res = await h.fetchAs(PERSONAS.alice, "/api/files/search", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ cwd: ALICE_HOME, query: "THE-SECRET" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    // The authoritative server-side secret policy drops secret-shaped
+    // basenames (secret.txt) from brokered results exactly like legacy ones.
+    expect(body).not.toContain("THE-SECRET-OF-dtalice");
+    expect(body).not.toContain(BOB_SECRET_MARKER);
+  });
+
+  test("alice search in bob's home is denied, no content", async () => {
+    const res = await h.fetchAs(PERSONAS.alice, "/api/files/search", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({ cwd: BOB_HOME, query: "THE-SECRET" }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).not.toContain(BOB_SECRET_MARKER);
+  });
+
+  test("alice replace preview in bob's home is denied, no content", async () => {
+    // Track D4's replace-in-files shares the search gate stack; the write
+    // surface must deny cross-user exactly like search does.
+    const res = await h.fetchAs(PERSONAS.alice, "/api/files/replace", {
+      method: "POST",
+      headers: jsonHeaders,
+      body: JSON.stringify({
+        cwd: BOB_HOME,
+        query: "THE-SECRET",
+        replacement: "x",
+        preview: true,
+      }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.text()).not.toContain(BOB_SECRET_MARKER);
+  });
+
+  test("alice quick-open tree is denied os_isolation_pending (legacy-only walk)", async () => {
+    // Track D1's /api/files/tree is a legacy-only surface — under OS
+    // isolation it must fail CLOSED (brokerizing the walk is a documented
+    // follow-up), mirroring search's pre-D4 posture.
+    const res = await h.fetchAs(
+      PERSONAS.alice,
+      `/api/files/tree?cwd=${encodeURIComponent(ALICE_HOME)}`,
+    );
     expect(res.status).toBe(403);
     const body = await res.text();
     expect(JSON.parse(body).reason).toBe("os_isolation_pending");
