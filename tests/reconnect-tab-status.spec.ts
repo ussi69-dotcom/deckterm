@@ -1,4 +1,10 @@
-import { test, expect, resetAppState, waitForTerminal } from "./fixtures";
+import {
+  test,
+  expect,
+  resetAppState,
+  waitForTerminal,
+  readActiveTerminalText,
+} from "./fixtures";
 import { mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -242,12 +248,10 @@ test.describe("Terminal Tab Status on Reconnection", () => {
       );
     }, reconnectMarker);
 
+    // Renderer-independent read (Track D2 made WebGL the default renderer —
+    // `.xterm-rows` stays empty under WebGL; only the buffer API is reliable).
     await expect
-      .poll(
-        async () =>
-          page.locator(".tile.active .xterm-rows").first().textContent(),
-        { timeout: 10000 },
-      )
+      .poll(async () => readActiveTerminalText(page), { timeout: 10000 })
       .toContain(reconnectMarker);
   });
 

@@ -404,3 +404,84 @@ renderer, §5.6 explicit `merge.resolve` route+audit, §4 non-goals no longer as
 
 **Pass 3 (2026-07-05):** "No remaining consistency findings… **READY**." All six pass-2
 fold-ins verified individually. Coding may start.
+
+## 10. Delivery record (appendix, 2026-07-05/06)
+
+Executed in one autonomous tiered-delivery session (Sonnet coded each slice from the
+brief; orchestrator diff-reviewed every slice against the brief invariants; per-slice
+gates: full `test:unit` → `tsc --noEmit` → live verify on 4174 headless Playwright).
+Order as planned: D1 → D6 → D5 → D2 → D3 → D4. Each slice pushed to `dev` on landing.
+Suite grew 944 → 1031 unit tests, all green; `tsc` green throughout.
+
+### Per-slice commits
+
+| Slice              | Commit    | Live-verified on 4174                                                                                                                                                |
+| ------------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1 quick-open      | `551c9e7` | Ctrl+P → fuzzy match → file opens as pinned tab; `/api/files/tree` gates/caps/audit; new palette actions findable                                                    |
+| D6 UI polish       | `a6d001a` | toggle pills + focus ring (desktop + 375px sheet screenshots); contrast fixes live                                                                                   |
+| D5 editor breadth  | `86029f0` | .yaml highlighting; Mod-f panel opens only editor-focused (terminal search untouched); autosave 1s round-trip to disk; setting reset to off                          |
+| D2 renderer        | `9c372d3` | WebGL active on both terminals; forced `WEBGL_lose_context` → addon disposed → keeps painting; 10 open/close cycles leak-free; `default` switch disposes live addons |
+| D3 merge conflicts | `06f9c9d` | real UU conflict: classified `merge`, STAGE2/3 diffs, accept-current resolves+stages, `merge.resolve` audit row, dash-ref still 400                                  |
+| D4 search/replace  | `fbf2796` | preview/apply round-trip on scratch dir; token reuse → 400; regex → 400; summary + per-file + deny audit rows verified in DB                                         |
+
+### Deviations from the plan (all reviewed, none unresolved)
+
+- **D1:** `Files` palette group inserted at rank 2 (Workspaces/Views/Contextual/Other
+  shift by one — no golden test pinned the ranks). Empty bare query does NOT trigger
+  quick-open (consistent with other providers). Ctrl+P with focus INSIDE a terminal
+  stays with the shell (xterm's `cancel()` stops propagation for keys it handles) —
+  the palette binding fires from any other focus; this is the correct terminal-first
+  semantic and was accepted at review.
+- **D6:** the app has a SINGLE dark theme (no light theme exists) — the "both themes"
+  contrast requirement was N/A. `--text-muted` fails 4.5:1 on all panel backgrounds but
+  remains only on decorative glyphs (3:1 UI threshold); real empty/loading text
+  (`.muted`, `.settings-empty`) moved to `--text-secondary`. `settings-ui.js` renders no
+  markup (descriptor builder only) — checkbox restyle is pure CSS over the classes
+  `app.js` already emits.
+- **D5:** vendor bundle 692 KB → 977 KB (≤ ~1 MB budget). Two unplanned-but-necessary
+  guards: `basicSetup` already ships a default Mod-f WITHOUT stopPropagation (would have
+  double-fired the terminal Ctrl+F handler) — a preceding `stopPropagation:true` binding
+  wins; the CM search panel's Escape doesn't stop propagation either — the modal's
+  Escape-to-close is guarded while the panel is open. `vendor/codemirror.js` dynamic
+  import stays unversioned (server sends `no-store` on everything, so no stale-cache
+  window).
+- **D2 (F8 assert):** xterm 5.3.0's default renderer after WebGL-addon disposal is the
+  **DOM renderer** (asserted live: canvases removed, `.xterm-rows` repaints). The webgl
+  addon holds a 3 s context-restore window before firing `onContextLoss`. unicode11 is
+  always on; agent badges/size thresholds unaffected.
+- **D3:** the slice as coded left conflicted files INVISIBLE in the classic
+  (non-IDE/mobile) git panel (they had mis-shown under Staged before) — orchestrator
+  review added a read-only "Merge Conflicts" section there (visibility only; accept
+  actions stay IDE-side, terminal remains the mobile resolve tool). Tests fabricate all
+  7 conflict XY shapes via `git update-index --index-info`.
+- **D4:** Codex re-confirmed the §6 mini-design pre-coding with 4 hardening additions
+  (dev+ino in the token identity, dedup+sort before HMAC, nonce burned only at the
+  apply boundary, explicit per-file result states) — all implemented. Post-code Codex
+  security review returned 7 findings; **6 fixed in-slice** (raw query from UI + pinned
+  preview tuple + preview invalidation on input; last-instant re-stat before write;
+  UTF-8 round-trip gate excluding non-UTF-8 text; deny audit rows on every rejected
+  apply; broker slot release on spawn failure; exec-context tag in the token tuple) and
+  **1 accepted** (legacy parent-directory symlink-swap window — pre-existing
+  `LegacyFsExecutor` property shared with editor save; follow-up below). Additionally
+  the orchestrator review hardened F5 server-side: ineligible (truncated) files are
+  never signed into the token, so applying them fails token validation regardless of
+  client behavior. Brokered file identities carry a 0/0 dev/ino sentinel (broker
+  fs-helper `op_stat` doesn't surface them; extending the broker was out of scope) —
+  race detection there is size+mtime + the broker's inode-pinned atomic commit.
+
+### Follow-ups (backlogged, not in this track)
+
+1. **Brokered tree walk** — `/api/files/tree` (quick-open) denies under OS isolation;
+   wire a broker walk or reuse the search profile with `-l`.
+2. **rg vendoring** — optional perf slice; grep engine stays.
+3. **Format-on-save** — deferred to 1.1 (needs its own mini-design; no in-browser
+   prettier vendor, no new exec surface).
+4. **Regex replace v2** — capture groups via a bounded worker/subprocess strategy;
+   per-match selection would need match offsets bound into the token.
+5. **LegacyFsExecutor parent-dir symlink-swap window** — shared with the editor-save
+   path; candidate fix is fd-based/no-follow parent verification (D4 Codex review f3).
+6. **Broker fs-helper `op_stat` dev/ino** — would upgrade brokered replace identity
+   binding from the 0/0 sentinel to real values.
+7. **Git panel keyboard focusability** — `.git-file`/branch/commit rows are divs without
+   `tabindex`; focus-visible rings only reach their inner buttons (D6).
+8. **3-way merge editor** — 1.1 per program (D3 shipped ours/theirs MergeView + accepts).
