@@ -424,6 +424,22 @@ Suite grew 944 → 1031 unit tests, all green; `tsc` green throughout.
 | D3 merge conflicts | `06f9c9d` | real UU conflict: classified `merge`, STAGE2/3 diffs, accept-current resolves+stages, `merge.resolve` audit row, dash-ref still 400                                  |
 | D4 search/replace  | `fbf2796` | preview/apply round-trip on scratch dir; token reuse → 400; regex → 400; summary + per-file + deny audit rows verified in DB                                         |
 
+### Close-out commits (post-slice)
+
+| Commit    | What                                                                                                                                                                                                                                                                                                           |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0c1a5ec` | CI smoke fix: `.xterm-rows` textContent reads are EMPTY under the D2 WebGL renderer — new `readActiveTerminalText` fixture (xterm buffer API); remaining non-smoke `.xterm-rows` readers are a follow-up. Plus this appendix + program-doc marks.                                                              |
+| `1e1d72f` | isolation-e2e contract update: suite §9 asserted the pre-D4 posture (search 403 `os_isolation_pending`) — D4 delivered that fast-follow, so the suite now asserts brokered own-home search (200, real match, secrets filtered), cross-user deny, replace cross-user deny, and the D1 tree walk failing closed. |
+| `8a1a889` | Codex pre-finalization findings (2 Medium, both fixed): conflict-diff tabs reopen with ≥1 existing stage (one-sided UD/DU/AU/UA shapes no longer dropped on reload); `confirmReplaceApply` explicitly refuses while the regex toggle is on.                                                                    |
+
+### Codex pre-finalization pass (2026-07-06)
+
+Ran over the full integrated `4b82940..dev` diff (vendor + lockfile excluded; the
+first attempt with vendor included blew the 1 MB input cap). Verdict: **two Medium
+cross-slice findings** (fixed in `8a1a889`, above); explicitly no cache-bust
+inconsistencies and no other cross-slice conflicts. CI (unit + tsc + smoke-e2e +
+isolation-e2e) green on `dev` after `1e1d72f`.
+
 ### Deviations from the plan (all reviewed, none unresolved)
 
 - **D1:** `Files` palette group inserted at rank 2 (Workspaces/Views/Contextual/Other
@@ -485,3 +501,7 @@ Suite grew 944 → 1031 unit tests, all green; `tsc` green throughout.
 7. **Git panel keyboard focusability** — `.git-file`/branch/commit rows are divs without
    `tabindex`; focus-visible rings only reach their inner buttons (D6).
 8. **3-way merge editor** — 1.1 per program (D3 shipped ours/theirs MergeView + accepts).
+9. **e2e `.xterm-rows` reader migration** — non-smoke specs (reconnect-scrollback/
+   -debug/-realistic, tmux-rich-mode, terminal-basics, tab-switch-reliability) still
+   read terminal text from DOM rows, which are empty under the WebGL renderer; migrate
+   to the `readActiveTerminalText` fixture (buffer API) before the next full e2e run.
