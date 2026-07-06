@@ -10686,6 +10686,11 @@ class TerminalManager {
     }
 
     const results = await Promise.all(probes);
+    // Conflict diffs are meaningful with a single existing stage (UD/DU/AU/UA
+    // — one side deleted/absent renders ours-vs-empty; showAt() already
+    // substitutes "" for a missing stage). Only a conflict with NO stage at
+    // all (DD) has nothing to show. Every other mode needs both sides.
+    if (mode === "conflict") return results.some(Boolean);
     return results.every(Boolean);
   }
 

@@ -693,6 +693,16 @@ class SearchViewController {
       this._replacePhase !== "preview"
     )
       return;
+    // Belt-and-braces (Codex pre-final finding 2): the regex toggle already
+    // invalidates any live preview via onQueryInput → invalidateReplace-
+    // PreviewOnInput, but a literal preview must never apply while the UI is
+    // visibly in regex mode regardless of event ordering.
+    if (this._regex) {
+      this.setStatus(
+        "Replace does not support regex — turn off .* to replace.",
+      );
+      return;
+    }
     const cwd = this.cwd();
     const files = buildReplaceApplyFileList(
       this._replaceData.files,
