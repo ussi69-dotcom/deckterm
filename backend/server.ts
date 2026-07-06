@@ -25,6 +25,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   classifyAgentOutputPhase,
   createGitWorktreeDetector,
@@ -140,7 +141,13 @@ import {
   evaluateOsAccountEligibility,
   resolveEligibilityPolicy,
 } from "./services/os-mapping-eligibility";
-import { brokerCheck, brokerKill, brokerExec } from "./services/broker-client";
+import {
+  brokerCheck,
+  brokerKill,
+  brokerExec,
+  buildBrokerArgv,
+  resolveBrokerPath,
+} from "./services/broker-client";
 import {
   getFsExecutor,
   matchGrantedRoot,
@@ -1986,6 +1993,48 @@ function parseGrepLine(line: string): ScopedSearchMatch | null {
   return { path, line: lineNo, text };
 }
 
+// Shared per-line accumulation: NUL-line parse + secret pre-filter + per-file
+// cap + global maxResults cap. Factored out so the BROKERED search consumer
+// (D4 — search v2) runs through the exact same acceptance logic as the legacy
+// streaming grep below (Codex F1: "broker output goes through the same
+// consumer"), differing only in how the child process is spawned and how a
+// raw line's path is normalized before being handed here.
+function createSearchAccumulator(maxResults: number) {
+  const matches: ScopedSearchMatch[] = [];
+  const perFile = new Map<string, number>();
+  let truncated = false;
+  return {
+    matches,
+    get truncated() {
+      return truncated;
+    },
+    markTruncated() {
+      truncated = true;
+    },
+    atCap(): boolean {
+      return matches.length >= maxResults;
+    },
+    consumeLine(line: string) {
+      if (matches.length >= maxResults) {
+        truncated = true;
+        return;
+      }
+      const parsed = parseGrepLine(line);
+      if (!parsed) return;
+      // Authoritative secret policy (case-insensitive) — grep --exclude is
+      // only a perf first-pass; this drops case/name variants it misses.
+      if (isSecretSearchMatch(parsed.path)) return;
+      const seen = perFile.get(parsed.path) || 0;
+      if (seen >= SEARCH_MAX_PER_FILE) {
+        truncated = true;
+        return;
+      }
+      perFile.set(parsed.path, seen + 1);
+      matches.push(parsed);
+    },
+  };
+}
+
 async function runScopedSearch(opts: {
   ownerId: string;
   root: string;
@@ -2046,29 +2095,9 @@ async function runScopedSearch(opts: {
     }
   }, SEARCH_TIMEOUT_MS);
 
-  const matches: ScopedSearchMatch[] = [];
-  const perFile = new Map<string, number>();
+  const acc = createSearchAccumulator(maxResults);
   let buffer = "";
   let bytesRead = 0;
-
-  const consumeLine = (line: string) => {
-    if (matches.length >= maxResults) {
-      truncated = true;
-      return;
-    }
-    const parsed = parseGrepLine(line);
-    if (!parsed) return;
-    // Authoritative secret policy (case-insensitive) — grep --exclude is only a
-    // perf first-pass; this drops case/name variants it misses.
-    if (isSecretSearchMatch(parsed.path)) return;
-    const seen = perFile.get(parsed.path) || 0;
-    if (seen >= SEARCH_MAX_PER_FILE) {
-      truncated = true;
-      return;
-    }
-    perFile.set(parsed.path, seen + 1);
-    matches.push(parsed);
-  };
 
   try {
     const decoder = new TextDecoder();
@@ -2079,10 +2108,10 @@ async function runScopedSearch(opts: {
       while ((nl = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, nl);
         buffer = buffer.slice(nl + 1);
-        if (line) consumeLine(line);
-        if (matches.length >= maxResults) break;
+        if (line) acc.consumeLine(line);
+        if (acc.atCap()) break;
       }
-      if (matches.length >= maxResults) {
+      if (acc.atCap()) {
         truncated = true;
         try {
           proc.kill();
@@ -2102,7 +2131,7 @@ async function runScopedSearch(opts: {
       }
     }
     // Trailing line (no terminating newline) within bounds.
-    if (buffer && matches.length < maxResults) consumeLine(buffer);
+    if (buffer && !acc.atCap()) acc.consumeLine(buffer);
   } catch {
     // Stream torn down by kill() (timeout / abort / cap) — keep what we have.
   } finally {
@@ -2122,7 +2151,7 @@ async function runScopedSearch(opts: {
   // unique path so we pay it once per file, not per match line.
   const realpathCache = new Map<string, string | null>();
   const filtered: ScopedSearchMatch[] = [];
-  for (const m of matches) {
+  for (const m of acc.matches) {
     if (isSecretSearchMatch(m.path)) continue;
     let canonical = realpathCache.get(m.path);
     if (canonical === undefined) {
@@ -2136,7 +2165,868 @@ async function runScopedSearch(opts: {
     filtered.push(m);
   }
 
-  return { matches: filtered, truncated };
+  return { matches: filtered, truncated: truncated || acc.truncated };
+}
+
+// ── Brokered search (D4 — search v2) ─────────────────────────────────────────
+// Path normalization (Codex F1, HIGH): the broker `search` profile runs grep
+// against "." inside the fd-resolved root+reldir, so its NUL-delimited paths
+// are RELATIVE ("./x/y.ts" or "."), while every consumer downstream (secret
+// filter, post-filter, UI) expects the ABSOLUTE form the legacy path produces.
+// This is a small pure exported function so it is unit-testable directly with
+// fabricated broker output — the broker is not runnable in the unit-test env.
+export function normalizeBrokeredSearchPath(
+  rawPath: string,
+  root: string,
+  reldir: string,
+): string {
+  let rel = rawPath;
+  if (rel === ".") rel = "";
+  else if (rel.startsWith("./")) rel = rel.slice(2);
+  const base = reldir ? `${root}/${reldir}` : root;
+  if (!rel) return base;
+  return `${base}/${rel}`;
+}
+
+// Rewrites a raw NUL-delimited grep result line ("relpath\0lineno:text") so its
+// path segment is absolutized via normalizeBrokeredSearchPath BEFORE the line
+// ever reaches parseGrepLine/consumeLine — i.e. the brokered consumer feeds
+// the SAME acceptance path (createSearchAccumulator) as the legacy grep
+// stream, just pre-normalized. Malformed lines (no NUL) pass through
+// unchanged; parseGrepLine rejects them the same way it would for legacy.
+export function normalizeBrokeredSearchLine(
+  rawLine: string,
+  root: string,
+  reldir: string,
+): string {
+  const nul = rawLine.indexOf("\0");
+  if (nul < 0) return rawLine;
+  const rawPath = rawLine.slice(0, nul);
+  const rest = rawLine.slice(nul + 1);
+  return `${normalizeBrokeredSearchPath(rawPath, root, reldir)}\0${rest}`;
+}
+
+// Authoritative post-filter for BROKERED results. Unlike the legacy post-filter
+// (which calls node's fs.realpath as the trusted single service account), THIS
+// process cannot fs.realpath a brokered actor's files — home dirs are 0700 to
+// the mapped uid, so the containment guarantee here comes from the broker's
+// own fd-beneath resolution (kernel-level, race-free) PLUS grep's own "."
+// recursion (which can never emit a path containing ".." — it only descends).
+// This is therefore a cheap LEXICAL defense-in-depth belt (no fs touch),
+// mirroring the legacy post-filter's shape (secret re-check + containment)
+// without re-verifying at the filesystem level.
+function postFilterBrokeredMatches(
+  matches: ScopedSearchMatch[],
+  root: string,
+  reldir: string,
+): ScopedSearchMatch[] {
+  const base = reldir ? `${root}/${reldir}` : root;
+  const filtered: ScopedSearchMatch[] = [];
+  for (const m of matches) {
+    if (isSecretSearchMatch(m.path)) continue;
+    if (m.path !== base && !m.path.startsWith(`${base}/`)) continue;
+    filtered.push(m);
+  }
+  return filtered;
+}
+
+/** Server-generated broker session id for the `search` profile (matches the
+ *  broker's SESSION_RE, same shape as runGit's git session ids). */
+function searchSessionId(): string {
+  return (
+    "srch" + Math.random().toString(36).slice(2).padEnd(10, "0").slice(0, 12)
+  );
+}
+
+// Brokered counterpart to runScopedSearch: same bounds (timeout, stdout cap,
+// per-file cap, global maxResults cap, secret policy), same NUL-delimited
+// parse, same accumulator — the ONLY difference is the child process is the
+// broker-wrapped grep (mapped-uid, fd-beneath cwd) and each raw line is path-
+// normalized (F1) before being fed to the shared consumer.
+async function runBrokeredScopedSearch(opts: {
+  ctx: { uid: number; gid: number; osUsername: string };
+  root: string;
+  reldir: string;
+  query: string;
+  regex: boolean;
+  maxResults: number;
+}): Promise<{ matches: ScopedSearchMatch[]; truncated: boolean }> {
+  const { ctx, root, reldir, query, regex, maxResults } = opts;
+
+  const argv = buildBrokerArgv(resolveBrokerPath(process.env), "exec", {
+    session: searchSessionId(),
+    username: ctx.osUsername,
+    uid: ctx.uid,
+    gid: ctx.gid,
+    cwd: root,
+    reldir,
+    profile: "search",
+    profileArgs: [regex ? "-E" : "-F", query],
+  });
+
+  acquireBrokerSlot(ctx.uid);
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(argv, {
+      stdout: "pipe",
+      stderr: "ignore",
+      stdin: "ignore",
+    });
+  } catch (err) {
+    // Spawn failure (missing broker binary, EPERM, …) never reaches the
+    // release in the finally below — release here or the uid's slot leaks
+    // permanently (Codex D4 review, finding 6).
+    releaseBrokerSlot(ctx.uid);
+    throw err;
+  }
+
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    try {
+      proc.kill();
+    } catch {
+      // best-effort
+    }
+  }, SEARCH_TIMEOUT_MS);
+
+  const acc = createSearchAccumulator(maxResults);
+  let buffer = "";
+  let bytesRead = 0;
+
+  try {
+    const decoder = new TextDecoder();
+    for await (const chunk of proc.stdout as ReadableStream<Uint8Array>) {
+      bytesRead += chunk.byteLength;
+      buffer += decoder.decode(chunk, { stream: true });
+      let nl: number;
+      while ((nl = buffer.indexOf("\n")) >= 0) {
+        const rawLine = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        if (rawLine)
+          acc.consumeLine(normalizeBrokeredSearchLine(rawLine, root, reldir));
+        if (acc.atCap()) break;
+      }
+      if (acc.atCap()) {
+        acc.markTruncated();
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+      if (bytesRead > SEARCH_MAX_STDOUT_BYTES) {
+        acc.markTruncated();
+        try {
+          proc.kill();
+        } catch {
+          // best-effort
+        }
+        break;
+      }
+    }
+    if (buffer && !acc.atCap())
+      acc.consumeLine(normalizeBrokeredSearchLine(buffer, root, reldir));
+  } catch {
+    // torn down by kill() — keep what we have.
+  } finally {
+    clearTimeout(timeout);
+    await proc.exited.catch(() => undefined);
+    releaseBrokerSlot(ctx.uid);
+  }
+
+  const filtered = postFilterBrokeredMatches(acc.matches, root, reldir);
+  return { matches: filtered, truncated: timedOut || acc.truncated };
+}
+
+// ── Replace-in-files (POST /api/files/replace) — D4 ─────────────────────────
+// v1 is LITERAL-ONLY (Codex F2, HIGH): a regex query stays search-only; this
+// route 400s on `regex:true`. Two phases share one shape: preview (reuses the
+// bounded search above to discover candidate files, computes per-file edits,
+// returns a signed previewToken — NEVER writes) and apply (validates the
+// token+nonce, re-stats every file, writes atomically via fx.write). Limits:
+// REPLACE_MAX_FILE_BYTES (2 MB, same value as the editor's
+// EDITOR_MAX_FILE_BYTES) per file, REPLACE_MAX_FILES (200) per apply. A
+// separate module-level constant (rather than reusing EDITOR_MAX_FILE_BYTES,
+// which is scoped inside createWebApp()) since these helpers run at module
+// scope.
+const REPLACE_MAX_FILE_BYTES = 2 * 1024 * 1024;
+const REPLACE_MAX_FILES = 200;
+const REPLACE_MAX_MATCHES_PER_FILE = SEARCH_MAX_PER_FILE; // 50, same cap as search
+const REPLACE_TOKEN_TTL_MS = 60_000;
+
+// Per-process random HMAC key (node:crypto, invariant §0): tokens do not need
+// to survive a restart, so a fresh key each boot is fine — it just invalidates
+// any in-flight tokens, which the 60s TTL already assumes is rare/cheap.
+const REPLACE_TOKEN_KEY = randomBytes(32);
+
+type ReplaceFileIdentity = {
+  path: string; // absolute: legacy realpath, or brokered lexical root+reldir join
+  size: number;
+  mtimeMs: number;
+  // dev/ino: real values for legacy; 0 sentinel for brokered (see
+  // replaceFileDevIno below — the broker fs helper's stat op does not surface
+  // them and extending it is out of scope for this slice).
+  dev: number;
+  ino: number;
+};
+
+export type ReplaceTokenPayload = {
+  actorId: string;
+  root: string;
+  query: string;
+  replacement: string;
+  mode: "literal";
+  // Execution-context binding (Codex D4 review, finding 7): a token minted
+  // under one exec mode (legacy vs brokered-as-uid-N) must not be applicable
+  // under another — identities were gathered with that mode's stat/canon
+  // semantics (brokered uses the 0/0 dev/ino sentinel + lexical canon).
+  exec: string; // "legacy" | "brokered:<uid>:<gid>:<osUsername>"
+  files: ReplaceFileIdentity[]; // deduped + sorted by path
+  nonce: string;
+  exp: number;
+};
+
+// Normalized execution-context tag for the replace token tuple.
+export function replaceExecTag(ctx: FsExecutorContext): string {
+  if (ctx.kind === "legacy") return "legacy";
+  return `brokered:${ctx.uid}:${ctx.gid}:${ctx.osUsername}`;
+}
+
+// Exported ONLY for test use (files-replace.test.ts forges an
+// already-expired token by decoding a real preview's payload, tweaking `exp`,
+// and re-signing with this same function/key — see the "expired token" test).
+export function signReplaceToken(payload: ReplaceTokenPayload): string {
+  const payloadB64 = Buffer.from(JSON.stringify(payload), "utf8").toString(
+    "base64url",
+  );
+  const sig = createHmac("sha256", REPLACE_TOKEN_KEY)
+    .update(payloadB64)
+    .digest("hex");
+  return `${payloadB64}.${sig}`;
+}
+
+function verifyReplaceToken(
+  token: unknown,
+): { ok: true; payload: ReplaceTokenPayload } | { ok: false } {
+  if (typeof token !== "string" || !token) return { ok: false };
+  const dot = token.indexOf(".");
+  if (dot < 0) return { ok: false };
+  const payloadB64 = token.slice(0, dot);
+  const sig = token.slice(dot + 1);
+  if (!/^[a-f0-9]{64}$/.test(sig)) return { ok: false };
+  const expected = createHmac("sha256", REPLACE_TOKEN_KEY)
+    .update(payloadB64)
+    .digest("hex");
+  const a = Buffer.from(sig, "hex");
+  const b = Buffer.from(expected, "hex");
+  if (a.length !== b.length || !timingSafeEqual(a, b)) return { ok: false };
+  try {
+    const payload = JSON.parse(
+      Buffer.from(payloadB64, "base64url").toString("utf8"),
+    ) as ReplaceTokenPayload;
+    if (
+      !payload ||
+      typeof payload !== "object" ||
+      typeof payload.nonce !== "string" ||
+      typeof payload.exp !== "number" ||
+      !Array.isArray(payload.files)
+    ) {
+      return { ok: false };
+    }
+    return { ok: true, payload };
+  } catch {
+    return { ok: false };
+  }
+}
+
+// Single-use nonce store (module state — Codex F3 re-confirmation hardening).
+// A nonce is consumed ONLY at the apply transaction boundary, and ONLY after
+// the token has already passed signature + expiry + tuple-match validation —
+// an INVALID or mismatched token never touches this map, so probing with junk
+// tokens can never burn a legitimate nonce. Entries are kept until their own
+// token's expiry (not deleted immediately) so a same-nonce replay is reliably
+// rejected for the token's whole lifetime, then GC'd lazily.
+const consumedReplaceNonces = new Map<string, number>();
+
+function gcReplaceNonces(): void {
+  const now = Date.now();
+  for (const [nonce, exp] of consumedReplaceNonces) {
+    if (exp < now) consumedReplaceNonces.delete(nonce);
+  }
+}
+
+function isReplaceNonceConsumed(nonce: string): boolean {
+  gcReplaceNonces();
+  return consumedReplaceNonces.has(nonce);
+}
+
+function consumeReplaceNonce(nonce: string, exp: number): void {
+  consumedReplaceNonces.set(nonce, exp);
+}
+
+// ── Pure literal-edit computation (unit-tested directly, no fs/network) ─────
+// Splits on "\n" only — a CRLF line keeps its trailing "\r" as part of the
+// line string, so it is never touched by the query/replacement and comes back
+// byte-for-byte in `newContent` on rejoin. A line whose match count would push
+// the file's running total over `maxMatches` is left COMPLETELY unmodified
+// (never partially replaced) and the file is marked truncated — a truncated
+// preview must never be applied (Codex F5).
+export type LiteralEdit = { line: number; before: string; after: string };
+export type LiteralEditResult = {
+  edits: LiteralEdit[];
+  matchCount: number;
+  truncated: boolean;
+  newContent: string;
+};
+
+// UTF-8 safety gate (Codex D4 review, finding 4): the edit engine works on
+// JS strings, so a file must survive a bytes→utf8→bytes round trip UNCHANGED
+// or the "unmodified" parts of the file would be silently rewritten (invalid
+// sequences become U+FFFD). NUL-free is not enough — latin-1/CP-1252 files
+// have no NUL bytes but are not valid UTF-8. Such files are excluded from
+// preview and refused at apply, same posture as binary files.
+export function utf8RoundTrips(buf: Buffer): boolean {
+  return Buffer.from(buf.toString("utf8"), "utf8").equals(buf);
+}
+
+export function computeLiteralEdits(
+  content: string,
+  query: string,
+  replacement: string,
+  maxMatches: number = REPLACE_MAX_MATCHES_PER_FILE,
+): LiteralEditResult {
+  if (!query) {
+    return { edits: [], matchCount: 0, truncated: false, newContent: content };
+  }
+  const rawLines = content.split("\n");
+  const edits: LiteralEdit[] = [];
+  const outLines: string[] = [];
+  let matchCount = 0;
+  let truncated = false;
+  for (let i = 0; i < rawLines.length; i++) {
+    const line = rawLines[i];
+    if (!line.includes(query)) {
+      outLines.push(line);
+      continue;
+    }
+    let occurrences = 0;
+    let idx = 0;
+    while (true) {
+      const found = line.indexOf(query, idx);
+      if (found < 0) break;
+      occurrences++;
+      idx = found + query.length;
+    }
+    if (occurrences === 0 || matchCount + occurrences > maxMatches) {
+      truncated = true;
+      outLines.push(line);
+      continue;
+    }
+    const after = line.split(query).join(replacement);
+    matchCount += occurrences;
+    edits.push({ line: i + 1, before: line, after });
+    outLines.push(after);
+  }
+  return { edits, matchCount, truncated, newContent: outLines.join("\n") };
+}
+
+// Canonicalize + containment-verify a single replace candidate. Legacy: real
+// fs.realpath (the service account can read its own root — same trust model
+// as resolveAllowedPath). Brokered: LEXICAL canonicalization only, same
+// rationale as postFilterBrokeredMatches above — this process cannot
+// fs.realpath a mapped user's files, so containment relies on the granted
+// root string + the broker's own fd-beneath resolution at read/write time.
+async function canonicalReplaceCandidate(
+  ctx: FsExecutorContext,
+  absPath: string,
+  root: string,
+): Promise<string | null> {
+  if (ctx.kind === "legacy") {
+    try {
+      const real = await realpath(absPath);
+      if (real === root || real.startsWith(`${root}/`)) return real;
+      return null;
+    } catch {
+      return null;
+    }
+  }
+  const canon = canonicalizeLexical(absPath);
+  if (!canon) return null;
+  if (canon === root || canon.startsWith(`${root}/`)) return canon;
+  return null;
+}
+
+// BROKERED IDENTITY NOTE: scripts/broker/deckterm-fs-helper's `stat` op
+// (op_stat) reports only kind/size/mtimeMs/mode — it does not surface
+// dev/ino, and extending it is out of scope for this slice (no scripts/broker
+// changes; D4 brief). Brokered conflict/race detection instead relies on
+// size+mtimeMs (fx.statPath, available identically for both modes) PLUS the
+// broker's own inode-pinned atomic commit (nlink==1 + RENAME_EXCHANGE verify,
+// fs-executor.ts) at write time — a race-free guarantee a node-side dev/ino
+// comparison could not improve on anyway. dev/ino are a 0/0 sentinel (never a
+// real value) for every brokered file identity.
+async function replaceFileDevIno(
+  ctx: FsExecutorContext,
+  absPath: string,
+): Promise<{ dev: number; ino: number }> {
+  if (ctx.kind !== "legacy") return { dev: 0, ino: 0 };
+  try {
+    const st = await lstat(absPath);
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return { dev: 0, ino: 0 };
+  }
+}
+
+type ReplacePreviewFile = {
+  path: string;
+  relPath: string;
+  matchCount: number;
+  previewIncomplete: boolean;
+  eligible: boolean;
+  edits: LiteralEdit[];
+};
+
+async function buildReplacePreview(
+  ctx: FsExecutorContext,
+  actorId: string,
+  root: string,
+  reldir: string,
+  query: string,
+  replacement: string,
+  explicitPaths: string[] | null,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  const resolvedDir = reldir ? `${root}/${reldir}` : root;
+
+  let candidateAbsPaths: string[];
+  let searchTruncated = false;
+
+  if (explicitPaths && explicitPaths.length > 0) {
+    candidateAbsPaths = explicitPaths.map((p) =>
+      p.startsWith("/") ? p : `${resolvedDir}/${p}`,
+    );
+  } else if (ctx.kind === "legacy") {
+    const result = await runScopedSearch({
+      ownerId: actorId,
+      root: resolvedDir,
+      query,
+      regex: false,
+      maxResults: SEARCH_MAX_RESULTS,
+    });
+    searchTruncated = result.truncated;
+    candidateAbsPaths = [...new Set(result.matches.map((m) => m.path))];
+  } else {
+    const result = await runBrokeredScopedSearch({
+      ctx,
+      root,
+      reldir,
+      query,
+      regex: false,
+      maxResults: SEARCH_MAX_RESULTS,
+    });
+    searchTruncated = result.truncated;
+    candidateAbsPaths = [...new Set(result.matches.map((m) => m.path))];
+  }
+
+  let globallyTruncated = searchTruncated;
+  if (candidateAbsPaths.length > REPLACE_MAX_FILES) {
+    candidateAbsPaths = candidateAbsPaths.slice(0, REPLACE_MAX_FILES);
+    globallyTruncated = true;
+  }
+
+  // Canonicalize + containment-verify + DEDUPE by canonical path. Two distinct
+  // candidate strings resolving to the same canonical file is a duplicate
+  // alias — reject the whole preview (400) rather than silently collapsing it
+  // (Codex token-binding hardening).
+  const canonicalSeen = new Set<string>();
+  for (const abs of candidateAbsPaths) {
+    const canon = await canonicalReplaceCandidate(ctx, abs, root);
+    if (!canon) continue; // outside the root / vanished — dropped
+    if (canonicalSeen.has(canon)) {
+      return {
+        status: 400,
+        body: {
+          error: "Duplicate file alias in selection",
+          reason: "duplicate_alias",
+          path: canon,
+        },
+      };
+    }
+    canonicalSeen.add(canon);
+  }
+
+  const fx = getFsExecutor(ctx);
+  const files: ReplacePreviewFile[] = [];
+  const identities: ReplaceFileIdentity[] = [];
+
+  for (const canon of canonicalSeen) {
+    if (isSecretSearchMatch(canon)) continue; // secret-shaped — never touched
+    const relPath =
+      canon === root ? "" : canon.slice(root.length).replace(/^\/+/, "");
+    let statResult;
+    try {
+      statResult = await fx.statPath(root, relPath);
+    } catch {
+      continue; // vanished — dropped silently
+    }
+    if (statResult.kind !== "file") continue;
+    if (statResult.size > REPLACE_MAX_FILE_BYTES) continue; // oversize excluded
+
+    let content: Buffer;
+    try {
+      const read = await fx.read(root, relPath, REPLACE_MAX_FILE_BYTES);
+      content = read.content;
+    } catch {
+      continue;
+    }
+    if (content.includes(0)) continue; // binary — excluded
+    if (!utf8RoundTrips(content)) continue; // non-UTF-8 text — excluded (finding 4)
+
+    const editResult = computeLiteralEdits(
+      content.toString("utf8"),
+      query,
+      replacement,
+      REPLACE_MAX_MATCHES_PER_FILE,
+    );
+    if (editResult.matchCount === 0 && !editResult.truncated) continue;
+
+    const { dev, ino } = await replaceFileDevIno(ctx, canon);
+    const eligible = !editResult.truncated && !globallyTruncated;
+    files.push({
+      path: canon,
+      relPath,
+      matchCount: editResult.matchCount,
+      previewIncomplete: editResult.truncated,
+      eligible,
+      edits: editResult.edits,
+    });
+    // Codex F5 is enforced SERVER-SIDE, not just advisorily in the UI: an
+    // ineligible file (per-file cap hit, or ANY global truncation) is never
+    // signed into the token, so an apply naming it fails token validation
+    // ("File not in the previewed set") no matter what the client sends. The
+    // apply-time re-compute (skipped_truncated) stays as defense for files
+    // that grew past the cap AFTER a clean preview.
+    if (eligible) {
+      identities.push({
+        path: canon,
+        size: statResult.size,
+        mtimeMs: statResult.mtimeMs,
+        dev,
+        ino,
+      });
+    }
+  }
+
+  files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  identities.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+
+  const nonce = randomBytes(16).toString("hex");
+  const exp = Date.now() + REPLACE_TOKEN_TTL_MS;
+  const previewToken = signReplaceToken({
+    actorId,
+    root,
+    query,
+    replacement,
+    mode: "literal",
+    exec: replaceExecTag(ctx),
+    files: identities,
+    nonce,
+    exp,
+  });
+
+  return {
+    status: 200,
+    body: {
+      previewToken,
+      files,
+      globallyTruncated,
+      expiresAt: exp,
+      // Legacy applies as the single DeckTerm service account, so per-file
+      // ownership is never individually preserved (there is only one owner to
+      // begin with) — the brokered path DOES preserve owner via the fs
+      // helper's atomic commit. Surfaced so the UI can show an accurate note.
+      legacyOwnerNote:
+        ctx.kind === "legacy"
+          ? "Applied as the DeckTerm service account — original per-file ownership is not individually preserved (single-owner legacy mode)."
+          : null,
+    },
+  };
+}
+
+type ReplaceFileResultState =
+  | "replaced"
+  | "skipped_conflict"
+  | "skipped_truncated"
+  | "dropped_symlink"
+  | "error";
+
+async function applyReplace(
+  ctx: FsExecutorContext,
+  actorId: string,
+  root: string,
+  query: string,
+  replacement: string,
+  previewToken: unknown,
+  requestedFiles: unknown,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  // Deny-side audit for a WRITE-capable endpoint (Codex D4 review, finding
+  // 5): every rejected apply attempt after root/context resolution leaves a
+  // files.replace deny row — reason only, never query/replacement/content.
+  const denyState = await getFoundationState();
+  const denyRootId = resolveFoundationRootIdForPath(denyState, root);
+  const deny = (
+    status: number,
+    reason: string,
+    body: Record<string, unknown>,
+  ): { status: number; body: Record<string, unknown> } => {
+    writeAuditEvent(denyState.db, {
+      actorUserId: actorId,
+      action: "files.replace",
+      resourceType: "root",
+      resourceId: denyRootId || root,
+      decision: "deny",
+      reason,
+      data: {},
+    });
+    return { status, body };
+  };
+
+  const verified = verifyReplaceToken(previewToken);
+  if (!verified.ok) {
+    return deny(400, "invalid_token", {
+      error: "Invalid replace token",
+      reason: "invalid_token",
+    });
+  }
+  const { payload } = verified;
+
+  // Tuple binding (Codex F3): the CURRENT request's transaction params must
+  // exactly match what was signed at preview time. A mismatch (or an invalid
+  // signature above) NEVER touches the nonce store.
+  if (
+    payload.actorId !== actorId ||
+    payload.root !== root ||
+    payload.query !== query ||
+    payload.replacement !== replacement ||
+    payload.mode !== "literal" ||
+    payload.exec !== replaceExecTag(ctx)
+  ) {
+    return deny(400, "token_mismatch", {
+      error: "Replace token does not match this request",
+      reason: "token_mismatch",
+    });
+  }
+
+  if (Date.now() > payload.exp) {
+    return deny(400, "token_expired", {
+      error: "Replace token expired",
+      reason: "token_expired",
+    });
+  }
+
+  if (!Array.isArray(requestedFiles) || requestedFiles.length === 0) {
+    return deny(400, "bad_request", {
+      error: "files required",
+      reason: "bad_request",
+    });
+  }
+  const requestedPaths: string[] = [];
+  for (const f of requestedFiles) {
+    const p =
+      typeof f === "string"
+        ? f
+        : f && typeof (f as { path?: unknown }).path === "string"
+          ? (f as { path: string }).path
+          : null;
+    if (!p) {
+      return deny(400, "bad_request", {
+        error: "Invalid files list",
+        reason: "bad_request",
+      });
+    }
+    requestedPaths.push(p);
+  }
+  const uniqueRequested = new Set(requestedPaths);
+  if (uniqueRequested.size !== requestedPaths.length) {
+    return deny(400, "duplicate_alias", {
+      error: "Duplicate file in apply set",
+      reason: "duplicate_alias",
+    });
+  }
+
+  const tokenFilesByPath = new Map(payload.files.map((f) => [f.path, f]));
+  for (const p of uniqueRequested) {
+    if (!tokenFilesByPath.has(p)) {
+      return deny(400, "tampered_files", {
+        error: "File not in the previewed set",
+        reason: "tampered_files",
+        path: p,
+      });
+    }
+  }
+
+  // Nonce check + burn: only reached once signature/tuple/expiry are ALL
+  // valid. Burn happens BEFORE any write begins (Codex F3 re-confirmation
+  // hardening) so a retry after a partial failure can't double-apply.
+  if (isReplaceNonceConsumed(payload.nonce)) {
+    return deny(400, "token_reused", {
+      error: "Replace token already used",
+      reason: "token_reused",
+    });
+  }
+  consumeReplaceNonce(payload.nonce, payload.exp);
+
+  const fx = getFsExecutor(ctx);
+  const state = await getFoundationState();
+  const rootId = resolveFoundationRootIdForPath(state, root);
+
+  const results: Array<{
+    path: string;
+    state: ReplaceFileResultState;
+    bytes?: number;
+  }> = [];
+  const counts: Record<ReplaceFileResultState, number> = {
+    replaced: 0,
+    skipped_conflict: 0,
+    skipped_truncated: 0,
+    dropped_symlink: 0,
+    error: 0,
+  };
+  let totalBytes = 0;
+
+  for (const p of uniqueRequested) {
+    const identity = tokenFilesByPath.get(p)!;
+
+    // Re-realpath/re-canonicalize before EVERY write (TOCTOU close, mirrors
+    // the search post-filter). A file whose canonical location changed (a
+    // symlink swap) or that left the root is dropped, never written.
+    const canon = await canonicalReplaceCandidate(ctx, identity.path, root);
+    if (!canon || canon !== identity.path) {
+      results.push({ path: p, state: "dropped_symlink" });
+      counts.dropped_symlink++;
+      continue;
+    }
+
+    const relPath =
+      identity.path === root
+        ? ""
+        : identity.path.slice(root.length).replace(/^\/+/, "");
+
+    let current: { size: number; mtimeMs: number; mode: number };
+    try {
+      current = await fx.statPath(root, relPath);
+    } catch {
+      results.push({ path: p, state: "skipped_conflict" });
+      counts.skipped_conflict++;
+      continue;
+    }
+    const { dev, ino } = await replaceFileDevIno(ctx, identity.path);
+    const identityMatches =
+      current.size === identity.size &&
+      current.mtimeMs === identity.mtimeMs &&
+      (ctx.kind !== "legacy" || (dev === identity.dev && ino === identity.ino));
+    if (!identityMatches) {
+      results.push({ path: p, state: "skipped_conflict" });
+      counts.skipped_conflict++;
+      continue;
+    }
+
+    try {
+      const read = await fx.read(root, relPath, REPLACE_MAX_FILE_BYTES);
+      if (read.content.includes(0) || !utf8RoundTrips(read.content)) {
+        // Binary or non-UTF-8 text (finding 4): the string-based edit engine
+        // would corrupt bytes outside the matched spans — refuse.
+        results.push({ path: p, state: "error" });
+        counts.error++;
+        continue;
+      }
+      const editResult = computeLiteralEdits(
+        read.content.toString("utf8"),
+        query,
+        replacement,
+        REPLACE_MAX_MATCHES_PER_FILE,
+      );
+      if (editResult.truncated) {
+        // The per-file cap was hit again at apply time (file grew between
+        // preview and apply) — never apply an incomplete edit (Codex F5).
+        results.push({ path: p, state: "skipped_truncated" });
+        counts.skipped_truncated++;
+        continue;
+      }
+      const newBuf = Buffer.from(editResult.newContent, "utf8");
+      // Last-instant identity re-check (finding 2): the stat that validated
+      // the preview identity happened before the read/edit above — re-stat
+      // right before the write and skip on ANY drift, shrinking the
+      // stat→write TOCTOU window to the write call itself (which is atomic
+      // tmp+rename in both executors; the brokered helper additionally
+      // verifies the inode pin at commit).
+      try {
+        const recheck = await fx.statPath(root, relPath);
+        if (
+          recheck.kind !== "file" ||
+          recheck.size !== current.size ||
+          recheck.mtimeMs !== current.mtimeMs
+        ) {
+          results.push({ path: p, state: "skipped_conflict" });
+          counts.skipped_conflict++;
+          continue;
+        }
+      } catch {
+        results.push({ path: p, state: "skipped_conflict" });
+        counts.skipped_conflict++;
+        continue;
+      }
+      await fx.write(root, relPath, newBuf, current.mode);
+      results.push({ path: p, state: "replaced", bytes: newBuf.length });
+      counts.replaced++;
+      totalBytes += newBuf.length;
+
+      // Per-file file.write-shaped audit row (Codex F4) — mirrors PUT
+      // /api/files/content's audit shape; never the query/replacement/content.
+      writeAuditEvent(state.db, {
+        actorUserId: actorId,
+        action: "file.write",
+        resourceType: "root",
+        resourceId: rootId || root,
+        decision: "allow",
+        reason: "replace_in_files",
+        data: {
+          path: identity.path,
+          bytes: newBuf.length,
+          brokered: fx.brokered,
+        },
+      });
+    } catch (err) {
+      if (err instanceof FsExecError && err.code === "escape_denied") {
+        results.push({ path: p, state: "dropped_symlink" });
+        counts.dropped_symlink++;
+      } else {
+        results.push({ path: p, state: "error" });
+        counts.error++;
+      }
+    }
+  }
+
+  // ONE files.replace summary row per APPLY — counts only, NEVER the raw
+  // query/replacement/content (Codex F4).
+  writeAuditEvent(state.db, {
+    actorUserId: actorId,
+    action: "files.replace",
+    resourceType: "root",
+    resourceId: rootId || root,
+    decision: "allow",
+    reason: "apply",
+    data: {
+      brokered: ctx.kind === "brokered",
+      fileCount: uniqueRequested.size,
+      bytes: totalBytes,
+      ...counts,
+    },
+  });
+
+  return { status: 200, body: { ok: true, results, counts } };
 }
 
 // ── Scoped file-tree walk (GET /api/files/tree) bounds + impl ────────────────
@@ -6495,26 +7385,85 @@ export function createWebApp() {
       );
     }
 
-    // ── Isolation gate FIRST (B4 deferred fast-follow) ───────────────────────
-    // Workspace search is not brokered in 1.0, so under isolation it must deny
-    // explicitly and BEFORE the realpath gate below. Otherwise the deny would
-    // depend on filesystem permissions: `resolveAllowedPath` realpaths as the
-    // service account and only incidentally fails on a mapped user's 0700 home
-    // — on a world-traversable granted root, grep would run AS THE SERVICE
-    // ACCOUNT and read files the mapped user cannot. Fail closed regardless.
-    const searchIsolationDeny = await denyIfOsIsolationPending(
-      c,
-      "search",
-      typeof requestId === "string" ? requestId : String(requestId),
-    );
-    if (searchIsolationDeny) {
+    // ── Exec-context gate FIRST (D4 — search v2 wires the `search` broker
+    // profile; same mechanism as /api/git/* and /api/files/* via
+    // resolveExecFsContext). Legacy ⇒ falls through to the byte-identical path
+    // below. Brokered ⇒ a mapped-uid grep run via the broker (not a flat deny
+    // anymore). Anything else ⇒ resolveExecFsContext's own audited 403.
+    const execCtx = await resolveExecFsContext(c, "search");
+    if (!execCtx.ok) {
       return c.json(
-        { ...searchIsolationDeny.body, requestId },
-        { status: searchIsolationDeny.status as any },
+        { ...execCtx.body, requestId },
+        { status: execCtx.status as any },
       );
     }
 
-    // ── Gating: realpath-resolve cwd to an allowed root ──────────────────────
+    if (execCtx.ctx.kind === "brokered") {
+      const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedCwd);
+      if (!scoped.ok) {
+        const state = await getFoundationState();
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "files.search",
+          resourceType: "root",
+          decision: "deny",
+          reason: String(
+            (scoped.body as Record<string, unknown>)?.reason ||
+              "forbidden_root",
+          ),
+          data: {},
+        });
+        return c.json(
+          { ...scoped.body, requestId },
+          { status: scoped.status as any },
+        );
+      }
+
+      let matches: ScopedSearchMatch[] = [];
+      let truncated = false;
+      try {
+        const result = await runBrokeredScopedSearch({
+          ctx: execCtx.ctx,
+          root: scoped.root,
+          reldir: scoped.relPath,
+          query,
+          regex,
+          maxResults,
+        });
+        matches = result.matches;
+        truncated = result.truncated;
+      } catch (err) {
+        if (err instanceof FsExecError && err.code === "isolation_busy") {
+          return c.json(
+            { error: "Too many concurrent searches", requestId },
+            429,
+          );
+        }
+        throw err;
+      }
+
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.search",
+        resourceType: "root",
+        resourceId: scoped.rootId || scoped.root,
+        decision: "allow",
+        // DECISION: never log the raw query (it can contain secrets).
+        data: {
+          queryLength: query.length,
+          regex,
+          matchCount: matches.length,
+          truncated,
+          brokered: true,
+        },
+      });
+
+      return c.json({ matches, truncated, requestId });
+    }
+
+    // ── LEGACY (byte-identical) — gating: realpath-resolve cwd to an allowed
+    // root ────────────────────────────────────────────────────────────────────
     const resolvedRoot = await resolveAllowedPath(requestedCwd);
     if (!resolvedRoot) {
       const state = await getFoundationState();
@@ -6812,6 +7761,123 @@ export function createWebApp() {
         return fsErrorResponse(c, err, "Cannot write file");
       return c.json({ error: "Cannot write file", message: String(err) }, 500);
     }
+  });
+
+  // POST /api/files/replace — literal-only replace-in-files (D4). Preview
+  // never writes; apply is token+nonce gated. See buildReplacePreview /
+  // applyReplace above for the full threat model + invariants.
+  app.post("/api/files/replace", async (c) => {
+    const { ownerId } = getCurrentUser(c);
+    const actor = getCurrentActor(c);
+    const body = (await c.req.json().catch(() => ({}))) as {
+      cwd?: unknown;
+      query?: unknown;
+      replacement?: unknown;
+      regex?: unknown;
+      paths?: unknown;
+      preview?: unknown;
+      previewToken?: unknown;
+      files?: unknown;
+    };
+
+    // LITERAL-ONLY in v1 (Codex F2, HIGH): regex stays search-only.
+    if (body.regex === true) {
+      return c.json(
+        {
+          error: "regex is not supported for replace",
+          reason: "regex_not_supported",
+        },
+        400,
+      );
+    }
+
+    const requestedCwd = typeof body.cwd === "string" ? body.cwd : "";
+    const rawQuery = typeof body.query === "string" ? body.query : "";
+    if (typeof body.replacement !== "string") {
+      return c.json({ error: "replacement (string) required" }, 400);
+    }
+    const replacement = body.replacement;
+
+    const REPLACE_MAX_CWD_LEN = 4096;
+    if (requestedCwd.length > REPLACE_MAX_CWD_LEN) {
+      return c.json({ error: "cwd too long" }, 400);
+    }
+    // NOTE: unlike search, the query is NOT trimmed for matching — a literal
+    // replace must match the exact string the user typed (leading/trailing
+    // whitespace is significant). Only the emptiness/length CHECK uses a
+    // trimmed view.
+    if (!rawQuery.trim()) {
+      return c.json({ error: "Empty query" }, 400);
+    }
+    if (rawQuery.length > SEARCH_MAX_QUERY_LEN) {
+      return c.json({ error: "Query too long" }, 400);
+    }
+    if (replacement.length > SEARCH_MAX_QUERY_LEN) {
+      return c.json({ error: "Replacement too long" }, 400);
+    }
+    const query = rawQuery;
+
+    const execCtx = await resolveExecFsContext(c, "files_replace");
+    if (!execCtx.ok) {
+      return c.json(execCtx.body, { status: execCtx.status as any });
+    }
+
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedCwd);
+    if (!scoped.ok) {
+      const state = await getFoundationState();
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "files.replace",
+        resourceType: "root",
+        decision: "deny",
+        reason: String(
+          (scoped.body as Record<string, unknown>)?.reason || "forbidden_root",
+        ),
+        data: {},
+      });
+      return c.json(scoped.body, { status: scoped.status as any });
+    }
+
+    try {
+      if (body.preview === true) {
+        let explicitPaths: string[] | null = null;
+        if (Array.isArray(body.paths)) {
+          explicitPaths = body.paths.filter(
+            (p): p is string => typeof p === "string",
+          );
+        }
+        const result = await buildReplacePreview(
+          execCtx.ctx,
+          actor.id,
+          scoped.root,
+          scoped.relPath,
+          query,
+          replacement,
+          explicitPaths,
+        );
+        return c.json(result.body, { status: result.status as any });
+      }
+
+      if (body.preview === false) {
+        const result = await applyReplace(
+          execCtx.ctx,
+          actor.id,
+          scoped.root,
+          query,
+          replacement,
+          body.previewToken,
+          body.files,
+        );
+        return c.json(result.body, { status: result.status as any });
+      }
+    } catch (err) {
+      if (err instanceof FsExecError && err.code === "isolation_busy") {
+        return c.json({ error: "Too many concurrent operations" }, 429);
+      }
+      throw err;
+    }
+
+    return c.json({ error: "preview must be true or false" }, 400);
   });
 
   // File upload

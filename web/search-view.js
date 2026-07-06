@@ -82,6 +82,77 @@ function searchResultLineLabel(match) {
   return `${line}:${col}`;
 }
 
+// ── Replace-in-files pure helpers (D4, DOM-free) ─────────────────────────────
+// The token/apply contract binds a FILE set (POST /api/files/replace) — v1 has
+// no per-match selection, only per-file include/exclude via checkboxes.
+
+// Per-file eligibility badge text. Global truncation always wins over a
+// file's own previewIncomplete flag (server contract: a globally truncated
+// preview marks EVERY file ineligible, regardless of its own state).
+function replaceFileEligibilityLabel(file, globallyTruncated) {
+  if (globallyTruncated) return "narrow your query to replace";
+  if (file && file.previewIncomplete) return "too many matches — truncated";
+  return "";
+}
+
+// Default checked set for a freshly rendered preview: every ELIGIBLE file.
+// Ineligible files are never pre-checked (their checkbox is also disabled).
+function defaultReplaceCheckedPaths(files) {
+  const list = Array.isArray(files) ? files : [];
+  return new Set(
+    list
+      .filter((f) => f && f.eligible && typeof f.path === "string")
+      .map((f) => f.path),
+  );
+}
+
+// The file set to submit as `files` on POST /api/files/replace (preview:
+// false) — only paths that are BOTH eligible and currently checked. Order
+// follows `files` (not Set iteration order) so it is deterministic.
+function buildReplaceApplyFileList(files, checkedPaths) {
+  const list = Array.isArray(files) ? files : [];
+  const checked =
+    checkedPaths instanceof Set ? checkedPaths : new Set(checkedPaths || []);
+  return list
+    .filter((f) => f && f.eligible && checked.has(f.path))
+    .map((f) => f.path);
+}
+
+// Human summary of an apply response's per-state counts, e.g.
+// "3 replaced, 1 skipped (conflict), 1 dropped (symlink)".
+function formatReplaceCounts(counts) {
+  if (!counts || typeof counts !== "object") return "No files changed";
+  const parts = [];
+  if (counts.replaced) parts.push(`${counts.replaced} replaced`);
+  if (counts.skipped_conflict)
+    parts.push(`${counts.skipped_conflict} skipped (changed on disk)`);
+  if (counts.skipped_truncated)
+    parts.push(`${counts.skipped_truncated} skipped (truncated)`);
+  if (counts.dropped_symlink)
+    parts.push(`${counts.dropped_symlink} dropped (symlink)`);
+  if (counts.error)
+    parts.push(`${counts.error} error${counts.error === 1 ? "" : "s"}`);
+  return parts.length ? parts.join(", ") : "No files changed";
+}
+
+// Per-file result-state → short badge text for the post-apply render.
+function replaceResultBadge(state) {
+  switch (state) {
+    case "replaced":
+      return "Replaced";
+    case "skipped_conflict":
+      return "Skipped — changed on disk";
+    case "skipped_truncated":
+      return "Skipped — truncated";
+    case "dropped_symlink":
+      return "Dropped — symlink";
+    case "error":
+      return "Error";
+    default:
+      return "";
+  }
+}
+
 // ── DOM controller (browser-only) ────────────────────────────────────────────
 
 // Options:
@@ -118,6 +189,15 @@ class SearchViewController {
     this._latestRequestId = 0;
     this._results = []; // grouped results last rendered
     this._regex = false;
+
+    // ── Replace-in-files state (D4) ────────────────────────────────────────
+    this._replaceMode = false; // replacement row visible
+    this._replacePhase = "idle"; // idle | previewing | preview | applying | applied
+    this._replaceData = null; // last POST /api/files/replace preview response
+    this._checkedPaths = new Set(); // paths currently checked in the preview
+    this._applyResult = null; // last apply response ({results, counts})
+    this._replaceStatus = ""; // status line shown above the replace results
+    this._replaceRequestSeq = 0; // staleness guard for preview/apply calls
   }
 
   get terminalManager() {
@@ -155,6 +235,8 @@ class SearchViewController {
     }
     // Bump the request id so any in-flight response is treated as stale.
     this._latestRequestId = ++this._requestSeq;
+    // Same staleness treatment for any in-flight replace preview/apply call.
+    this._replaceRequestSeq++;
     if (this.root && this.root.parentElement) {
       this.root.parentElement.removeChild(this.root);
     }
@@ -175,6 +257,11 @@ class SearchViewController {
       <div class="ide-search-header">
         <input type="text" class="ide-search-input" placeholder="Search" maxlength="${MAX_QUERY_LEN}" autocomplete="off" spellcheck="false" />
         <label class="ide-search-regex" title="Use regular expression"><input type="checkbox" class="ide-search-regex-input" /> .*</label>
+        <button type="button" class="ide-search-replace-toggle" title="Toggle Replace" aria-label="Toggle Replace">&#8644;</button>
+      </div>
+      <div class="ide-search-replace-row" hidden>
+        <input type="text" class="ide-search-replace-input" placeholder="Replace" maxlength="${MAX_QUERY_LEN}" autocomplete="off" spellcheck="false" />
+        <button type="button" class="ide-search-replace-btn">Replace&hellip;</button>
       </div>
       <div class="ide-search-status"></div>
       <div class="ide-search-results"></div>
@@ -197,6 +284,15 @@ class SearchViewController {
   renderResults() {
     const host = this.q(".ide-search-results");
     if (!host) return;
+    if (
+      this._replaceMode &&
+      (this._replacePhase === "preview" ||
+        this._replacePhase === "applying" ||
+        this._replacePhase === "applied")
+    ) {
+      host.innerHTML = this.renderReplacePreviewHtml();
+      return;
+    }
     const groups = this._results;
     if (!Array.isArray(groups) || groups.length === 0) {
       host.innerHTML = "";
@@ -227,6 +323,78 @@ class SearchViewController {
     host.innerHTML = html;
   }
 
+  // Renders the replace preview/apply view: per-file include checkboxes (the
+  // token/apply contract binds a FILE set — no per-match selection in v1),
+  // before/after LINE previews, an eligibility badge (previewIncomplete /
+  // globallyTruncated), and — once applied — a per-file result badge. Every
+  // user-supplied string (paths, before/after text) goes through this.esc().
+  renderReplacePreviewHtml() {
+    const data = this._replaceData;
+    if (!data || !Array.isArray(data.files) || data.files.length === 0) {
+      return `<div class="ide-replace-empty">No matches to replace.</div>`;
+    }
+    const applying = this._replacePhase === "applying";
+    const applied = this._replacePhase === "applied";
+    const resultsByPath = new Map(
+      (this._applyResult && Array.isArray(this._applyResult.results)
+        ? this._applyResult.results
+        : []
+      ).map((r) => [r.path, r]),
+    );
+
+    let html = "";
+    if (data.globallyTruncated) {
+      html += `<div class="ide-replace-banner">Too many matching files — narrow your query to replace.</div>`;
+    }
+    for (const file of data.files) {
+      const fileName = (file.path || "").split("/").pop() || file.path || "";
+      const eligibilityLabel = replaceFileEligibilityLabel(
+        file,
+        data.globallyTruncated,
+      );
+      const checked = this._checkedPaths.has(file.path);
+      const disabled = !file.eligible || applying || applied;
+      const result = resultsByPath.get(file.path);
+      const resultBadge = result ? replaceResultBadge(result.state) : "";
+      const edits = (Array.isArray(file.edits) ? file.edits : [])
+        .map(
+          (e) => `
+            <div class="ide-replace-edit">
+              <div class="ide-replace-edit-before">${this.esc(e.before == null ? "" : e.before)}</div>
+              <div class="ide-replace-edit-after">${this.esc(e.after == null ? "" : e.after)}</div>
+            </div>`,
+        )
+        .join("");
+      html += `
+        <div class="ide-replace-file" data-path="${this.esc(file.path)}">
+          <div class="ide-replace-file-header">
+            <input type="checkbox" class="ide-replace-file-checkbox" data-path="${this.esc(file.path)}" ${checked ? "checked" : ""} ${disabled ? "disabled" : ""} />
+            <span class="ide-replace-file-name" title="${this.esc(file.path)}">${this.esc(fileName)}</span>
+            <span class="ide-replace-file-count">${this.esc(String(file.matchCount || 0))}</span>
+            ${eligibilityLabel ? `<span class="ide-replace-file-badge">${this.esc(eligibilityLabel)}</span>` : ""}
+            ${result ? `<span class="ide-replace-file-result ide-replace-file-result-${this.esc(result.state)}">${this.esc(resultBadge)}</span>` : ""}
+          </div>
+          <div class="ide-replace-file-edits">${edits}</div>
+        </div>`;
+    }
+
+    const checkedEligibleCount = data.files.filter(
+      (f) => f.eligible && this._checkedPaths.has(f.path),
+    ).length;
+
+    html += `<div class="ide-replace-actions">`;
+    if (applied) {
+      html += `<span class="ide-replace-summary">${this.esc(formatReplaceCounts(this._applyResult ? this._applyResult.counts : null))}</span>`;
+      html += `<button type="button" class="ide-replace-cancel-btn">Close</button>`;
+    } else {
+      const confirmDisabled = checkedEligibleCount === 0 || applying;
+      html += `<button type="button" class="ide-replace-confirm-btn" ${confirmDisabled ? "disabled" : ""}>${applying ? "Replacing…" : `Replace ${checkedEligibleCount} file${checkedEligibleCount === 1 ? "" : "s"}`}</button>`;
+      html += `<button type="button" class="ide-replace-cancel-btn" ${applying ? "disabled" : ""}>Cancel</button>`;
+    }
+    html += `</div>`;
+    return html;
+  }
+
   // ── Events ───────────────────────────────────────────────────────────────────
 
   bindEvents() {
@@ -248,9 +416,32 @@ class SearchViewController {
         this.onQueryInput();
       });
     }
+    const replaceToggle = this.q(".ide-search-replace-toggle");
+    if (replaceToggle) {
+      replaceToggle.addEventListener("click", () => this.toggleReplaceMode());
+    }
+    const replaceInput = this.q(".ide-search-replace-input");
+    if (replaceInput) {
+      replaceInput.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          void this.runReplacePreview();
+        }
+      });
+      replaceInput.addEventListener("input", () =>
+        this.invalidateReplacePreviewOnInput(),
+      );
+    }
+    const replaceBtn = this.q(".ide-search-replace-btn");
+    if (replaceBtn) {
+      replaceBtn.addEventListener("click", () => void this.runReplacePreview());
+    }
     const results = this.q(".ide-search-results");
     if (results) {
       results.addEventListener("click", (e) => this.onResultClick(e));
+      results.addEventListener("change", (e) =>
+        this.onReplaceCheckboxChange(e),
+      );
     }
   }
 
@@ -260,6 +451,7 @@ class SearchViewController {
   }
 
   onQueryInput() {
+    this.invalidateReplacePreviewOnInput();
     if (this._debounceTimer) clearTimeout(this._debounceTimer);
     this._debounceTimer = setTimeout(() => {
       this._debounceTimer = null;
@@ -352,6 +544,14 @@ class SearchViewController {
   }
 
   onResultClick(e) {
+    if (e.target.closest(".ide-replace-confirm-btn")) {
+      if (this._replacePhase === "preview") void this.confirmReplaceApply();
+      return;
+    }
+    if (e.target.closest(".ide-replace-cancel-btn")) {
+      this.cancelReplacePreview();
+      return;
+    }
     const row = e.target.closest(".ide-search-match");
     if (!row) return;
     const path = row.dataset.path;
@@ -377,6 +577,188 @@ class SearchViewController {
       tm.openFileInEditor?.(path, { line, col });
     }
   }
+
+  // ── Replace-in-files (D4) ────────────────────────────────────────────────
+
+  replacementValue() {
+    const input = this.q(".ide-search-replace-input");
+    return (input?.value || "").slice(0, MAX_QUERY_LEN);
+  }
+
+  toggleReplaceMode() {
+    this._replaceMode = !this._replaceMode;
+    const row = this.q(".ide-search-replace-row");
+    if (row) row.hidden = !this._replaceMode;
+    const toggle = this.q(".ide-search-replace-toggle");
+    if (toggle) toggle.classList.toggle("active", this._replaceMode);
+    if (!this._replaceMode) this.cancelReplacePreview();
+  }
+
+  // Runs the preview phase: POST /api/files/replace { cwd, query, replacement,
+  // preview:true }. NEVER writes. Regex is search-only (Codex F2) — refuse
+  // client-side too so a user doesn't burn a round trip on a guaranteed 400.
+  async runReplacePreview() {
+    // The RAW query is sent — the backend deliberately preserves leading/
+    // trailing whitespace for a literal replace (the token tuple must reflect
+    // the exact string). Trim is only the emptiness CHECK, mirroring the
+    // server's own validation.
+    const query = this.currentQuery();
+    if (!query.trim()) {
+      this.setStatus("Type a query to replace.");
+      return;
+    }
+    if (this._regex) {
+      this.setStatus(
+        "Replace does not support regex — turn off .* to replace.",
+      );
+      return;
+    }
+    const cwd = this.cwd();
+    if (!cwd) {
+      this.setStatus("Open a workspace to search.");
+      return;
+    }
+    if (!this.fetchImpl) return;
+
+    const seq = ++this._replaceRequestSeq;
+    this._replacePhase = "previewing";
+    this._applyResult = null;
+    this.setStatus("Previewing replace…");
+    try {
+      const res = await this.fetchImpl("/api/files/replace", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          cwd,
+          query,
+          replacement: this.replacementValue(),
+          preview: true,
+        }),
+      });
+      if (seq !== this._replaceRequestSeq) return; // a newer call superseded this one
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this._replacePhase = "idle";
+        this._replaceData = null;
+        this._previewTuple = null;
+        const denial =
+          typeof window !== "undefined"
+            ? window.AccessDenied?.describeAccessDenied?.(body)
+            : null;
+        this.setStatus(denial?.text || body.error || "Replace preview failed");
+        this.renderResults();
+        return;
+      }
+      this._replaceData = body;
+      // Pin the EXACT tuple this preview (and its token) was minted for —
+      // apply sends this, never a re-read of the live inputs, so editing a
+      // field after previewing can't produce a token_mismatch surprise.
+      this._previewTuple = { query, replacement: this.replacementValue() };
+      this._checkedPaths = defaultReplaceCheckedPaths(body.files);
+      this._replacePhase = "preview";
+      const files = Array.isArray(body.files) ? body.files : [];
+      const eligible = files.filter((f) => f.eligible).length;
+      this.setStatus(
+        body.globallyTruncated
+          ? "Too many matches — narrow your query to replace."
+          : `${files.length} file${files.length === 1 ? "" : "s"} match (${eligible} replaceable)`,
+      );
+      this.renderResults();
+    } catch {
+      if (seq !== this._replaceRequestSeq) return;
+      this._replacePhase = "idle";
+      this.setStatus("Replace preview failed");
+      this.renderResults();
+    }
+  }
+
+  onReplaceCheckboxChange(e) {
+    const box = e.target.closest(".ide-replace-file-checkbox");
+    if (!box) return;
+    const path = box.dataset.path;
+    if (!path) return;
+    if (box.checked) this._checkedPaths.add(path);
+    else this._checkedPaths.delete(path);
+    this.renderResults(); // refresh the confirm button's count/enabled state
+  }
+
+  // Apply phase: POST /api/files/replace { ..., preview:false, previewToken,
+  // files }. `files` is built from the CURRENT checkbox selection intersected
+  // with eligibility (buildReplaceApplyFileList) — the token/apply contract
+  // binds this file set server-side.
+  async confirmReplaceApply() {
+    if (
+      !this._replaceData ||
+      !this._previewTuple ||
+      this._replacePhase !== "preview"
+    )
+      return;
+    const cwd = this.cwd();
+    const files = buildReplaceApplyFileList(
+      this._replaceData.files,
+      this._checkedPaths,
+    );
+    if (!cwd || files.length === 0 || !this.fetchImpl) return;
+
+    const seq = ++this._replaceRequestSeq;
+    this._replacePhase = "applying";
+    this.renderResults();
+    this.setStatus("Applying replace…");
+    try {
+      const res = await this.fetchImpl("/api/files/replace", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          cwd,
+          // The pinned preview tuple, NOT a live input re-read (the token was
+          // signed over exactly these strings).
+          query: this._previewTuple.query,
+          replacement: this._previewTuple.replacement,
+          preview: false,
+          previewToken: this._replaceData.previewToken,
+          files,
+        }),
+      });
+      if (seq !== this._replaceRequestSeq) return;
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        this._replacePhase = "preview";
+        this.setStatus(body.error || "Replace failed");
+        this.renderResults();
+        return;
+      }
+      this._applyResult = body;
+      this._replacePhase = "applied";
+      this.setStatus(formatReplaceCounts(body.counts));
+      this.renderResults();
+    } catch {
+      if (seq !== this._replaceRequestSeq) return;
+      this._replacePhase = "preview";
+      this.setStatus("Replace failed");
+      this.renderResults();
+    }
+  }
+
+  cancelReplacePreview() {
+    this._replaceRequestSeq++; // stale-out any in-flight preview/apply call
+    this._replacePhase = "idle";
+    this._replaceData = null;
+    this._previewTuple = null;
+    this._applyResult = null;
+    this._checkedPaths = new Set();
+    this.setStatus("");
+    this.renderResults();
+  }
+
+  // A live preview only stays valid for the tuple it was minted for — any
+  // edit to the query or replacement inputs invalidates it (the alternative,
+  // applying the pinned stale tuple while the inputs show something else,
+  // would be far more surprising).
+  invalidateReplacePreviewOnInput() {
+    if (this._replacePhase === "preview" || this._replacePhase === "applied") {
+      this.cancelReplacePreview();
+    }
+  }
 }
 
 // ── Exports (triple pattern) ─────────────────────────────────────────────────
@@ -386,6 +768,11 @@ const SearchViewModule = {
   searchTotalMatches,
   isStaleResponse,
   searchResultLineLabel,
+  replaceFileEligibilityLabel,
+  defaultReplaceCheckedPaths,
+  buildReplaceApplyFileList,
+  formatReplaceCounts,
+  replaceResultBadge,
   SearchViewController,
 };
 
@@ -402,5 +789,10 @@ if (typeof exports !== "undefined") {
   exports.searchTotalMatches = searchTotalMatches;
   exports.isStaleResponse = isStaleResponse;
   exports.searchResultLineLabel = searchResultLineLabel;
+  exports.replaceFileEligibilityLabel = replaceFileEligibilityLabel;
+  exports.defaultReplaceCheckedPaths = defaultReplaceCheckedPaths;
+  exports.buildReplaceApplyFileList = buildReplaceApplyFileList;
+  exports.formatReplaceCounts = formatReplaceCounts;
+  exports.replaceResultBadge = replaceResultBadge;
   exports.SearchViewController = SearchViewController;
 }

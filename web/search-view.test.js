@@ -4,6 +4,11 @@ import {
   isStaleResponse,
   searchResultLineLabel,
   searchTotalMatches,
+  replaceFileEligibilityLabel,
+  defaultReplaceCheckedPaths,
+  buildReplaceApplyFileList,
+  formatReplaceCounts,
+  replaceResultBadge,
 } from "./search-view.js";
 
 test("groupSearchResults groups flat matches by file, preserving order", () => {
@@ -57,4 +62,88 @@ test("searchResultLineLabel formats line:col", () => {
   // Missing col defaults to column 1.
   expect(searchResultLineLabel({ line: 5 })).toBe("5:1");
   expect(searchResultLineLabel({})).toBe("1:1");
+});
+
+// ── Replace-in-files pure helpers (D4) ───────────────────────────────────────
+
+test("replaceFileEligibilityLabel: global truncation wins over a file's own previewIncomplete", () => {
+  expect(replaceFileEligibilityLabel({ previewIncomplete: true }, true)).toBe(
+    "narrow your query to replace",
+  );
+  expect(replaceFileEligibilityLabel({ previewIncomplete: true }, false)).toBe(
+    "too many matches — truncated",
+  );
+  expect(replaceFileEligibilityLabel({ previewIncomplete: false }, false)).toBe(
+    "",
+  );
+});
+
+test("defaultReplaceCheckedPaths: only ELIGIBLE files are pre-checked", () => {
+  const files = [
+    { path: "a.txt", eligible: true },
+    { path: "b.txt", eligible: false },
+    { path: "c.txt", eligible: true },
+  ];
+  const checked = defaultReplaceCheckedPaths(files);
+  expect(checked instanceof Set).toBe(true);
+  expect([...checked].sort()).toEqual(["a.txt", "c.txt"]);
+});
+
+test("defaultReplaceCheckedPaths: tolerates empty/junk input", () => {
+  expect(defaultReplaceCheckedPaths(undefined).size).toBe(0);
+  expect(defaultReplaceCheckedPaths(null).size).toBe(0);
+  expect(defaultReplaceCheckedPaths([]).size).toBe(0);
+});
+
+test("buildReplaceApplyFileList: only eligible AND checked files are included, in file order", () => {
+  const files = [
+    { path: "a.txt", eligible: true },
+    { path: "b.txt", eligible: true },
+    { path: "c.txt", eligible: false }, // ineligible — excluded even if "checked"
+  ];
+  const checked = new Set(["c.txt", "a.txt"]); // note: reverse insertion order
+  expect(buildReplaceApplyFileList(files, checked)).toEqual(["a.txt"]);
+});
+
+test("buildReplaceApplyFileList: accepts a plain array for checkedPaths too", () => {
+  const files = [{ path: "a.txt", eligible: true }];
+  expect(buildReplaceApplyFileList(files, ["a.txt"])).toEqual(["a.txt"]);
+  expect(buildReplaceApplyFileList(files, [])).toEqual([]);
+});
+
+test("formatReplaceCounts: summarizes per-state counts", () => {
+  expect(
+    formatReplaceCounts({
+      replaced: 3,
+      skipped_conflict: 1,
+      skipped_truncated: 0,
+      dropped_symlink: 1,
+      error: 0,
+    }),
+  ).toBe("3 replaced, 1 skipped (changed on disk), 1 dropped (symlink)");
+});
+
+test("formatReplaceCounts: all-zero counts reads as 'No files changed'", () => {
+  expect(
+    formatReplaceCounts({
+      replaced: 0,
+      skipped_conflict: 0,
+      skipped_truncated: 0,
+      dropped_symlink: 0,
+      error: 0,
+    }),
+  ).toBe("No files changed");
+  expect(formatReplaceCounts(null)).toBe("No files changed");
+  expect(formatReplaceCounts(undefined)).toBe("No files changed");
+});
+
+test("replaceResultBadge: maps every server result state to a label", () => {
+  expect(replaceResultBadge("replaced")).toBe("Replaced");
+  expect(replaceResultBadge("skipped_conflict")).toBe(
+    "Skipped — changed on disk",
+  );
+  expect(replaceResultBadge("skipped_truncated")).toBe("Skipped — truncated");
+  expect(replaceResultBadge("dropped_symlink")).toBe("Dropped — symlink");
+  expect(replaceResultBadge("error")).toBe("Error");
+  expect(replaceResultBadge("unknown-state")).toBe("");
 });
