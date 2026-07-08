@@ -66,6 +66,7 @@ import {
   runWalCheckpoint,
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
+import { idleMsSince } from "./services/session-idle";
 import { listHarnessSummaries } from "./services/agent-harnesses";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
@@ -213,6 +214,7 @@ type Terminal = {
   rows: number;
   createdAt: number;
   lastActivityAt: number; // Last user input timestamp for idle detection
+  lastOutputAt?: number; // Last live PTY output timestamp; counts as liveness for the reapers
   lastDetachedAt?: number; // Last client socket disconnection timestamp for detached reaper
   ownerId: string; // User sub from JWT
   ownerEmail: string; // User email for display
@@ -670,6 +672,10 @@ function applyParsedShellIntegrationState(
   }
 
   if (emitOutput && parsed.output) {
+    // Live PTY output is a liveness signal for the reapers: an unattended
+    // job streaming output (no keystrokes) must not be treated as idle. This
+    // is the live-output path only — reconnect replay passes emitOutput:false.
+    term.lastOutputAt = Date.now();
     appendScrollback(term.id, parsed.output);
     broadcastTerminalOutput(term.id, parsed.output);
   }
@@ -4752,6 +4758,7 @@ async function createManagedTerminal({
     rows,
     createdAt: now,
     lastActivityAt: now,
+    lastOutputAt: now,
     lastDetachedAt: now, // starts as detached/unattached
     ownerId,
     ownerEmail,
@@ -9928,7 +9935,9 @@ export async function startWebServer(host: string, port: number) {
 
       // Only clean up idle active/attached terminals. Detached terminals are reaped after 8 hours!
       if (activeSocketsCount > 0) {
-        const idleTime = now - term.lastActivityAt;
+        // Idle measured from the later of input/output: a terminal actively
+        // streaming output (a running job on a tab left open) is not idle.
+        const idleTime = idleMsSince(term, now);
 
         if (idleTime > resolveSessionPolicy(term.ownerId).idleTimeoutMs) {
           console.log(
@@ -9978,17 +9987,16 @@ export async function startWebServer(host: string, port: number) {
 
       // Only reap detached sessions (0 active connections)
       if (activeSocketsCount === 0 && term.lastDetachedAt) {
-        const detachedTime = now - term.lastDetachedAt;
-        const idleTime = now - term.lastActivityAt;
-        // Detached and inactive past the owner's detached TTL
-        const timeSinceLastActivityOrDetach = Math.max(detachedTime, idleTime);
+        // Reap a detached session only once it has produced neither input NOR
+        // live output for the detached TTL. Basing this on inactivity (not on
+        // how long the browser has been gone) is what lets an unattended job
+        // run overnight with the browser closed without being reaped — live
+        // PTY output keeps `lastOutputAt` fresh via the persistent attach.
+        const inactiveMs = idleMsSince(term, now);
 
-        if (
-          timeSinceLastActivityOrDetach >
-          resolveSessionPolicy(term.ownerId).detachedTtlMs
-        ) {
+        if (inactiveMs > resolveSessionPolicy(term.ownerId).detachedTtlMs) {
           console.log(
-            `[reaper] Reaping expired detached terminal ${id} (detached/inactive: ${Math.round(timeSinceLastActivityOrDetach / 1000 / 60)}min, owner: ${term.ownerEmail})`,
+            `[reaper] Reaping expired detached terminal ${id} (inactive: ${Math.round(inactiveMs / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
 
           try {
