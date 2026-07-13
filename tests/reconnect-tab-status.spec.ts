@@ -255,6 +255,54 @@ test.describe("Terminal Tab Status on Reconnection", () => {
       .toContain(reconnectMarker);
   });
 
+  test("page reload settles an existing tmux session back to connected", async ({
+    page,
+  }) => {
+    await resetAppState(page, APP_URL);
+    await waitForTerminal(page);
+
+    const terminalId = await page.evaluate(() => {
+      // @ts-ignore
+      return window.terminalManager?.activeId || null;
+    });
+    expect(terminalId).toBeTruthy();
+
+    await page.reload();
+    await page.waitForLoadState("domcontentloaded");
+    await waitForTerminal(page);
+
+    await expect
+      .poll(
+        () =>
+          page.evaluate((expectedId) => {
+            // @ts-ignore
+            const tm = window.terminalManager;
+            const terminal = tm?.terminals?.get(expectedId);
+            const tile = document.querySelector(
+              `.tile[data-terminal-id="${expectedId}"]`,
+            );
+            const tab = document.querySelector(`[data-id="${expectedId}"]`);
+            return {
+              activeId: tm?.activeId || null,
+              connectionStatus: terminal?.connectionStatus || null,
+              awaitingReconnectReady:
+                terminal?.awaitingReconnectReady === true ||
+                terminal?.ws?.awaitingReconnectReady === true,
+              tileStatus: tile?.getAttribute("data-connection-status") || null,
+              tabReconnecting: tab?.classList.contains("reconnecting") ?? true,
+            };
+          }, terminalId),
+        { timeout: 15000 },
+      )
+      .toEqual({
+        activeId: terminalId,
+        connectionStatus: "connected",
+        awaitingReconnectReady: false,
+        tileStatus: "connected",
+        tabReconnecting: false,
+      });
+  });
+
   test("should keep increasing reconnect attempts until ready is received", async ({
     page,
   }) => {
@@ -350,6 +398,93 @@ test.describe("Terminal Tab Status on Reconnection", () => {
     });
 
     expect(reconnectAttempts).toEqual([1, 2]);
+  });
+
+  test("first browser transport settles after replaying an existing tmux session", async ({
+    page,
+  }) => {
+    await resetAppState(page, APP_URL);
+
+    const result = await page.evaluate(() => {
+      const OriginalWebSocket = window.WebSocket;
+      const instances: any[] = [];
+      const statuses: Array<{ status: string; resumed: boolean }> = [];
+      const lifecycles: string[] = [];
+
+      class FakeWebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        readyState = FakeWebSocket.CONNECTING;
+        onopen: null | (() => void) = null;
+        onmessage: null | ((event: { data: string }) => void) = null;
+        onclose: null | (() => void) = null;
+        onerror: null | (() => void) = null;
+
+        constructor(public url: string) {
+          instances.push(this);
+        }
+
+        send() {}
+        close() {
+          this.readyState = FakeWebSocket.CLOSED;
+        }
+      }
+
+      window.WebSocket = FakeWebSocket as any;
+      try {
+        const socket = new ReconnectingWebSocket(
+          "ws://fake",
+          "existing-tmux-session",
+          {
+            onMessage: () => {},
+            onLifecycle: (message: { phase: string }) =>
+              lifecycles.push(message.phase),
+            onStatusChange: (status: string, extra?: { resumed?: boolean }) =>
+              statuses.push({
+                status,
+                resumed: extra?.resumed === true,
+              }),
+          },
+        );
+
+        const first = instances[0];
+        first.readyState = FakeWebSocket.OPEN;
+        first.onopen?.();
+        first.onmessage?.({
+          data: JSON.stringify({
+            type: "reconnect_lifecycle",
+            phase: "replay-start",
+          }),
+        });
+        const waitingAfterReplayStart = socket.awaitingReconnectReady;
+        first.onmessage?.({
+          data: JSON.stringify({
+            type: "reconnect_lifecycle",
+            phase: "ready",
+          }),
+        });
+
+        return {
+          statuses,
+          lifecycles,
+          waitingAfterReplayStart,
+          waitingAfterReady: socket.awaitingReconnectReady,
+        };
+      } finally {
+        window.WebSocket = OriginalWebSocket;
+      }
+    });
+
+    expect(result.lifecycles).toEqual(["replay-start", "ready"]);
+    expect(result.waitingAfterReplayStart).toBe(true);
+    expect(result.waitingAfterReady).toBe(false);
+    expect(result.statuses).toEqual([
+      { status: "connected", resumed: false },
+      { status: "connected", resumed: true },
+    ]);
   });
 
   test("stale socket events and heartbeat timeouts cannot affect a newer generation", async ({

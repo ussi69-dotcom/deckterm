@@ -553,6 +553,14 @@ class ReconnectingWebSocket {
           return;
         }
         if (data.type === "reconnect_lifecycle") {
+          // The first browser transport can still be attaching to an already
+          // running tmux session. In that case `openedOnce` is false, so the
+          // socket cannot infer replay from its transport generation alone.
+          // Let the server lifecycle become authoritative before accepting
+          // the matching `ready` event below.
+          if (data.phase === "replay-start") {
+            this.awaitingReconnectReady = true;
+          }
           this.callbacks.onLifecycle?.(data);
           if (
             data.phase === "ready" &&
