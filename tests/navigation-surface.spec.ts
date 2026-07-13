@@ -58,6 +58,57 @@ test.describe("Shell action hierarchy on desktop", () => {
     await expect(page.getByRole("button", { name: "More" })).toBeVisible();
   });
 
+  test("keeps one fixed Font size stepper in More while stepping repeatedly", async ({
+    page,
+  }) => {
+    await page.getByRole("button", { name: "More" }).click();
+    const sheet = page.locator("#tools-sheet");
+    const stepper = sheet.locator("#tools-sheet-font-size");
+    await expect(stepper).toBeVisible();
+    await expect(
+      sheet.getByRole("button", { name: "Font -", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      sheet.getByRole("button", { name: "Font +", exact: true }),
+    ).toHaveCount(0);
+
+    const value = stepper.locator("output");
+    const initial = Number.parseInt((await value.textContent()) || "14", 10);
+    await stepper.getByRole("button", { name: "Increase font size" }).click();
+    await stepper.getByRole("button", { name: "Increase font size" }).click();
+    await expect(sheet).toBeVisible();
+    await expect(value).toHaveText(`${Math.min(32, initial + 2)}px`);
+
+    const applied = await page.evaluate(() => {
+      const manager = (window as any).terminalManager;
+      const active = manager?.terminals?.get(manager.activeId);
+      return {
+        manager: manager?.fontSize,
+        terminal: active?.terminal?.options?.fontSize,
+        stored: manager?.settingsStore?.get("terminal.fontSize"),
+      };
+    });
+    expect(applied.manager).toBe(Math.min(32, initial + 2));
+    expect(applied.terminal).toBe(applied.manager);
+    expect(applied.stored).toBe(applied.manager);
+
+    await page.evaluate(() => (window as any).terminalManager.applyFontSize(32));
+    await expect(
+      stepper.getByRole("button", { name: "Increase font size" }),
+    ).toBeDisabled();
+    await page.evaluate(() => (window as any).terminalManager.applyFontSize(8));
+    await expect(
+      stepper.getByRole("button", { name: "Decrease font size" }),
+    ).toBeDisabled();
+
+    await page.locator("#tools-sheet-close").click();
+    await openCommandPalette(page);
+    await page.locator("#command-palette-input").fill("Increase Font Size");
+    await expect(
+      page.locator("#command-palette-results").getByText("Increase Font Size"),
+    ).toBeVisible();
+  });
+
   test("opens Git and Files from explicit top-bar actions", async ({
     page,
   }) => {

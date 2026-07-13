@@ -8,9 +8,14 @@ import {
   type Response,
 } from "@playwright/test";
 import { execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import {
+  E2E_RUN_ACTOR_PREFIX,
+  E2E_RUN_COOKIE_NAME,
+} from "../backend/services/foundation-actors";
 
 const DEFAULT_APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 const TERMINAL_CREATE_RATE_LIMIT_WINDOW_MS = 60_000;
@@ -21,6 +26,7 @@ const TERMINAL_CREATE_RATE_LIMIT_BUFFER_MS = 250;
 let terminalCreateRequestTimestamps: number[] = [];
 
 type ServerGuardState = {
+  runId: string;
   createdTerminalIds: Set<string>;
   pendingResponseTracks: Set<Promise<void>>;
   pendingTerminalCreates: Set<Promise<void>>;
@@ -28,6 +34,49 @@ type ServerGuardState = {
 };
 
 const serverGuardByContext = new WeakMap<BrowserContext, ServerGuardState>();
+
+async function installE2ERunCookie(
+  context: BrowserContext,
+  rawUrl: string,
+  runId: string,
+) {
+  const baseUrl = assertDevE2eUrl(rawUrl);
+  await context.addCookies([
+    {
+      name: E2E_RUN_COOKIE_NAME,
+      value: runId,
+      url: baseUrl.origin,
+      httpOnly: true,
+      secure: false,
+      sameSite: "Strict",
+    },
+  ]);
+}
+
+async function verifyE2ERunActor(
+  context: BrowserContext,
+  rawUrl: string,
+  runId: string,
+) {
+  const baseUrl = assertDevE2eUrl(rawUrl);
+  const response = await context.request.get(
+    new URL("/api/foundation/status", baseUrl).toString(),
+  );
+  if (!response.ok()) {
+    throw new Error(
+      `DeckTerm E2E namespace verification failed (HTTP ${response.status()}).`,
+    );
+  }
+  const payload = (await response.json().catch(() => null)) as {
+    auth?: { actor?: { id?: unknown } };
+  } | null;
+  const expectedActorId = `${E2E_RUN_ACTOR_PREFIX}${runId}`;
+  if (payload?.auth?.actor?.id !== expectedActorId) {
+    throw new Error(
+      `DeckTerm E2E namespace verification returned an unexpected actor.`,
+    );
+  }
+}
 
 function isLiveTerminal(value: unknown): boolean {
   if (!value || typeof value !== "object") return false;
@@ -129,43 +178,6 @@ async function installVirtualSettings(
   );
 }
 
-async function installTerminalCatalogGuard(
-  context: BrowserContext,
-  state: ServerGuardState,
-) {
-  await context.route(
-    (url) => url.pathname === "/api/terminals",
-    async (route) => {
-      try {
-        if (route.request().method() !== "GET") {
-          await route.fallback();
-          return;
-        }
-        const response = await route.fetch();
-        if (!response.ok()) {
-          await route.fulfill({ response });
-          return;
-        }
-        const payload = (await response.json().catch(() => [])) as unknown[];
-        const terminals = Array.isArray(payload)
-          ? payload.filter(
-              (terminal) =>
-                terminal &&
-                typeof terminal === "object" &&
-                "id" in terminal &&
-                state.createdTerminalIds.has(
-                  String((terminal as { id?: unknown }).id || ""),
-                ),
-            )
-          : [];
-        await route.fulfill({ response, json: terminals });
-      } catch (error) {
-        if (!state.shuttingDown) throw error;
-      }
-    },
-  );
-}
-
 async function installTerminalCreateBudget(
   context: BrowserContext,
   state: ServerGuardState,
@@ -217,32 +229,6 @@ async function installTerminalCreateBudget(
   );
 }
 
-async function assertServerIsIdle(context: BrowserContext, rawUrl: string) {
-  const baseUrl = assertDevE2eUrl(rawUrl);
-  const response = await context.request.get(
-    new URL("/api/terminals", baseUrl).toString(),
-  );
-  if (!response.ok()) {
-    throw new Error(
-      `DeckTerm E2E safety check could not list development terminals (${response.status()}).`,
-    );
-  }
-  const terminals = (await response.json().catch(() => [])) as unknown[];
-  const live = Array.isArray(terminals) ? terminals.filter(isLiveTerminal) : [];
-  if (live.length === 0) return;
-
-  const ids = live
-    .map((value) =>
-      value && typeof value === "object" && "id" in value
-        ? String((value as { id?: unknown }).id || "unknown")
-        : "unknown",
-    )
-    .join(", ");
-  throw new Error(
-    `Refusing to run DeckTerm E2E against port 4174 while ${live.length} live terminal(s) exist (${ids}). Close them explicitly first; the harness never deletes pre-existing sessions.`,
-  );
-}
-
 async function cleanupCreatedTerminals(
   context: BrowserContext,
   rawUrl: string,
@@ -250,7 +236,25 @@ async function cleanupCreatedTerminals(
 ) {
   await Promise.allSettled([...state.pendingResponseTracks]);
   const baseUrl = assertDevE2eUrl(rawUrl);
-  const createdIds = [...state.createdTerminalIds];
+  const catalogResponse = await context.request.get(
+    new URL("/api/terminals", baseUrl).toString(),
+  );
+  if (!catalogResponse.ok()) {
+    throw new Error(
+      `DeckTerm E2E cleanup could not enumerate its namespace (HTTP ${catalogResponse.status()}).`,
+    );
+  }
+  const catalog = (await catalogResponse.json().catch(() => [])) as unknown[];
+  const createdIds = Array.isArray(catalog)
+    ? catalog
+        .filter(isLiveTerminal)
+        .map((value) =>
+          value && typeof value === "object" && "id" in value
+            ? String((value as { id?: unknown }).id || "")
+            : "",
+        )
+        .filter(Boolean)
+    : [];
   const deletions = await Promise.allSettled(
     createdIds.map(async (id) => {
       const response = await context.request.delete(
@@ -766,6 +770,12 @@ export async function resetAppState(page: Page, url = DEFAULT_APP_URL) {
   assertDevE2eUrl(url);
   await clearBrowserStateForOrigin(page, url);
   await page.context().clearCookies();
+  const guardState = serverGuardByContext.get(page.context());
+  if (!guardState) {
+    throw new Error("DeckTerm E2E namespace guard is not installed.");
+  }
+  await installE2ERunCookie(page.context(), url, guardState.runId);
+  await verifyE2ERunActor(page.context(), url, guardState.runId);
   await page.goto(url);
   await page.waitForLoadState("domcontentloaded");
 }
@@ -1035,22 +1045,23 @@ type DeckTermFixtures = {
 };
 
 // Every browser test is fail-closed against the shared development service:
-// pre-existing sessions abort the test before navigation, settings stay inside
-// the BrowserContext, and teardown deletes only terminal IDs observed from
-// successful create responses in this test.
+// the server verifies a unique owner namespace before navigation, settings stay
+// inside the BrowserContext, and teardown enumerates/deletes only that namespace.
 export const test = base.extend<DeckTermFixtures>({
   decktermServerGuard: [
     async ({ context }, use) => {
       const state: ServerGuardState = {
+        runId: randomBytes(16).toString("hex"),
         createdTerminalIds: new Set(),
         pendingResponseTracks: new Set(),
         pendingTerminalCreates: new Set(),
         shuttingDown: false,
       };
       serverGuardByContext.set(context, state);
-      await assertServerIsIdle(context, DEFAULT_APP_URL);
+      assertDevE2eUrl(DEFAULT_APP_URL);
+      await installE2ERunCookie(context, DEFAULT_APP_URL, state.runId);
+      await verifyE2ERunActor(context, DEFAULT_APP_URL, state.runId);
       await installVirtualSettings(context, state);
-      await installTerminalCatalogGuard(context, state);
       await installTerminalCreateBudget(context, state);
 
       const onResponse = (response: Response) => {

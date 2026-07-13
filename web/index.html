@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260713c" />
+    <link rel="stylesheet" href="/styles.css?v=20260713d" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -32,15 +32,36 @@
             <i data-lucide="menu"></i>
           </button>
 
-          <button id="new-terminal" class="btn btn-new" title="New Terminal (Ctrl+N)">
-            <i data-lucide="plus"></i>
-            <span class="btn-label">New</span>
-          </button>
+          <div class="session-actions" role="group" aria-label="Session actions">
+            <button
+              id="new-terminal"
+              class="btn btn-new"
+              type="button"
+              title="New Terminal (Ctrl+N)"
+            >
+              <i data-lucide="plus"></i>
+              <span class="btn-label">New</span>
+            </button>
 
-          <button id="sessions-btn" class="btn btn-secondary" title="Sessions (C1b)" style="margin-left: 5px;">
-            <i data-lucide="terminal"></i>
-            <span class="btn-label">Sessions</span>
-          </button>
+            <button
+              id="sessions-btn"
+              class="btn-icon sessions-trigger"
+              type="button"
+              title="Sessions"
+              aria-label="Sessions"
+              aria-haspopup="dialog"
+              aria-controls="sessions-panel"
+              aria-expanded="false"
+            >
+              <i data-lucide="panels-top-left"></i>
+              <span
+                id="sessions-available-badge"
+                class="sessions-available-badge"
+                aria-hidden="true"
+                hidden
+              ></span>
+            </button>
+          </div>
 
           <div
             id="terminals-tabs"
@@ -678,6 +699,7 @@
               <table class="help-table">
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td><td>Split workspace (add terminal)</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Move current pane to a new tab</td></tr>
+                <tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd>/<kbd>↓</kbd></td><td>Previous/next pane in this tab</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td><td>Undo layout change</td></tr>
                 <tr><td>Drag tile edge</td><td>Resize terminals</td></tr>
               </table>
@@ -755,7 +777,7 @@
     <script src="/action-registry.js?v=20260403a"></script>
     <script src="/palette-providers.js?v=20260705a"></script>
     <script src="/command-palette.js?v=20260705a"></script>
-    <script src="/navigation-surface.js?v=20260403a"></script>
+    <script src="/navigation-surface.js?v=20260713b"></script>
     <script src="/settings-schema.js?v=20260705b"></script>
     <script src="/terminal-renderer.js?v=20260705a"></script>
     <script src="/settings-ui.js?v=20260705a"></script>
@@ -773,6 +795,6 @@
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260713g"></script>
+    <script src="/app.js?v=20260713h"></script>
   </body>
 </html>

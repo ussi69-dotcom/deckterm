@@ -351,4 +351,151 @@ test.describe("Terminal Tab Status on Reconnection", () => {
 
     expect(reconnectAttempts).toEqual([1, 2]);
   });
+
+  test("stale socket events and heartbeat timeouts cannot affect a newer generation", async ({
+    page,
+  }) => {
+    await resetAppState(page, APP_URL);
+
+    const result = await page.evaluate(() => {
+      const OriginalWebSocket = window.WebSocket;
+      const originalSetInterval = window.setInterval.bind(window);
+      const originalClearInterval = window.clearInterval.bind(window);
+      const originalSetTimeout = window.setTimeout.bind(window);
+      const originalClearTimeout = window.clearTimeout.bind(window);
+      const intervals: Array<() => void> = [];
+      const timeouts: Array<() => void> = [];
+      const instances: any[] = [];
+      const messages: string[] = [];
+      const lifecycles: string[] = [];
+      const terminalStates: string[] = [];
+      const statuses: string[] = [];
+
+      class FakeWebSocket {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+
+        readyState = FakeWebSocket.CONNECTING;
+        sent: string[] = [];
+        closeCount = 0;
+        onopen: null | (() => void) = null;
+        onmessage: null | ((event: { data: string }) => void) = null;
+        onclose: null | (() => void) = null;
+        onerror: null | (() => void) = null;
+
+        constructor(public url: string) {
+          instances.push(this);
+        }
+
+        send(payload: string) {
+          this.sent.push(payload);
+        }
+
+        close() {
+          this.closeCount += 1;
+          this.readyState = FakeWebSocket.CLOSED;
+          this.onclose?.();
+        }
+      }
+
+      window.WebSocket = FakeWebSocket as any;
+      window.setInterval = ((fn: () => void) => {
+        intervals.push(fn);
+        return intervals.length;
+      }) as any;
+      window.clearInterval = (() => {}) as any;
+      window.setTimeout = ((fn: () => void) => {
+        timeouts.push(fn);
+        return timeouts.length;
+      }) as any;
+      window.clearTimeout = (() => {}) as any;
+
+      try {
+        const socket = new ReconnectingWebSocket(
+          "ws://fake",
+          "term-generation",
+          {
+            onMessage: (message: string) => messages.push(message),
+            onLifecycle: (message: { phase: string }) =>
+              lifecycles.push(message.phase),
+            onTerminalState: (message: { marker: string }) =>
+              terminalStates.push(message.marker),
+            onStatusChange: (status: string) => statuses.push(status),
+          },
+        );
+
+        const first = instances[0];
+        first.readyState = FakeWebSocket.OPEN;
+        first.onopen?.();
+
+        // Arm a heartbeat timeout owned by the first transport. Retain the
+        // callback even though retry() clears it so we can model a late task.
+        intervals[0]?.();
+        const staleHeartbeatTimeout = timeouts.at(-1);
+
+        socket.retry();
+        const second = instances[1];
+        second.readyState = FakeWebSocket.OPEN;
+        second.onopen?.();
+        second.onmessage?.({
+          data: JSON.stringify({
+            type: "reconnect_lifecycle",
+            phase: "ready",
+          }),
+        });
+
+        const baseline = {
+          messages: messages.length,
+          lifecycles: lifecycles.length,
+          terminalStates: terminalStates.length,
+          statuses: statuses.length,
+          instances: instances.length,
+        };
+
+        // Late callbacks from the replaced transport must all be inert.
+        first.onmessage?.({ data: "stale-output" });
+        first.onmessage?.({
+          data: JSON.stringify({
+            type: "reconnect_lifecycle",
+            phase: "ready",
+          }),
+        });
+        first.onmessage?.({
+          data: JSON.stringify({
+            type: "terminal_state",
+            marker: "stale-state",
+          }),
+        });
+        first.onclose?.();
+        staleHeartbeatTimeout?.();
+
+        return {
+          baseline,
+          after: {
+            messages: messages.length,
+            lifecycles: lifecycles.length,
+            terminalStates: terminalStates.length,
+            statuses: statuses.length,
+            instances: instances.length,
+          },
+          currentIsSecond: socket.ws === second,
+          secondReadyState: second.readyState,
+          secondCloseCount: second.closeCount,
+        };
+      } finally {
+        window.WebSocket = OriginalWebSocket;
+        window.setInterval = originalSetInterval;
+        window.clearInterval = originalClearInterval;
+        window.setTimeout = originalSetTimeout;
+        window.clearTimeout = originalClearTimeout;
+      }
+    });
+
+    expect(result.after).toEqual(result.baseline);
+    expect(result.currentIsSecond).toBe(true);
+    expect(result.secondReadyState).toBe(1);
+    expect(result.secondCloseCount).toBe(0);
+  });
 });

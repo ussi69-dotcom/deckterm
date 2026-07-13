@@ -433,20 +433,6 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-fullscreen",
     desktopTone: "secondary",
   }),
-  "font-decrease": Object.freeze({
-    label: "Font -",
-    icon: "zoom-out",
-    action: "font-decrease",
-    toolsId: "tools-sheet-font-decrease",
-    desktopTone: "secondary",
-  }),
-  "font-increase": Object.freeze({
-    label: "Font +",
-    icon: "zoom-in",
-    action: "font-increase",
-    toolsId: "tools-sheet-font-increase",
-    desktopTone: "secondary",
-  }),
   help: Object.freeze({
     label: "Help",
     icon: "help-circle",
@@ -505,6 +491,7 @@ class ReconnectingWebSocket {
     this.reconnectTimer = null;
     this.heartbeatInterval = null;
     this.heartbeatTimeout = null;
+    this.heartbeatSocket = null;
     this.intentionallyClosed = false;
     this.openedOnce = false;
     this.awaitingReconnectReady = false;
@@ -512,34 +499,60 @@ class ReconnectingWebSocket {
   }
 
   connect() {
+    if (this.intentionallyClosed) return;
     const isReconnectTransport = this.openedOnce || this.retryCount > 0;
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
-    this.ws = new WebSocket(this.url);
-    this.ws.onopen = () => {
-      this.startHeartbeat();
+    this.stopHeartbeat();
+
+    const previousSocket = this.ws;
+    this.ws = null;
+
+    // Replacing a connecting/open transport must invalidate it before close
+    // can synchronously fire. Every callback below is generation-bound, so a
+    // late event from this previous socket cannot mutate the new connection.
+    if (
+      previousSocket &&
+      previousSocket.readyState < WebSocket.CLOSING
+    ) {
+      try {
+        previousSocket.close();
+      } catch {}
+    }
+
+    const socket = new WebSocket(this.url);
+    this.ws = socket;
+
+    socket.onopen = () => {
+      if (!this.isCurrentSocket(socket)) return;
+      this.startHeartbeat(socket);
       this.openedOnce = true;
       this.awaitingReconnectReady = isReconnectTransport;
       this.callbacks.onTransportOpen?.(isReconnectTransport);
-      if (!isReconnectTransport) {
-        this.markConnectionReady(false);
+      if (!isReconnectTransport && this.isCurrentSocket(socket)) {
+        this.markConnectionReady(false, socket);
       }
     };
-    this.ws.onmessage = (e) => {
+    socket.onmessage = (e) => {
+      if (!this.isCurrentSocket(socket)) return;
       try {
         const data = JSON.parse(e.data);
         if (data.type === "ping") {
-          this.send(JSON.stringify({ type: "pong" }));
+          socket.send(JSON.stringify({ type: "pong" }));
           return;
         }
         if (data.type === "pong") {
-          this.clearHeartbeatTimeout();
+          this.clearHeartbeatTimeout(socket);
           return;
         }
         if (data.type === "reconnect_lifecycle") {
           this.callbacks.onLifecycle?.(data);
-          if (data.phase === "ready" && this.awaitingReconnectReady) {
-            this.markConnectionReady(true);
+          if (
+            data.phase === "ready" &&
+            this.awaitingReconnectReady &&
+            this.isCurrentSocket(socket)
+          ) {
+            this.markConnectionReady(true, socket);
           }
           return;
         }
@@ -548,37 +561,47 @@ class ReconnectingWebSocket {
           return;
         }
         if (data.type === "exit") {
-          this.callbacks.onStatusChange("exited", data.code);
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.stopHeartbeat(socket);
+          this.callbacks.onStatusChange("exited", data.code);
           return;
         }
         if (data.type === "terminal_dead") {
-          this.callbacks.onStatusChange("dead");
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.stopHeartbeat(socket);
+          this.callbacks.onStatusChange("dead");
           return;
         }
         if (data.type === "session_handoff") {
-          this.callbacks.onStatusChange("taken_over", data);
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
-          this.stopHeartbeat();
-          this.ws?.close();
+          this.stopHeartbeat(socket);
+          this.callbacks.onStatusChange("taken_over", data);
+          socket.close();
           return;
         }
       } catch {}
       this.callbacks.onMessage(e.data);
     };
-    this.ws.onclose = () => {
-      this.stopHeartbeat();
-      if (!this.intentionallyClosed) this.scheduleReconnect();
+    socket.onclose = () => {
+      if (socket !== this.ws) return;
+      this.awaitingReconnectReady = false;
+      this.stopHeartbeat(socket);
+      if (!this.intentionallyClosed) this.scheduleReconnect(socket);
     };
-    this.ws.onerror = () => {};
+    socket.onerror = () => {};
   }
 
-  scheduleReconnect() {
+  isCurrentSocket(socket) {
+    return Boolean(socket && socket === this.ws && !this.intentionallyClosed);
+  }
+
+  scheduleReconnect(socket = this.ws) {
+    if (!this.isCurrentSocket(socket)) return;
     if (this.retryCount >= this.maxRetries) {
+      this.awaitingReconnectReady = false;
       this.callbacks.onStatusChange("failed");
       return;
     }
@@ -599,13 +622,16 @@ class ReconnectingWebSocket {
     // instead of switching to the accurate dead/blocked overlay.
     if (this.retryCount >= 3) {
       this.classifyReconnect().then((outcome) => {
+        if (!this.isCurrentSocket(socket)) return;
         if (outcome === "gone") {
           this.intentionallyClosed = true;
+          this.awaitingReconnectReady = false;
           this.callbacks.onStatusChange("dead");
           return;
         }
         if (outcome === "blocked") {
           this.intentionallyClosed = true;
+          this.awaitingReconnectReady = false;
           this.callbacks.onStatusChange("setup_required");
           return;
         }
@@ -615,7 +641,10 @@ class ReconnectingWebSocket {
           maxRetries: this.maxRetries,
           delay,
         });
-        this.reconnectTimer = setTimeout(() => this.connect(), delay);
+        if (!this.isCurrentSocket(socket)) return;
+        this.reconnectTimer = setTimeout(() => {
+          if (this.isCurrentSocket(socket)) this.connect();
+        }, delay);
       });
       return;
     }
@@ -625,7 +654,10 @@ class ReconnectingWebSocket {
       maxRetries: this.maxRetries,
       delay,
     });
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    if (!this.isCurrentSocket(socket)) return;
+    this.reconnectTimer = setTimeout(() => {
+      if (this.isCurrentSocket(socket)) this.connect();
+    }, delay);
   }
 
   async classifyReconnect() {
@@ -684,7 +716,10 @@ class ReconnectingWebSocket {
     this.intentionallyClosed = true;
     this.stopHeartbeat();
     clearTimeout(this.reconnectTimer);
-    this.ws?.close();
+    this.reconnectTimer = null;
+    const socket = this.ws;
+    this.ws = null;
+    socket?.close();
   }
 
   retry() {
@@ -694,7 +729,8 @@ class ReconnectingWebSocket {
     this.connect();
   }
 
-  markConnectionReady(resumed) {
+  markConnectionReady(resumed, socket = this.ws) {
+    if (!this.isCurrentSocket(socket)) return;
     this.retryCount = 0;
     this.awaitingReconnectReady = false;
     this.callbacks.onStatusChange(
@@ -703,22 +739,42 @@ class ReconnectingWebSocket {
     );
   }
 
-  startHeartbeat() {
+  startHeartbeat(socket = this.ws) {
+    if (!this.isCurrentSocket(socket)) return;
     this.stopHeartbeat();
+    this.heartbeatSocket = socket;
     this.heartbeatInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send(JSON.stringify({ type: "ping" }));
-        this.heartbeatTimeout = setTimeout(() => this.ws.close(), 5000);
+      if (
+        !this.isCurrentSocket(socket) ||
+        socket !== this.heartbeatSocket ||
+        socket.readyState !== WebSocket.OPEN
+      ) {
+        return;
       }
+      socket.send(JSON.stringify({ type: "ping" }));
+      this.clearHeartbeatTimeout(socket);
+      this.heartbeatTimeout = setTimeout(() => {
+        if (
+          this.isCurrentSocket(socket) &&
+          socket === this.heartbeatSocket &&
+          socket.readyState === WebSocket.OPEN
+        ) {
+          socket.close();
+        }
+      }, 5000);
     }, 25000);
   }
 
-  stopHeartbeat() {
+  stopHeartbeat(socket = null) {
+    if (socket && socket !== this.heartbeatSocket) return;
     clearInterval(this.heartbeatInterval);
-    this.clearHeartbeatTimeout();
+    this.heartbeatInterval = null;
+    this.clearHeartbeatTimeout(socket);
+    this.heartbeatSocket = null;
   }
 
-  clearHeartbeatTimeout() {
+  clearHeartbeatTimeout(socket = null) {
+    if (socket && socket !== this.heartbeatSocket) return;
     clearTimeout(this.heartbeatTimeout);
     this.heartbeatTimeout = null;
   }
@@ -748,6 +804,11 @@ class Tile {
     this.groupId = null;
     this.element = null;
     this.terminalWrapper = null;
+    this.paneStatus = null;
+    this.paneStatusDot = null;
+    this.paneStatusConnection = null;
+    this.paneStatusFolder = null;
+    this.paneStatusActivity = null;
     this.closeConfirmVisible = false;
     this.onDocumentClick = null;
 
@@ -766,16 +827,48 @@ class Tile {
     this.element.className = "tile";
     this.element.dataset.tileId = this.id;
     this.element.dataset.terminalId = this.terminalId;
+    this.element.setAttribute("role", "group");
 
     this.terminalWrapper = document.createElement("div");
     this.terminalWrapper.className = "terminal-wrapper";
     this.terminalWrapper.id = `terminal-${this.terminalId}`;
     this.element.appendChild(this.terminalWrapper);
 
+    this.createPaneStatus();
     this.createCloseButton();
     this.createResizeHandles();
     this.setupResizeHandlers();
     this.container.appendChild(this.element);
+  }
+
+  createPaneStatus() {
+    const status = document.createElement("div");
+    status.className = "tile-pane-status";
+    status.setAttribute("aria-hidden", "true");
+
+    const dot = document.createElement("span");
+    dot.className = "tile-pane-status-dot";
+
+    const folder = document.createElement("span");
+    folder.className = "tile-pane-status-folder";
+
+    const connection = document.createElement("span");
+    connection.className = "tile-pane-status-connection";
+
+    const activity = document.createElement("span");
+    activity.className = "tile-pane-status-activity";
+
+    status.appendChild(dot);
+    status.appendChild(connection);
+    status.appendChild(folder);
+    status.appendChild(activity);
+    this.element.appendChild(status);
+
+    this.paneStatus = status;
+    this.paneStatusDot = dot;
+    this.paneStatusConnection = connection;
+    this.paneStatusFolder = folder;
+    this.paneStatusActivity = activity;
   }
 
   createCloseButton() {
@@ -845,11 +938,13 @@ class Tile {
 
   showCloseConfirm() {
     this.closeConfirmVisible = true;
+    this.element.classList.add("close-confirm-open");
     this.closeConfirm.classList.add("visible");
   }
 
   hideCloseConfirm() {
     this.closeConfirmVisible = false;
+    this.element.classList.remove("close-confirm-open");
     this.closeConfirm.classList.remove("visible");
   }
 
@@ -5080,7 +5175,10 @@ class TerminalManager {
     this.viewportFocusTimer = null;
     this.notificationsEnabled = true;
     this.clientInstanceId = this.getOrCreateClientInstanceId();
+    this._sessionCatalog = [];
+    this.sessionsReturnFocus = null;
     this.commandPaletteGitCache = new Map();
+    this.handledPaneShortcutEvents = new WeakSet();
     // Quick-open (Ctrl+P) file tree cache, keyed by cwd. Providers are SYNC
     // (same constraint as the git cache above), so the tree is prefetched on
     // palette open (buildCommandPaletteContext) and read back synchronously
@@ -6048,7 +6146,7 @@ class TerminalManager {
     const actionIds = this.getToolsSheetActionIds(mode);
     grid.replaceChildren();
     grid.dataset.mode = mode;
-    grid.dataset.empty = actionIds.length > 0 ? "false" : "true";
+    grid.dataset.empty = "false";
 
     actionIds.forEach((actionId) => {
       const button = this.createActionButton(actionId, "tools-sheet");
@@ -6056,6 +6154,63 @@ class TerminalManager {
         grid.appendChild(button);
       }
     });
+
+    grid.appendChild(this.createFontSizeStepper());
+    this.syncFontSizeStepper();
+  }
+
+  createFontSizeStepper() {
+    const group = document.createElement("div");
+    group.id = "tools-sheet-font-size";
+    group.className = "tools-sheet-font-stepper";
+    group.setAttribute("role", "group");
+    group.setAttribute("aria-label", "Font size");
+
+    const label = document.createElement("span");
+    label.className = "tools-sheet-font-label";
+    label.textContent = "Font size";
+    group.appendChild(label);
+
+    const controls = document.createElement("span");
+    controls.className = "tools-sheet-font-controls";
+
+    const createStepButton = (action, labelText, iconName) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "tools-sheet-font-button";
+      button.dataset.action = action;
+      button.dataset.actionSurface = "tools-sheet";
+      button.setAttribute("aria-label", labelText);
+      button.title = labelText;
+      const icon = document.createElement("i");
+      icon.dataset.lucide = iconName;
+      button.appendChild(icon);
+      return button;
+    };
+
+    controls.appendChild(
+      createStepButton("font-decrease", "Decrease font size", "minus"),
+    );
+    const value = document.createElement("output");
+    value.className = "tools-sheet-font-value";
+    value.setAttribute("aria-live", "polite");
+    controls.appendChild(value);
+    controls.appendChild(
+      createStepButton("font-increase", "Increase font size", "plus"),
+    );
+    group.appendChild(controls);
+    return group;
+  }
+
+  syncFontSizeStepper() {
+    const group = this.toolsSheet?.querySelector("#tools-sheet-font-size");
+    if (!group) return;
+    const value = group.querySelector("output");
+    if (value) value.textContent = `${this.fontSize}px`;
+    const decrease = group.querySelector('[data-action="font-decrease"]');
+    const increase = group.querySelector('[data-action="font-increase"]');
+    if (decrease) decrease.disabled = this.fontSize <= 8;
+    if (increase) increase.disabled = this.fontSize >= 32;
   }
 
   setupDesktopTabOverflowScroll() {
@@ -6177,7 +6332,9 @@ class TerminalManager {
     if (
       button?.closest("#tools-sheet") &&
       action !== "toggle-tools-sheet" &&
-      action !== "palette"
+      action !== "palette" &&
+      action !== "font-decrease" &&
+      action !== "font-increase"
     ) {
       this.closeToolsSheet();
     }
@@ -6362,6 +6519,26 @@ class TerminalManager {
     panel
       .querySelector("#sessions-refresh-btn")
       ?.addEventListener("click", () => this.refreshSessionsPanel());
+    panel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.closeSessionsPanel();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = this.getSessionsFocusableElements();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
     const list = panel.querySelector("#sessions-list");
     list?.addEventListener("click", (event) => {
       const row = event.target.closest("[data-session-id]");
@@ -6376,6 +6553,16 @@ class TerminalManager {
       event.preventDefault();
       void this.handleSessionRowActivate(row.dataset.sessionId);
     });
+  }
+
+  getSessionsFocusableElements() {
+    const panel = this.getSessionsPanel();
+    if (!panel || panel.classList.contains("hidden")) return [];
+    return Array.from(
+      panel.querySelectorAll(
+        'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((element) => !element.hidden && element.offsetParent !== null);
   }
 
   async handleSessionRowActivate(sessionId) {
@@ -6411,7 +6598,8 @@ class TerminalManager {
         await this.createTerminal(false, { cwd: session.cwd });
         break;
     }
-    this.closeSessionsPanel();
+    this.updateSessionsAvailableBadge();
+    this.closeSessionsPanel({ restoreFocus: false });
   }
 
   openSessionsPanel() {
@@ -6420,18 +6608,58 @@ class TerminalManager {
     this.closeToolsSheet();
     this.closeTaskPanel();
     this.closeSetupPanel();
+    this.sessionsReturnFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : document.getElementById("sessions-btn");
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
+    document
+      .getElementById("sessions-btn")
+      ?.setAttribute("aria-expanded", "true");
     void this.refreshSessionsPanel();
     this.syncSurfaceButtonState();
+    panel
+      .querySelector("#sessions-panel-close")
+      ?.focus({ preventScroll: true });
   }
 
-  closeSessionsPanel() {
+  closeSessionsPanel({ restoreFocus = true } = {}) {
     const panel = this.getSessionsPanel();
     if (!panel) return;
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    document
+      .getElementById("sessions-btn")
+      ?.setAttribute("aria-expanded", "false");
     this.syncSurfaceButtonState();
+    const returnTarget = this.sessionsReturnFocus;
+    this.sessionsReturnFocus = null;
+    if (restoreFocus && returnTarget?.isConnected) {
+      returnTarget.focus({ preventScroll: true });
+    }
+  }
+
+  updateSessionsAvailableBadge(sessions = this._sessionCatalog || []) {
+    const trigger = document.getElementById("sessions-btn");
+    const badge = document.getElementById("sessions-available-badge");
+    if (!trigger || !badge) return;
+    const available = Array.isArray(sessions)
+      ? sessions.filter((session) => {
+          const live =
+            session?.active === true ||
+            session?.status === "active" ||
+            session?.sessionStatus === "active";
+          return live && session?.id && !this.terminals.has(session.id);
+        }).length
+      : 0;
+    badge.hidden = available === 0;
+    badge.textContent = available > 99 ? "99+" : String(available || "");
+    const label = available
+      ? `Sessions, ${available} available`
+      : "Sessions";
+    trigger.setAttribute("aria-label", label);
+    trigger.title = label;
   }
 
   async refreshSessionsPanel() {
@@ -6446,6 +6674,7 @@ class TerminalManager {
       const sessions = await res.json();
       // Keep the catalog so the click handler can resolve cwd/flags per row.
       this._sessionCatalog = sessions;
+      this.updateSessionsAvailableBadge(sessions);
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
         return;
@@ -6467,7 +6696,7 @@ class TerminalManager {
             <div class="session-row-cwd">${cwd}</div>
             <small>${esc(status)} · ${esc(mode)}${s.sessionName ? " · tmux" : ""}</small>
           </div>
-          <button class="session-row-action" type="button" data-session-action="${s.id}">${action.label}</button>
+          <span class="session-row-action" aria-hidden="true">${action.label}</span>
         </div>`;
         })
         .join("");
@@ -8820,6 +9049,25 @@ class TerminalManager {
         }),
       );
 
+      if (context.paneCount > 1) {
+        contextualActions.push(
+          {
+            id: "focus-next-pane",
+            title: "Focus Next Pane",
+            group: "Contextual",
+            keywords: ["pane", "terminal", "next", "down"],
+            run: () => this.switchToAdjacentPane(1),
+          },
+          {
+            id: "focus-previous-pane",
+            title: "Focus Previous Pane",
+            group: "Contextual",
+            keywords: ["pane", "terminal", "previous", "up"],
+            run: () => this.switchToAdjacentPane(-1),
+          },
+        );
+      }
+
       // IDE-gated editor-tab commands: only meaningful with the IDE editor
       // area live and at least one open tab.
       if (context.isIdeMode && context.hasEditorTabs) {
@@ -9088,6 +9336,7 @@ class TerminalManager {
       quickOpenTruncated: Boolean(treeContext.truncated),
       isIdeMode,
       hasEditorTabs: Boolean(isIdeMode && this.editorTabs?.model?.hasTabs()),
+      paneCount: this.getActiveWorkspacePaneIds().length,
     };
   }
 
@@ -9368,6 +9617,88 @@ class TerminalManager {
     return last || "/";
   }
 
+  normalizeConnectionStatus(status) {
+    const normalized = String(status || "").trim().toLowerCase();
+    if (normalized === "connected") return "connected";
+    if (normalized === "connecting" || normalized === "reconnecting") {
+      return normalized;
+    }
+    if (
+      [
+        "disconnected",
+        "failed",
+        "dead",
+        "exited",
+        "taken_over",
+        "setup_required",
+      ].includes(normalized)
+    ) {
+      return "disconnected";
+    }
+    return "disconnected";
+  }
+
+  getTerminalConnectionStatus(terminal) {
+    if (!terminal) return "disconnected";
+    if (
+      terminal.awaitingReconnectReady ||
+      terminal.ws?.awaitingReconnectReady
+    ) {
+      return "reconnecting";
+    }
+
+    if (terminal.connectionStatus) {
+      return this.normalizeConnectionStatus(terminal.connectionStatus);
+    }
+
+    // readyState is an initialization fallback only. Once DeckTerm has an
+    // application-level status, reconnect replay readiness owns the truth.
+    if (terminal.ws?.readyState === WebSocket.OPEN) return "connected";
+    if (terminal.ws?.readyState === WebSocket.CONNECTING) return "connecting";
+    return "disconnected";
+  }
+
+  getConnectionStatusLabel(status) {
+    const normalized = this.normalizeConnectionStatus(status);
+    if (normalized === "connected") return "Connected";
+    if (normalized === "connecting") return "Connecting";
+    if (normalized === "reconnecting") return "Reconnecting";
+    return "Disconnected";
+  }
+
+  getPaneActivityState(terminal) {
+    const agentState = String(terminal?.agentState || "")
+      .trim()
+      .toLowerCase();
+    const rawAgentName = String(terminal?.agentName || "").trim();
+    const agentName = rawAgentName
+      ? rawAgentName.charAt(0).toUpperCase() + rawAgentName.slice(1)
+      : "Agent";
+
+    if (agentState === "responding") {
+      return {
+        key: "responding",
+        label: "Responding",
+        accessibleLabel: `${agentName} responding`,
+      };
+    }
+    if (agentState === "thinking") {
+      return {
+        key: "thinking",
+        label: "Thinking",
+        accessibleLabel: `${agentName} thinking`,
+      };
+    }
+    if (terminal?.running || terminal?.busy) {
+      return {
+        key: "running",
+        label: "Running",
+        accessibleLabel: "Command running",
+      };
+    }
+    return { key: "idle", label: "Idle", accessibleLabel: "Idle" };
+  }
+
   getActiveTerminal() {
     if (!this.activeId) return null;
     return this.terminals.get(this.activeId) || null;
@@ -9430,6 +9761,10 @@ class TerminalManager {
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
+        this._sessionCatalog = Array.isArray(serverTerminals)
+          ? serverTerminals
+          : [];
+        this.updateSessionsAvailableBadge(this._sessionCatalog);
         const telemetryById = new Map(
           serverTerminals
             .filter((terminal) => terminal?.id)
@@ -9803,16 +10138,17 @@ class TerminalManager {
   applyWorkspaceConnectionState(tab, workspaceId, fallbackStatuses = []) {
     if (!tab) return;
     const workspaceStatuses = workspaceId
-      ? this.getWorkspaceTerminals(workspaceId).map(
-          ({ connectionStatus }) => connectionStatus,
+      ? this.getWorkspaceTerminals(workspaceId).map((terminal) =>
+          this.getTerminalConnectionStatus(terminal),
         )
       : fallbackStatuses;
-    const hasDisconnectedPane = workspaceStatuses.some((paneStatus) =>
-      ["failed", "dead", "taken_over", "setup_required"].includes(
-        paneStatus,
-      ),
+    const normalizedStatuses = workspaceStatuses.map((paneStatus) =>
+      this.normalizeConnectionStatus(paneStatus),
     );
-    const hasReconnectingPane = workspaceStatuses.includes("reconnecting");
+    const hasDisconnectedPane = normalizedStatuses.includes("disconnected");
+    const hasReconnectingPane = normalizedStatuses.some((paneStatus) =>
+      ["connecting", "reconnecting"].includes(paneStatus),
+    );
 
     tab.classList.toggle("disconnected", hasDisconnectedPane);
     tab.classList.toggle(
@@ -11291,6 +11627,7 @@ class TerminalManager {
 
   setupKeyboardShortcuts() {
     document.addEventListener("keydown", (e) => {
+      if (this.handledPaneShortcutEvents.has(e)) return;
       if (
         (e.ctrlKey || e.metaKey) &&
         e.shiftKey &&
@@ -11351,6 +11688,24 @@ class TerminalManager {
       if (e.altKey && e.shiftKey && e.key === "ArrowLeft") {
         e.preventDefault();
         this.switchToNext(-1);
+      }
+      if (
+        e.altKey &&
+        e.shiftKey &&
+        e.key === "ArrowDown" &&
+        this.switchToAdjacentPane(1)
+      ) {
+        e.preventDefault();
+        return;
+      }
+      if (
+        e.altKey &&
+        e.shiftKey &&
+        e.key === "ArrowUp" &&
+        this.switchToAdjacentPane(-1)
+      ) {
+        e.preventDefault();
+        return;
       }
       if (e.ctrlKey && e.key === "f") {
         e.preventDefault();
@@ -11693,6 +12048,7 @@ class TerminalManager {
       hasConnected: false, // Track if WebSocket has ever successfully connected
       isReconnection,
       awaitingReconnectReady: false,
+      connectionStatus: "connecting",
     });
 
     dbg(`[reconnect] Terminal ${id} stored in Map with isReconnection=true`);
@@ -12193,6 +12549,22 @@ class TerminalManager {
 
     // Intercept Ctrl+V for clipboard paste with large content warning
     terminal.attachCustomKeyEventHandler((event) => {
+      if (
+        event.type === "keydown" &&
+        event.altKey &&
+        event.shiftKey &&
+        (event.key === "ArrowDown" || event.key === "ArrowUp")
+      ) {
+        const switched = this.switchToAdjacentPane(
+          event.key === "ArrowDown" ? 1 : -1,
+        );
+        if (switched) {
+          event.preventDefault();
+          this.handledPaneShortcutEvents.add(event);
+          return false;
+        }
+      }
+
       // Ctrl+Shift+F: scrollback search overlay
       if (
         event.ctrlKey &&
@@ -12549,44 +12921,63 @@ class TerminalManager {
   }
 
   handleStatusChange(id, status, extra) {
-    this.updateOverlay(id, status, extra);
     const t = this.terminals.get(id);
-    if (id === this.activeId) {
-      this.updateConnectionStatus(status);
+    const waitingForReplay = Boolean(
+      status === "connected" &&
+        (t?.awaitingReconnectReady || t?.ws?.awaitingReconnectReady),
+    );
+    const effectiveStatus = waitingForReplay ? "reconnecting" : status;
+
+    if (t) {
+      t.connectionStatus = effectiveStatus;
+      if (
+        !["connecting", "reconnecting"].includes(
+          this.normalizeConnectionStatus(effectiveStatus),
+        )
+      ) {
+        t.awaitingReconnectReady = false;
+      }
     }
 
-    if (status === "connected") {
+    this.updateOverlay(id, effectiveStatus, extra);
+    if (id === this.activeId) {
+      this.updateConnectionStatus(
+        t
+          ? this.getTerminalConnectionStatus(t)
+          : this.normalizeConnectionStatus(effectiveStatus),
+      );
+    }
+
+    if (effectiveStatus === "connected") {
       // Mark terminal as successfully connected
       if (t) {
         t.hasConnected = true;
         dbg(`[reconnect] Terminal ${id} marked as hasConnected=true`);
       }
 
-      if (t?.awaitingReconnectReady) {
-        dbg(`[reconnect] Transport connected for ${id}, waiting for ready`);
-        return;
-      }
-
       this.performReconnectLayoutSync(id, {
         forceResize: true,
         scrollToPrompt: platformDetector.hasTouch,
       });
+    } else if (waitingForReplay) {
+      dbg(`[reconnect] Transport connected for ${id}, waiting for ready`);
     }
-
-    if (t) t.connectionStatus = status;
 
     const tab =
       this.getWorkspaceTab(t?.workspaceId) ||
       this.tabs.querySelector(`[data-id="${id}"]`);
     dbg(
-      `[reconnect] Tab update for ${id}: status=${status}, tab found=${!!tab}, hasConnected=${t?.hasConnected}`,
+      `[reconnect] Tab update for ${id}: status=${effectiveStatus}, tab found=${!!tab}, hasConnected=${t?.hasConnected}`,
     );
     if (tab) {
-      this.applyWorkspaceConnectionState(tab, t?.workspaceId, [status]);
+      this.applyWorkspaceConnectionState(tab, t?.workspaceId, [
+        effectiveStatus,
+      ]);
       dbg(`[reconnect] Workspace ${t?.workspaceId || id} status updated`);
     } else if (t) {
       console.warn(`[reconnect] Tab not found for ${id}!`);
     }
+    this.updatePaneControls();
   }
 
   retryConnection(id) {
@@ -12624,6 +13015,13 @@ class TerminalManager {
 
     if (message.phase === "replay-start") {
       t.awaitingReconnectReady = true;
+      t.connectionStatus = "reconnecting";
+      if (id === this.activeId) {
+        this.updateConnectionStatus("reconnecting");
+      }
+      const tab = this.getWorkspaceTab(t.workspaceId);
+      if (tab) this.applyWorkspaceConnectionState(tab, t.workspaceId);
+      this.updatePaneControls();
       return;
     }
 
@@ -13013,6 +13411,7 @@ class TerminalManager {
         activationCleanup,
         inputState,
         awaitingReconnectReady: false,
+        connectionStatus: "connecting",
       });
 
       // Register with session registry for reconnection persistence
@@ -13216,7 +13615,39 @@ class TerminalManager {
         ? this.getWorkspaceTerminals(terminal.workspaceId).length
         : 0;
       const canDetach = paneCount > 1;
+      const connectionStatus = this.getTerminalConnectionStatus(terminal);
+      const connectionLabel = this.getConnectionStatusLabel(connectionStatus);
+      const activity = this.getPaneActivityState(terminal);
+      const cwd = terminal?.cwd || "Terminal";
+      const folderLabel = this.formatCwdLabel(cwd);
+      const hasAttention =
+        connectionStatus !== "connected" || activity.key !== "idle";
+
       tile.element.classList.toggle("workspace-multi-pane", canDetach);
+      tile.element.classList.toggle("pane-has-attention", hasAttention);
+      tile.element.dataset.connectionStatus = connectionStatus;
+      tile.element.dataset.activity = activity.key;
+      tile.element.title = `${cwd}\n${connectionLabel} • ${activity.accessibleLabel}`;
+      tile.element.setAttribute(
+        "aria-label",
+        `Terminal pane: ${cwd}. ${connectionLabel}. ${activity.accessibleLabel}.`,
+      );
+
+      if (tile.paneStatus) {
+        tile.paneStatus.dataset.connectionStatus = connectionStatus;
+        tile.paneStatus.dataset.activity = activity.key;
+      }
+      if (tile.paneStatusFolder) {
+        tile.paneStatusFolder.textContent = folderLabel;
+      }
+      if (tile.paneStatusConnection) {
+        tile.paneStatusConnection.textContent =
+          connectionStatus === "connected" ? "" : connectionLabel;
+      }
+      if (tile.paneStatusActivity) {
+        tile.paneStatusActivity.textContent = activity.label;
+      }
+
       if (tile.detachButton) {
         const label = terminal?.cwd
           ? `Move ${this.formatCwdLabel(terminal.cwd)} pane to a new tab`
@@ -13371,6 +13802,32 @@ class TerminalManager {
     return fallbackId;
   }
 
+  getActiveWorkspacePaneIds() {
+    const workspaceId = this.terminals.get(this.activeId)?.workspaceId;
+    if (!workspaceId) return [];
+    return this.tileManager
+      .getWorkspaceTiles(workspaceId)
+      .map((tile) => tile.terminalId)
+      .filter((id) => this.terminals.has(id));
+  }
+
+  switchToAdjacentPane(direction) {
+    const paneIds = this.getActiveWorkspacePaneIds();
+    if (paneIds.length < 2) return false;
+
+    const currentIndex = paneIds.indexOf(this.activeId);
+    const step = direction < 0 ? -1 : 1;
+    const nextIndex =
+      currentIndex === -1
+        ? 0
+        : (currentIndex + step + paneIds.length) % paneIds.length;
+    const targetId = paneIds[nextIndex];
+    if (!targetId) return false;
+
+    this.switchTo(targetId);
+    return true;
+  }
+
   activateTerminal(id) {
     if (!this.terminals.has(id)) return false;
     const t = this.terminals.get(id);
@@ -13413,9 +13870,7 @@ class TerminalManager {
       tab.setAttribute("aria-selected", isActive ? "true" : "false");
     });
 
-    this.updateConnectionStatus(
-      t?.ws?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
-    );
+    this.updateConnectionStatus(this.getTerminalConnectionStatus(t));
     this.updateLinkedViewButton();
     this.refreshCommandPalette();
     void this.syncRightSurfaceForWorkspace();
@@ -13549,9 +14004,9 @@ class TerminalManager {
 
   updateConnectionStatus(status) {
     if (!this.connectionStatus) return;
-    this.connectionStatus.className = "status-dot " + status;
-    this.connectionStatus.title =
-      status.charAt(0).toUpperCase() + status.slice(1);
+    const normalized = this.normalizeConnectionStatus(status);
+    this.connectionStatus.className = "status-dot " + normalized;
+    this.connectionStatus.title = this.getConnectionStatusLabel(normalized);
   }
 
   changeFontSize(delta) {
@@ -13578,6 +14033,7 @@ class TerminalManager {
       this.fitTerminalState(t);
     }
     if (this.activeId) this.syncTerminalSize(this.activeId);
+    this.syncFontSizeStepper();
   }
 
   handleViewportResize() {

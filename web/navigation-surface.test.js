@@ -151,8 +151,15 @@ test("loads an empty recent workspace list when storage is empty or invalid", ()
 test("validates layout state by filtering unknown ids and ignoring more", () => {
   expect(
     validateActionLayoutState({
-      desktopPinned: ["files", "more", "clipboard", "missing", "clipboard"],
-      mobilePinned: ["paste", "more", "nope"],
+      desktopPinned: [
+        "files",
+        "font-decrease",
+        "more",
+        "clipboard",
+        "missing",
+        "clipboard",
+      ],
+      mobilePinned: ["paste", "font-increase", "more", "nope"],
     }),
   ).toEqual({
     desktopPinned: ["files", "clipboard"],
@@ -579,7 +586,7 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(13);
+  expect(overflow).toHaveLength(11);
   expect(overflow).toContain("palette");
   expect(overflow).toContain("setup");
   expect(overflow).toContain("settings");
@@ -589,8 +596,8 @@ test("overflow actions contain the secondary utilities", () => {
   expect(overflow).toContain("toggle-extra-keys");
   expect(overflow).toContain("wrap-lines");
   expect(overflow).toContain("fullscreen");
-  expect(overflow).toContain("font-decrease");
-  expect(overflow).toContain("font-increase");
+  expect(overflow).not.toContain("font-decrease");
+  expect(overflow).not.toContain("font-increase");
   expect(overflow).toContain("help");
   expect(overflow).toContain("linked-view");
 });

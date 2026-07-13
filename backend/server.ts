@@ -165,6 +165,9 @@ import {
 } from "./services/brokered-tmux-backend";
 import type { BrokeredExecContext } from "./services/terminal-backend";
 import {
+  applyE2ERunActorNamespace,
+  crossesE2ERunNamespaceForRequest,
+  getE2ERunIdFromActorId,
   resolveActorFromAccessPayload,
   isEdgeProtectedTunnelMode,
   hasExplicitLegacyDevActorMode,
@@ -1366,7 +1369,14 @@ async function requireOnboardingAdmin(
         reason: "unauthenticated",
         data,
       });
-      return { ok: false, status: 401, body: { error: err.message } };
+      return {
+        ok: false,
+        status: err.status,
+        body:
+          err.status === 401
+            ? { error: err.message }
+            : { error: err.message, reason: err.reason },
+      };
     }
     throw err;
   }
@@ -1499,7 +1509,14 @@ async function requireRole(
         reason: "unauthenticated",
         data,
       });
-      return { ok: false, status: 401, body: { error: err.message } };
+      return {
+        ok: false,
+        status: err.status,
+        body:
+          err.status === 401
+            ? { error: err.message }
+            : { error: err.message, reason: err.reason },
+      };
     }
     throw err;
   }
@@ -3664,11 +3681,27 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
     };
   }
 
+  const namespacedActor = applyE2ERunActorNamespace({
+    actor: actorResult.actor,
+    cookieHeader: req.headers.get("cookie"),
+    requestUrl: req.url,
+    env: process.env,
+  });
+  if (!namespacedActor.ok) {
+    return {
+      ok: false,
+      status: namespacedActor.status,
+      message: "Forbidden",
+      ownerId: "",
+      ownerEmail: "",
+    };
+  }
+
   return {
     ok: true,
-    ownerId: actorResult.actor.id,
-    ownerEmail: actorResult.actor.email,
-    actor: actorResult.actor,
+    ownerId: namespacedActor.actor.id,
+    ownerEmail: namespacedActor.actor.email,
+    actor: namespacedActor.actor,
   };
 }
 
@@ -3703,8 +3736,14 @@ function getScrollbackSnapshot(term: Terminal): string {
 }
 
 class UnauthorizedRequestError extends Error {
-  status = 401 as const;
-  constructor(message = "Unauthorized") {
+  constructor(
+    message = "Unauthorized",
+    readonly status: 401 | 403 = 401,
+    readonly reason:
+      | "cloudflare_access_required"
+      | "e2e_run_cookie_invalid"
+      | "e2e_run_context_invalid" = "cloudflare_access_required",
+  ) {
     super(message);
     this.name = "UnauthorizedRequestError";
   }
@@ -3712,7 +3751,10 @@ class UnauthorizedRequestError extends Error {
 
 function getCurrentActor(c: {
   get: (key: string) => CloudflareAccessPayload | undefined;
-  req?: { header: (name: string) => string | undefined };
+  req?: {
+    header: (name: string) => string | undefined;
+    url?: string;
+  };
 }): DeckTermActor {
   const actorResult = resolveActorFromAccessPayload({
     accessPayload: c.get("accessPayload") || null,
@@ -3721,9 +3763,26 @@ function getCurrentActor(c: {
     env: process.env,
   });
   if (!actorResult.ok) {
-    throw new UnauthorizedRequestError();
+    throw new UnauthorizedRequestError(
+      "Unauthorized",
+      actorResult.status,
+      actorResult.reason,
+    );
   }
-  return actorResult.actor;
+  const namespacedActor = applyE2ERunActorNamespace({
+    actor: actorResult.actor,
+    cookieHeader: c.req?.header("cookie") ?? null,
+    requestUrl: c.req?.url,
+    env: process.env,
+  });
+  if (!namespacedActor.ok) {
+    throw new UnauthorizedRequestError(
+      "Forbidden",
+      namespacedActor.status,
+      namespacedActor.reason,
+    );
+  }
+  return namespacedActor.actor;
 }
 
 function getCurrentUser(c: {
@@ -6976,6 +7035,16 @@ export function createWebApp() {
     if (!sourceTerm) {
       return c.json({ error: "Terminal not found" }, 404);
     }
+    if (
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: sourceTerm.ownerId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
     const sourceAccess = await requireTerminalSessionAccess({
       actor,
       term: sourceTerm,
@@ -7183,6 +7252,16 @@ export function createWebApp() {
     if (!term) {
       return c.json({ error: "Terminal not found" }, 404);
     }
+    if (
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: term.ownerId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
     const access = await requireTerminalSessionAccess({
       actor,
       term,
@@ -7209,6 +7288,16 @@ export function createWebApp() {
     const id = c.req.param("id");
     const term = terminals.get(id);
     if (!term) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: term.ownerId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
       return c.json({ error: "Terminal not found" }, 404);
     }
     const access = await requireTerminalSessionAccess({
@@ -9362,6 +9451,30 @@ export function createWebApp() {
   return app;
 }
 
+export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
+  actorId,
+  recordedOwnerId,
+  requestUrl,
+  restore,
+}: {
+  actorId: string;
+  recordedOwnerId: string | null | undefined;
+  requestUrl: string;
+  restore: () => Promise<T>;
+}): Promise<{ ok: false } | { ok: true; terminal: T }> {
+  if (
+    crossesE2ERunNamespaceForRequest({
+      actorId,
+      resourceOwnerId: recordedOwnerId,
+      requestUrl,
+      env: process.env,
+    })
+  ) {
+    return { ok: false };
+  }
+  return { ok: true, terminal: await restore() };
+}
+
 export async function startWebServer(host: string, port: number) {
   if (CF_ACCESS_REQUIRED && !CF_ACCESS_TEAM_NAME) {
     throw new Error(
@@ -9570,7 +9683,12 @@ export async function startWebServer(host: string, port: number) {
         // `auth.ok`.
         let ownerId: string;
         try {
-          ({ ownerId } = resolveCanonicalOwnerId(state, auth.actor!));
+          ownerId =
+            isFoundationLegacyBypassEnabled() &&
+            auth.actor!.source === "legacy_dev" &&
+            getE2ERunIdFromActorId(auth.actor!.id)
+            ? auth.actor!.id
+            : resolveCanonicalOwnerId(state, auth.actor!).ownerId;
         } catch (err) {
           if (err instanceof IdentityConflictError) {
             writeAuditEvent(state.db, {
@@ -9600,12 +9718,32 @@ export async function startWebServer(host: string, port: number) {
 
         let term = terminals.get(id);
 
+        if (
+          term &&
+          crossesE2ERunNamespaceForRequest({
+            actorId: ownerId,
+            resourceOwnerId: term.ownerId,
+            requestUrl: req.url,
+            env: process.env,
+          })
+        ) {
+          return new Response("Terminal not found", { status: 404 });
+        }
+
         if (!term) {
           const recordedSession = getTerminalSession(state.db, id);
-          term = recordedSession
-            ? ((await restoreRecordedTmuxSession(state, recordedSession)) ??
-              undefined)
-            : undefined;
+          if (recordedSession) {
+            const restored = await restoreRecordedTerminalAfterE2ERunBoundary({
+              actorId: ownerId,
+              recordedOwnerId: recordedSession.actorUserId,
+              requestUrl: req.url,
+              restore: () => restoreRecordedTmuxSession(state, recordedSession),
+            });
+            if (!restored.ok) {
+              return new Response("Terminal not found", { status: 404 });
+            }
+            term = restored.terminal ?? undefined;
+          }
         }
 
         if (!term) {

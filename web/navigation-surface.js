@@ -19,8 +19,6 @@ const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
     "wrap-lines",
     "dock-sessions",
     "fullscreen",
-    "font-decrease",
-    "font-increase",
     "help",
     "linked-view",
   ]),

@@ -135,6 +135,57 @@ test.describe("Mobile regressions", () => {
     ]);
   });
 
+  test("keeps the compact session group and Font stepper touch-safe in portrait and landscape", async ({
+    page,
+  }) => {
+    for (const viewport of [
+      { width: 390, height: 844 },
+      { width: 844, height: 390 },
+    ]) {
+      await resizeWindow(page, viewport.width, viewport.height);
+      await page.waitForTimeout(200);
+      const metrics = await page.evaluate(() => {
+        const rectOf = (selector: string) => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          return rect ? { width: rect.width, height: rect.height } : null;
+        };
+        return {
+          group: rectOf(".session-actions"),
+          create: rectOf("#new-terminal"),
+          sessions: rectOf("#sessions-btn"),
+          overflow:
+            document.documentElement.scrollWidth -
+            document.documentElement.clientWidth,
+        };
+      });
+      expect(metrics.group).not.toBeNull();
+      expect(metrics.create?.width).toBeGreaterThanOrEqual(44);
+      expect(metrics.create?.height).toBeGreaterThanOrEqual(44);
+      expect(metrics.sessions?.width).toBeGreaterThanOrEqual(44);
+      expect(metrics.sessions?.height).toBeGreaterThanOrEqual(44);
+      expect(metrics.overflow).toBeLessThanOrEqual(1);
+    }
+
+    await openToolsSheet(page);
+    const fontButtons = page
+      .locator("#tools-sheet-font-size")
+      .getByRole("button");
+    await expect(fontButtons).toHaveCount(2);
+    for (let index = 0; index < 2; index += 1) {
+      const box = await fontButtons.nth(index).boundingBox();
+      expect(box?.width).toBeGreaterThanOrEqual(44);
+      expect(box?.height).toBeGreaterThanOrEqual(44);
+    }
+
+    await page.locator("#tools-sheet-close").click();
+    await page.locator("#sessions-btn").click();
+    const sessionsCloseBox = await page
+      .locator("#sessions-panel-close")
+      .boundingBox();
+    expect(sessionsCloseBox?.width).toBeGreaterThanOrEqual(44);
+    expect(sessionsCloseBox?.height).toBeGreaterThanOrEqual(44);
+  });
+
   test("customizes the mobile pinned actions from the tools sheet and moves them back", async ({
     page,
   }) => {
@@ -435,5 +486,55 @@ test.describe("Mobile regressions", () => {
     expect(after.activeIsTextarea).toBe(true);
     expect(after.scrollTop).toBeGreaterThan(before.scrollTop);
     expect(after.maxScrollTop - after.scrollTop).toBeLessThanOrEqual(16);
+  });
+
+  test("coarse-pointer pane controls and close confirmation meet 44px targets", async ({
+    page,
+  }) => {
+    expect(
+      await page.evaluate(() => matchMedia("(pointer: coarse)").matches),
+    ).toBe(true);
+
+    await page.evaluate(() => window.terminalManager.createTerminal(true));
+    await expect
+      .poll(() =>
+        page.evaluate(() => window.terminalManager.terminals.size),
+      )
+      .toBe(2);
+
+    const activeTile = page.locator(".tile.active");
+    await expect(activeTile.locator(".tile-close-container")).toHaveCSS(
+      "pointer-events",
+      "auto",
+    );
+
+    const controlSizes = await activeTile
+      .locator(".tile-close-btn, .tile-detach-btn")
+      .evaluateAll((buttons) =>
+        buttons.map((button) => {
+          const rect = button.getBoundingClientRect();
+          return { width: rect.width, height: rect.height };
+        }),
+      );
+    expect(controlSizes).toHaveLength(2);
+    for (const size of controlSizes) {
+      expect(size.width).toBeGreaterThanOrEqual(44);
+      expect(size.height).toBeGreaterThanOrEqual(44);
+    }
+
+    await activeTile.locator(".tile-close-btn").click();
+    const confirmationSizes = await activeTile
+      .locator(".tile-close-confirm.visible button")
+      .evaluateAll((buttons) =>
+        buttons.map((button) => {
+          const rect = button.getBoundingClientRect();
+          return { width: rect.width, height: rect.height };
+        }),
+      );
+    expect(confirmationSizes).toHaveLength(2);
+    for (const size of confirmationSizes) {
+      expect(size.width).toBeGreaterThanOrEqual(44);
+      expect(size.height).toBeGreaterThanOrEqual(44);
+    }
   });
 });
