@@ -446,6 +446,13 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "linked-view",
     toolsId: "tools-sheet-linked-view",
     desktopTone: "secondary",
+    description: "Open another synchronized view of this tmux session",
+  }),
+  "font-size": Object.freeze({
+    label: "Font size",
+    icon: "type",
+    action: "font-size",
+    kind: "stepper",
   }),
   paste: Object.freeze({
     label: "Paste",
@@ -5742,8 +5749,11 @@ class TerminalManager {
     }
 
     const label = config.label;
-    button.title = label;
+    button.title = config.description || label;
     button.setAttribute("aria-label", label);
+    if (config.description) {
+      button.setAttribute("aria-description", config.description);
+    }
 
     if (surface === "desktop-primary") {
       const toneClass =
@@ -5814,9 +5824,13 @@ class TerminalManager {
     }
 
     actionIds.forEach((actionId) => {
-      const button = this.createActionButton(actionId, surface, density);
-      if (button) {
-        root.appendChild(button);
+      if (actionId === "font-size") {
+        root.appendChild(this.createFontSizeStepper(surface));
+      } else {
+        const button = this.createActionButton(actionId, surface, density);
+        if (button) {
+          root.appendChild(button);
+        }
       }
     });
   }
@@ -6144,18 +6158,24 @@ class TerminalManager {
 
     const mode = this.getActiveChromeMode();
     const actionIds = this.getToolsSheetActionIds(mode);
+    const fontSizePinned = this.getLayoutPinnedActionIds(mode).includes(
+      "font-size",
+    );
     grid.replaceChildren();
     grid.dataset.mode = mode;
     grid.dataset.empty = "false";
 
     actionIds.forEach((actionId) => {
+      if (actionId === "font-size") return;
       const button = this.createActionButton(actionId, "tools-sheet");
       if (button) {
         grid.appendChild(button);
       }
     });
 
-    grid.appendChild(this.createFontSizeStepper());
+    if (!fontSizePinned) {
+      grid.appendChild(this.createFontSizeStepper("tools-sheet"));
+    }
     this.syncFontSizeStepper();
     // The sheet is rebuilt at runtime, after the one-time page bootstrap icon
     // pass. Hydrate the newly inserted placeholders so the compact stepper and
@@ -6165,10 +6185,15 @@ class TerminalManager {
     }
   }
 
-  createFontSizeStepper() {
+  createFontSizeStepper(surface = "tools-sheet") {
+    const inToolbar = surface === "desktop-primary";
     const group = document.createElement("div");
-    group.id = "tools-sheet-font-size";
-    group.className = "tools-sheet-font-stepper";
+    group.id = inToolbar ? "desktop-font-size" : "tools-sheet-font-size";
+    group.className = inToolbar
+      ? "font-size-stepper toolbar-font-stepper"
+      : "font-size-stepper tools-sheet-font-stepper";
+    group.dataset.actionId = "font-size";
+    group.dataset.actionSurface = surface;
     group.setAttribute("role", "group");
     group.setAttribute("aria-label", "Font size");
 
@@ -6185,7 +6210,7 @@ class TerminalManager {
       button.type = "button";
       button.className = "tools-sheet-font-button";
       button.dataset.action = action;
-      button.dataset.actionSurface = "tools-sheet";
+      button.dataset.actionSurface = surface;
       button.setAttribute("aria-label", labelText);
       button.title = labelText;
       const icon = document.createElement("i");
@@ -6209,14 +6234,18 @@ class TerminalManager {
   }
 
   syncFontSizeStepper() {
-    const group = this.toolsSheet?.querySelector("#tools-sheet-font-size");
-    if (!group) return;
-    const value = group.querySelector("output");
-    if (value) value.textContent = `${this.fontSize}px`;
-    const decrease = group.querySelector('[data-action="font-decrease"]');
-    const increase = group.querySelector('[data-action="font-increase"]');
-    if (decrease) decrease.disabled = this.fontSize <= 8;
-    if (increase) increase.disabled = this.fontSize >= 32;
+    document.querySelectorAll(".font-size-stepper").forEach((group) => {
+      const value = group.querySelector("output");
+      if (value) {
+        value.textContent = group.classList.contains("toolbar-font-stepper")
+          ? `${this.fontSize}`
+          : `${this.fontSize}px`;
+      }
+      const decrease = group.querySelector('[data-action="font-decrease"]');
+      const increase = group.querySelector('[data-action="font-increase"]');
+      if (decrease) decrease.disabled = this.fontSize <= 8;
+      if (increase) increase.disabled = this.fontSize >= 32;
+    });
   }
 
   setupDesktopTabOverflowScroll() {
@@ -9721,7 +9750,7 @@ class TerminalManager {
   updateLinkedViewButton() {
     const isAvailable = this.canCreateLinkedView();
     document
-      .querySelectorAll('#linked-view-btn, [data-action="linked-view"]')
+      .querySelectorAll('[data-action="linked-view"]')
       .forEach((button) => {
         button.hidden = !isAvailable;
         button.disabled = !isAvailable;

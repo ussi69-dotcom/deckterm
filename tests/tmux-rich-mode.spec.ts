@@ -29,8 +29,13 @@ test.describe("Tmux Rich Mode", () => {
       "TMUX_BACKEND=1 with linked-view support is required for tmux rich mode coverage",
     );
 
-    const linkedViewButton = page.locator("#linked-view-btn");
+    await expect(page.locator("#linked-view-btn")).toHaveCount(0);
+    await page.getByRole("button", { name: "More" }).click();
+    const linkedViewButton = page
+      .locator("#tools-sheet")
+      .getByRole("button", { name: "Linked View" });
     await expect(linkedViewButton).toBeVisible();
+    await expect(page.locator('[data-action="linked-view"]')).toHaveCount(1);
 
     const initialContext = await page.evaluate(() => {
       // @ts-ignore

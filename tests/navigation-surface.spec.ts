@@ -115,6 +115,49 @@ test.describe("Shell action hierarchy on desktop", () => {
     ).toBeVisible();
   });
 
+  test("moves the combined Font size stepper from More to the desktop toolbar", async ({
+    page,
+  }) => {
+    await page.getByRole("button", { name: "More" }).click();
+    await expect(page.locator("#tools-sheet-font-size")).toBeVisible();
+    await page.getByRole("button", { name: "More" }).click();
+    await expect(page.locator("#tools-sheet")).toBeHidden();
+
+    const layoutEditor = await openLayoutEditor(page, "Desktop");
+    const fontSizeAction = layoutEditor
+      .getByTestId(LAYOUT_EDITOR_TEST_IDS.available)
+      .getByRole("button", { name: "Font size" });
+    await expect(fontSizeAction).toBeVisible();
+
+    await dragLayoutEditorItem(
+      page,
+      fontSizeAction,
+      layoutEditor.getByTestId(LAYOUT_EDITOR_TEST_IDS.pinned),
+    );
+
+    const toolbarStepper = page.locator("#desktop-font-size");
+    await expect(toolbarStepper).toBeVisible();
+    await expect(page.locator("#tools-sheet-font-size")).toHaveCount(0);
+    await page.getByRole("button", { name: "Done" }).click();
+
+    const value = toolbarStepper.locator("output");
+    const initial = Number.parseInt((await value.textContent()) || "14", 10);
+    await toolbarStepper
+      .getByRole("button", { name: "Increase font size" })
+      .click();
+    await expect(value).toHaveText(`${Math.min(32, initial + 1)}`);
+    await page.evaluate(() =>
+      (window as any).terminalManager?.settingsStore?.flush(),
+    );
+
+    await page.reload();
+    await waitForTerminal(page);
+    await expect(page.locator("#desktop-font-size")).toBeVisible();
+    await expect(page.locator("#desktop-font-size output")).toHaveText(
+      `${Math.min(32, initial + 1)}`,
+    );
+  });
+
   test("opens Git and Files from explicit top-bar actions", async ({
     page,
   }) => {
@@ -323,7 +366,7 @@ test.describe("Shell action hierarchy on desktop", () => {
     ).toBeGreaterThanOrEqual(8);
   });
 
-  test("fits four desktop tabs before promoting the fifth tab into a second row", async ({
+  test("uses reclaimed toolbar space before promoting the sixth tab into a second row", async ({
     page,
   }) => {
     await pruneTerminalsToActiveSession(page);
@@ -363,8 +406,23 @@ test.describe("Shell action hierarchy on desktop", () => {
         distinctRows: [...new Set(tabTops)].length,
       };
     });
-    expect(fiveTabMetrics.layout).toBe("wrapped");
-    expect(fiveTabMetrics.distinctRows).toBe(2);
+    expect(fiveTabMetrics.layout).toBe("single");
+    expect(fiveTabMetrics.distinctRows).toBe(1);
+
+    await createTerminal(page);
+    await page.waitForTimeout(300);
+
+    const sixTabMetrics = await page.locator(".tabs").evaluate((element) => {
+      const tabTops = Array.from(element.querySelectorAll(".tab")).map((tab) =>
+        Math.round((tab as HTMLElement).offsetTop),
+      );
+      return {
+        layout: element.dataset.layout,
+        distinctRows: [...new Set(tabTops)].length,
+      };
+    });
+    expect(sixTabMetrics.layout).toBe("wrapped");
+    expect(sixTabMetrics.distinctRows).toBe(2);
   });
 
   test("keeps narrow desktop tab overflow reachable with mouse-wheel scrolling", async ({

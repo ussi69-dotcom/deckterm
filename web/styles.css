@@ -1477,6 +1477,40 @@ body.touch-input-mode .xterm .composition-view.active {
   background: rgba(255, 255, 255, 0.035);
 }
 
+.toolbar-font-stepper {
+  display: inline-flex;
+  align-items: center;
+  height: 36px;
+  flex: 0 0 auto;
+}
+
+.toolbar-font-stepper .tools-sheet-font-label {
+  display: none;
+}
+
+.toolbar-font-stepper .tools-sheet-font-controls {
+  grid-template-columns: 30px 36px 30px;
+  height: 36px;
+  border-color: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.toolbar-font-stepper .tools-sheet-font-button {
+  width: 30px;
+  height: 34px;
+}
+
+.toolbar-font-stepper .tools-sheet-font-value {
+  min-width: 36px;
+  font-size: 11px;
+}
+
+.toolbar-font-stepper:hover .tools-sheet-font-controls {
+  border-color: rgba(88, 166, 255, 0.35);
+  background: rgba(88, 166, 255, 0.08);
+}
+
 .tools-sheet-font-label {
   color: var(--text-primary);
   font-size: 13px;

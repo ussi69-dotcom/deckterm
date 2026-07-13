@@ -79,6 +79,9 @@ const ACTION_LAYOUT_CUSTOMIZABLE_ACTION_IDS = Object.freeze({
     uniqueActionIds([
       ...getDesktopPrimaryActionIds().filter((actionId) => actionId !== "more"),
       ...getOverflowActionIds(),
+      // Treat font sizing as one compound desktop control. It lives in More
+      // until the user pins the whole stepper into the toolbar.
+      "font-size",
     ]),
   ),
   mobile: Object.freeze(

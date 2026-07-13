@@ -312,6 +312,7 @@ test("desktop customizable action ids keep more fixed outside the editor", () =>
   expect(desktopEditable).toContain("setup");
   expect(desktopEditable).toContain("tasks");
   expect(desktopEditable).toContain("clipboard");
+  expect(desktopEditable).toContain("font-size");
 });
 
 test("mobile customizable action ids keep more fixed outside the editor", () => {
@@ -322,6 +323,20 @@ test("mobile customizable action ids keep more fixed outside the editor", () => 
   expect(mobileEditable).toContain("setup");
   expect(mobileEditable).toContain("tasks");
   expect(mobileEditable).toContain("clipboard");
+  expect(mobileEditable).not.toContain("font-size");
+});
+
+test("pinLayoutAction treats the combined font stepper as one desktop item", () => {
+  const state = getDefaultActionLayoutState();
+  const next = pinLayoutAction(state, "desktop", "font-size", 1);
+
+  expect(next.desktopPinned).toEqual([
+    "files",
+    "font-size",
+    "git",
+    "palette",
+  ]);
+  expect(next.mobilePinned).toEqual(state.mobilePinned);
 });
 
 test("pinLayoutAction inserts available actions into the pinned list", () => {
