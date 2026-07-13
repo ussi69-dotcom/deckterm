@@ -727,7 +727,8 @@ body {
 .tile-pane-status {
   position: absolute;
   top: 8px;
-  left: 8px;
+  left: 50%;
+  transform: translateX(-50%);
   z-index: 29;
   display: inline-flex;
   align-items: center;
@@ -839,8 +840,11 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .tile-pane-status,
-  .tile-pane-status-dot {
+  .tile-pane-status {
+    transition: none;
+  }
+
+  .tile[data-connection-status] .tile-pane-status-dot {
     animation: none;
     transition: none;
   }
@@ -967,7 +971,10 @@ body {
 
   .tile-close-btn,
   .tile-detach-btn {
+    flex: 0 0 44px;
+    min-width: 44px;
     width: 44px;
+    min-height: 44px;
     height: 44px;
   }
 
@@ -4126,8 +4133,29 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 }
 
+@keyframes tile-enter-coarse {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 .tile {
   animation: tile-enter 0.2s ease-out;
+}
+
+@media (pointer: coarse) {
+  .tile {
+    animation-name: tile-enter-coarse;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile {
+    animation: none;
+  }
 }
 
 /* =============================================================================

@@ -476,8 +476,20 @@ test("each pane exposes its own folder, activity, and truthful connection state"
     )
     .toBe(2);
 
-  const [respondingId, thinkingId] = await page.evaluate(() => {
+  const [respondingId, thinkingId] = await page.evaluate(async () => {
     const tm = (window as any).terminalManager;
+    // This is a rendering-state test. Let an in-flight server refresh settle,
+    // then pause the polling loop so its real idle telemetry cannot race the
+    // deterministic pane states injected below.
+    if (tm.telemetryRefreshPromise) await tm.telemetryRefreshPromise;
+    if (tm.telemetryRefreshTimer) {
+      clearTimeout(tm.telemetryRefreshTimer);
+      tm.telemetryRefreshTimer = null;
+    }
+    if (tm.telemetryRefreshInterval) {
+      clearInterval(tm.telemetryRefreshInterval);
+      tm.telemetryRefreshInterval = null;
+    }
     const ids = [...tm.terminals.keys()];
     const responding = tm.terminals.get(ids[0]);
     const thinking = tm.terminals.get(ids[1]);

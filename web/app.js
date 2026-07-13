@@ -6157,6 +6157,12 @@ class TerminalManager {
 
     grid.appendChild(this.createFontSizeStepper());
     this.syncFontSizeStepper();
+    // The sheet is rebuilt at runtime, after the one-time page bootstrap icon
+    // pass. Hydrate the newly inserted placeholders so the compact stepper and
+    // dynamic action buttons never render as empty hit targets.
+    if (window.lucide?.createIcons) {
+      window.lucide.createIcons();
+    }
   }
 
   createFontSizeStepper() {

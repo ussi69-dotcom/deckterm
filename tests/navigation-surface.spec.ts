@@ -73,6 +73,12 @@ test.describe("Shell action hierarchy on desktop", () => {
     ).toHaveCount(0);
 
     const value = stepper.locator("output");
+    await expect(
+      stepper.getByRole("button", { name: "Decrease font size" }).locator("svg"),
+    ).toHaveCount(1);
+    await expect(
+      stepper.getByRole("button", { name: "Increase font size" }).locator("svg"),
+    ).toHaveCount(1);
     const initial = Number.parseInt((await value.textContent()) || "14", 10);
     await stepper.getByRole("button", { name: "Increase font size" }).click();
     await stepper.getByRole("button", { name: "Increase font size" }).click();
