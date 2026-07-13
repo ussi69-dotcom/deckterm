@@ -733,11 +733,18 @@ class ReconnectingWebSocket {
 // =============================================================================
 
 class Tile {
-  constructor(id, terminalId, container, onCloseRequest) {
+  constructor(
+    id,
+    terminalId,
+    container,
+    onCloseRequest,
+    onDetachRequest,
+  ) {
     this.id = id;
     this.terminalId = terminalId;
     this.container = container;
     this.onCloseRequest = onCloseRequest;
+    this.onDetachRequest = onDetachRequest;
     this.groupId = null;
     this.element = null;
     this.terminalWrapper = null;
@@ -775,10 +782,19 @@ class Tile {
     const closeContainer = document.createElement("div");
     closeContainer.className = "tile-close-container";
 
+    const detachBtn = document.createElement("button");
+    detachBtn.className = "tile-detach-btn";
+    detachBtn.type = "button";
+    detachBtn.textContent = "↗";
+    detachBtn.title = "Move pane to a new tab";
+    detachBtn.setAttribute("aria-label", "Move pane to a new tab");
+
     const closeBtn = document.createElement("button");
     closeBtn.className = "tile-close-btn";
+    closeBtn.type = "button";
     closeBtn.innerHTML = "&times;";
     closeBtn.title = "Close terminal";
+    closeBtn.setAttribute("aria-label", "Close terminal");
 
     const confirmPopup = document.createElement("div");
     confirmPopup.className = "tile-close-confirm";
@@ -790,6 +806,11 @@ class Tile {
     closeBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.showCloseConfirm();
+    });
+
+    detachBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (this.onDetachRequest) this.onDetachRequest(this.terminalId);
     });
 
     confirmPopup
@@ -814,9 +835,11 @@ class Tile {
     };
     document.addEventListener("click", this.onDocumentClick);
 
+    closeContainer.appendChild(detachBtn);
     closeContainer.appendChild(closeBtn);
     closeContainer.appendChild(confirmPopup);
     this.element.appendChild(closeContainer);
+    this.detachButton = detachBtn;
     this.closeConfirm = confirmPopup;
   }
 
@@ -1151,8 +1174,27 @@ class TileManager {
 
     // Handle window resize
     window.addEventListener("resize", () => {
+      const wasMobile = this.isMobile;
       this.isMobile = platformDetector.isMobile;
-      // Platform change handled by PlatformDetector
+      if (!this.activeWorkspaceId) return;
+      if (wasMobile !== this.isMobile) {
+        const activeWorkspaceId = this.activeWorkspaceId;
+        const workspaceIds = new Set(
+          Array.from(this.tiles.values(), (tile) => tile.workspaceId).filter(
+            Boolean,
+          ),
+        );
+        workspaceIds.forEach((workspaceId) => this.relayout(workspaceId));
+        this.showWorkspace(activeWorkspaceId);
+        if (this.isMobile && this.activeTileId) {
+          this.setActive(this.activeTileId);
+        }
+      } else {
+        // Mobile uses pixel geometry derived from percentage bounds. Refresh
+        // those pixels on portrait/landscape changes even when the interaction
+        // mode remains mobile, otherwise the old portrait width survives.
+        this.normalizeWorkspaceTiles(this.activeWorkspaceId);
+      }
     });
 
     // Keyboard shortcuts
@@ -1259,9 +1301,21 @@ class TileManager {
     );
   }
 
-  createTile(terminalId, workspaceId, split = false, onCloseRequest = null) {
+  createTile(
+    terminalId,
+    workspaceId,
+    split = false,
+    onCloseRequest = null,
+    onDetachRequest = null,
+  ) {
     const tileId = `tile-${terminalId}`;
-    const tile = new Tile(tileId, terminalId, this.container, onCloseRequest);
+    const tile = new Tile(
+      tileId,
+      terminalId,
+      this.container,
+      onCloseRequest,
+      onDetachRequest,
+    );
     tile.workspaceId = workspaceId;
     this.tiles.set(terminalId, tile);
 
@@ -1330,7 +1384,18 @@ class TileManager {
       }
     });
     // Relayout the merged workspace
-    this.relayoutWorkspace(toWorkspaceId);
+    this.relayout(toWorkspaceId);
+  }
+
+  moveTileToWorkspace(terminalId, workspaceId) {
+    const tile = this.tiles.get(terminalId);
+    if (!tile || !workspaceId) return null;
+    const previousWorkspaceId = tile.workspaceId;
+    tile.workspaceId = workspaceId;
+    tile.bounds = { x: 0, y: 0, width: 100, height: 100 };
+    if (previousWorkspaceId) this.relayout(previousWorkspaceId);
+    this.relayout(workspaceId);
+    return previousWorkspaceId;
   }
 
   // Relayout tiles in a specific workspace
@@ -1701,6 +1766,11 @@ class TileManager {
         tile.element.style.display = id === terminalId ? "block" : "none";
       }
     });
+
+    if (this.isMobile) {
+      const workspaceId = this.tiles.get(terminalId)?.workspaceId;
+      if (workspaceId) this.relayout(workspaceId);
+    }
 
     this.ensureTileVisible(terminalId);
   }
@@ -2250,13 +2320,9 @@ class ExtraKeysManager {
   }
 
   hideForKeyboard() {
-    // Desktop: extra keys were only ever shown transiently for the keyboard,
-    // so hide again once it closes if the user hasn't explicitly enabled them.
-    if (platformDetector.isDesktop) {
-      this.visible = false;
-      this.updateVisibility();
-    }
-    // Mobile: keep whatever the persisted pref says — do NOT force back on.
+    // Visibility is owned by terminal.extraKeysVisible on every platform.
+    // A viewport resize (including applyVisibility()'s immediate layout pass)
+    // must never overwrite an explicit user preference.
   }
 }
 
@@ -5200,10 +5266,21 @@ class TerminalManager {
 
     // Window resize
     let resizeTimeout;
+    let resizeBaseline = null;
     window.addEventListener("resize", () => {
+      const resizeStartTerminal = this.terminals.get(this.activeId);
+      if (!resizeBaseline && resizeStartTerminal?.terminal) {
+        resizeBaseline = {
+          id: this.activeId,
+          cols: resizeStartTerminal.terminal.cols,
+          rows: resizeStartTerminal.terminal.rows,
+        };
+      }
       clearTimeout(resizeTimeout);
       resizeTimeout = setTimeout(() => {
         const active = this.terminals.get(this.activeId);
+        const baseline = resizeBaseline;
+        resizeBaseline = null;
         if (DEBUG) {
           dbg("window.resize", {
             activeId: this.activeId,
@@ -5213,8 +5290,26 @@ class TerminalManager {
           });
         }
         if (active) {
+          const previousCols =
+            baseline?.id === this.activeId
+              ? baseline.cols
+              : active.terminal?.cols;
+          const previousRows =
+            baseline?.id === this.activeId
+              ? baseline.rows
+              : active.terminal?.rows;
           this.fitTerminalState(active);
           this.syncTerminalSize(this.activeId);
+          if (
+            active.terminal?.cols !== previousCols ||
+            active.terminal?.rows !== previousRows
+          ) {
+            this.showDimensionOverlay(this.activeId);
+          } else if (this.debugMode) {
+            // A sub-cell pixel resize can leave the grid unchanged while the
+            // diagnostic container dimensions still need to be refreshed.
+            this.updateDebugOverlay(this.activeId);
+          }
         }
         this.scheduleDesktopToolbarDensitySync();
       }, 150);
@@ -5687,6 +5782,24 @@ class TerminalManager {
     );
   }
 
+  getDesktopTabReserveWidth(tabCount) {
+    const count = Math.max(0, Math.trunc(Number(tabCount) || 0));
+    if (!count) return 0;
+
+    const gap = 4;
+    const widthFor = (columns, tabWidth) =>
+      columns * tabWidth + Math.max(0, columns - 1) * gap;
+
+    // Preserve four comfortable single-row tabs before spending horizontal
+    // space on full action labels. Beyond four, reserve enough room for the
+    // existing two-row layout at its 96px minimum.
+    if (count <= 4) return widthFor(count, 144);
+    return Math.max(
+      widthFor(4, 144),
+      widthFor(Math.ceil(count / 2), 96),
+    );
+  }
+
   syncDesktopTabLayout() {
     const toolbar = this.toolbar;
     const tabs = this.tabs;
@@ -5872,8 +5985,16 @@ class TerminalManager {
     }
 
     const widthsByTier = this.measureDesktopActionWidthsByTier(actionBar);
-    const availableWidth = Math.ceil(
+    const actionWidth = Math.ceil(
       actionBar.getBoundingClientRect().width || 0,
+    );
+    const tabsWidth = Math.ceil(
+      this.tabs?.getBoundingClientRect().width || 0,
+    );
+    const tabCount = this.tabs?.querySelectorAll(".tab").length || 0;
+    const availableWidth = Math.max(
+      0,
+      actionWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
     );
     const fallbackDensity =
       actionBar.dataset.density ||
@@ -8464,6 +8585,14 @@ class TerminalManager {
         run: () => this.splitWorkspace(),
       },
       {
+        id: "detach-terminal-pane",
+        title: "Move Pane to New Tab",
+        group: "Actions",
+        keywords: ["detach", "unmerge", "ungroup", "pane", "tab"],
+        priority: 45,
+        run: () => this.detachTerminalToWorkspace(),
+      },
+      {
         id: "new-task-workspace",
         title: "New Task Workspace",
         group: "Actions",
@@ -9219,6 +9348,17 @@ class TerminalManager {
     }
   }
 
+  bindTerminalActivation(id, element) {
+    if (!element) return null;
+    const activate = () => this.activateTerminal(id);
+    element.addEventListener("pointerdown", activate);
+    element.addEventListener("focusin", activate);
+    return () => {
+      element.removeEventListener("pointerdown", activate);
+      element.removeEventListener("focusin", activate);
+    };
+  }
+
   formatCwdLabel(cwd) {
     if (!cwd) return "Terminal";
     const cleaned = cwd.replace(/\/+$/, "");
@@ -9631,7 +9771,11 @@ class TerminalManager {
         "--tab-border",
         TerminalColors.hexToRgba(color1, 0.35),
       );
-      if (countBadge) countBadge.textContent = snapshot.count;
+      if (countBadge) {
+        countBadge.textContent = String(snapshot.count);
+        countBadge.title = `${snapshot.count} panes`;
+        countBadge.setAttribute("aria-label", `${snapshot.count} panes`);
+      }
       if (dot) dot.style.removeProperty("background-color");
     } else {
       tab.classList.remove("multicolor", "grouped");
@@ -9645,10 +9789,36 @@ class TerminalManager {
       tab.style.removeProperty("--color-3-solid");
       tab.style.removeProperty("--tab-border");
       tab.style.removeProperty("--group-color");
-      if (countBadge) countBadge.textContent = "";
+      if (countBadge) {
+        countBadge.textContent = "";
+        countBadge.removeAttribute("title");
+        countBadge.removeAttribute("aria-label");
+      }
     }
 
     this.applyWorkspaceSignals(tab, snapshot);
+    this.applyWorkspaceConnectionState(tab, tab.dataset.workspaceId);
+  }
+
+  applyWorkspaceConnectionState(tab, workspaceId, fallbackStatuses = []) {
+    if (!tab) return;
+    const workspaceStatuses = workspaceId
+      ? this.getWorkspaceTerminals(workspaceId).map(
+          ({ connectionStatus }) => connectionStatus,
+        )
+      : fallbackStatuses;
+    const hasDisconnectedPane = workspaceStatuses.some((paneStatus) =>
+      ["failed", "dead", "taken_over", "setup_required"].includes(
+        paneStatus,
+      ),
+    );
+    const hasReconnectingPane = workspaceStatuses.includes("reconnecting");
+
+    tab.classList.toggle("disconnected", hasDisconnectedPane);
+    tab.classList.toggle(
+      "reconnecting",
+      !hasDisconnectedPane && hasReconnectingPane,
+    );
   }
 
   parseOsc7Cwd(data) {
@@ -11372,8 +11542,14 @@ class TerminalManager {
       dbg("[Reconnect] New workspace for:", id, workspaceId);
     }
 
-    const element = this.tileManager.createTile(id, workspaceId, false, (tid) =>
-      this.closeTerminal(tid),
+    const workspaceAlreadyRestored =
+      this.tileManager.getWorkspaceTiles(workspaceId).length > 0;
+    const element = this.tileManager.createTile(
+      id,
+      workspaceId,
+      false,
+      (tid) => this.closeTerminal(tid),
+      (tid) => this.detachTerminalToWorkspace(tid),
     );
     const overlay = this.createOverlay(element.parentElement);
     const dimensionOverlay = this.createDimensionOverlay(element.parentElement);
@@ -11404,8 +11580,9 @@ class TerminalManager {
     });
     element.parentElement.appendChild(debugOverlay);
 
-    const terminal = this.createXtermInstance();
+    const terminal = this.createXtermInstance(id);
     terminal.open(element);
+    const activationCleanup = this.bindTerminalActivation(id, element);
     const webglAddon = this.setupTerminalRenderer(id, terminal);
     const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
@@ -11500,7 +11677,7 @@ class TerminalManager {
       supportsLinkedView,
       tabNum,
       workspaceId,
-      originalWorkspaceId: workspaceId,
+      originalWorkspaceId: savedSession?.originalWorkspaceId || workspaceId,
       resizeObserver: null,
       resizeTimer: null,
       preferredCols: 0,
@@ -11511,6 +11688,7 @@ class TerminalManager {
       osc7Disposable,
       inputFallbackCleanup,
       pasteFallbackCleanup,
+      activationCleanup,
       inputState,
       hasConnected: false, // Track if WebSocket has ever successfully connected
       isReconnection,
@@ -11524,9 +11702,21 @@ class TerminalManager {
       workspaceId,
       cwd: restoredCwd,
       tabNum,
+      originalWorkspaceId: savedSession?.originalWorkspaceId || workspaceId,
     });
 
-    this.addTab(id, restoredCwd, tabNum, workspaceId);
+    if (!this.getWorkspaceTab(workspaceId)) {
+      this.addTab(id, restoredCwd, tabNum, workspaceId);
+    } else {
+      this.retargetWorkspaceTab(workspaceId);
+      // Restored panes can share a workspace before telemetry has completed.
+      // Refresh pane count/detach chrome immediately instead of depending on
+      // a later catalog response to reveal the multi-pane state.
+      this.updateTabGroups();
+    }
+    if (workspaceAlreadyRestored) {
+      this.tileManager.relayout(workspaceId);
+    }
     this.queueTelemetryRefresh(0);
     this.switchTo(id);
     this.attachResizeObserver(id);
@@ -11933,7 +12123,7 @@ class TerminalManager {
     };
   }
 
-  createXtermInstance() {
+  createXtermInstance(id) {
     const terminal = new Terminal({
       theme: {
         background: "#0d1117",
@@ -12017,9 +12207,10 @@ class TerminalManager {
       // Ctrl+V or Cmd+V
       if (
         (event.ctrlKey || event.metaKey) &&
-        event.key === "v" &&
+        event.key.toLowerCase() === "v" &&
         event.type === "keydown"
       ) {
+        this.activateTerminal(id);
         if (event.shiftKey) {
           // Ctrl+Shift+V (and similar "paste as plain text"): the browser
           // fires a native `paste` event that attachClipboardPasteFallback
@@ -12030,7 +12221,7 @@ class TerminalManager {
           return false;
         }
         event.preventDefault();
-        const termData = this.terminals.get(this.activeId);
+        const termData = this.terminals.get(id);
         if (termData?.ws) {
           this.clipboardManager.handlePaste(termData.ws);
         }
@@ -12359,9 +12550,10 @@ class TerminalManager {
 
   handleStatusChange(id, status, extra) {
     this.updateOverlay(id, status, extra);
-    this.updateConnectionStatus(status);
-
     const t = this.terminals.get(id);
+    if (id === this.activeId) {
+      this.updateConnectionStatus(status);
+    }
 
     if (status === "connected") {
       // Mark terminal as successfully connected
@@ -12381,27 +12573,18 @@ class TerminalManager {
       });
     }
 
-    const tab = this.tabs.querySelector(`[data-id="${id}"]`);
+    if (t) t.connectionStatus = status;
+
+    const tab =
+      this.getWorkspaceTab(t?.workspaceId) ||
+      this.tabs.querySelector(`[data-id="${id}"]`);
     dbg(
       `[reconnect] Tab update for ${id}: status=${status}, tab found=${!!tab}, hasConnected=${t?.hasConnected}`,
     );
     if (tab) {
-      tab.classList.remove("reconnecting", "disconnected");
-      if (status === "reconnecting") {
-        tab.classList.add("reconnecting");
-        dbg(`[reconnect] Tab ${id} marked as reconnecting`);
-      } else if (
-        status === "failed" ||
-        status === "dead" ||
-        status === "taken_over" ||
-        status === "setup_required"
-      ) {
-        tab.classList.add("disconnected");
-        dbg(`[reconnect] Tab ${id} marked as disconnected`);
-      } else if (status === "connected") {
-        dbg(`[reconnect] Tab ${id} marked as connected (classes cleared)`);
-      }
-    } else {
+      this.applyWorkspaceConnectionState(tab, t?.workspaceId, [status]);
+      dbg(`[reconnect] Workspace ${t?.workspaceId || id} status updated`);
+    } else if (t) {
       console.warn(`[reconnect] Tab not found for ${id}!`);
     }
   }
@@ -12455,11 +12638,13 @@ class TerminalManager {
 
     if (message.phase === "ready") {
       t.awaitingReconnectReady = false;
-      this.focusTerminal(id, {
-        syncSize: false,
-        scrollToPrompt: platformDetector.hasTouch,
-        ensureVisible: false,
-      });
+      if (id === this.activeId) {
+        this.focusTerminal(id, {
+          syncSize: false,
+          scrollToPrompt: platformDetector.hasTouch,
+          ensureVisible: false,
+        });
+      }
     }
   }
 
@@ -12688,6 +12873,7 @@ class TerminalManager {
         workspaceId,
         split,
         (tid) => this.closeTerminal(tid),
+        (tid) => this.detachTerminalToWorkspace(tid),
       );
       const overlay = this.createOverlay(element.parentElement);
       const dimensionOverlay = this.createDimensionOverlay(
@@ -12720,8 +12906,9 @@ class TerminalManager {
       });
       element.parentElement.appendChild(debugOverlay);
 
-      const terminal = this.createXtermInstance();
+      const terminal = this.createXtermInstance(id);
       terminal.open(element);
+      const activationCleanup = this.bindTerminalActivation(id, element);
       const webglAddon = this.setupTerminalRenderer(id, terminal);
       const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
@@ -12823,6 +13010,7 @@ class TerminalManager {
         osc7Disposable,
         inputFallbackCleanup,
         pasteFallbackCleanup,
+        activationCleanup,
         inputState,
         awaitingReconnectReady: false,
       });
@@ -12832,6 +13020,7 @@ class TerminalManager {
         workspaceId,
         cwd: resolvedCwd,
         tabNum,
+        originalWorkspaceId: workspaceId,
       });
 
       // Only add tab for new workspaces, not splits
@@ -12882,6 +13071,12 @@ class TerminalManager {
   }
 
   addTab(id, cwd, tabNum, workspaceId) {
+    const existingTab = this.getWorkspaceTab(workspaceId);
+    if (existingTab) {
+      this.retargetWorkspaceTab(workspaceId, id);
+      this.renderWorkspaceTab(existingTab, cwd);
+      return existingTab;
+    }
     const tab = document.createElement("div");
     tab.className = "tab";
     tab.dataset.id = id;
@@ -12901,7 +13096,7 @@ class TerminalManager {
         <span class="tab-meta" hidden></span>
         <span class="tab-signal-badge" hidden aria-hidden="true"></span>
       </span>
-      <button class="tab-close" title="Close (Ctrl+W)">&times;</button>
+      <button class="tab-close" title="Close workspace" aria-label="Close workspace">&times;</button>
     `;
 
     tab.querySelector(".tab-close").addEventListener("click", (e) => {
@@ -12971,6 +13166,7 @@ class TerminalManager {
 
     this.tabs.appendChild(tab);
     this.updateTabGroups();
+    return tab;
   }
 
   clearDropTargets() {
@@ -12983,8 +13179,52 @@ class TerminalManager {
     this.tabs.querySelectorAll(".tab").forEach((tab) => {
       this.renderWorkspaceTab(tab);
     });
+    this.updatePaneControls();
     this.refreshCommandPalette();
     this.scheduleDesktopToolbarDensitySync();
+  }
+
+  getWorkspaceTab(workspaceId) {
+    if (!workspaceId) return null;
+    return (
+      Array.from(this.tabs.querySelectorAll(".tab")).find(
+        (tab) => tab.dataset.workspaceId === workspaceId,
+      ) || null
+    );
+  }
+
+  retargetWorkspaceTab(workspaceId, preferredId = null) {
+    const tab = this.getWorkspaceTab(workspaceId);
+    if (!tab) return null;
+    const preferredTerminal = preferredId
+      ? this.terminals.get(preferredId)
+      : null;
+    const terminalId =
+      preferredTerminal?.workspaceId === workspaceId
+        ? preferredId
+        : this.resolveWorkspaceTerminalId(workspaceId);
+    if (terminalId && this.terminals.has(terminalId)) {
+      tab.dataset.id = terminalId;
+    }
+    return tab;
+  }
+
+  updatePaneControls() {
+    this.tileManager.tiles.forEach((tile, id) => {
+      const terminal = this.terminals.get(id);
+      const paneCount = terminal
+        ? this.getWorkspaceTerminals(terminal.workspaceId).length
+        : 0;
+      const canDetach = paneCount > 1;
+      tile.element.classList.toggle("workspace-multi-pane", canDetach);
+      if (tile.detachButton) {
+        const label = terminal?.cwd
+          ? `Move ${this.formatCwdLabel(terminal.cwd)} pane to a new tab`
+          : "Move pane to a new tab";
+        tile.detachButton.title = label;
+        tile.detachButton.setAttribute("aria-label", label);
+      }
+    });
   }
 
   groupWithPrevious() {
@@ -12998,10 +13238,51 @@ class TerminalManager {
   }
 
   ungroupCurrent() {
-    if (this.activeId) {
-      this.tileManager.removeFromGroup(this.activeId);
-      this.updateTabGroups();
+    if (!this.activeId) return;
+    const terminal = this.terminals.get(this.activeId);
+    if (this.getWorkspaceTerminals(terminal?.workspaceId).length > 1) {
+      this.detachTerminalToWorkspace(this.activeId);
+      return;
     }
+    this.tileManager.removeFromGroup(this.activeId);
+    this.updateTabGroups();
+  }
+
+  detachTerminalToWorkspace(id = this.activeId) {
+    const terminal = this.terminals.get(id);
+    if (!terminal?.workspaceId) return false;
+
+    const sourceWorkspaceId = terminal.workspaceId;
+    const sourceTerminals = this.getWorkspaceTerminals(sourceWorkspaceId);
+    if (sourceTerminals.length <= 1) return false;
+
+    this.workspaceIndex += 1;
+    const workspaceId = `ws-${this.workspaceIndex}`;
+    this.tabIndex += 1;
+    const tabNum = this.tabIndex;
+    const sourceSurvivor = sourceTerminals.find((item) => item.id !== id);
+
+    terminal.workspaceId = workspaceId;
+    terminal.originalWorkspaceId = workspaceId;
+    terminal.tabNum = tabNum;
+    this.tileManager.moveTileToWorkspace(id, workspaceId);
+    this.sessionRegistry.update(id, {
+      workspaceId,
+      originalWorkspaceId: workspaceId,
+      tabNum,
+    });
+
+    if (sourceSurvivor) {
+      this.workspaceLastActive.set(sourceWorkspaceId, sourceSurvivor.id);
+      this.retargetWorkspaceTab(sourceWorkspaceId, sourceSurvivor.id);
+    }
+    this.workspaceLastActive.set(workspaceId, id);
+    this.addTab(id, terminal.cwd, tabNum, workspaceId);
+    this.tileManager.relayout(sourceWorkspaceId);
+    this.tileManager.relayout(workspaceId);
+    this.updateTabGroups();
+    this.switchTo(id);
+    return true;
   }
 
   splitWorkspace() {
@@ -13036,6 +13317,10 @@ class TerminalManager {
     this.terminals.forEach((t, id) => {
       if (t.workspaceId === fromWorkspaceId) {
         t.workspaceId = toWorkspaceId;
+        this.sessionRegistry.update(id, {
+          workspaceId: toWorkspaceId,
+          originalWorkspaceId: t.originalWorkspaceId || fromWorkspaceId,
+        });
       }
     });
     const rememberedFrom = this.workspaceLastActive.get(fromWorkspaceId);
@@ -13051,12 +13336,14 @@ class TerminalManager {
     this.tabs
       .querySelector(`[data-workspace-id="${fromWorkspaceId}"]`)
       ?.remove();
+    this.retargetWorkspaceTab(toWorkspaceId);
 
     // Update tab display
     this.updateTabGroups();
 
-    // Show the merged workspace
-    this.tileManager.showWorkspace(toWorkspaceId);
+    // `switchTo` owns workspace visibility and active-tab state. Calling
+    // showWorkspace first can make activation look like a no-op when the
+    // active terminal came from the removed source tab.
     const targetId = this.resolveWorkspaceTerminalId(
       toWorkspaceId,
       this.activeId,
@@ -13084,14 +13371,19 @@ class TerminalManager {
     return fallbackId;
   }
 
-  switchTo(id) {
-    if (!this.terminals.has(id)) return;
+  activateTerminal(id) {
+    if (!this.terminals.has(id)) return false;
+    const t = this.terminals.get(id);
+    const changed =
+      this.activeId !== id ||
+      this.tileManager.activeTileId !== id ||
+      this.tileManager.activeWorkspaceId !== t?.workspaceId;
+    if (!changed) return false;
 
     // The search bar/controller are bound to the previous terminal's addon.
     this.closeTerminalSearch();
 
     this.activeId = id;
-    const t = this.terminals.get(id);
     if (t?.workspaceId) {
       this.workspaceLastActive.set(t.workspaceId, id);
     }
@@ -13105,7 +13397,7 @@ class TerminalManager {
       this.rememberWorkspaceById(t.workspaceId, t.cwd);
     }
     if (DEBUG) {
-      dbg("switchTo", {
+      dbg("activateTerminal", {
         terminalId: id,
         workspaceId: t?.workspaceId || null,
         cols: t?.terminal?.cols,
@@ -13121,19 +13413,22 @@ class TerminalManager {
       tab.setAttribute("aria-selected", isActive ? "true" : "false");
     });
 
-    const active = this.terminals.get(id);
-    if (active) {
-      this.focusTerminal(id, {
-        syncSize: true,
-        scrollToPrompt: platformDetector.hasTouch,
-      });
-      this.updateConnectionStatus(
-        active.ws?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
-      );
-    }
+    this.updateConnectionStatus(
+      t?.ws?.readyState === WebSocket.OPEN ? "connected" : "disconnected",
+    );
     this.updateLinkedViewButton();
     this.refreshCommandPalette();
     void this.syncRightSurfaceForWorkspace();
+    return true;
+  }
+
+  switchTo(id) {
+    if (!this.terminals.has(id)) return;
+    this.activateTerminal(id);
+    this.focusTerminal(id, {
+      syncSize: true,
+      scrollToPrompt: platformDetector.hasTouch,
+    });
   }
 
   switchToIndex(index) {
@@ -13148,23 +13443,38 @@ class TerminalManager {
   }
 
   switchToNext(direction) {
-    const ids = Array.from(this.terminals.keys());
-    if (ids.length < 2) return;
-    const currentIndex = ids.indexOf(this.activeId);
-    const newIndex = (currentIndex + direction + ids.length) % ids.length;
-    this.switchTo(ids[newIndex]);
+    const tabs = Array.from(
+      this.tabs.querySelectorAll(".tab[data-workspace-id]"),
+    );
+    if (tabs.length < 2) return;
+    const activeWorkspaceId = this.terminals.get(this.activeId)?.workspaceId;
+    const currentIndex = Math.max(
+      0,
+      tabs.findIndex(
+        (tab) => tab.dataset.workspaceId === activeWorkspaceId,
+      ),
+    );
+    const newIndex = (currentIndex + direction + tabs.length) % tabs.length;
+    const targetTab = tabs[newIndex];
+    const targetId = this.resolveWorkspaceTerminalId(
+      targetTab.dataset.workspaceId,
+      targetTab.dataset.id,
+    );
+    if (targetId) this.switchTo(targetId);
   }
 
   async closeTerminal(id) {
     const t = this.terminals.get(id);
     if (!t) return;
     const closingWorkspaceId = t.workspaceId;
+    const wasActive = id === this.activeId;
 
-    if (id === this.activeId) this.closeTerminalSearch();
+    if (wasActive) this.closeTerminalSearch();
 
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
+    t.activationCleanup?.();
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
@@ -13188,37 +13498,39 @@ class TerminalManager {
       if (DEBUG) dbg("terminal.dispose error", { id, err });
     }
     this.tileManager.removeTile(id);
-
-    this.tabs.querySelector(`[data-id="${id}"]`)?.remove();
-    this.updateTabGroups();
-
-    try {
-      await fetch(`/api/terminals/${id}`, { method: "DELETE" });
-    } catch {}
-
     this.terminals.delete(id);
-    if (
-      closingWorkspaceId &&
-      this.workspaceLastActive.get(closingWorkspaceId) === id
-    ) {
-      this.workspaceLastActive.delete(closingWorkspaceId);
-    }
-
-    // Remove from session registry (terminal is explicitly closed)
     this.sessionRegistry.remove(id);
 
-    if (this.activeId === id) {
-      const remaining = Array.from(this.terminals.keys());
-      const workspaceFallback =
-        this.resolveWorkspaceTerminalId(closingWorkspaceId);
-      const nextId = workspaceFallback || remaining[0];
+    const workspaceFallback = this.resolveWorkspaceTerminalId(
+      closingWorkspaceId,
+    );
+    if (workspaceFallback) {
+      this.workspaceLastActive.set(closingWorkspaceId, workspaceFallback);
+      this.retargetWorkspaceTab(closingWorkspaceId, workspaceFallback);
+      this.tileManager.relayout(closingWorkspaceId);
+    } else {
+      this.workspaceLastActive.delete(closingWorkspaceId);
+      this.getWorkspaceTab(closingWorkspaceId)?.remove();
+    }
+    this.updateTabGroups();
+
+    if (wasActive) {
+      const nextId = workspaceFallback || this.terminals.keys().next().value;
       if (nextId) this.switchTo(nextId);
       else {
         this.activeId = null;
+        this.tileManager.activeTileId = null;
+        this.tileManager.activeWorkspaceId = null;
         this.updateConnectionStatus("disconnected");
       }
     }
     this.updateLinkedViewButton();
+
+    try {
+      await fetch(`/api/terminals/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+    } catch {}
   }
 
   sendResize(id, colsOverride = null, rowsOverride = null, options = {}) {

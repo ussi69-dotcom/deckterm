@@ -2,6 +2,7 @@ import {
   createTerminal,
   test,
   expect,
+  readActiveTerminalText,
   waitForTerminal,
   resetAppState,
   pressDocumentShortcut,
@@ -24,9 +25,9 @@ test.describe("Tab Switching Reliability", () => {
     const newTabMarker = `NEW_TAB_${Date.now()}`;
     await page.keyboard.type(`echo ${newTabMarker}`);
     await page.keyboard.press("Enter");
-    await expect(
-      page.locator(".tile.active .xterm-rows").first(),
-    ).toContainText(newTabMarker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(newTabMarker);
 
     const activeTab = page.locator("#terminals-tabs .tab.active").first();
     const targetTab = page.locator("#terminals-tabs .tab:not(.active)").first();

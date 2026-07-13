@@ -1,4 +1,10 @@
-import { test, expect, resetAppState, waitForTerminal } from "./fixtures";
+import {
+  test,
+  expect,
+  readActiveTerminalText,
+  resetAppState,
+  waitForTerminal,
+} from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
@@ -19,9 +25,9 @@ test.describe("Reconnect Scrollback", () => {
       t?.ws?.send(JSON.stringify({ type: "input", data: `echo ${text}\r` }));
     }, marker);
     await page.waitForTimeout(400);
-    await expect(
-      page.locator(".tile.active .xterm-rows").first(),
-    ).toContainText(marker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(marker);
 
     // Current reconnect implementation uses age-based reconnect detection.
     await page.waitForTimeout(5500);
@@ -32,8 +38,8 @@ test.describe("Reconnect Scrollback", () => {
     });
     await page.waitForTimeout(2000);
 
-    await expect(
-      page.locator(".tile.active .xterm-rows").first(),
-    ).toContainText(marker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(marker);
   });
 });

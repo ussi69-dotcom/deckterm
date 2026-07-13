@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { expect, readActiveTerminalText, test } from "./fixtures";
 
 test.describe("Terminal Reconnection Debug", () => {
   test("should properly reconnect and display terminal after page reload", async ({
@@ -55,10 +55,7 @@ test.describe("Terminal Reconnection Debug", () => {
     });
 
     // Step 5: Check terminal content - should NOT have "Reconnecting" message
-    const terminalText = await page
-      .locator(".xterm-rows")
-      .first()
-      .textContent();
+    const terminalText = await readActiveTerminalText(page);
     console.log(`Terminal content: ${terminalText?.substring(0, 300)}`);
 
     // Step 6: Check overlay state - should be hidden
@@ -79,10 +76,10 @@ test.describe("Terminal Reconnection Debug", () => {
     });
 
     // Verify terminal doesn't show "Reconnecting" message
-    const finalContent = await page
-      .locator(".xterm-rows")
-      .first()
-      .textContent();
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain("reconnected");
+    const finalContent = await readActiveTerminalText(page);
     console.log(`Final content: ${finalContent?.substring(0, 300)}`);
 
     // The terminal should be interactive and not show reconnecting message

@@ -2,7 +2,7 @@
  * Size Warning Feature Tests
  *
  * Tests for the minimum terminal size warning in DeckTerm.
- * DeckTerm enforces a minimum terminal size of 80x24 characters.
+ * DeckTerm warns below its desktop usability floor of 60x16 characters.
  * When the terminal container is too small, a warning message appears.
  */
 
@@ -22,8 +22,8 @@ const NORMAL_WIDTH = 1200;
 const NORMAL_HEIGHT = 800;
 const SMALL_WIDTH = 820;
 const SMALL_HEIGHT = 300;
-const MIN_COLS = 80;
-const MIN_ROWS = 24;
+const MIN_COLS = 60;
+const MIN_ROWS = 16;
 
 test.describe("Size Warning Feature", () => {
   test.beforeEach(async ({ page }) => {
@@ -115,7 +115,7 @@ test.describe("Size Warning Feature", () => {
     // Get the size warning element
     const sizeWarning = await getSizeWarning(page);
 
-    // Verify the warning text includes the minimum dimensions (80x24)
+    // Verify the warning text includes the actual desktop threshold.
     const warningText = await sizeWarning.textContent();
     expect(warningText).toContain(`${MIN_COLS}x${MIN_ROWS}`);
   });

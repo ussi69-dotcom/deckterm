@@ -1,7 +1,13 @@
 import { chmod, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test, expect, resetAppState, waitForTerminal } from "./fixtures";
+import {
+  test,
+  expect,
+  readActiveTerminalText,
+  resetAppState,
+  waitForTerminal,
+} from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 const RESIZE_WATCH_SCRIPT = path.join(os.tmpdir(), "deckterm-resize-watch.sh");
@@ -16,7 +22,7 @@ render() {
 }
 trap render WINCH
 render
-while :; do sleep 60; done
+while :; do sleep 1; done
 `,
     "utf8",
   );
@@ -53,15 +59,9 @@ test.describe("Mobile reconnect redraw", () => {
     }, RESIZE_WATCH_SCRIPT);
 
     await expect
-      .poll(
-        async () =>
-          page.evaluate(() => {
-            const tm = window.terminalManager;
-            const active = tm.terminals.get(tm.activeId);
-            return active.element.innerText.includes("SIZE ");
-          }),
-        { timeout: 5000 },
-      )
+      .poll(async () => (await readActiveTerminalText(page)).includes("SIZE "), {
+        timeout: 5000,
+      })
       .toBe(true);
 
     await page.setViewportSize({ width: 390, height: 844 });
@@ -80,16 +80,36 @@ test.describe("Mobile reconnect redraw", () => {
       )
       .toBeLessThan(80);
 
+    const activeTerminalId = await page.evaluate(() => {
+      const tm = window.terminalManager;
+      return tm.activeId;
+    });
+    await expect
+      .poll(async () => {
+        const response = await page.request.get(`${APP_URL}/api/terminals`);
+        const terminals = (await response.json()) as Array<{
+          id?: string;
+          cols?: number;
+        }>;
+        return (
+          terminals.find(({ id }) => id === activeTerminalId)?.cols ??
+          Number.POSITIVE_INFINITY
+        );
+      })
+      .toBeLessThan(80);
+
     await expect
       .poll(
-        async () =>
-          page.evaluate(() => {
-            const tm = window.terminalManager;
-            const active = tm.terminals.get(tm.activeId);
-            return active.element.innerText.includes("SIZE ");
-          }),
+        async () => {
+          const matches = [
+            ...(await readActiveTerminalText(page)).matchAll(/SIZE (\d+)x(\d+)/g),
+          ];
+          return matches.length
+            ? Number(matches[matches.length - 1][1])
+            : Number.POSITIVE_INFINITY;
+        },
         { timeout: 5000 },
       )
-      .toBe(true);
+      .toBeLessThan(80);
   });
 });

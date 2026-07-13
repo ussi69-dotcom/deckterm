@@ -678,15 +678,21 @@ body {
   top: 8px;
   right: 8px;
   z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 4px;
   opacity: 0;
   transition: opacity 0.15s;
 }
 
-.tile:hover .tile-close-container {
+.tile:hover .tile-close-container,
+.tile:focus-within .tile-close-container,
+.tile.workspace-multi-pane.active .tile-close-container {
   opacity: 1;
 }
 
-.tile-close-btn {
+.tile-close-btn,
+.tile-detach-btn {
   width: 24px;
   height: 24px;
   background: rgba(22, 27, 34, 0.9);
@@ -699,6 +705,22 @@ body {
   align-items: center;
   justify-content: center;
   transition: all 0.15s;
+}
+
+.tile-detach-btn {
+  display: none;
+  font-size: 14px;
+}
+
+.tile.workspace-multi-pane .tile-detach-btn {
+  display: flex;
+}
+
+.tile-detach-btn:hover,
+.tile-detach-btn:focus-visible {
+  background: var(--accent-blue);
+  border-color: var(--accent-blue);
+  color: #fff;
 }
 
 .tile-close-btn:hover {

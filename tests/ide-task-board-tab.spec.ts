@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 // Browser smoke for the Task Board editor tab (backlog 2026-07-05: the kanban
 // board gets the full-width editor area; the Tasks sidebar stays the compact

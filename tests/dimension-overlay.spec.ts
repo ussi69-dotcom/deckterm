@@ -42,7 +42,10 @@ test.describe("Dimension Overlay", () => {
     await waitForTerminal(page);
 
     // Resize the window to trigger the dimension overlay
-    await resizeWindow(page, 1000, 600);
+    // Desktop terminals are capped at 120x30. A 1000px viewport can still fit
+    // that same grid, so use a narrower size that guarantees a real cols/rows
+    // change (the overlay intentionally ignores sub-cell/container-only jitter).
+    await resizeWindow(page, 800, 600);
 
     // Wait for the overlay to become visible
     await waitForClass(page, ".dimension-overlay", "visible");
@@ -64,7 +67,7 @@ test.describe("Dimension Overlay", () => {
     await waitForTerminal(page);
 
     // Resize the window to trigger the dimension overlay
-    await resizeWindow(page, 1000, 600);
+    await resizeWindow(page, 800, 600);
 
     // Wait for the overlay to become visible
     await waitForClass(page, ".dimension-overlay", "visible");
@@ -90,7 +93,7 @@ test.describe("Dimension Overlay", () => {
     await waitForTerminal(page);
 
     // First resize to a different size than initial (1200x800)
-    await resizeWindow(page, 1100, 700);
+    await resizeWindow(page, 900, 650);
 
     // Wait for the overlay to become visible and capture the text
     await waitForClass(page, ".dimension-overlay", "visible");
@@ -101,7 +104,7 @@ test.describe("Dimension Overlay", () => {
     await page.waitForTimeout(1500);
 
     // Second resize to a smaller size
-    await resizeWindow(page, 800, 600);
+    await resizeWindow(page, 800, 550);
 
     // Wait for the overlay to become visible again
     await waitForClass(page, ".dimension-overlay", "visible");

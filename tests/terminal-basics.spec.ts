@@ -8,7 +8,13 @@
  * - tmux status bar visibility
  */
 
-import { test, expect, waitForTerminal, resizeWindow } from "./fixtures";
+import {
+  test,
+  expect,
+  readActiveTerminalText,
+  waitForTerminal,
+  resizeWindow,
+} from "./fixtures";
 
 const BASE_URL = "http://localhost:4174";
 
@@ -185,19 +191,21 @@ test.describe("Terminal Basics", () => {
     await expect(xtermViewport).toBeVisible();
   });
 
-  test("terminal rows render properly", async ({ page }) => {
+  test("terminal renderer surface is present", async ({ page }) => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
 
-    // xterm.js renders terminal rows - verify rows container exists
-    const rows = page.locator(".xterm-rows").first();
-    await expect(rows).toBeAttached();
+    // The WebGL renderer paints text to canvas and does not create DOM rows.
+    const renderer = page
+      .locator(".xterm-screen canvas, .xterm-screen .xterm-rows")
+      .first();
+    await expect(renderer).toBeVisible();
 
-    // Verify rows container has reasonable dimensions
-    const rowsBox = await rows.boundingBox();
-    if (rowsBox) {
-      expect(rowsBox.width).toBeGreaterThan(50);
-      expect(rowsBox.height).toBeGreaterThan(50);
+    // Verify the renderer surface has reasonable dimensions.
+    const rendererBox = await renderer.boundingBox();
+    if (rendererBox) {
+      expect(rendererBox.width).toBeGreaterThan(50);
+      expect(rendererBox.height).toBeGreaterThan(50);
     }
   });
 });
@@ -240,8 +248,19 @@ test.describe("Terminal Layout Integrity", () => {
     await expect(page.locator(visibleXtermScreen).first()).toBeVisible();
     await expect(page.locator(visibleXtermViewport).first()).toBeVisible();
 
-    // Check rows container is still present
-    const rows = page.locator(".xterm-rows").first();
-    await expect(rows).toBeAttached();
+    // Check the renderer surface is still present.
+    await expect(page.locator(visibleXtermScreen).first()).toBeVisible();
+
+    const marker = `RESIZE_OK_${Date.now()}`;
+    await page.evaluate((value) => {
+      const tm = (window as any).terminalManager;
+      const active = tm?.terminals?.get(tm.activeId);
+      active?.ws?.send(
+        JSON.stringify({ type: "input", data: `echo ${value}\r` }),
+      );
+    }, marker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(marker);
   });
 });

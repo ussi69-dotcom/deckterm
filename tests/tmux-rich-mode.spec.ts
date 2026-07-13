@@ -1,4 +1,10 @@
-import { test, expect, resetAppState, waitForTerminal } from "./fixtures";
+import {
+  test,
+  expect,
+  readActiveTerminalText,
+  resetAppState,
+  waitForTerminal,
+} from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
@@ -109,9 +115,9 @@ test.describe("Tmux Rich Mode", () => {
     await page.keyboard.type(`echo ${marker}`);
     await page.keyboard.press("Enter");
 
-    await expect(
-      page.locator(".tile.active .xterm-rows").first(),
-    ).toContainText(marker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(marker);
 
     const originalTab = page.locator(
       `#terminals-tabs .tab[data-workspace-id="${initialContext.workspaceId}"]`,
@@ -119,8 +125,8 @@ test.describe("Tmux Rich Mode", () => {
     await originalTab.click();
     await expect(originalTab).toHaveClass(/active/);
 
-    await expect(
-      page.locator(".tile.active .xterm-rows").first(),
-    ).toContainText(marker);
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain(marker);
   });
 });
