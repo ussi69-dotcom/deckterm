@@ -35,10 +35,12 @@ test("CI and deploy smoke runs use explicit temporary bootstrap compatibility by
   expect(deployWorkflow).toContain("DECKTERM_LEGACY_NO_BOOTSTRAP=1");
 });
 
-test("CI smoke server explicitly enables the development-only E2E namespace", () => {
+test("CI and deploy smoke servers explicitly enable the development-only E2E namespace", () => {
   const ciWorkflow = readText("../.github/workflows/ci.yml");
+  const deployWorkflow = readText("../.github/workflows/deploy-main.yml");
 
   expect(ciWorkflow).toContain("DECKTERM_RUNTIME_ENV=development");
+  expect(deployWorkflow).toContain("DECKTERM_RUNTIME_ENV=development");
 });
 
 test("deploy scripts target user-level systemd services", () => {
