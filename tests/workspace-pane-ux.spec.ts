@@ -463,7 +463,7 @@ test("pane traversal is not consumed for one pane and palette actions are contex
   );
 });
 
-test("each pane exposes its own folder, activity, and truthful connection state", async ({
+test("pane activity stays accessible without rendering an in-pane status banner", async ({
   page,
 }) => {
   await boot(page);
@@ -522,12 +522,7 @@ test("each pane exposes its own folder, activity, and truthful connection state"
     `.tile[data-terminal-id="${thinkingId}"]`,
   );
 
-  await expect(respondingPane.locator(".tile-pane-status")).toContainText(
-    "pane-alpha",
-  );
-  await expect(respondingPane.locator(".tile-pane-status")).toContainText(
-    "Responding",
-  );
+  await expect(respondingPane.locator(".tile-pane-status")).toHaveCount(0);
   await expect(respondingPane).toHaveAttribute(
     "aria-label",
     /pane-alpha.*Connected.*Codex responding/i,
@@ -536,16 +531,9 @@ test("each pane exposes its own folder, activity, and truthful connection state"
     "data-connection-status",
     "connected",
   );
+  await expect(respondingPane).toHaveAttribute("data-activity", "responding");
 
-  await expect(thinkingPane.locator(".tile-pane-status")).toContainText(
-    "pane-beta",
-  );
-  await expect(thinkingPane.locator(".tile-pane-status")).toContainText(
-    "Thinking",
-  );
-  await expect(
-    thinkingPane.locator(".tile-pane-status-connection"),
-  ).toHaveText("Reconnecting");
+  await expect(thinkingPane.locator(".tile-pane-status")).toHaveCount(0);
   await expect(thinkingPane).toHaveAttribute(
     "aria-label",
     /pane-beta.*Reconnecting.*Claude thinking/i,
@@ -554,27 +542,20 @@ test("each pane exposes its own folder, activity, and truthful connection state"
     "data-connection-status",
     "reconnecting",
   );
+  await expect(thinkingPane).toHaveAttribute("data-activity", "thinking");
   await expect(page.locator("#connection-status")).toHaveClass(/reconnecting/);
-  await page.emulateMedia({ reducedMotion: "reduce" });
-  await expect
-    .poll(() =>
-      thinkingPane
-        .locator(".tile-pane-status-dot")
-        .evaluate((element) => getComputedStyle(element).animationName),
-    )
-    .toBe("none");
 
   const desktopControlSizes = await thinkingPane
     .locator(".tile-close-btn, .tile-detach-btn")
     .evaluateAll((buttons) =>
       buttons.map((button) => {
-        const rect = button.getBoundingClientRect();
-        return { width: rect.width, height: rect.height };
+        const style = getComputedStyle(button);
+        return { width: style.width, height: style.height };
       }),
     );
   expect(desktopControlSizes).toEqual([
-    { width: 24, height: 24 },
-    { width: 24, height: 24 },
+    { width: "24px", height: "24px" },
+    { width: "24px", height: "24px" },
   ]);
 });
 
