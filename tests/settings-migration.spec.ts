@@ -22,7 +22,12 @@ async function openSettings(page) {
 // one-time migration actually runs (it no-ops once settings.migratedV1 is set).
 async function clearMigratedServerState(page) {
   await page.evaluate(async () => {
-    await fetch("/api/settings", {
+    // resetAppState boots the app once before this test seeds legacy storage.
+    // Let that boot's flush-then-flag migration finish before deleting the
+    // canonical keys, otherwise its late flag PUT can win the race and make the
+    // subsequent seeded reload incorrectly skip migration.
+    await (window as any).terminalManager?.settingsReady;
+    const response = await fetch("/api/settings", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -33,6 +38,9 @@ async function clearMigratedServerState(page) {
         },
       }),
     });
+    if (!response.ok) {
+      throw new Error(`Failed to reset migrated settings: HTTP ${response.status}`);
+    }
   });
 }
 
@@ -53,8 +61,10 @@ test.describe("Legacy localStorage settings migration", () => {
     await page.waitForLoadState("domcontentloaded");
     await waitForTerminal(page);
 
-    // Give the load + migration + debounced flush time to settle.
-    await page.waitForTimeout(800);
+    // Wait on the actual migration contract instead of a timing heuristic.
+    await page.evaluate(() =>
+      (window as any).terminalManager?.settingsReady,
+    );
 
     await openSettings(page);
     const win = page.locator('[data-window-id="settings"]');

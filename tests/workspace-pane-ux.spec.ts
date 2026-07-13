@@ -355,6 +355,229 @@ test("next and previous navigation count a merged workspace as one tab", async (
     .toBe(state.mergedWorkspaceId);
 });
 
+test("pane shortcuts traverse the active workspace in stable order and wrap", async ({
+  page,
+}) => {
+  await boot(page);
+  await page.evaluate(() =>
+    (window as any).terminalManager.createTerminal(true),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).terminalManager.terminals.size),
+    )
+    .toBe(2);
+
+  const initial = await page.evaluate(() => {
+    const tm = (window as any).terminalManager;
+    const workspaceId = tm.terminals.get(tm.activeId)?.workspaceId;
+    const ids = tm.tileManager
+      .getWorkspaceTiles(workspaceId)
+      .map((tile: any) => tile.terminalId);
+    tm.switchTo(ids[0]);
+    return { ids, workspaceId };
+  });
+
+  await page.keyboard.press("Alt+Shift+ArrowDown");
+  await expect
+    .poll(() =>
+      page.evaluate(() => {
+        const tm = (window as any).terminalManager;
+        return {
+          activeId: tm.activeId,
+          workspaceId: tm.terminals.get(tm.activeId)?.workspaceId,
+          focusedId:
+            document.activeElement
+              ?.closest?.(".tile")
+              ?.getAttribute("data-terminal-id") || null,
+        };
+      }),
+    )
+    .toEqual({
+      activeId: initial.ids[1],
+      workspaceId: initial.workspaceId,
+      focusedId: initial.ids[1],
+    });
+
+  await page.keyboard.press("Alt+Shift+ArrowDown");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).terminalManager.activeId),
+    )
+    .toBe(initial.ids[0]);
+
+  await page.keyboard.press("Alt+Shift+ArrowUp");
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).terminalManager.activeId),
+    )
+    .toBe(initial.ids[1]);
+
+  await expect(page.locator("#terminals-tabs .tab.active")).toHaveAttribute(
+    "data-workspace-id",
+    initial.workspaceId,
+  );
+});
+
+test("pane traversal is not consumed for one pane and palette actions are contextual", async ({
+  page,
+}) => {
+  await boot(page);
+
+  const singlePane = await page.evaluate(() => {
+    const tm = (window as any).terminalManager;
+    const event = new KeyboardEvent("keydown", {
+      key: "ArrowDown",
+      altKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    document.dispatchEvent(event);
+    const actionIds = tm.commandPaletteRegistry
+      .getResults("", tm.getCommandPaletteContext())
+      .map((action: any) => action.id);
+    return { defaultPrevented: event.defaultPrevented, actionIds };
+  });
+  expect(singlePane.defaultPrevented).toBe(false);
+  expect(singlePane.actionIds).not.toContain("focus-next-pane");
+  expect(singlePane.actionIds).not.toContain("focus-previous-pane");
+
+  await page.evaluate(() =>
+    (window as any).terminalManager.createTerminal(true),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).terminalManager.terminals.size),
+    )
+    .toBe(2);
+
+  const multiplePaneActionIds = await page.evaluate(() => {
+    const tm = (window as any).terminalManager;
+    return tm.commandPaletteRegistry
+      .getResults("", tm.getCommandPaletteContext())
+      .map((action: any) => action.id);
+  });
+  expect(multiplePaneActionIds).toEqual(
+    expect.arrayContaining(["focus-next-pane", "focus-previous-pane"]),
+  );
+});
+
+test("each pane exposes its own folder, activity, and truthful connection state", async ({
+  page,
+}) => {
+  await boot(page);
+  await page.evaluate(() =>
+    (window as any).terminalManager.createTerminal(true),
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(() => (window as any).terminalManager.terminals.size),
+    )
+    .toBe(2);
+
+  const [respondingId, thinkingId] = await page.evaluate(async () => {
+    const tm = (window as any).terminalManager;
+    // This is a rendering-state test. Let an in-flight server refresh settle,
+    // then pause the polling loop so its real idle telemetry cannot race the
+    // deterministic pane states injected below.
+    if (tm.telemetryRefreshPromise) await tm.telemetryRefreshPromise;
+    if (tm.telemetryRefreshTimer) {
+      clearTimeout(tm.telemetryRefreshTimer);
+      tm.telemetryRefreshTimer = null;
+    }
+    if (tm.telemetryRefreshInterval) {
+      clearInterval(tm.telemetryRefreshInterval);
+      tm.telemetryRefreshInterval = null;
+    }
+    const ids = [...tm.terminals.keys()];
+    const responding = tm.terminals.get(ids[0]);
+    const thinking = tm.terminals.get(ids[1]);
+
+    Object.assign(responding, {
+      cwd: "/tmp/pane-alpha",
+      running: true,
+      agentName: "codex",
+      agentState: "responding",
+      connectionStatus: "connected",
+    });
+    Object.assign(thinking, {
+      cwd: "/tmp/pane-beta",
+      running: true,
+      agentName: "claude",
+      agentState: "thinking",
+      connectionStatus: "reconnecting",
+      awaitingReconnectReady: true,
+    });
+    tm.updateTabGroups();
+    tm.switchTo(ids[0]);
+    tm.switchTo(ids[1]);
+    return ids;
+  });
+
+  const respondingPane = page.locator(
+    `.tile[data-terminal-id="${respondingId}"]`,
+  );
+  const thinkingPane = page.locator(
+    `.tile[data-terminal-id="${thinkingId}"]`,
+  );
+
+  await expect(respondingPane.locator(".tile-pane-status")).toContainText(
+    "pane-alpha",
+  );
+  await expect(respondingPane.locator(".tile-pane-status")).toContainText(
+    "Responding",
+  );
+  await expect(respondingPane).toHaveAttribute(
+    "aria-label",
+    /pane-alpha.*Connected.*Codex responding/i,
+  );
+  await expect(respondingPane).toHaveAttribute(
+    "data-connection-status",
+    "connected",
+  );
+
+  await expect(thinkingPane.locator(".tile-pane-status")).toContainText(
+    "pane-beta",
+  );
+  await expect(thinkingPane.locator(".tile-pane-status")).toContainText(
+    "Thinking",
+  );
+  await expect(
+    thinkingPane.locator(".tile-pane-status-connection"),
+  ).toHaveText("Reconnecting");
+  await expect(thinkingPane).toHaveAttribute(
+    "aria-label",
+    /pane-beta.*Reconnecting.*Claude thinking/i,
+  );
+  await expect(thinkingPane).toHaveAttribute(
+    "data-connection-status",
+    "reconnecting",
+  );
+  await expect(page.locator("#connection-status")).toHaveClass(/reconnecting/);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect
+    .poll(() =>
+      thinkingPane
+        .locator(".tile-pane-status-dot")
+        .evaluate((element) => getComputedStyle(element).animationName),
+    )
+    .toBe("none");
+
+  const desktopControlSizes = await thinkingPane
+    .locator(".tile-close-btn, .tile-detach-btn")
+    .evaluateAll((buttons) =>
+      buttons.map((button) => {
+        const rect = button.getBoundingClientRect();
+        return { width: rect.width, height: rect.height };
+      }),
+    );
+  expect(desktopControlSizes).toEqual([
+    { width: 24, height: 24 },
+    { width: 24, height: 24 },
+  ]);
+});
+
 test.describe("mobile orientation", () => {
   test.use({
     viewport: { width: 390, height: 844 },

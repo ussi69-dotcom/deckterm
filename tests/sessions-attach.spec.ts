@@ -18,9 +18,18 @@ test.describe("Sessions drawer attach / open-here", () => {
     expect(wired).toBe("function");
 
     // Open the Session Manager drawer.
-    await page.click("#sessions-btn");
+    const sessionsTrigger = page.locator("#sessions-btn");
+    await expect(sessionsTrigger.locator(".btn-label")).toHaveCount(0);
+    await expect(sessionsTrigger).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(sessionsTrigger).toHaveAttribute(
+      "aria-controls",
+      "sessions-panel",
+    );
+    await sessionsTrigger.click();
     const panel = page.locator("#sessions-panel");
     await expect(panel).not.toHaveClass(/hidden/);
+    await expect(sessionsTrigger).toHaveAttribute("aria-expanded", "true");
+    await expect(page.locator("#sessions-panel-close")).toBeFocused();
 
     // The terminal we just created is open locally → row shows an active badge
     // and a "Focus" action.
@@ -35,11 +44,37 @@ test.describe("Sessions drawer attach / open-here", () => {
     );
     await row.click();
     await expect(panel).toHaveClass(/hidden/);
+    await expect(sessionsTrigger).toHaveAttribute("aria-expanded", "false");
+    await expect(sessionsTrigger).not.toBeFocused();
+    await expect(page.locator(".tile.active .xterm-helper-textarea")).toBeFocused();
 
     const activeAfter = await page.evaluate(
       () => (window as any).terminalManager?.activeId,
     );
     expect(activeAfter).toBe(activeBefore);
+  });
+
+  test("traps dialog focus and restores the compact trigger on Escape", async ({
+    page,
+  }) => {
+    await resetAppState(page, APP_URL);
+    await waitForTerminal(page);
+
+    const trigger = page.locator("#sessions-btn");
+    await trigger.click();
+    const panel = page.locator("#sessions-panel");
+    await expect(page.locator("#sessions-panel-close")).toBeFocused();
+
+    await page.keyboard.press("Shift+Tab");
+    expect(
+      await page.evaluate(() =>
+        Boolean(document.activeElement?.closest("#sessions-panel")),
+      ),
+    ).toBe(true);
+
+    await page.keyboard.press("Escape");
+    await expect(panel).toHaveClass(/hidden/);
+    await expect(trigger).toBeFocused();
   });
 
   test("plans attach for a live session that is not open locally", async ({

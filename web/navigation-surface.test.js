@@ -151,8 +151,15 @@ test("loads an empty recent workspace list when storage is empty or invalid", ()
 test("validates layout state by filtering unknown ids and ignoring more", () => {
   expect(
     validateActionLayoutState({
-      desktopPinned: ["files", "more", "clipboard", "missing", "clipboard"],
-      mobilePinned: ["paste", "more", "nope"],
+      desktopPinned: [
+        "files",
+        "font-decrease",
+        "more",
+        "clipboard",
+        "missing",
+        "clipboard",
+      ],
+      mobilePinned: ["paste", "font-increase", "more", "nope"],
     }),
   ).toEqual({
     desktopPinned: ["files", "clipboard"],
@@ -305,6 +312,7 @@ test("desktop customizable action ids keep more fixed outside the editor", () =>
   expect(desktopEditable).toContain("setup");
   expect(desktopEditable).toContain("tasks");
   expect(desktopEditable).toContain("clipboard");
+  expect(desktopEditable).toContain("font-size");
 });
 
 test("mobile customizable action ids keep more fixed outside the editor", () => {
@@ -315,6 +323,20 @@ test("mobile customizable action ids keep more fixed outside the editor", () => 
   expect(mobileEditable).toContain("setup");
   expect(mobileEditable).toContain("tasks");
   expect(mobileEditable).toContain("clipboard");
+  expect(mobileEditable).not.toContain("font-size");
+});
+
+test("pinLayoutAction treats the combined font stepper as one desktop item", () => {
+  const state = getDefaultActionLayoutState();
+  const next = pinLayoutAction(state, "desktop", "font-size", 1);
+
+  expect(next.desktopPinned).toEqual([
+    "files",
+    "font-size",
+    "git",
+    "palette",
+  ]);
+  expect(next.mobilePinned).toEqual(state.mobilePinned);
 });
 
 test("pinLayoutAction inserts available actions into the pinned list", () => {
@@ -579,7 +601,7 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(13);
+  expect(overflow).toHaveLength(11);
   expect(overflow).toContain("palette");
   expect(overflow).toContain("setup");
   expect(overflow).toContain("settings");
@@ -589,8 +611,8 @@ test("overflow actions contain the secondary utilities", () => {
   expect(overflow).toContain("toggle-extra-keys");
   expect(overflow).toContain("wrap-lines");
   expect(overflow).toContain("fullscreen");
-  expect(overflow).toContain("font-decrease");
-  expect(overflow).toContain("font-increase");
+  expect(overflow).not.toContain("font-decrease");
+  expect(overflow).not.toContain("font-increase");
   expect(overflow).toContain("help");
   expect(overflow).toContain("linked-view");
 });

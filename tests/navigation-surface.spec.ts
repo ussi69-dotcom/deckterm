@@ -58,6 +58,106 @@ test.describe("Shell action hierarchy on desktop", () => {
     await expect(page.getByRole("button", { name: "More" })).toBeVisible();
   });
 
+  test("keeps one fixed Font size stepper in More while stepping repeatedly", async ({
+    page,
+  }) => {
+    await page.getByRole("button", { name: "More" }).click();
+    const sheet = page.locator("#tools-sheet");
+    const stepper = sheet.locator("#tools-sheet-font-size");
+    await expect(stepper).toBeVisible();
+    await expect(
+      sheet.getByRole("button", { name: "Font -", exact: true }),
+    ).toHaveCount(0);
+    await expect(
+      sheet.getByRole("button", { name: "Font +", exact: true }),
+    ).toHaveCount(0);
+
+    const value = stepper.locator("output");
+    await expect(
+      stepper.getByRole("button", { name: "Decrease font size" }).locator("svg"),
+    ).toHaveCount(1);
+    await expect(
+      stepper.getByRole("button", { name: "Increase font size" }).locator("svg"),
+    ).toHaveCount(1);
+    const initial = Number.parseInt((await value.textContent()) || "14", 10);
+    await stepper.getByRole("button", { name: "Increase font size" }).click();
+    await stepper.getByRole("button", { name: "Increase font size" }).click();
+    await expect(sheet).toBeVisible();
+    await expect(value).toHaveText(`${Math.min(32, initial + 2)}px`);
+
+    const applied = await page.evaluate(() => {
+      const manager = (window as any).terminalManager;
+      const active = manager?.terminals?.get(manager.activeId);
+      return {
+        manager: manager?.fontSize,
+        terminal: active?.terminal?.options?.fontSize,
+        stored: manager?.settingsStore?.get("terminal.fontSize"),
+      };
+    });
+    expect(applied.manager).toBe(Math.min(32, initial + 2));
+    expect(applied.terminal).toBe(applied.manager);
+    expect(applied.stored).toBe(applied.manager);
+
+    await page.evaluate(() => (window as any).terminalManager.applyFontSize(32));
+    await expect(
+      stepper.getByRole("button", { name: "Increase font size" }),
+    ).toBeDisabled();
+    await page.evaluate(() => (window as any).terminalManager.applyFontSize(8));
+    await expect(
+      stepper.getByRole("button", { name: "Decrease font size" }),
+    ).toBeDisabled();
+
+    await page.locator("#tools-sheet-close").click();
+    await openCommandPalette(page);
+    await page.locator("#command-palette-input").fill("Increase Font Size");
+    await expect(
+      page.locator("#command-palette-results").getByText("Increase Font Size"),
+    ).toBeVisible();
+  });
+
+  test("moves the combined Font size stepper from More to the desktop toolbar", async ({
+    page,
+  }) => {
+    await page.getByRole("button", { name: "More" }).click();
+    await expect(page.locator("#tools-sheet-font-size")).toBeVisible();
+    await page.getByRole("button", { name: "More" }).click();
+    await expect(page.locator("#tools-sheet")).toBeHidden();
+
+    const layoutEditor = await openLayoutEditor(page, "Desktop");
+    const fontSizeAction = layoutEditor
+      .getByTestId(LAYOUT_EDITOR_TEST_IDS.available)
+      .getByRole("button", { name: "Font size" });
+    await expect(fontSizeAction).toBeVisible();
+
+    await dragLayoutEditorItem(
+      page,
+      fontSizeAction,
+      layoutEditor.getByTestId(LAYOUT_EDITOR_TEST_IDS.pinned),
+    );
+
+    const toolbarStepper = page.locator("#desktop-font-size");
+    await expect(toolbarStepper).toBeVisible();
+    await expect(page.locator("#tools-sheet-font-size")).toHaveCount(0);
+    await page.getByRole("button", { name: "Done" }).click();
+
+    const value = toolbarStepper.locator("output");
+    const initial = Number.parseInt((await value.textContent()) || "14", 10);
+    await toolbarStepper
+      .getByRole("button", { name: "Increase font size" })
+      .click();
+    await expect(value).toHaveText(`${Math.min(32, initial + 1)}`);
+    await page.evaluate(() =>
+      (window as any).terminalManager?.settingsStore?.flush(),
+    );
+
+    await page.reload();
+    await waitForTerminal(page);
+    await expect(page.locator("#desktop-font-size")).toBeVisible();
+    await expect(page.locator("#desktop-font-size output")).toHaveText(
+      `${Math.min(32, initial + 1)}`,
+    );
+  });
+
   test("opens Git and Files from explicit top-bar actions", async ({
     page,
   }) => {
@@ -266,7 +366,7 @@ test.describe("Shell action hierarchy on desktop", () => {
     ).toBeGreaterThanOrEqual(8);
   });
 
-  test("fits four desktop tabs before promoting the fifth tab into a second row", async ({
+  test("uses reclaimed toolbar space before promoting the sixth tab into a second row", async ({
     page,
   }) => {
     await pruneTerminalsToActiveSession(page);
@@ -306,8 +406,23 @@ test.describe("Shell action hierarchy on desktop", () => {
         distinctRows: [...new Set(tabTops)].length,
       };
     });
-    expect(fiveTabMetrics.layout).toBe("wrapped");
-    expect(fiveTabMetrics.distinctRows).toBe(2);
+    expect(fiveTabMetrics.layout).toBe("single");
+    expect(fiveTabMetrics.distinctRows).toBe(1);
+
+    await createTerminal(page);
+    await page.waitForTimeout(300);
+
+    const sixTabMetrics = await page.locator(".tabs").evaluate((element) => {
+      const tabTops = Array.from(element.querySelectorAll(".tab")).map((tab) =>
+        Math.round((tab as HTMLElement).offsetTop),
+      );
+      return {
+        layout: element.dataset.layout,
+        distinctRows: [...new Set(tabTops)].length,
+      };
+    });
+    expect(sixTabMetrics.layout).toBe("wrapped");
+    expect(sixTabMetrics.distinctRows).toBe(2);
   });
 
   test("keeps narrow desktop tab overflow reachable with mouse-wheel scrolling", async ({
