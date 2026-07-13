@@ -24,12 +24,11 @@ async function pruneTerminalsToActiveSession(page: any) {
   await page.evaluate(async () => {
     const tm = (window as any).terminalManager;
     const activeId = tm?.activeId || null;
-    const response = await fetch("/api/terminals");
-    const terminals = await response.json().catch(() => []);
+    const terminalIds = tm?.terminals ? [...tm.terminals.keys()] : [];
 
-    for (const terminal of terminals) {
-      if (!terminal?.id || terminal.id === activeId) continue;
-      await fetch(`/api/terminals/${encodeURIComponent(terminal.id)}`, {
+    for (const terminalId of terminalIds) {
+      if (!terminalId || terminalId === activeId) continue;
+      await fetch(`/api/terminals/${encodeURIComponent(terminalId)}`, {
         method: "DELETE",
       }).catch(() => {});
     }

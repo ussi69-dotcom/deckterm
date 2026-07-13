@@ -1,5 +1,4 @@
-import { test, expect } from "@playwright/test";
-import { waitForTerminal } from "./fixtures";
+import { expect, test, waitForTerminal } from "./fixtures";
 
 const APP_URL = "http://localhost:4174";
 

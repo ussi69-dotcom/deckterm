@@ -3,7 +3,6 @@ import {
   expect,
   waitForTerminal,
   resetAppState,
-  reserveTerminalCreateBudget,
 } from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
@@ -16,7 +15,6 @@ test.describe("Layout Bounds + Scaling", () => {
     await resetAppState(page, APP_URL);
     await waitForTerminal(page);
 
-    await reserveTerminalCreateBudget(3);
     await page.evaluate(async () => {
       // @ts-ignore
       const tm = window.terminalManager;

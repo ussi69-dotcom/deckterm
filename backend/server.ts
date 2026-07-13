@@ -2538,6 +2538,30 @@ export function computeLiteralEdits(
   return { edits, matchCount, truncated, newContent: outLines.join("\n") };
 }
 
+export function classifyGitStatusFailure(exitCode: number, stderr: string) {
+  const message = stderr.trim() || "git status failed";
+  if (/not a git repository/i.test(message)) {
+    return {
+      status: 200 as const,
+      body: {
+        error: "Not a git repository",
+        message,
+        isRepository: false,
+      },
+    };
+  }
+  if (exitCode === 429 || message.startsWith("isolation_busy:")) {
+    return {
+      status: 429 as const,
+      body: { error: "isolation_busy", message },
+    };
+  }
+  return {
+    status: 502 as const,
+    body: { error: "Git status failed", message },
+  };
+}
+
 // Canonicalize + containment-verify a single replace candidate. Legacy: real
 // fs.realpath (the service account can read its own root — same trust model
 // as resolveAllowedPath). Brokered: LEXICAL canonicalization only, same
@@ -8352,13 +8376,10 @@ export function createWebApp() {
       const exitCode = statusRes.code;
 
       if (exitCode !== 0) {
-        return c.json(
-          {
-            error: "Not a git repository",
-            message: stderr.trim() || "git status failed",
-          },
-          400,
-        );
+        // An allowed non-repository is a normal SCM probe (HTTP 200), while
+        // broker pressure and other operational Git failures stay non-2xx.
+        const failure = classifyGitStatusFailure(exitCode, stderr);
+        return c.json(failure.body, failure.status);
       }
 
       const lines = output.trim().split("\n");
@@ -8427,8 +8448,8 @@ export function createWebApp() {
       return c.json({ branch, upstream, ahead, behind, files, cwd, root });
     } catch (err) {
       return c.json(
-        { error: "Not a git repository", message: String(err) },
-        400,
+        { error: "Git status failed", message: String(err) },
+        502,
       );
     }
   });

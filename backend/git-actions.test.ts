@@ -16,6 +16,7 @@ let allowedRoot: string;
 let repo: string; // working repo inside allowedRoot
 let remote: string; // bare repo acting as origin (file:// remote, offline)
 let app: { fetch: (req: Request) => Response | Promise<Response> };
+let classifyGitStatusFailure: typeof import("./server").classifyGitStatusFailure;
 
 async function git(cwd: string, ...args: string[]): Promise<string> {
   const proc = Bun.spawn(["git", ...args], {
@@ -86,7 +87,9 @@ beforeAll(async () => {
   }
   state.db.close();
 
-  const { createWebApp } = await import("./server");
+  const serverModule = await import("./server");
+  const { createWebApp } = serverModule;
+  classifyGitStatusFailure = serverModule.classifyGitStatusFailure;
   app = createWebApp();
 });
 
@@ -205,6 +208,44 @@ test("status exposes the repo toplevel as root", async () => {
   // Compare against git's own toplevel (handles symlink-resolved tmp paths).
   const toplevel = (await git(repo, "rev-parse", "--show-toplevel")).trim();
   expect(data.root).toBe(toplevel);
+});
+
+test("status treats an allowed non-repository directory as a normal probe result", async () => {
+  const { mkdir } = await import("node:fs/promises");
+  const nonRepo = join(allowedRoot, "not-a-repository");
+  await mkdir(nonRepo, { recursive: true });
+  const res = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(nonRepo)}`,
+    ),
+  );
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    error: "Not a git repository",
+    isRepository: false,
+  });
+});
+
+test("status failure classification preserves operational errors", () => {
+  expect(
+    classifyGitStatusFailure(
+      429,
+      "isolation_busy: too many concurrent isolated operations",
+    ),
+  ).toEqual({
+    status: 429,
+    body: {
+      error: "isolation_busy",
+      message: "isolation_busy: too many concurrent isolated operations",
+    },
+  });
+  expect(classifyGitStatusFailure(128, "fatal: permission denied")).toEqual({
+    status: 502,
+    body: {
+      error: "Git status failed",
+      message: "fatal: permission denied",
+    },
+  });
 });
 
 test("push syncs ahead commits to origin; status ahead drops to 0", async () => {

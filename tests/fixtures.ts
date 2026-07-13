@@ -1,4 +1,12 @@
-import { test as base, expect, Locator, Page } from "@playwright/test";
+import {
+  test as base,
+  expect,
+  Locator,
+  Page,
+  type APIResponse,
+  type BrowserContext,
+  type Response,
+} from "@playwright/test";
 import { execSync } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -11,6 +19,284 @@ const TERMINAL_CREATE_RATE_LIMIT_WINDOW_MS = 60_000;
 const TERMINAL_CREATE_RATE_LIMIT_MAX_REQUESTS = 36;
 const TERMINAL_CREATE_RATE_LIMIT_BUFFER_MS = 250;
 let terminalCreateRequestTimestamps: number[] = [];
+
+type ServerGuardState = {
+  createdTerminalIds: Set<string>;
+  pendingResponseTracks: Set<Promise<void>>;
+  pendingTerminalCreates: Set<Promise<void>>;
+  shuttingDown: boolean;
+};
+
+const serverGuardByContext = new WeakMap<BrowserContext, ServerGuardState>();
+
+function isLiveTerminal(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const terminal = value as {
+    active?: unknown;
+    status?: unknown;
+    sessionStatus?: unknown;
+  };
+  return (
+    terminal.active === true ||
+    terminal.status === "active" ||
+    terminal.sessionStatus === "active"
+  );
+}
+
+function assertDevE2eUrl(rawUrl: string): URL {
+  const url = new URL(rawUrl);
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  const isLoopback = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(
+    url.hostname,
+  );
+  if (url.protocol !== "http:" || port !== "4174" || !isLoopback) {
+    throw new Error(
+      `DeckTerm E2E is restricted to a loopback development server on port 4174 (received ${url.origin}).`,
+    );
+  }
+  return url;
+}
+
+function rememberCreatedTerminal(context: BrowserContext, id: unknown) {
+  if (typeof id !== "string" || !id.trim()) return;
+  serverGuardByContext.get(context)?.createdTerminalIds.add(id);
+  if (process.env.PW_GUARD_DEBUG === "1") {
+    console.error(`[deckterm-guard] observed create ${id}`);
+  }
+}
+
+async function trackTerminalResponse(
+  context: BrowserContext,
+  response: Response,
+) {
+  if (!response.ok() || response.request().method() !== "POST") return;
+  const pathname = new URL(response.url()).pathname;
+  if (
+    pathname !== "/api/terminals" &&
+    !/^\/api\/terminals\/[^/]+\/linked-view$/.test(pathname)
+  ) {
+    return;
+  }
+  const payload = (await response.json().catch(() => null)) as {
+    id?: unknown;
+  } | null;
+  rememberCreatedTerminal(context, payload?.id);
+}
+
+async function installVirtualSettings(
+  context: BrowserContext,
+  state: ServerGuardState,
+) {
+  const settings: Record<string, unknown> = {};
+  await context.route(
+    (url) => url.pathname === "/api/settings",
+    async (route) => {
+      try {
+        const method = route.request().method();
+        if (method === "GET") {
+          await route.fulfill({ json: { settings } });
+          return;
+        }
+        if (method === "PUT") {
+          const body = (route.request().postDataJSON() ?? {}) as {
+            settings?: unknown;
+          };
+          if (
+            !body.settings ||
+            typeof body.settings !== "object" ||
+            Array.isArray(body.settings)
+          ) {
+            await route.fulfill({
+              status: 400,
+              json: { error: "settings object required" },
+            });
+            return;
+          }
+          for (const [key, value] of Object.entries(
+            body.settings as Record<string, unknown>,
+          )) {
+            if (value === null) delete settings[key];
+            else settings[key] = value;
+          }
+          await route.fulfill({ json: { settings } });
+          return;
+        }
+        await route.fallback();
+      } catch (error) {
+        if (!state.shuttingDown) throw error;
+      }
+    },
+  );
+}
+
+async function installTerminalCatalogGuard(
+  context: BrowserContext,
+  state: ServerGuardState,
+) {
+  await context.route(
+    (url) => url.pathname === "/api/terminals",
+    async (route) => {
+      try {
+        if (route.request().method() !== "GET") {
+          await route.fallback();
+          return;
+        }
+        const response = await route.fetch();
+        if (!response.ok()) {
+          await route.fulfill({ response });
+          return;
+        }
+        const payload = (await response.json().catch(() => [])) as unknown[];
+        const terminals = Array.isArray(payload)
+          ? payload.filter(
+              (terminal) =>
+                terminal &&
+                typeof terminal === "object" &&
+                "id" in terminal &&
+                state.createdTerminalIds.has(
+                  String((terminal as { id?: unknown }).id || ""),
+                ),
+            )
+          : [];
+        await route.fulfill({ response, json: terminals });
+      } catch (error) {
+        if (!state.shuttingDown) throw error;
+      }
+    },
+  );
+}
+
+async function installTerminalCreateBudget(
+  context: BrowserContext,
+  state: ServerGuardState,
+) {
+  await context.route(
+    (url) =>
+      url.pathname === "/api/terminals" ||
+      /^\/api\/terminals\/[^/]+\/linked-view$/.test(url.pathname),
+    async (route) => {
+      try {
+        if (route.request().method() !== "POST") {
+          await route.fallback();
+          return;
+        }
+        if (state.shuttingDown) {
+          await route.abort("aborted");
+          return;
+        }
+
+        const pending = (async () => {
+          await reserveTerminalCreateBudget(1);
+          if (state.shuttingDown) {
+            await route.abort("aborted");
+            return;
+          }
+          // Execute the intercepted side effect through the context's independent
+          // API client. route.fetch() is tied to the page request: page.close()
+          // can abort response-body parsing after the server already created the
+          // PTY, leaving no trustworthy ID for cleanup.
+          const response = await context.request.fetch(route.request());
+          if (response.ok()) {
+            const payload = (await response.json().catch(() => null)) as {
+              id?: unknown;
+            } | null;
+            rememberCreatedTerminal(context, payload?.id);
+          }
+          await route.fulfill({ response });
+        })();
+        state.pendingTerminalCreates.add(pending);
+        try {
+          await pending;
+        } finally {
+          state.pendingTerminalCreates.delete(pending);
+        }
+      } catch (error) {
+        if (!state.shuttingDown) throw error;
+      }
+    },
+  );
+}
+
+async function assertServerIsIdle(context: BrowserContext, rawUrl: string) {
+  const baseUrl = assertDevE2eUrl(rawUrl);
+  const response = await context.request.get(
+    new URL("/api/terminals", baseUrl).toString(),
+  );
+  if (!response.ok()) {
+    throw new Error(
+      `DeckTerm E2E safety check could not list development terminals (${response.status()}).`,
+    );
+  }
+  const terminals = (await response.json().catch(() => [])) as unknown[];
+  const live = Array.isArray(terminals) ? terminals.filter(isLiveTerminal) : [];
+  if (live.length === 0) return;
+
+  const ids = live
+    .map((value) =>
+      value && typeof value === "object" && "id" in value
+        ? String((value as { id?: unknown }).id || "unknown")
+        : "unknown",
+    )
+    .join(", ");
+  throw new Error(
+    `Refusing to run DeckTerm E2E against port 4174 while ${live.length} live terminal(s) exist (${ids}). Close them explicitly first; the harness never deletes pre-existing sessions.`,
+  );
+}
+
+async function cleanupCreatedTerminals(
+  context: BrowserContext,
+  rawUrl: string,
+  state: ServerGuardState,
+) {
+  await Promise.allSettled([...state.pendingResponseTracks]);
+  const baseUrl = assertDevE2eUrl(rawUrl);
+  const createdIds = [...state.createdTerminalIds];
+  const deletions = await Promise.allSettled(
+    createdIds.map(async (id) => {
+      const response = await context.request.delete(
+        new URL(`/api/terminals/${encodeURIComponent(id)}`, baseUrl).toString(),
+      );
+      return { id, status: response.status() };
+    }),
+  );
+  if (process.env.PW_GUARD_DEBUG === "1") {
+    console.error(
+      `[deckterm-guard] cleanup ${JSON.stringify({ createdIds, deletions })}`,
+    );
+  }
+
+  // DELETE initiates PTY/tmux shutdown, but the catalog can report the entry
+  // live for a few milliseconds afterward. Do not let the next serial test's
+  // fail-closed guard mistake that test-owned shutdown tail for a user session.
+  if (createdIds.length === 0) return;
+  const createdIdSet = new Set(createdIds);
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const response = await context.request.get(
+      new URL("/api/terminals", baseUrl).toString(),
+    );
+    if (response.ok()) {
+      const terminals = (await response.json().catch(() => [])) as unknown[];
+      const stillLive = Array.isArray(terminals)
+        ? terminals.some(
+            (terminal) =>
+              terminal &&
+              typeof terminal === "object" &&
+              "id" in terminal &&
+              createdIdSet.has(
+                String((terminal as { id?: unknown }).id || ""),
+              ) &&
+              isLiveTerminal(terminal),
+          )
+        : false;
+      if (!stillLive) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(
+    `DeckTerm E2E cleanup could not confirm shutdown for test terminal(s): ${createdIds.join(", ")}`,
+  );
+}
 
 export async function reserveTerminalCreateBudget(requestCount = 1) {
   const needed = Math.max(0, Math.trunc(Number(requestCount) || 0));
@@ -75,6 +361,14 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
     })
     .catch(() => {});
 
+  // Automatic bootstrap creates are also rate-budgeted by the context route.
+  // If one is waiting for the shared dev server's one-minute window, let that
+  // request finish before deciding the app needs a recovery create.
+  const guardState = serverGuardByContext.get(page.context());
+  if (guardState?.pendingTerminalCreates.size) {
+    await Promise.allSettled([...guardState.pendingTerminalCreates]);
+  }
+
   await page
     .evaluate(async () => {
       const pendingBootstrap = (window as any).__decktermBootstrapPromise;
@@ -117,7 +411,6 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
   if (!hasTerminal) {
     const newButton = page.locator("#new-terminal, button:has-text('New')");
     if ((await newButton.count()) > 0) {
-      await reserveTerminalCreateBudget(1);
       await newButton.first().click();
       await page.waitForTimeout(1000);
       hasTerminal = (await page.locator(".tile .xterm").count()) > 0;
@@ -125,7 +418,6 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
   }
 
   if (!hasTerminal) {
-    await reserveTerminalCreateBudget(1);
     await page.evaluate(async () => {
       // @ts-ignore
       const tm = window.terminalManager;
@@ -145,7 +437,6 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
     if (page.isClosed()) {
       throw error;
     }
-    await reserveTerminalCreateBudget(1);
     await page.evaluate(async () => {
       // @ts-ignore
       const tm = window.terminalManager;
@@ -196,7 +487,6 @@ export async function createTerminal(page: Page) {
     };
   });
 
-  await reserveTerminalCreateBudget(1);
   const newButton = page.locator(
     "#new-terminal, [data-action='new-terminal']:visible, .new-terminal-btn:visible",
   );
@@ -231,7 +521,6 @@ export async function createTerminal(page: Page) {
       .catch(() => 0);
 
     if (currentTerminalCount <= previousState.terminalCount) {
-      await reserveTerminalCreateBudget(1);
       await newButton.first().click();
       await waitForCreatedTerminal();
     } else {
@@ -447,52 +736,6 @@ export async function cleanupTempDir(dir?: string | null) {
   await rm(dir, { recursive: true, force: true });
 }
 
-async function clearServerTerminals(page: Page, url: string) {
-  try {
-    const listRes = await page.request.get(`${url}/api/terminals`);
-    if (!listRes.ok()) return;
-    const terminals = (await listRes.json().catch(() => [])) as Array<{
-      id?: string;
-    }>;
-    await Promise.all(
-      terminals
-        .map((term) => term?.id)
-        .filter((id): id is string => Boolean(id))
-        .map((id) =>
-          page.request.delete(`${url}/api/terminals/${encodeURIComponent(id)}`),
-        ),
-    );
-  } catch {
-    // Keep tests running even if cleanup endpoint is unavailable.
-  }
-}
-
-async function clearServerSettings(page: Page, url: string) {
-  // The actor-scoped server settings KV (user_settings table) survives a
-  // browser-storage clear. A stale `files.defaultCwd` left by a prior test
-  // (e.g. a directory-picker fixture dir that was later deleted) gets restored
-  // into the new-terminal cwd on load, so createTerminal returns 403
-  // "Forbidden terminal root", waitForTerminal times out in beforeEach, and the
-  // failure cascades to every later test in the single worker. Reset the KV to
-  // empty so each test starts from a clean server-side state.
-  try {
-    const getRes = await page.request.get(`${url}/api/settings`);
-    if (!getRes.ok()) return;
-    const payload = (await getRes.json().catch(() => null)) as {
-      settings?: Record<string, unknown>;
-    } | null;
-    const keys = Object.keys(payload?.settings ?? {});
-    if (keys.length === 0) return;
-    const cleared: Record<string, null> = {};
-    for (const key of keys) cleared[key] = null;
-    await page.request.put(`${url}/api/settings`, {
-      data: { settings: cleared },
-    });
-  } catch {
-    // Keep tests running even if the settings endpoint is unavailable.
-  }
-}
-
 async function clearBrowserStateForOrigin(page: Page, url: string) {
   const origin = new URL(url).origin;
 
@@ -520,13 +763,67 @@ async function clearBrowserStateForOrigin(page: Page, url: string) {
  * Clear persisted UI/session state before each test for deterministic behavior.
  */
 export async function resetAppState(page: Page, url = DEFAULT_APP_URL) {
-  await clearServerTerminals(page, url);
-  await clearServerSettings(page, url);
+  assertDevE2eUrl(url);
   await clearBrowserStateForOrigin(page, url);
   await page.context().clearCookies();
-  await reserveTerminalCreateBudget(1);
   await page.goto(url);
   await page.waitForLoadState("domcontentloaded");
+}
+
+/**
+ * Direct API terminal creation bypasses BrowserContext response events. Use
+ * this helper so the fail-closed fixture can still clean only that test's ID.
+ */
+export async function createTrackedTerminalRequest(
+  page: Page,
+  url: string,
+  data: Record<string, unknown>,
+): Promise<APIResponse> {
+  await reserveTerminalCreateBudget(1);
+  const response = await page.request.post(url, { data });
+  if (response.ok()) {
+    const payload = (await response.json().catch(() => null)) as {
+      id?: unknown;
+    } | null;
+    rememberCreatedTerminal(page.context(), payload?.id);
+  }
+  return response;
+}
+
+export async function deleteTerminalAndWait(
+  page: Page,
+  id: string,
+  rawUrl = DEFAULT_APP_URL,
+) {
+  const baseUrl = assertDevE2eUrl(rawUrl);
+  const terminalUrl = new URL(
+    `/api/terminals/${encodeURIComponent(id)}`,
+    baseUrl,
+  ).toString();
+  const response = await page.request.delete(terminalUrl);
+  if (!response.ok() && response.status() !== 404) {
+    throw new Error(
+      `Failed to delete test terminal ${id} (HTTP ${response.status()}).`,
+    );
+  }
+
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const catalogResponse = await page.request.get(
+      new URL("/api/terminals", baseUrl).toString(),
+    );
+    if (catalogResponse.ok()) {
+      const catalog = (await catalogResponse.json().catch(() => [])) as Array<{
+        id?: unknown;
+      }>;
+      const terminal = Array.isArray(catalog)
+        ? catalog.find((entry) => String(entry?.id || "") === id)
+        : null;
+      if (!terminal || !isLiveTerminal(terminal)) return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Test terminal ${id} remained live after DELETE.`);
 }
 
 export async function createWorkspaceInDir(page: Page, cwd: string) {
@@ -558,9 +855,13 @@ export async function createWorkspaceInDir(page: Page, cwd: string) {
       { timeout: 12000 },
     );
 
-  await page.fill("#directory", cwd);
-  await reserveTerminalCreateBudget(1);
-  await page.click("#new-terminal");
+  await page.evaluate(
+    (expectedCwd) =>
+      (window as any).terminalManager.createTerminal(false, {
+        cwd: expectedCwd,
+      }),
+    cwd,
+  );
 
   try {
     await waitForCreatedWorkspace();
@@ -573,9 +874,13 @@ export async function createWorkspaceInDir(page: Page, cwd: string) {
       .catch(() => 0);
 
     if (currentTerminalCount <= previousState.terminalCount) {
-      await page.fill("#directory", cwd);
-      await reserveTerminalCreateBudget(1);
-      await page.click("#new-terminal");
+      await page.evaluate(
+        (expectedCwd) =>
+          (window as any).terminalManager.createTerminal(false, {
+            cwd: expectedCwd,
+          }),
+        cwd,
+      );
       await waitForCreatedWorkspace();
     } else {
       throw error;
@@ -725,6 +1030,71 @@ export async function waitForNoClass(
   );
 }
 
-// Export Playwright test for use in test files
-export const test = base;
+type DeckTermFixtures = {
+  decktermServerGuard: void;
+};
+
+// Every browser test is fail-closed against the shared development service:
+// pre-existing sessions abort the test before navigation, settings stay inside
+// the BrowserContext, and teardown deletes only terminal IDs observed from
+// successful create responses in this test.
+export const test = base.extend<DeckTermFixtures>({
+  decktermServerGuard: [
+    async ({ context }, use) => {
+      const state: ServerGuardState = {
+        createdTerminalIds: new Set(),
+        pendingResponseTracks: new Set(),
+        pendingTerminalCreates: new Set(),
+        shuttingDown: false,
+      };
+      serverGuardByContext.set(context, state);
+      await assertServerIsIdle(context, DEFAULT_APP_URL);
+      await installVirtualSettings(context, state);
+      await installTerminalCatalogGuard(context, state);
+      await installTerminalCreateBudget(context, state);
+
+      const onResponse = (response: Response) => {
+        const pending = trackTerminalResponse(context, response);
+        state.pendingResponseTracks.add(pending);
+        void pending.finally(() => state.pendingResponseTracks.delete(pending));
+      };
+      context.on("response", onResponse);
+
+      try {
+        await use();
+      } finally {
+        if (state.createdTerminalIds.size === 0) {
+          // DOMContentLoaded can precede the app's bootstrap POST. Give pages
+          // with no observed create one network-idle turn while guards are
+          // still accepting requests, so any already-scheduled side effect is
+          // either registered with an ID or never sent.
+          await Promise.allSettled(
+            context
+              .pages()
+              .filter((page) => !page.isClosed())
+              .map((page) =>
+                page.waitForLoadState("networkidle", { timeout: 2500 }),
+              ),
+          );
+        }
+
+        // Keep the guards installed until Playwright destroys the context and
+        // reject any bootstrap POST that starts after the test body has ended.
+        // Unrouting here creates a narrow bypass where a browser-network task
+        // queued before page.close() can reach the shared dev server unowned.
+        state.shuttingDown = true;
+        // A bootstrap create can still be waiting for the shared rate-limit
+        // window when the test body finishes. Let the guarded route observe
+        // and register its response before listener teardown and cleanup;
+        // otherwise a late successful POST becomes an unowned live session.
+        await Promise.allSettled([...state.pendingTerminalCreates]);
+        await Promise.allSettled([...state.pendingResponseTracks]);
+        await cleanupCreatedTerminals(context, DEFAULT_APP_URL, state);
+        context.off("response", onResponse);
+        serverGuardByContext.delete(context);
+      }
+    },
+    { auto: true },
+  ],
+});
 export { expect } from "@playwright/test";

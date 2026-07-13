@@ -1,4 +1,10 @@
-import { test, expect, resetAppState, waitForTerminal } from "./fixtures";
+import {
+  test,
+  expect,
+  readActiveTerminalText,
+  resetAppState,
+  waitForTerminal,
+} from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
@@ -50,10 +56,7 @@ test.describe("Terminal Reconnection - Realistic", () => {
     });
 
     // Step 5: Check if htop is visible (it should have redrawn)
-    const terminalContent = await page
-      .locator(".tile.active .xterm-rows")
-      .first()
-      .textContent();
+    const terminalContent = await readActiveTerminalText(page);
     console.log(
       `Terminal content after reconnect: ${terminalContent?.substring(0, 200)}`,
     );
@@ -84,23 +87,16 @@ test.describe("Terminal Reconnection - Realistic", () => {
         JSON.stringify({ type: "input", data: "echo test-after-reconnect\r" }),
       );
     });
-    await page.waitForFunction(
-      () =>
-        document
-          .querySelector(".tile.active .xterm-rows")
-          ?.textContent?.includes("test-after-reconnect"),
-      { timeout: 5000 },
-    );
+    await expect
+      .poll(() => readActiveTerminalText(page), { timeout: 10000 })
+      .toContain("test-after-reconnect");
 
     await page.screenshot({
       path: "test-results/r05-final.png",
       fullPage: true,
     });
 
-    const finalContent = await page
-      .locator(".tile.active .xterm-rows")
-      .first()
-      .textContent();
+    const finalContent = await readActiveTerminalText(page);
     expect(finalContent).toContain("test-after-reconnect");
   });
 });

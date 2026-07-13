@@ -4,8 +4,8 @@ import {
   resetAppState,
   waitForTerminal,
   cleanupTempDir,
+  createTrackedTerminalRequest,
   createGitFixtureRepo,
-  reserveTerminalCreateBudget,
 } from "./fixtures";
 import { execFileSync } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
@@ -110,14 +110,18 @@ test.describe("Workspace telemetry contract", () => {
     });
     tempDirs.push(linkedDir);
 
-    const createMain = await page.request.post(`${BASE_URL}/api/terminals`, {
-      data: { cwd: repoDir, cols: 80, rows: 24 },
-    });
+    const createMain = await createTrackedTerminalRequest(
+      page,
+      `${BASE_URL}/api/terminals`,
+      { cwd: repoDir, cols: 80, rows: 24 },
+    );
     expect(createMain.ok()).toBeTruthy();
 
-    const createLinked = await page.request.post(`${BASE_URL}/api/terminals`, {
-      data: { cwd: linkedDir, cols: 80, rows: 24 },
-    });
+    const createLinked = await createTrackedTerminalRequest(
+      page,
+      `${BASE_URL}/api/terminals`,
+      { cwd: linkedDir, cols: 80, rows: 24 },
+    );
     expect(createLinked.ok()).toBeTruthy();
 
     await expect
@@ -165,7 +169,6 @@ test.describe("Workspace telemetry contract", () => {
     tempDirs.push(worktreeCwd);
 
     await page.locator("#directory").fill(worktreeCwd);
-    await reserveTerminalCreateBudget(1);
     await page.evaluate(async () => {
       // @ts-ignore
       await window.terminalManager?.createTerminal();
@@ -655,7 +658,6 @@ test.describe("Workspace telemetry contract", () => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
 
-    await reserveTerminalCreateBudget(2);
     await page.evaluate(async () => {
       // @ts-ignore
       await window.terminalManager?.createTerminal(false, {

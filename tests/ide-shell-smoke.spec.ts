@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 // Targeted browser smoke for IDE shell slice 2. Validates the mode-transition
 // contract against the live dev app: terminals are NOT recreated across the
@@ -6,6 +6,7 @@ import { test, expect } from "@playwright/test";
 // is restored on toggle-off, and there are zero console errors.
 test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
   const consoleErrors: string[] = [];
+  const httpErrors: string[] = [];
   // Pre-existing startup noise unrelated to the IDE shell: the headless smoke
   // env can't create a terminal (foundation auth "Forbidden terminal root"),
   // and the matching 403. Filter these so the assertion stays meaningful.
@@ -22,6 +23,16 @@ test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
   });
   page.on("pageerror", (err) => {
     if (!isPreexisting(String(err))) consoleErrors.push(String(err));
+  });
+  page.on("response", (response) => {
+    if (response.status() < 400) return;
+    const url = new URL(response.url());
+    const isExpectedForbiddenTerminal =
+      response.status() === 403 &&
+      response.request().method() === "POST" &&
+      url.pathname === "/api/terminals";
+    if (!isExpectedForbiddenTerminal)
+      httpErrors.push(`${response.status()} ${response.url()}`);
   });
 
   // Desktop viewport BEFORE navigation so the app boots in desktop mode (IDE
@@ -162,5 +173,8 @@ test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
   // Still no PTY recreation after the round trip.
   expect(offState.ids.sort()).toEqual(idsBefore.sort());
 
-  expect(consoleErrors).toEqual([]);
+  expect({ consoleErrors, httpErrors }).toEqual({
+    consoleErrors: [],
+    httpErrors: [],
+  });
 });

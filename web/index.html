@@ -18,7 +18,7 @@
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260705d" />
+    <link rel="stylesheet" href="/styles.css?v=20260713c" />
     <!-- Lucide Icons for modern UI -->
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
   </head>
@@ -667,7 +667,7 @@
               <h4>Workspaces & Tabs</h4>
               <table class="help-table">
                 <tr><td><kbd>Ctrl</kbd> + <kbd>N</kbd></td><td>New workspace tab</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>W</kbd></td><td>Close current workspace</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>W</kbd></td><td>Close current pane</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Tab</kbd></td><td>Next tab</td></tr>
                 <tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>←</kbd>/<kbd>→</kbd></td><td>Previous/next tab</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>1-9</kbd></td><td>Switch to tab number</td></tr>
@@ -677,17 +677,17 @@
               <h4>Terminals</h4>
               <table class="help-table">
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td><td>Split workspace (add terminal)</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Move current pane to a new tab</td></tr>
                 <tr><td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td><td>Undo layout change</td></tr>
                 <tr><td>Drag tile edge</td><td>Resize terminals</td></tr>
               </table>
             </div>
 
             <div class="help-column">
-              <h4>Groups</h4>
+              <h4>Visual Groups</h4>
               <table class="help-table">
-                <tr><td><kbd>Ctrl</kbd> + <kbd>G</kbd></td><td>Group with previous</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Ungroup current</td></tr>
-                <tr><td>Drag tab → tab</td><td>Merge into group</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>G</kbd></td><td>Color-group with previous</td></tr>
+                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Ungroup when pane is already alone</td></tr>
               </table>
 
               <h4>General</h4>
@@ -773,6 +773,6 @@
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260706a"></script>
+    <script src="/app.js?v=20260713g"></script>
   </body>
 </html>

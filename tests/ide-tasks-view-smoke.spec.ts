@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { expect, test } from "./fixtures";
 
 // Targeted browser smoke for IDE shell slice 6 (Tasks sidebar view). Validates
 // against the live dev app that: entering IDE mode + clicking the Tasks

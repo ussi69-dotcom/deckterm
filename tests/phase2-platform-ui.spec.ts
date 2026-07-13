@@ -3,7 +3,7 @@
  *
  * Tests for extra keys visibility and access patterns:
  * - Desktop: extra keys hidden by default, toggle via More or Ctrl+.
- * - Desktop: state persists in localStorage
+ * - Desktop: state persists in the canonical actor-scoped settings store
  * - Mobile: extra keys visible by default and row expansion still works
  */
 
@@ -96,9 +96,14 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       await expect(extraKeys).not.toHaveClass(/\bhidden\b/);
 
       const savedState = await page.evaluate(() =>
-        localStorage.getItem("extraKeysVisible"),
+        (window as any).terminalManager.settingsStore.get(
+          "terminal.extraKeysVisible",
+        ),
       );
-      expect(savedState).toBe("true");
+      expect(savedState).toBe(true);
+      await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.flush(),
+      );
 
       await page.reload();
       await waitForTerminal(page);
@@ -116,9 +121,14 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       await toggleExtraKeysFromMore(page);
 
       const savedState = await page.evaluate(() =>
-        localStorage.getItem("extraKeysVisible"),
+        (window as any).terminalManager.settingsStore.get(
+          "terminal.extraKeysVisible",
+        ),
       );
-      expect(savedState).toBe("false");
+      expect(savedState).toBe(false);
+      await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.flush(),
+      );
 
       await page.reload();
       await waitForTerminal(page);
@@ -156,19 +166,19 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       ).toBeVisible();
     });
 
-    test("extra keys row can be expanded on mobile", async ({ page }) => {
+    test("secondary extra keys row toggles on mobile", async ({ page }) => {
       const extraKeysToggle = page.locator("#extra-keys-toggle");
       const row2 = page.locator(".extra-keys-row-2");
 
-      await expect(row2).toHaveClass(/\bhidden\b/);
-
-      await extraKeysToggle.click();
-      await page.waitForTimeout(100);
       await expect(row2).not.toHaveClass(/\bhidden\b/);
 
       await extraKeysToggle.click();
       await page.waitForTimeout(100);
       await expect(row2).toHaveClass(/\bhidden\b/);
+
+      await extraKeysToggle.click();
+      await page.waitForTimeout(100);
+      await expect(row2).not.toHaveClass(/\bhidden\b/);
     });
   });
 
