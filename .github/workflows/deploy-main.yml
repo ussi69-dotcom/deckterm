@@ -58,7 +58,7 @@ jobs:
 
       - name: Start DeckTerm
         run: |
-          nohup env PORT=4174 DECKTERM_LEGACY_NO_BOOTSTRAP=1 bun run start >/tmp/deckterm-deploy.log 2>&1 &
+          nohup env PORT=4174 DECKTERM_RUNTIME_ENV=development DECKTERM_LEGACY_NO_BOOTSTRAP=1 bun run start >/tmp/deckterm-deploy.log 2>&1 &
           echo $! >/tmp/deckterm-deploy.pid
 
       - name: Wait for health check
