@@ -819,11 +819,6 @@ class Tile {
     this.groupId = null;
     this.element = null;
     this.terminalWrapper = null;
-    this.paneStatus = null;
-    this.paneStatusDot = null;
-    this.paneStatusConnection = null;
-    this.paneStatusFolder = null;
-    this.paneStatusActivity = null;
     this.closeConfirmVisible = false;
     this.onDocumentClick = null;
 
@@ -849,41 +844,10 @@ class Tile {
     this.terminalWrapper.id = `terminal-${this.terminalId}`;
     this.element.appendChild(this.terminalWrapper);
 
-    this.createPaneStatus();
     this.createCloseButton();
     this.createResizeHandles();
     this.setupResizeHandlers();
     this.container.appendChild(this.element);
-  }
-
-  createPaneStatus() {
-    const status = document.createElement("div");
-    status.className = "tile-pane-status";
-    status.setAttribute("aria-hidden", "true");
-
-    const dot = document.createElement("span");
-    dot.className = "tile-pane-status-dot";
-
-    const folder = document.createElement("span");
-    folder.className = "tile-pane-status-folder";
-
-    const connection = document.createElement("span");
-    connection.className = "tile-pane-status-connection";
-
-    const activity = document.createElement("span");
-    activity.className = "tile-pane-status-activity";
-
-    status.appendChild(dot);
-    status.appendChild(connection);
-    status.appendChild(folder);
-    status.appendChild(activity);
-    this.element.appendChild(status);
-
-    this.paneStatus = status;
-    this.paneStatusDot = dot;
-    this.paneStatusConnection = connection;
-    this.paneStatusFolder = folder;
-    this.paneStatusActivity = activity;
   }
 
   createCloseButton() {
@@ -13662,12 +13626,8 @@ class TerminalManager {
       const connectionLabel = this.getConnectionStatusLabel(connectionStatus);
       const activity = this.getPaneActivityState(terminal);
       const cwd = terminal?.cwd || "Terminal";
-      const folderLabel = this.formatCwdLabel(cwd);
-      const hasAttention =
-        connectionStatus !== "connected" || activity.key !== "idle";
 
       tile.element.classList.toggle("workspace-multi-pane", canDetach);
-      tile.element.classList.toggle("pane-has-attention", hasAttention);
       tile.element.dataset.connectionStatus = connectionStatus;
       tile.element.dataset.activity = activity.key;
       tile.element.title = `${cwd}\n${connectionLabel} • ${activity.accessibleLabel}`;
@@ -13675,21 +13635,6 @@ class TerminalManager {
         "aria-label",
         `Terminal pane: ${cwd}. ${connectionLabel}. ${activity.accessibleLabel}.`,
       );
-
-      if (tile.paneStatus) {
-        tile.paneStatus.dataset.connectionStatus = connectionStatus;
-        tile.paneStatus.dataset.activity = activity.key;
-      }
-      if (tile.paneStatusFolder) {
-        tile.paneStatusFolder.textContent = folderLabel;
-      }
-      if (tile.paneStatusConnection) {
-        tile.paneStatusConnection.textContent =
-          connectionStatus === "connected" ? "" : connectionLabel;
-      }
-      if (tile.paneStatusActivity) {
-        tile.paneStatusActivity.textContent = activity.label;
-      }
 
       if (tile.detachButton) {
         const label = terminal?.cwd
