@@ -9677,6 +9677,23 @@ export async function startWebServer(host: string, port: number) {
     });
   }
 
+  // Fail fast if the port is already taken BEFORE touching recorded
+  // sessions: a second instance pointed at the same state dir must not
+  // reconcile (= write to) a live instance's rows (observed 2026-07-16: an
+  // unpinned test-spawned child ended the dev instance's session row).
+  // Residual: a process bound to a DIFFERENT port but sharing the state dir
+  // still needs a real instance-ownership lock — backlogged.
+  if (port !== 0) {
+    const { createServer } = await import("node:net");
+    await new Promise<void>((resolvePort, rejectPort) => {
+      const probe = createServer();
+      probe.once("error", rejectPort);
+      probe.listen(port, host, () => {
+        probe.close((err) => (err ? rejectPort(err) : resolvePort()));
+      });
+    });
+  }
+
   // Reconcile recorded sessions before starting the server: in tmux mode
   // this ends rows whose tmux session is gone; in raw mode it ends every
   // active row (raw PTYs never survive a restart).
