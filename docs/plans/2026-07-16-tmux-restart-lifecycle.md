@@ -1,0 +1,96 @@
+# Tmux Restart Lifecycle Fix — Implementation Plan
+
+> **For Claude:** Execute this plan task-by-task with TDD (`superpowers:executing-plans` style). P1 from the backlog ("Restart/session lifecycle — P1 before next promotion", discovered 2026-07-13 during release `a006ae6`).
+
+**Goal:** A service SIGTERM/SIGINT must never persist `status=ended` for a still-live tmux session; shutdown becomes deterministic and idempotent, and startup reconciliation remains the single source of truth for session liveness in tmux mode.
+
+**Architecture:** Add a module-level shutdown latch in `backend/server.ts`. The signal handlers call one idempotent `shutdownGracefully()` that (1) sets the latch first, (2) closes WebSockets *without* an `exit` message so clients auto-reconnect, (3) marks sessions ended **synchronously and only in raw mode** (`TMUX_BACKEND` off — those PTYs die with the process), (4) kills only the attach/PTY subprocesses (tmux server survives via state-dir socket + `KillMode=process`), then exits. `closeAndRemoveTerminal` early-returns behind the latch, eliminating the timing-dependent async `markTerminalSessionEnded` write that caused the incident. In tmux mode nothing is written at shutdown: `reconcileSessionsOnStartup` already handles every case at next boot (session exists → recover; missing → ended; OS isolation → end-all + broker reap).
+
+**Tech Stack:** Bun, `bun:sqlite`, tmux, `bun:test` subprocess integration tests (template: `backend/startup-failure.test.ts`).
+
+**Why this shape (design decisions):**
+- *No DB write at shutdown in tmux mode* — the truth about tmux liveness is only knowable at next startup; writing "ended" at shutdown is exactly the bug. Reconcile/recover paths (`server.ts:843`, `server.ts:926`) already cover exists/missing/isolation deterministically, with audit.
+- *Raw mode writes synchronously in the handler* — the current async `.then()` write is racy against `process.exit(0)`; raw PTYs genuinely die, and nothing reconciles raw rows at startup (`reconcileSessionsOnStartup` returns 0 when `!TMUX_BACKEND`), so the handler must do it, synchronously (`markTerminalSessionEnded` is sync sqlite; foundation state is awaited once in `startWebServer` scope before handler registration).
+- *No `{type:"exit"}` WS message at shutdown* — that tells clients the terminal died; a plain close lets `ReconnectingWebSocket` reconnect into the recovered session after restart.
+- *Latch guards `closeAndRemoveTerminal` entirely* — killed attach clients may fire `onExit` before exit; behind the latch it must not write DB, not `notifyTerminalExit` (task-runner verdict fallback must not trigger on deploy), not double-close sockets.
+- Explicit user delete, idle reap, revocation, and genuine tmux exit keep their existing paths untouched (they run only pre-latch).
+
+**Acceptance (from backlog):** deterministic restart test with ≥3 sessions (attached, detached, active-output): unchanged tmux `session_created` + pane PID, DB rows stay `active`, catalog recovery on restart, WS reattach works, no duplicate terminals; failure-path test proving a truly missing tmux session still reconciles to `ended`; raw-mode rows end deterministically.
+
+---
+
+### Task 1: Failing integration tests — `backend/shutdown-lifecycle.test.ts`
+
+**Files:**
+- Create: `backend/shutdown-lifecycle.test.ts`
+- Modify: `package.json` (`test:unit` main batch — the test spawns child server processes and never touches the in-process foundation singleton, so it belongs in the main list like `startup-failure.test.ts`)
+
+**Step 1: Write the test file.** Reuse the `startup-failure.test.ts` fixtures (`getFreePort`, temp state dir under `$HOME`, child tracking + afterEach cleanup). Child env: `TMUX_BACKEND=1`, `DECKTERM_STATE_DIR=<tmp>`, `ALLOWED_FILE_ROOTS=<tmp-work>`, `DECKTERM_LEGACY_NO_BOOTSTRAP=1`, `DECKTERM_RUNTIME_ENV=development`, `CF_ACCESS_REQUIRED=0`, fixed free `PORT` (tmux socket = `<tmp>/tmux/deckterm_p<port>.sock`, namespace `p<port>` — fully isolated from dev/prod). Helper `tmuxQuery(sock, args)` shells out to `tmux -S`.
+
+Test A — **SIGTERM preserves live tmux sessions (the incident)**:
+1. Spawn server, poll `/api/health`.
+2. Create 3 terminals via `POST /api/terminals` (cwd = tmp work root).
+3. Shape them: #1 attach a WS (`/ws/terminals/:id`) and keep it open; #2 stays detached; #3 gets `{type:"input"}` starting a short output loop (active output).
+4. Snapshot `tmux list-sessions -F '#{session_name} #{session_created}'` + pane PIDs (`#{pane_pid}`).
+5. `child.kill("SIGTERM")`; await exit; expect code 0 and the WS to close *without* receiving `{type:"exit"}`.
+6. Assert all 3 tmux sessions still exist with identical `session_created` and `pane_pid`; open the sqlite file readonly → all 3 `terminal_sessions` rows `status='active'`.
+7. Restart (same port/state dir), poll health; `GET /api/terminals` → exactly the same 3 ids, no duplicates; re-attach WS to #1 → `ping`→`pong` round-trip works.
+
+Test B — **missing tmux session still reconciles to ended**: after the SIGTERM stop, `tmux -S <sock> kill-session -t deckterm_p<port>_<id2>`; restart; `GET /api/terminals` shows #1/#3 active, and the DB row for #2 is `ended`.
+
+Test C — **raw mode ends deterministically**: `TMUX_BACKEND=0`, create 2 terminals, SIGTERM, expect exit 0 and both DB rows `ended` (no zombie `active` rows — raw mode has no startup reconcile).
+
+**Step 2: Run** `bun test ./backend/shutdown-lifecycle.test.ts`. Expected: Test A/B fail on current code (rows flip to `ended` and/or recovery misses sessions; the race may make it flaky-red — run 3× to observe). Test C may fail today too (async write can miss the exit).
+
+**Step 3: Commit** the red tests? No — this repo's convention is test+fix in one commit per slice; keep them staged.
+
+### Task 2: Implementation in `backend/server.ts`
+
+**Files:**
+- Modify: `backend/server.ts` — module scope near `closeTerminalSockets` (~4191), `closeAndRemoveTerminal` (~4779), signal handlers (~10251–10267)
+
+**Step 1: Latch + guard.** Module scope:
+```ts
+let shutdownInProgress = false;
+```
+In `closeAndRemoveTerminal` (inside `createManagedTerminal`): first line
+```ts
+if (shutdownInProgress) return;
+```
+
+**Step 2: One idempotent shutdown routine** registered from `startWebServer` (which awaits `getFoundationState()` into scope before registering, so the DB write is synchronous):
+```ts
+const shutdownGracefully = (signal: string) => {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  console.log(`[shutdown] ${signal}: detaching ${terminals.size} terminal(s) (tmux=${TMUX_BACKEND ? "preserve" : "end"})`);
+  for (const term of terminals.values()) {
+    try { closeTerminalSockets(term.id); } catch {}
+    if (!TMUX_BACKEND) {
+      try { markTerminalSessionEnded(foundationState.db, term.id); } catch {}
+    }
+    try { term.proc.kill(); } catch {}
+  }
+  process.exit(0);
+};
+process.on("SIGINT", () => shutdownGracefully("SIGINT"));
+process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
+```
+(Replaces both existing handlers. No WS `exit` payload; tmux attach clients are killed → detach only.)
+
+**Step 3: Run the new tests** → green, 3× in a row (race regression check).
+
+**Step 4: Full gates.** `bun run test:unit` (all green, incl. the new file in the main batch), `bun x tsc --noEmit`.
+
+**Step 5: Commit** `fix(lifecycle): preserve live tmux sessions across service shutdown` (tests + impl + package.json).
+
+### Task 3: Live verification on dev (4174)
+
+1. `GET /api/terminals` snapshot + `tmux -S ~/.deckterm-dev/tmux/deckterm_*.sock list-sessions` before.
+2. Deploy the fix: `systemctl --user restart deckterm-dev.service` (this restart itself still runs the OLD code's handler — the fix takes effect for subsequent restarts; restart twice and verify the second one preserves sessions + rows, `journalctl` shows the new `[shutdown]` line).
+3. Verify: same tmux `session_created`/pane PIDs, `/api/terminals` catalog identical, no `ended` flips in the DB, web client reconnects (WS log `reconnect: true`).
+
+### Task 4: Independent review + ship
+
+1. `~/.claude/bin/codex-caller review` over the diff (advisor tool is down for this session); fix real findings.
+2. Push to `dev`; update OK KB (session-end sync: agent memory delta, development-log milestone, plan "Now" section, backlog item resolution).

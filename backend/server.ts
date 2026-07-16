@@ -4188,6 +4188,14 @@ function createTerminalHandle(id: string, cols: number, rows: number) {
   });
 }
 
+// Restart/session lifecycle (backlog P1, release a006ae6 incident): once a
+// shutdown begins, terminal-exit callbacks must not persist status=ended —
+// killing our tmux attach clients merely detaches from sessions that survive
+// the restart, and a timing-dependent async DB write here is exactly what
+// falsely ended live sessions. Truth about tmux liveness is re-established by
+// reconcileSessionsOnStartup/recoverTmuxSessions on the next boot.
+let shutdownInProgress = false;
+
 function closeTerminalSockets(id: string, message?: string) {
   const sockets = terminalSockets.get(id);
   if (!sockets) return;
@@ -4780,6 +4788,9 @@ async function createManagedTerminal({
     exitCode: number,
     signalCode?: number | null,
   ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -10248,23 +10259,39 @@ export async function startWebServer(host: string, port: number) {
   setInterval(retentionTick, 60 * 60 * 1000);
   setTimeout(retentionTick, 60 * 1000);
 
-  process.on("SIGINT", () => {
+  // Deliberate service shutdown (deploy/restart). Tmux-backed sessions
+  // survive the restart (state-dir-scoped socket + KillMode=process), so we
+  // only detach: close client sockets WITHOUT an exit message (a plain close
+  // lets ReconnectingWebSocket reconnect into the recovered session) and kill
+  // the attach clients. Their DB rows stay active — startup reconciliation is
+  // the single source of truth for tmux liveness. Raw-mode PTYs genuinely die
+  // with the process and nothing reconciles raw rows at startup, so those are
+  // marked ended HERE, synchronously — the old async .then() write raced
+  // process.exit() in both directions (a006ae6 incident).
+  const shutdownState = await getFoundationState();
+  const shutdownGracefully = (signal: string) => {
+    if (shutdownInProgress) return;
+    shutdownInProgress = true;
+    console.log(
+      `[shutdown] ${signal}: detaching ${terminals.size} terminal(s) (${TMUX_BACKEND ? "tmux sessions preserved" : "raw sessions ended"})`,
+    );
     for (const term of terminals.values()) {
+      try {
+        closeTerminalSockets(term.id);
+      } catch {}
+      if (!TMUX_BACKEND) {
+        try {
+          markTerminalSessionEnded(shutdownState.db, term.id);
+        } catch {}
+      }
       try {
         term.proc.kill();
       } catch {}
     }
     process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    for (const term of terminals.values()) {
-      try {
-        term.proc.kill();
-      } catch {}
-    }
-    process.exit(0);
-  });
+  };
+  process.on("SIGINT", () => shutdownGracefully("SIGINT"));
+  process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
 
   return server;
 }
