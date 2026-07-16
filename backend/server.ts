@@ -843,7 +843,44 @@ ensureClipboardDir().catch(() => {});
 export async function reconcileSessionsOnStartup(
   db: Database,
 ): Promise<number> {
-  if (!TMUX_BACKEND) return 0;
+  if (!TMUX_BACKEND) {
+    // Raw PTYs cannot survive a restart, and the shutdown-time ended write
+    // can be bypassed entirely (SIGKILL, crash) — an active row here is
+    // unattachable by definition, so end it. This deliberately includes rows
+    // created by a tmux-mode deployment later switched to raw: the raw
+    // backend cannot attach them either, and an "active" catalog entry no
+    // surface can reach is a lie (same end-don't-adopt policy as the OS
+    // isolation branch below). The tmux shells themselves are NOT killed;
+    // switching back to tmux mode will not auto-recover the ended rows.
+    let fixed = 0;
+    try {
+      const activeSessions = db
+        .query("SELECT id FROM terminal_sessions WHERE status = 'active'")
+        .all() as { id: string }[];
+      for (const session of activeSessions) {
+        try {
+          markTerminalSessionEnded(db, session.id);
+          fixed++;
+        } catch (err) {
+          console.error(
+            `[reconciliation] Failed to end zombie raw-mode session ${session.id}:`,
+            err,
+          );
+        }
+      }
+      if (fixed > 0) {
+        console.log(
+          `[reconciliation] Ended ${fixed} zombie raw-mode session(s) on startup`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        "[reconciliation] Error during raw-mode startup reconciliation:",
+        err,
+      );
+    }
+    return fixed;
+  }
   let fixed = 0;
   try {
     const activeSessions = db
@@ -4188,6 +4225,14 @@ function createTerminalHandle(id: string, cols: number, rows: number) {
   });
 }
 
+// Restart/session lifecycle (backlog P1, release a006ae6 incident): once a
+// shutdown begins, terminal-exit callbacks must not persist status=ended —
+// killing our tmux attach clients merely detaches from sessions that survive
+// the restart, and a timing-dependent async DB write here is exactly what
+// falsely ended live sessions. Truth about tmux liveness is re-established by
+// reconcileSessionsOnStartup/recoverTmuxSessions on the next boot.
+let shutdownInProgress = false;
+
 function closeTerminalSockets(id: string, message?: string) {
   const sockets = terminalSockets.get(id);
   if (!sockets) return;
@@ -4780,6 +4825,9 @@ async function createManagedTerminal({
     exitCode: number,
     signalCode?: number | null,
   ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -9629,11 +9677,27 @@ export async function startWebServer(host: string, port: number) {
     });
   }
 
-  // Recover existing tmux sessions before starting server
-  if (TMUX_BACKEND) {
-    console.log(
-      "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
-    );
+  // Fail fast if the port is already taken BEFORE touching recorded
+  // sessions: a second instance pointed at the same state dir must not
+  // reconcile (= write to) a live instance's rows (observed 2026-07-16: an
+  // unpinned test-spawned child ended the dev instance's session row).
+  // Residual: a process bound to a DIFFERENT port but sharing the state dir
+  // still needs a real instance-ownership lock — backlogged.
+  if (port !== 0) {
+    const { createServer } = await import("node:net");
+    await new Promise<void>((resolvePort, rejectPort) => {
+      const probe = createServer();
+      probe.once("error", rejectPort);
+      probe.listen(port, host, () => {
+        probe.close((err) => (err ? rejectPort(err) : resolvePort()));
+      });
+    });
+  }
+
+  // Reconcile recorded sessions before starting the server: in tmux mode
+  // this ends rows whose tmux session is gone; in raw mode it ends every
+  // active row (raw PTYs never survive a restart).
+  {
     const state = await getFoundationState();
     const reconciled = await reconcileSessionsOnStartup(state.db);
     if (reconciled > 0) {
@@ -9641,6 +9705,13 @@ export async function startWebServer(host: string, port: number) {
         `[reconciliation] Reconciled ${reconciled} zombie session(s) on startup`,
       );
     }
+  }
+
+  // Recover existing tmux sessions before starting server
+  if (TMUX_BACKEND) {
+    console.log(
+      "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
+    );
     const recovered = await recoverTmuxSessions();
     if (recovered > 0) {
       console.log(`[tmux] Recovered ${recovered} session(s)`);
@@ -10248,23 +10319,46 @@ export async function startWebServer(host: string, port: number) {
   setInterval(retentionTick, 60 * 60 * 1000);
   setTimeout(retentionTick, 60 * 1000);
 
-  process.on("SIGINT", () => {
+  // Deliberate service shutdown (deploy/restart). Tmux-backed sessions
+  // survive the restart (state-dir-scoped socket + KillMode=process), so we
+  // only detach: close client sockets WITHOUT an exit message (a plain close
+  // lets ReconnectingWebSocket reconnect into the recovered session) and kill
+  // the attach clients. Their DB rows stay active — startup reconciliation is
+  // the single source of truth for tmux liveness. Raw-mode PTYs genuinely die
+  // with the process and nothing reconciles raw rows at startup, so those are
+  // marked ended HERE, synchronously — the old async .then() write raced
+  // process.exit() in both directions (a006ae6 incident).
+  const shutdownState = await getFoundationState();
+  const shutdownGracefully = (signal: string) => {
+    if (shutdownInProgress) return;
+    shutdownInProgress = true;
+    console.log(
+      `[shutdown] ${signal}: detaching ${terminals.size} terminal(s) (${TMUX_BACKEND ? "tmux sessions preserved" : "raw sessions ended"})`,
+    );
     for (const term of terminals.values()) {
+      try {
+        closeTerminalSockets(term.id);
+      } catch {}
+      if (!TMUX_BACKEND) {
+        try {
+          markTerminalSessionEnded(shutdownState.db, term.id);
+        } catch (err) {
+          // Startup reconciliation ends any row this write missed; still
+          // surface the failure instead of pretending the write landed.
+          console.error(
+            `[shutdown] failed to mark raw session ${term.id} ended:`,
+            err,
+          );
+        }
+      }
       try {
         term.proc.kill();
       } catch {}
     }
     process.exit(0);
-  });
-
-  process.on("SIGTERM", () => {
-    for (const term of terminals.values()) {
-      try {
-        term.proc.kill();
-      } catch {}
-    }
-    process.exit(0);
-  });
+  };
+  process.on("SIGINT", () => shutdownGracefully("SIGINT"));
+  process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
 
   return server;
 }

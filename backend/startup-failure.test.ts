@@ -27,6 +27,20 @@ afterEach(async () => {
   );
 });
 
+/**
+ * Every spawned child MUST get its own DECKTERM_STATE_DIR: `bun run` in the
+ * child auto-loads the repo .env, so an unpinned child boots against the REAL
+ * dev state dir and its startup reconciliation mutates live session rows
+ * (observed 2026-07-16: a raw-mode child ended the dev instance's active
+ * tmux session row).
+ */
+async function isolatedStateDir(): Promise<string> {
+  const home = process.env.HOME || "/tmp";
+  const stateDir = await mkdtemp(join(home, ".deckterm-isolated-state-"));
+  tempStateDirs.push(stateDir);
+  return stateDir;
+}
+
 /** Allocates a free TCP port by binding to port 0 and immediately closing. */
 async function getFreePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
@@ -200,6 +214,7 @@ test("server exits when startup fails because the port is already in use", async
       CF_ACCESS_REQUIRED: "0",
       CF_ACCESS_TEAM_NAME: "",
       CF_ACCESS_AUD: "",
+      DECKTERM_STATE_DIR: await isolatedStateDir(),
     },
     stderr: "pipe",
     stdout: "pipe",
@@ -237,6 +252,7 @@ test("server exits when CF_ACCESS_REQUIRED=1 but CF_ACCESS_TEAM_NAME is empty", 
       CF_ACCESS_REQUIRED: "1",
       CF_ACCESS_TEAM_NAME: "",
       CF_ACCESS_AUD: "any",
+      DECKTERM_STATE_DIR: await isolatedStateDir(),
     },
     stderr: "pipe",
     stdout: "pipe",
@@ -268,6 +284,7 @@ test("server exits when CF_ACCESS_REQUIRED=1 but CF_ACCESS_AUD is empty", async 
       CF_ACCESS_REQUIRED: "1",
       CF_ACCESS_TEAM_NAME: "some-team",
       CF_ACCESS_AUD: "",
+      DECKTERM_STATE_DIR: await isolatedStateDir(),
     },
     stderr: "pipe",
     stdout: "pipe",
@@ -399,6 +416,7 @@ test("server exits when DECKTERM_PUBLISH_MODE=cloudflare-tunnel binds a non-loop
       CF_ACCESS_TEAM_NAME: "",
       CF_ACCESS_AUD: "",
       DECKTERM_PUBLISH_MODE: "cloudflare-tunnel",
+      DECKTERM_STATE_DIR: await isolatedStateDir(),
       // Clear every dev/CI marker so the (production-only) guard actually runs,
       // and ensure the trust-proxy override is absent.
       CI: undefined,
@@ -441,6 +459,7 @@ test("server starts when cloudflare-tunnel binds a loopback host (guard does not
       CF_ACCESS_TEAM_NAME: "",
       CF_ACCESS_AUD: "",
       DECKTERM_PUBLISH_MODE: "cloudflare-tunnel",
+      DECKTERM_STATE_DIR: await isolatedStateDir(),
       CI: undefined,
       DECKTERM_RUNTIME_ENV: undefined,
       NODE_ENV: undefined,
