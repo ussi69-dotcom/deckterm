@@ -105,11 +105,11 @@ function spawnServer(opts: {
     // the child's `bun run` auto-loads the repo .env, which would fill in
     // the dev namespace (TMUX_SESSION_NAMESPACE=deckterm) behind our back.
     TMUX_SESSION_NAMESPACE: `p${opts.port}`,
-    DECKTERM_PUBLISH_MODE: undefined,
-    DECKTERM_OS_ISOLATION: undefined,
+    // Explicit safe values, never deletions: an absent var would be
+    // repopulated from the repo .env by the child's `bun run` auto-load.
+    DECKTERM_PUBLISH_MODE: "local",
+    DECKTERM_OS_ISOLATION: "0",
   };
-  delete env.DECKTERM_PUBLISH_MODE;
-  delete env.DECKTERM_OS_ISOLATION;
 
   const child = Bun.spawn(["bun", "run", "backend/index.ts"], {
     cwd: process.cwd(),
@@ -144,12 +144,15 @@ async function startHarness(opts: { tmuxBackend: boolean }): Promise<Harness> {
   return { port, stateDir, workRoot, tmuxSocket, child };
 }
 
-async function restartHarness(h: Harness): Promise<Harness> {
+async function restartHarness(
+  h: Harness,
+  opts: { tmuxBackend: boolean } = { tmuxBackend: true },
+): Promise<Harness> {
   const child = spawnServer({
     port: h.port,
     stateDir: h.stateDir,
     workRoot: h.workRoot,
-    tmuxBackend: true,
+    tmuxBackend: opts.tmuxBackend,
   });
   await waitForHealth(h.port);
   return { ...h, child };
@@ -221,8 +224,15 @@ async function tmuxQuery(socket: string, args: string[]): Promise<string> {
     stdout: "pipe",
     stderr: "pipe",
   });
-  await proc.exited;
-  return (await new Response(proc.stdout).text()).trim();
+  const exitCode = await proc.exited;
+  const stdout = (await new Response(proc.stdout).text()).trim();
+  if (exitCode !== 0) {
+    // A swallowed failure would make e.g. two empty pane maps compare equal
+    // and falsely pass the identity-preservation assertions.
+    const stderr = (await new Response(proc.stderr).text()).trim();
+    throw new Error(`tmux ${args.join(" ")} failed (${exitCode}): ${stderr}`);
+  }
+  return stdout;
 }
 
 /** session_name -> session_created for every session on the socket. */
@@ -384,10 +394,60 @@ test("raw mode SIGTERM deterministically marks sessions ended (no zombie active 
   childProcesses.delete(h.child);
   expect(exitCode).toBe(0);
 
-  // Raw PTYs die with the process and nothing reconciles raw rows at startup
-  // (reconcileSessionsOnStartup is tmux-only), so the shutdown path itself
-  // must persist ended — synchronously, not in a racy async callback.
+  // Raw PTYs die with the process, so the shutdown path itself must persist
+  // ended — synchronously, not in a racy async callback.
   const statuses = dbSessionStatuses(h.stateDir);
   expect(statuses.get(firstId)).toBe("ended");
   expect(statuses.get(secondId)).toBe("ended");
 }, 30000);
+
+test("raw-mode startup reconciles active rows the shutdown write never saw (SIGKILL / backend switch)", async () => {
+  const h = await startHarness({ tmuxBackend: false });
+
+  const firstId = await createTerminal(h);
+  const secondId = await createTerminal(h);
+
+  // SIGKILL bypasses the shutdown handler entirely — the same DB shape a
+  // crash or a tmux→raw backend switch leaves behind: active rows with no
+  // surviving PTY.
+  h.child.kill("SIGKILL");
+  await h.child.exited;
+  childProcesses.delete(h.child);
+
+  const beforeRestart = dbSessionStatuses(h.stateDir);
+  expect(beforeRestart.get(firstId)).toBe("active");
+  expect(beforeRestart.get(secondId)).toBe("active");
+
+  // The catalog may still list them as recent history, but never as live.
+  const h2 = await restartHarness(h, { tmuxBackend: false });
+  const listed = (await listTerminals(h2)) as { sessionStatus?: string }[];
+  expect(listed.filter((t) => t.sessionStatus === "active")).toEqual([]);
+
+  const statuses = dbSessionStatuses(h.stateDir);
+  expect(statuses.get(firstId)).toBe("ended");
+  expect(statuses.get(secondId)).toBe("ended");
+}, 30000);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "tmux→raw backend switch ends the unreachable rows but leaves the tmux shells running",
+  async () => {
+    const h = await startHarness({ tmuxBackend: true });
+    const id = await createTerminal(h);
+
+    h.child.kill("SIGTERM");
+    await h.child.exited;
+    childProcesses.delete(h.child);
+
+    // Operator flips the deployment to the raw backend: the row is
+    // unreachable from DeckTerm (raw cannot attach tmux sessions), so
+    // startup must end it — honestly — without killing the tmux shell.
+    const h2 = await restartHarness(h, { tmuxBackend: false });
+    const listed = (await listTerminals(h2)) as { sessionStatus?: string }[];
+    expect(listed.filter((t) => t.sessionStatus === "active")).toEqual([]);
+    expect(dbSessionStatuses(h.stateDir).get(id)).toBe("ended");
+
+    const survivors = await tmuxSessions(h.tmuxSocket);
+    expect(survivors.has(`deckterm_p${h.port}_${id}`)).toBe(true);
+  },
+  30000,
+);

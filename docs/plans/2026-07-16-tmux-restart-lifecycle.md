@@ -94,3 +94,15 @@ process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
 
 1. `~/.claude/bin/codex-caller review` over the diff (advisor tool is down for this session); fix real findings.
 2. Push to `dev`; update OK KB (session-end sync: agent memory delta, development-log milestone, plan "Now" section, backlog item resolution).
+
+---
+
+## Delivery record (2026-07-16)
+
+Commits on `dev`: `f2e223a` (fix + tests + CI tmux install) + the review-fix follow-up. All 5 tests green 3× in a row; full `test:unit` rc=0; `tsc --noEmit` clean. Live-verified on 4174: double restart, owner's real session survived both with identical `session_created` + pane PID `419614`, DB row stayed `active`, journal shows `[shutdown] SIGTERM: detaching 1 terminal(s) (tmux sessions preserved)`.
+
+**Deviation from Task 1 as written:** on this harness the pre-fix SIGTERM race never fired (the async `.then()` writes *never* land before `process.exit`, so tests A/B passed pre-fix and act as regression guards); the deterministic RED driver was raw mode (test C). Also discovered: merely *deleting* env vars in the child is not isolation — the child's `bun run` auto-loads the repo `.env` (namespace initially came back as `deckterm`); the harness now sets explicit values for `TMUX_SESSION_NAMESPACE`, `DECKTERM_PUBLISH_MODE`, `DECKTERM_OS_ISOLATION`.
+
+**Codex review — pass 1 (commit `f2e223a`), 4 findings, all addressed:** (1) silent `catch {}` on the raw-mode ended write → now logged (exit stays 0: a deliberate stop must not flag the unit failed; raw startup reconcile is the backstop); (2) tmux-mode rows stranded `active` forever after a switch to raw mode → `reconcileSessionsOnStartup` now runs in raw mode too and ends every active row; (3) test env deletions repopulated by `.env` → explicit values; (4) `tmuxQuery` swallowed failures (two empty pane maps compare equal) → throws on non-zero exit.
+
+**Codex review — pass 2 (follow-up diff), dispositions:** (1-High) raw reconcile also ends rows of still-live tmux shells after a tmux→raw switch — **accepted as policy**: the raw backend cannot attach them, an "active" catalog row no surface can reach is a lie (same end-don't-adopt stance as the B2 isolation branch); shells are not killed; flip-flopping back to tmux does not auto-recover ended rows (never a supported flow). Pinned by a dedicated test. (2-High) a second process on the same state dir could reconcile-end a live instance's rows — **pre-existing exposure** (tmux reconcile since C1b, B2 end-all), needs an instance lock / ownership design → backlogged. (3-Med) one bad row aborted the reconcile loop → per-row try/catch. (4) tmux→raw switch test gap → added (test 5).

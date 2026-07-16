@@ -843,7 +843,44 @@ ensureClipboardDir().catch(() => {});
 export async function reconcileSessionsOnStartup(
   db: Database,
 ): Promise<number> {
-  if (!TMUX_BACKEND) return 0;
+  if (!TMUX_BACKEND) {
+    // Raw PTYs cannot survive a restart, and the shutdown-time ended write
+    // can be bypassed entirely (SIGKILL, crash) — an active row here is
+    // unattachable by definition, so end it. This deliberately includes rows
+    // created by a tmux-mode deployment later switched to raw: the raw
+    // backend cannot attach them either, and an "active" catalog entry no
+    // surface can reach is a lie (same end-don't-adopt policy as the OS
+    // isolation branch below). The tmux shells themselves are NOT killed;
+    // switching back to tmux mode will not auto-recover the ended rows.
+    let fixed = 0;
+    try {
+      const activeSessions = db
+        .query("SELECT id FROM terminal_sessions WHERE status = 'active'")
+        .all() as { id: string }[];
+      for (const session of activeSessions) {
+        try {
+          markTerminalSessionEnded(db, session.id);
+          fixed++;
+        } catch (err) {
+          console.error(
+            `[reconciliation] Failed to end zombie raw-mode session ${session.id}:`,
+            err,
+          );
+        }
+      }
+      if (fixed > 0) {
+        console.log(
+          `[reconciliation] Ended ${fixed} zombie raw-mode session(s) on startup`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        "[reconciliation] Error during raw-mode startup reconciliation:",
+        err,
+      );
+    }
+    return fixed;
+  }
   let fixed = 0;
   try {
     const activeSessions = db
@@ -9640,11 +9677,10 @@ export async function startWebServer(host: string, port: number) {
     });
   }
 
-  // Recover existing tmux sessions before starting server
-  if (TMUX_BACKEND) {
-    console.log(
-      "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
-    );
+  // Reconcile recorded sessions before starting the server: in tmux mode
+  // this ends rows whose tmux session is gone; in raw mode it ends every
+  // active row (raw PTYs never survive a restart).
+  {
     const state = await getFoundationState();
     const reconciled = await reconcileSessionsOnStartup(state.db);
     if (reconciled > 0) {
@@ -9652,6 +9688,13 @@ export async function startWebServer(host: string, port: number) {
         `[reconciliation] Reconciled ${reconciled} zombie session(s) on startup`,
       );
     }
+  }
+
+  // Recover existing tmux sessions before starting server
+  if (TMUX_BACKEND) {
+    console.log(
+      "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
+    );
     const recovered = await recoverTmuxSessions();
     if (recovered > 0) {
       console.log(`[tmux] Recovered ${recovered} session(s)`);
@@ -10282,7 +10325,14 @@ export async function startWebServer(host: string, port: number) {
       if (!TMUX_BACKEND) {
         try {
           markTerminalSessionEnded(shutdownState.db, term.id);
-        } catch {}
+        } catch (err) {
+          // Startup reconciliation ends any row this write missed; still
+          // surface the failure instead of pretending the write landed.
+          console.error(
+            `[shutdown] failed to mark raw session ${term.id} ended:`,
+            err,
+          );
+        }
       }
       try {
         term.proc.kill();
