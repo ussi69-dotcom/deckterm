@@ -99,6 +99,36 @@ test("parseShellIntegrationChunk tracks active agent markers", () => {
   });
 });
 
+test("parseShellIntegrationChunk detects the Codex title reset at turn completion", () => {
+  const initial: ShellIntegrationParseState = {
+    carry: "",
+    running: true,
+    lastExitCode: null,
+    agentName: "codex",
+    agentState: "responding",
+  };
+  const spinner = "\x1b]0;\u280b deckterm_dev\x07";
+  const completed = "\x1b]0;deckterm_dev\x07";
+
+  const working = parseShellIntegrationChunk(spinner, initial);
+  expect(working.events).toEqual([]);
+  expect(working.output).toBe(spinner);
+
+  const result = parseShellIntegrationChunk(completed, working.state);
+  expect(result.events).toEqual([
+    { type: "agent-turn-complete", agentName: "codex" },
+  ]);
+  expect(result.output).toBe(completed);
+});
+
+test("parseShellIntegrationChunk ignores a plain title before Codex is active", () => {
+  const title = "\x1b]0;deckterm_dev\x07";
+  const result = parseShellIntegrationChunk(title);
+
+  expect(result.events).toEqual([]);
+  expect(result.output).toBe(title);
+});
+
 test("parseShellIntegrationChunk emits a tool-used event for a well-formed tool marker", () => {
   const result = parseShellIntegrationChunk(
     `${TOOL_MARKER("Bash", "ls -la /tmp")}hello`,

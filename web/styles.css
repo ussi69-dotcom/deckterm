@@ -147,6 +147,35 @@ body {
   color: var(--text-primary);
 }
 
+.notification-sound-toggle {
+  position: relative;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+}
+
+.notification-sound-toggle[data-mode="always"],
+.notification-sound-toggle[data-mode="unfocused"] {
+  border-color: rgba(88, 166, 255, 0.34);
+  background: rgba(88, 166, 255, 0.08);
+  color: var(--accent-blue);
+}
+
+.notification-sound-toggle[data-mode="off"] {
+  color: var(--text-secondary);
+  opacity: 0.72;
+}
+
+.notification-sound-toggle[data-mode="off"]::after {
+  content: "";
+  position: absolute;
+  width: 20px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+  transform: rotate(-45deg);
+}
+
 .sessions-available-badge {
   position: absolute;
   top: -5px;
@@ -1962,6 +1991,11 @@ body.touch-input-mode .xterm .composition-view.active {
 .session-row small {
   color: var(--text-secondary);
   font-size: 12px;
+}
+
+.session-row small.session-termination-countdown {
+  color: var(--accent-orange, #d29922);
+  font-weight: 700;
 }
 
 .session-badge {

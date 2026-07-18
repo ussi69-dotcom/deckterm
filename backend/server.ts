@@ -82,6 +82,7 @@ import {
 import {
   bootstrapFirstAdmin,
   appendTerminalEvent,
+  cancelTerminalSessionTermination,
   createInvitedUser,
   disableOrphanGrantPrincipal,
   getFoundationUserById,
@@ -104,6 +105,7 @@ import {
   recordTerminalSession,
   resolveUserForActor,
   revokeScopedCapability,
+  scheduleTerminalSessionTermination,
   setUserDisabled,
   setUserRole,
   setUserSettings,
@@ -219,6 +221,7 @@ type Terminal = {
   lastActivityAt: number; // Last user input timestamp for idle detection
   lastOutputAt?: number; // Last live PTY output timestamp; counts as liveness for the reapers
   lastDetachedAt?: number; // Last client socket disconnection timestamp for detached reaper
+  terminationScheduledAt?: number; // Explicit tab-close deadline; reconnect cancels it
   ownerId: string; // User sub from JWT
   ownerEmail: string; // User email for display
   sessionName?: string; // tmux session name (when TMUX_BACKEND=1)
@@ -230,6 +233,7 @@ type Terminal = {
   agentName: "codex" | "claude" | null;
   agentState: "thinking" | "responding" | null;
   agentHasUserPrompt: boolean;
+  agentTurnCompletedAt: number | null;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
   // S11: display-only ring of recent tool-used marker events (untrusted,
   // forgeable in-band data — never feeds transitions or authz).
@@ -317,6 +321,19 @@ const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
 ); // 2 hours default
 const DECKTERM_ORPHAN_TTL_MS_DEFAULT =
   parseInt(process.env.DECKTERM_ORPHAN_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
+const TERMINAL_TAB_CLOSE_GRACE_MS = (() => {
+  const parsed = parseInt(
+    process.env.DECKTERM_TAB_CLOSE_GRACE_MS || String(15 * 60 * 1000),
+    10,
+  );
+  const minimum =
+    process.env.DECKTERM_RUNTIME_ENV === "development" ? 250 : 10_000;
+  return Number.isFinite(parsed) && parsed >= minimum ? parsed : 15 * 60 * 1000;
+})();
+const TERMINAL_TAB_CLOSE_SWEEP_MS = Math.min(
+  10_000,
+  Math.max(250, Math.floor(TERMINAL_TAB_CLOSE_GRACE_MS / 2)),
+);
 const AGENT_RESPONDING_IDLE_MS = parseInt(
   process.env.AGENT_RESPONDING_IDLE_MS || "700",
   10,
@@ -572,6 +589,7 @@ function broadcastTerminalState(term: Terminal) {
     lastExitCode: term.lastExitCode,
     agentName: term.agentName,
     agentState: term.agentState,
+    agentTurnCompletedAt: term.agentTurnCompletedAt,
   };
   appendTerminalRuntimeEvent(term.id, "state", { dataJson: statePayload });
   if (!sockets || sockets.size === 0) return;
@@ -656,6 +674,13 @@ function applyParsedShellIntegrationState(
     }
     if (nextAgentState && term.agentState !== nextAgentState) {
       term.agentState = nextAgentState;
+      stateChanged = true;
+    }
+  }
+  for (const event of parsed.events) {
+    if (event.type === "agent-turn-complete" && term.agentHasUserPrompt) {
+      term.agentHasUserPrompt = false;
+      term.agentTurnCompletedAt = Date.now();
       stateChanged = true;
     }
   }
@@ -1030,6 +1055,10 @@ async function recoverTmuxSessions(): Promise<number> {
         initialScrollback: paneCapture,
       });
       recoveredTerminal.hadSocketConnection = true;
+      recoveredTerminal.terminationScheduledAt =
+        recordedSession.terminationScheduledAt
+          ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
+          : undefined;
 
       recovered++;
       console.log(
@@ -1115,6 +1144,10 @@ async function restoreRecordedTmuxSession(
     initialScrollback: paneCapture,
   });
   restoredTerminal.hadSocketConnection = true;
+  restoredTerminal.terminationScheduledAt =
+    recordedSession.terminationScheduledAt
+      ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
+      : undefined;
   return restoredTerminal;
 }
 
@@ -3945,12 +3978,14 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     lastExitCode: term.lastExitCode,
     agentName: term.agentName,
     agentState: term.agentState,
+    agentTurnCompletedAt: term.agentTurnCompletedAt,
     recentTools: term.recentTools,
     backendMode: getBackendMode(),
     supportsLinkedView: supportsLinkedView(term),
     sharedSessionKey: term.sessionName || null,
     activeConnectionCount: socketStats.activeConnectionCount,
     hasForeignConnection: socketStats.hasForeignConnection,
+    terminationScheduledAt: term.terminationScheduledAt || null,
     active: true,
     status: "active" as const,
     sessionStatus: "active" as const,
@@ -3986,6 +4021,9 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
     createdAt: parseSessionTimestamp(session.createdAt),
     updatedAt: session.updatedAt,
     endedAt: session.endedAt,
+    terminationScheduledAt: session.terminationScheduledAt
+      ? parseSessionTimestamp(session.terminationScheduledAt)
+      : null,
     running: false,
     lastExitCode: session.status === "ended" ? 0 : null,
     agentName: null,
@@ -4903,6 +4941,7 @@ async function createManagedTerminal({
     agentName: initialRuntimeState?.agentName || null,
     agentState: initialRuntimeState?.agentState || null,
     agentHasUserPrompt: Boolean(initialRuntimeState?.agentName),
+    agentTurnCompletedAt: null,
     agentRespondingTimer: null,
     recentTools: [],
     toolRate: { windowStart: 0, count: 0 },
@@ -7292,7 +7331,90 @@ export function createWebApp() {
     return c.json([...list, ...memoryOnly]);
   });
 
-  // Delete terminal
+  // Closing a browser tab first schedules termination instead of immediately
+  // killing the session. Reattaching within the grace window cancels it.
+  app.post("/api/terminals/:id/close-later", async (c) => {
+    const actor = getCurrentActor(c);
+    const id = c.req.param("id");
+    const term = terminals.get(id);
+    if (!term) return c.json({ error: "Terminal not found" }, 404);
+    if (
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: term.ownerId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    const access = await requireTerminalSessionAccess({
+      actor,
+      term,
+      capability: "terminal.manage",
+    });
+    if (!access.ok) {
+      return c.json(foundationGateJson(access), access.status);
+    }
+
+    const state = await getFoundationState();
+    ensureTerminalSessionRecorded(state, term);
+    const requestingClientId =
+      c.req.header("x-deckterm-client-id")?.trim() || null;
+    if (getTerminalSocketStats(term, requestingClientId).hasForeignConnection) {
+      cancelTerminalSessionTermination(state.db, id);
+      term.terminationScheduledAt = undefined;
+      return c.json({
+        ok: true,
+        terminationScheduledAt: null,
+        graceMs: TERMINAL_TAB_CLOSE_GRACE_MS,
+        preservedByOtherClient: true,
+      });
+    }
+    const terminationScheduledAt = Date.now() + TERMINAL_TAB_CLOSE_GRACE_MS;
+    term.terminationScheduledAt = terminationScheduledAt;
+    scheduleTerminalSessionTermination(
+      state.db,
+      id,
+      new Date(terminationScheduledAt),
+    );
+    return c.json({
+      ok: true,
+      terminationScheduledAt,
+      graceMs: TERMINAL_TAB_CLOSE_GRACE_MS,
+    });
+  });
+
+  app.delete("/api/terminals/:id/close-later", async (c) => {
+    const actor = getCurrentActor(c);
+    const id = c.req.param("id");
+    const term = terminals.get(id);
+    if (!term) return c.json({ error: "Terminal not found" }, 404);
+    if (
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: term.ownerId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    const access = await requireTerminalSessionAccess({
+      actor,
+      term,
+      capability: "terminal.manage",
+    });
+    if (!access.ok) {
+      return c.json(foundationGateJson(access), access.status);
+    }
+    const state = await getFoundationState();
+    cancelTerminalSessionTermination(state.db, id);
+    term.terminationScheduledAt = undefined;
+    return c.json({ ok: true });
+  });
+
+  // Immediate terminal deletion remains available to explicit API callers.
   app.delete("/api/terminals/:id", async (c) => {
     const actor = getCurrentActor(c);
     const id = c.req.param("id");
@@ -8584,10 +8706,7 @@ export function createWebApp() {
 
       return c.json({ branch, upstream, ahead, behind, files, cwd, root });
     } catch (err) {
-      return c.json(
-        { error: "Git status failed", message: String(err) },
-        502,
-      );
+      return c.json({ error: "Git status failed", message: String(err) }, 502);
     }
   });
 
@@ -9758,8 +9877,8 @@ export async function startWebServer(host: string, port: number) {
             isFoundationLegacyBypassEnabled() &&
             auth.actor!.source === "legacy_dev" &&
             getE2ERunIdFromActorId(auth.actor!.id)
-            ? auth.actor!.id
-            : resolveCanonicalOwnerId(state, auth.actor!).ownerId;
+              ? auth.actor!.id
+              : resolveCanonicalOwnerId(state, auth.actor!).ownerId;
         } catch (err) {
           if (err instanceof IdentityConflictError) {
             writeAuditEvent(state.db, {
@@ -9854,6 +9973,11 @@ export async function startWebServer(host: string, port: number) {
           decision: "allow",
           reason: attachDecision.reason,
         });
+
+        // A successful reattach is the user's undo action for a recently
+        // closed tab. Clear the persisted deadline before upgrading the socket.
+        cancelTerminalSessionTermination(state.db, id);
+        term.terminationScheduledAt = undefined;
 
         const clientId = url.searchParams.get("clientId")?.trim() || null;
         const requestedMode = url.searchParams.get("mode")?.trim();
@@ -10260,8 +10384,45 @@ export async function startWebServer(host: string, port: number) {
     }
   };
 
+  const reapScheduledTerminalClosures = async () => {
+    const now = Date.now();
+    const state = await getFoundationState();
+
+    for (const [id, term] of terminals) {
+      if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
+        continue;
+      }
+      const sockets = terminalSockets.get(id);
+      const activeSocketsCount = sockets ? sockets.size : 0;
+      if (activeSocketsCount > 0) {
+        // Defensive race handling: a restored tab always wins over the timer.
+        cancelTerminalSessionTermination(state.db, id);
+        term.terminationScheduledAt = undefined;
+        continue;
+      }
+
+      console.log(
+        `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
+      );
+      markTerminalSessionEnded(state.db, id);
+      removeTerminalState(id);
+      try {
+        await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
+      } catch (err) {
+        debug(`[close-later] tmux kill-session error for ${id}:`, err);
+      }
+      try {
+        term.proc.kill();
+        term.terminal.close();
+      } catch (err) {
+        debug(`[close-later] cleanup error for ${id}:`, err);
+      }
+    }
+  };
+
   setInterval(cleanupIdleTerminals, 5 * 60 * 1000);
   setInterval(reapDetachedSessions, 15 * 60 * 1000);
+  setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS);
 
   // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
   // durable `retention_runs` bookkeeping, so cadence survives restarts and a

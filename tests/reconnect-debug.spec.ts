@@ -1,12 +1,19 @@
-import { expect, readActiveTerminalText, test } from "./fixtures";
+import {
+  expect,
+  readActiveTerminalText,
+  resetAppState,
+  test,
+} from "./fixtures";
+
+const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
 test.describe("Terminal Reconnection Debug", () => {
   test("should properly reconnect and display terminal after page reload", async ({
     page,
   }) => {
     // Step 1: Navigate and create a terminal
-    await page.goto("http://localhost:4174/");
-    await page.waitForSelector(".xterm-screen", { timeout: 10000 });
+    await resetAppState(page, APP_URL);
+    await page.waitForSelector(".xterm-screen:visible", { timeout: 10000 });
     await page.waitForTimeout(2000);
 
     await page.screenshot({
@@ -27,7 +34,7 @@ test.describe("Terminal Reconnection Debug", () => {
     // Step 3: Reload page (simulates reconnection)
     console.log("Reloading page to test reconnection...");
     await page.reload();
-    await page.waitForSelector(".xterm-screen", { timeout: 10000 });
+    await page.waitForSelector(".xterm-screen:visible", { timeout: 10000 });
 
     // Take screenshot immediately after reload
     await page.screenshot({
@@ -59,7 +66,7 @@ test.describe("Terminal Reconnection Debug", () => {
     console.log(`Terminal content: ${terminalText?.substring(0, 300)}`);
 
     // Step 6: Check overlay state - should be hidden
-    const overlay = await page.locator(".terminal-overlay").first();
+    const overlay = page.locator(".tile.active .terminal-overlay").first();
     const isOverlayHidden = await overlay.evaluate((el) =>
       el.classList.contains("hidden"),
     );

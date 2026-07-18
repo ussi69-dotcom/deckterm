@@ -55,6 +55,9 @@ const B2_ISOLATION_DENY_COUNTERS_MIGRATION = 7;
 // the last successful run per job, and "did the destructive cleanup run, when,
 // with what result" has a durable answer (plan D-B6-5, Codex #4).
 const B6_RETENTION_RUNS_MIGRATION = 8;
+// Graceful tab close: keep an active terminal restorable for a short window,
+// with the deadline persisted so a DeckTerm service restart does not lose it.
+const TERMINAL_TERMINATION_DEADLINE_MIGRATION = 9;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -72,6 +75,7 @@ export type RecordedTerminalSession = {
   createdAt: string;
   updatedAt: string;
   endedAt: string | null;
+  terminationScheduledAt: string | null;
   lastEventId: number;
   /** B2: how the PTY was executed — 'legacy' (service account), 'brokered'
    *  (run as a mapped uid), or null for pre-B2 rows. Authoritative across
@@ -175,6 +179,7 @@ export function migrateFoundationDb(db: Database): void {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       ended_at TEXT,
+      termination_scheduled_at TEXT,
       last_event_id INTEGER NOT NULL DEFAULT 0,
       exec_kind TEXT,
       os_uid INTEGER,
@@ -376,6 +381,20 @@ export function migrateFoundationDb(db: Database): void {
     db.query(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(B6_RETENTION_RUNS_MIGRATION, new Date().toISOString());
+  }
+
+  if (!tableColumnExists(db, "terminal_sessions", "termination_scheduled_at")) {
+    db.exec(
+      "ALTER TABLE terminal_sessions ADD COLUMN termination_scheduled_at TEXT",
+    );
+  }
+  const terminationDeadlineExisting = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(TERMINAL_TERMINATION_DEADLINE_MIGRATION);
+  if (!terminationDeadlineExisting) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(TERMINAL_TERMINATION_DEADLINE_MIGRATION, new Date().toISOString());
   }
 }
 
@@ -774,8 +793,8 @@ export function recordTerminalSession(
   const timestamp = isoDate(session.now || new Date());
   db.query(
     `INSERT INTO terminal_sessions
-      (id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      (id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET
        actor_user_id = excluded.actor_user_id,
        root_id = excluded.root_id,
@@ -785,6 +804,10 @@ export function recordTerminalSession(
        os_uid = excluded.os_uid,
        updated_at = excluded.updated_at,
        ended_at = excluded.ended_at,
+       termination_scheduled_at = CASE
+         WHEN excluded.status = 'ended' THEN NULL
+         ELSE terminal_sessions.termination_scheduled_at
+       END,
        last_event_id = MAX(terminal_sessions.last_event_id, excluded.last_event_id)`,
   ).run(
     session.id,
@@ -797,6 +820,7 @@ export function recordTerminalSession(
     timestamp,
     timestamp,
     session.status === "ended" ? timestamp : null,
+    null,
     session.lastEventId || 0,
   );
 }
@@ -850,9 +874,36 @@ export function markTerminalSessionEnded(
   const timestamp = isoDate(now);
   db.query(
     `UPDATE terminal_sessions
-     SET status = 'ended', updated_at = ?, ended_at = COALESCE(ended_at, ?)
+     SET status = 'ended', updated_at = ?, ended_at = COALESCE(ended_at, ?),
+         termination_scheduled_at = NULL
      WHERE id = ?`,
   ).run(timestamp, timestamp, id);
+}
+
+export function scheduleTerminalSessionTermination(
+  db: Database,
+  id: string,
+  terminationScheduledAt: Date,
+  now: Date = new Date(),
+): void {
+  db.query(
+    `UPDATE terminal_sessions
+     SET termination_scheduled_at = ?, updated_at = ?
+     WHERE id = ? AND status = 'active'`,
+  ).run(isoDate(terminationScheduledAt), isoDate(now), id);
+}
+
+export function cancelTerminalSessionTermination(
+  db: Database,
+  id: string,
+  now: Date = new Date(),
+): void {
+  db.query(
+    `UPDATE terminal_sessions
+     SET termination_scheduled_at = NULL, updated_at = ?
+     WHERE id = ? AND status = 'active'
+       AND termination_scheduled_at IS NOT NULL`,
+  ).run(isoDate(now), id);
 }
 
 export function getTerminalSession(
@@ -861,7 +912,7 @@ export function getTerminalSession(
 ): RecordedTerminalSession | null {
   const row = db
     .query(
-      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id
        FROM terminal_sessions
        WHERE id = ?`,
     )
@@ -876,6 +927,7 @@ export function getTerminalSession(
     created_at: string;
     updated_at: string;
     ended_at: string | null;
+    termination_scheduled_at: string | null;
     last_event_id: number;
   } | null;
 
@@ -889,6 +941,7 @@ export function getTerminalSession(
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     endedAt: row.ended_at,
+    terminationScheduledAt: row.termination_scheduled_at,
     lastEventId: row.last_event_id || 0,
     execKind: row.exec_kind ?? null,
     osUid: row.os_uid ?? null,
@@ -918,20 +971,20 @@ export function listTerminalSessionsForActor(
     Number.isFinite(endedLimit) &&
     endedLimit >= 0;
   const query = capEnded
-    ? `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+    ? `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id
        FROM terminal_sessions
        WHERE actor_user_id = ?1 AND status != 'ended'
        UNION ALL
-       SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+       SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id
        FROM (
-         SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+         SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id
          FROM terminal_sessions
          WHERE actor_user_id = ?1 AND status = 'ended'
          ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
          LIMIT ?2
        )
        ORDER BY created_at DESC`
-    : `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, last_event_id
+    : `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id
        FROM terminal_sessions
        WHERE actor_user_id = ?
        ORDER BY created_at DESC`;
@@ -950,6 +1003,7 @@ export function listTerminalSessionsForActor(
     created_at: string;
     updated_at: string;
     ended_at: string | null;
+    termination_scheduled_at: string | null;
     last_event_id: number;
   }>;
 
@@ -962,6 +1016,7 @@ export function listTerminalSessionsForActor(
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     endedAt: row.ended_at,
+    terminationScheduledAt: row.termination_scheduled_at,
     lastEventId: row.last_event_id || 0,
     execKind: row.exec_kind ?? null,
     osUid: row.os_uid ?? null,
