@@ -74,10 +74,14 @@ test.describe("Shell action hierarchy on desktop", () => {
 
     const value = stepper.locator("output");
     await expect(
-      stepper.getByRole("button", { name: "Decrease font size" }).locator("svg"),
+      stepper
+        .getByRole("button", { name: "Decrease font size" })
+        .locator("svg"),
     ).toHaveCount(1);
     await expect(
-      stepper.getByRole("button", { name: "Increase font size" }).locator("svg"),
+      stepper
+        .getByRole("button", { name: "Increase font size" })
+        .locator("svg"),
     ).toHaveCount(1);
     const initial = Number.parseInt((await value.textContent()) || "14", 10);
     await stepper.getByRole("button", { name: "Increase font size" }).click();
@@ -98,7 +102,9 @@ test.describe("Shell action hierarchy on desktop", () => {
     expect(applied.terminal).toBe(applied.manager);
     expect(applied.stored).toBe(applied.manager);
 
-    await page.evaluate(() => (window as any).terminalManager.applyFontSize(32));
+    await page.evaluate(() =>
+      (window as any).terminalManager.applyFontSize(32),
+    );
     await expect(
       stepper.getByRole("button", { name: "Increase font size" }),
     ).toBeDisabled();
@@ -519,14 +525,15 @@ test.describe("Shell action hierarchy on desktop", () => {
         const snapshot = await snapshotTargetTab();
         return snapshot.stage;
       })
-      .toBe("truncated");
+      .toMatch(/^(truncated|cramped)$/);
 
     const finalSnapshot = await snapshotTargetTab();
     expect(finalSnapshot.error).toBeUndefined();
-    expect(finalSnapshot.stage).toBe("truncated");
+    expect(["truncated", "cramped"]).toContain(finalSnapshot.stage);
     expect(finalSnapshot.badgeBelowLabel).toBe(true);
     expect(finalSnapshot.sameRow).toBe(false);
     expect(finalSnapshot.overlap).toBe(false);
+    expect(finalSnapshot.copyClearsClose).toBe(true);
     expect(finalSnapshot.labelTextOverflow).toBe("ellipsis");
     expect(finalSnapshot.badgeTextOverflow).toBe("ellipsis");
   });

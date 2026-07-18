@@ -296,6 +296,16 @@ export function getRouteCapability(
         resourceId,
       };
     }
+    if (
+      (normalizedMethod === "POST" || normalizedMethod === "DELETE") &&
+      action === "close-later"
+    ) {
+      return {
+        capability: "terminal.manage",
+        resourceType: "terminal",
+        resourceId,
+      };
+    }
   }
 
   if (

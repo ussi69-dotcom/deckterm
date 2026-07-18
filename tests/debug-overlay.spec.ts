@@ -15,7 +15,7 @@ import {
   pressDocumentShortcut,
 } from "./fixtures";
 
-const APP_URL = "http://localhost:4174";
+const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
 test.describe("Debug Overlay", () => {
   test.beforeEach(async ({ page }) => {

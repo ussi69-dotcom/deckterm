@@ -182,6 +182,39 @@ const SETTINGS_SCHEMA = [
     searchText: "tasks view list board kanban runner layout default",
   },
 
+  // ── Notifications ───────────────────────────────────────────────────────
+  {
+    key: "notifications.soundMode",
+    category: "Notifications",
+    label: "Completion sounds",
+    description:
+      "Play a sound when a terminal command or agent session finishes.",
+    type: "select",
+    default: "unfocused",
+    options: [
+      { value: "always", label: "Always" },
+      { value: "unfocused", label: "Only when DeckTerm is unfocused" },
+      { value: "off", label: "Off" },
+    ],
+    searchText:
+      "notification sound audio bell alert completion finished focus background off",
+  },
+  {
+    key: "notifications.sound",
+    category: "Notifications",
+    label: "Completion sound",
+    description: "Sound played for a completed terminal session.",
+    type: "select",
+    default: "chime",
+    options: [
+      { value: "chime", label: "Chime" },
+      { value: "ping", label: "Ping" },
+      { value: "bell", label: "Bell" },
+      { value: "pop", label: "Pop" },
+    ],
+    searchText: "notification sound audio tone chime ping bell pop preview",
+  },
+
   // ── Advanced ──────────────────────────────────────────────────────────────
   {
     key: "workspace.reconnectBehavior",

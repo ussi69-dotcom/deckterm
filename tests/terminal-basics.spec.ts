@@ -12,11 +12,12 @@ import {
   test,
   expect,
   readActiveTerminalText,
+  resetAppState,
   waitForTerminal,
   resizeWindow,
 } from "./fixtures";
 
-const BASE_URL = "http://localhost:4174";
+const BASE_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
 // Helper to get visible elements (handles multiple tabs)
 const visibleXterm = ".xterm:visible";
@@ -28,6 +29,7 @@ test.describe("Terminal Basics", () => {
   test.beforeEach(async ({ page }) => {
     // Set consistent viewport for tests
     await page.setViewportSize({ width: 1200, height: 800 });
+    await resetAppState(page, BASE_URL);
   });
 
   test("terminal loads and renders", async ({ page }) => {
@@ -197,7 +199,9 @@ test.describe("Terminal Basics", () => {
 
     // The WebGL renderer paints text to canvas and does not create DOM rows.
     const renderer = page
-      .locator(".xterm-screen canvas, .xterm-screen .xterm-rows")
+      .locator(
+        ".xterm-screen:visible canvas:visible, .xterm-screen:visible .xterm-rows:visible",
+      )
       .first();
     await expect(renderer).toBeVisible();
 

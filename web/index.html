@@ -2,25 +2,41 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, interactive-widget=resizes-content"
+    />
     <title>DeckTerm</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23238636'/><text x='50' y='68' font-size='50' text-anchor='middle' fill='white'>❯</text></svg>" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23238636'/><text x='50' y='68' font-size='50' text-anchor='middle' fill='white'>❯</text></svg>"
+    />
     <!-- Nerd Font for terminal icons (Claude Code statusline, etc.) -->
     <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.0.0/400.css" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.0.0/400.css"
+    />
     <style>
       /* Nerd Font symbols fallback - loaded from CDN */
       @font-face {
-        font-family: 'Symbols Nerd Font';
-        src: url('https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@master/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf') format('truetype');
+        font-family: "Symbols Nerd Font";
+        src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@master/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf")
+          format("truetype");
         font-display: swap;
       }
     </style>
     <link rel="stylesheet" href="/vendor/xterm.css" />
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css" />
-    <link rel="stylesheet" href="/styles.css?v=20260713g" />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css"
+    />
+    <link rel="stylesheet" href="/styles.css?v=20260718a" />
     <!-- Lucide Icons for modern UI -->
-    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js" defer></script>
+    <script
+      src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"
+      defer
+    ></script>
   </head>
   <body>
     <div id="app">
@@ -32,7 +48,11 @@
             <i data-lucide="menu"></i>
           </button>
 
-          <div class="session-actions" role="group" aria-label="Session actions">
+          <div
+            class="session-actions"
+            role="group"
+            aria-label="Session actions"
+          >
             <button
               id="new-terminal"
               class="btn btn-new"
@@ -61,6 +81,18 @@
                 hidden
               ></span>
             </button>
+
+            <button
+              id="notification-sound-toggle"
+              class="btn-icon notification-sound-toggle"
+              type="button"
+              title="Completion sounds: when unfocused"
+              aria-label="Completion sounds: when unfocused"
+              aria-pressed="true"
+              data-mode="unfocused"
+            >
+              <i data-lucide="bell-ring"></i>
+            </button>
           </div>
 
           <div
@@ -70,7 +102,9 @@
             aria-label="Workspace tabs"
           ></div>
 
-          <span id="connection-status" class="status-dot" title="Connected">●</span>
+          <span id="connection-status" class="status-dot" title="Connected"
+            >●</span
+          >
         </div>
 
         <!-- ROW 2: Desktop primary actions and context -->
@@ -160,7 +194,11 @@
             aria-hidden="true"
           >
             <div class="tools-sheet-layout-toolbar">
-              <div class="tools-sheet-layout-toggle" role="group" aria-label="Layout mode">
+              <div
+                class="tools-sheet-layout-toggle"
+                role="group"
+                aria-label="Layout mode"
+              >
                 <button
                   id="layout-editor-mode-desktop"
                   class="tools-sheet-layout-toggle-btn"
@@ -271,7 +309,11 @@
             </label>
             <label>
               <span>Task description</span>
-              <textarea id="task-description" name="description" rows="4"></textarea>
+              <textarea
+                id="task-description"
+                name="description"
+                rows="4"
+              ></textarea>
             </label>
             <div class="task-form-row">
               <label>
@@ -290,7 +332,12 @@
               </label>
             </div>
             <label class="task-checkbox">
-              <input id="task-use-worktree" name="useWorktree" type="checkbox" checked />
+              <input
+                id="task-use-worktree"
+                name="useWorktree"
+                type="checkbox"
+                checked
+              />
               <span>Use git worktree</span>
             </label>
             <button id="task-create" class="btn btn-primary" type="submit">
@@ -395,11 +442,23 @@
               <i data-lucide="x"></i>
             </button>
           </div>
-          <div style="padding: 15px; display: flex; flex-direction: column; gap: 12px; height: calc(100% - 70px); overflow-y: auto;">
-            <button id="sessions-refresh-btn" class="btn btn-secondary btn-block">
+          <div
+            style="
+              padding: 15px;
+              display: flex;
+              flex-direction: column;
+              gap: 12px;
+              height: calc(100% - 70px);
+              overflow-y: auto;
+            "
+          >
+            <button
+              id="sessions-refresh-btn"
+              class="btn btn-secondary btn-block"
+            >
               Refresh Catalog
             </button>
-            <div id="sessions-list" class="task-list" style="margin-top: 10px;">
+            <div id="sessions-list" class="task-list" style="margin-top: 10px">
               <!-- Dynamically loaded sessions -->
             </div>
           </div>
@@ -464,7 +523,12 @@
             >
               <i data-lucide="refresh-cw"></i>
             </button>
-            <input type="file" id="file-explorer-upload-input" multiple hidden />
+            <input
+              type="file"
+              id="file-explorer-upload-input"
+              multiple
+              hidden
+            />
           </div>
 
           <div id="file-explorer-list" class="file-list file-explorer-list">
@@ -496,11 +560,7 @@
         </section>
       </div>
 
-      <div
-        id="settings-sheet"
-        class="settings-sheet hidden"
-        aria-hidden="true"
-      >
+      <div id="settings-sheet" class="settings-sheet hidden" aria-hidden="true">
         <div class="settings-sheet-backdrop"></div>
         <section
           class="settings-sheet-shell"
@@ -530,7 +590,11 @@
           <!-- Tiles will be created dynamically -->
         </div>
         <div id="surface-windows-layer"></div>
-        <div id="dock-sash" class="dock-sash" title="Drag to resize, double-click to reset"></div>
+        <div
+          id="dock-sash"
+          class="dock-sash"
+          title="Drag to resize, double-click to reset"
+        ></div>
       </div>
 
       <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
@@ -541,10 +605,18 @@
           <span data-key="CTRL" class="ek-btn ek-modifier">CTRL</span>
           <span data-key="ALT" class="ek-btn ek-modifier">ALT</span>
           <span data-key="SHIFT" class="ek-btn ek-modifier">SHIFT</span>
-          <span data-key="UP" class="ek-btn ek-icon"><i data-lucide="chevron-up"></i></span>
-          <span data-key="DOWN" class="ek-btn ek-icon"><i data-lucide="chevron-down"></i></span>
-          <span data-key="LEFT" class="ek-btn ek-icon"><i data-lucide="chevron-left"></i></span>
-          <span data-key="RIGHT" class="ek-btn ek-icon"><i data-lucide="chevron-right"></i></span>
+          <span data-key="UP" class="ek-btn ek-icon"
+            ><i data-lucide="chevron-up"></i
+          ></span>
+          <span data-key="DOWN" class="ek-btn ek-icon"
+            ><i data-lucide="chevron-down"></i
+          ></span>
+          <span data-key="LEFT" class="ek-btn ek-icon"
+            ><i data-lucide="chevron-left"></i
+          ></span>
+          <span data-key="RIGHT" class="ek-btn ek-icon"
+            ><i data-lucide="chevron-right"></i
+          ></span>
           <span data-key="HOME" class="ek-btn">HOME</span>
           <span data-key="END" class="ek-btn">END</span>
           <span data-key="INS" class="ek-btn">INS</span>
@@ -566,16 +638,28 @@
           <span data-key="PGUP" class="ek-btn">PgUp</span>
           <span data-key="PGDN" class="ek-btn">PgDn</span>
         </div>
-        <span id="extra-keys-toggle" class="ek-toggle" title="More keys">⋯</span>
+        <span id="extra-keys-toggle" class="ek-toggle" title="More keys"
+          >⋯</span
+        >
       </div>
 
-      <nav id="mobile-action-bar" class="mobile-action-bar" aria-label="Primary actions"></nav>
+      <nav
+        id="mobile-action-bar"
+        class="mobile-action-bar"
+        aria-label="Primary actions"
+      ></nav>
 
       <!-- Debug Panel (debug=1 only) -->
       <div id="debug-panel" class="debug-panel">
         <div class="debug-panel-header">
           <span>DEBUG LOG</span>
-          <button id="debug-panel-close" type="button" class="debug-panel-close">X</button>
+          <button
+            id="debug-panel-close"
+            type="button"
+            class="debug-panel-close"
+          >
+            X
+          </button>
         </div>
         <div id="debug-log"></div>
       </div>
@@ -623,7 +707,11 @@
       </div>
 
       <!-- Fullscreen exit button -->
-      <button id="fullscreen-exit" class="fullscreen-exit hidden" title="Exit fullscreen (Esc)">
+      <button
+        id="fullscreen-exit"
+        class="fullscreen-exit hidden"
+        title="Exit fullscreen (Esc)"
+      >
         <i data-lucide="minimize-2"></i>
       </button>
     </div>
@@ -659,7 +747,9 @@
         </div>
         <div class="modal-footer">
           <button id="paste-cancel" class="btn btn-secondary">Cancel</button>
-          <button id="paste-confirm" class="btn btn-primary">Paste Anyway</button>
+          <button id="paste-confirm" class="btn btn-primary">
+            Paste Anyway
+          </button>
         </div>
       </div>
     </div>
@@ -676,52 +766,132 @@
             <div class="help-column">
               <h4>Workspaces & Tabs</h4>
               <table class="help-table">
-                <tr><td><kbd>Ctrl</kbd> + <kbd>N</kbd></td><td>New workspace tab</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>W</kbd></td><td>Close current pane</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Tab</kbd></td><td>Next tab</td></tr>
-                <tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>←</kbd>/<kbd>→</kbd></td><td>Previous/next tab</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>1-9</kbd></td><td>Switch to tab number</td></tr>
-                <tr><td>Drag tab → tab</td><td>Merge workspaces</td></tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>N</kbd></td>
+                  <td>New workspace tab</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>W</kbd></td>
+                  <td>Close current pane</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Tab</kbd></td>
+                  <td>Next tab</td>
+                </tr>
+                <tr>
+                  <td>
+                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>←</kbd>/<kbd
+                      >→</kbd
+                    >
+                  </td>
+                  <td>Previous/next tab</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>1-9</kbd></td>
+                  <td>Switch to tab number</td>
+                </tr>
+                <tr>
+                  <td>Drag tab → tab</td>
+                  <td>Merge workspaces</td>
+                </tr>
               </table>
 
               <h4>Terminals</h4>
               <table class="help-table">
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td><td>Split workspace (add terminal)</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Move current pane to a new tab</td></tr>
-                <tr><td><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd>/<kbd>↓</kbd></td><td>Previous/next pane in this tab</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td><td>Undo layout change</td></tr>
-                <tr><td>Drag tile edge</td><td>Resize terminals</td></tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td>
+                  <td>Split workspace (add terminal)</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
+                  <td>Move current pane to a new tab</td>
+                </tr>
+                <tr>
+                  <td>
+                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd>/<kbd
+                      >↓</kbd
+                    >
+                  </td>
+                  <td>Previous/next pane in this tab</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td>
+                  <td>Undo layout change</td>
+                </tr>
+                <tr>
+                  <td>Drag tile edge</td>
+                  <td>Resize terminals</td>
+                </tr>
               </table>
             </div>
 
             <div class="help-column">
               <h4>Visual Groups</h4>
               <table class="help-table">
-                <tr><td><kbd>Ctrl</kbd> + <kbd>G</kbd></td><td>Color-group with previous</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td><td>Ungroup when pane is already alone</td></tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>G</kbd></td>
+                  <td>Color-group with previous</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
+                  <td>Ungroup when pane is already alone</td>
+                </tr>
               </table>
 
               <h4>General</h4>
               <table class="help-table">
-                <tr><td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd></td><td>Open actions palette</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>F</kbd></td><td>Search</td></tr>
-                <tr><td><kbd>F11</kbd></td><td>Toggle fullscreen</td></tr>
-                <tr><td><kbd>Ctrl</kbd> + <kbd>+</kbd>/<kbd>-</kbd></td><td>Font size</td></tr>
-                <tr><td><kbd>F1</kbd> or <kbd>?</kbd></td><td>Show this help</td></tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd></td>
+                  <td>Open actions palette</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>F</kbd></td>
+                  <td>Search</td>
+                </tr>
+                <tr>
+                  <td><kbd>F11</kbd></td>
+                  <td>Toggle fullscreen</td>
+                </tr>
+                <tr>
+                  <td><kbd>Ctrl</kbd> + <kbd>+</kbd>/<kbd>-</kbd></td>
+                  <td>Font size</td>
+                </tr>
+                <tr>
+                  <td><kbd>F1</kbd> or <kbd>?</kbd></td>
+                  <td>Show this help</td>
+                </tr>
               </table>
 
               <h4>Surfaces</h4>
               <table class="help-table">
-                <tr><td>Desktop</td><td>Use the top-bar actions to open Files, Git, Palette, and More</td></tr>
-                <tr><td>Mobile</td><td>Use the bottom action bar for Files, Git, Paste, and More</td></tr>
+                <tr>
+                  <td>Desktop</td>
+                  <td>
+                    Use the top-bar actions to open Files, Git, Palette, and
+                    More
+                  </td>
+                </tr>
+                <tr>
+                  <td>Mobile</td>
+                  <td>
+                    Use the bottom action bar for Files, Git, Paste, and More
+                  </td>
+                </tr>
               </table>
             </div>
           </div>
 
           <div class="help-legend">
             <h4>Tab Colors</h4>
-            <p><span class="legend-dot" style="background: #58a6ff;"></span> <strong>Single color dot</strong> = 1 terminal</p>
-            <p><span class="legend-gradient"></span> <strong>Gradient with badge</strong> = Multiple terminals (shows count)</p>
+            <p>
+              <span class="legend-dot" style="background: #58a6ff"></span>
+              <strong>Single color dot</strong> = 1 terminal
+            </p>
+            <p>
+              <span class="legend-gradient"></span>
+              <strong>Gradient with badge</strong> = Multiple terminals (shows
+              count)
+            </p>
           </div>
         </div>
         <div class="modal-actions">
@@ -753,10 +923,11 @@
     <script src="/git-decorations.js?v=20260616a"></script>
     <script src="/git-scm-view.js?v=20260705e"></script>
     <script src="/git-history-view.js?v=20260620b"></script>
-    <script src="/session-actions.js?v=20260601b"></script>
+    <script src="/session-actions.js?v=20260718a"></script>
     <script src="/reconnect-classify.js?v=20260601a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
+    <script src="/notification-sounds.js?v=20260718a"></script>
     <script src="/task-board.js?v=20260611a"></script>
     <script src="/tasks-view.js?v=20260705a"></script>
     <script src="/search-view.js?v=20260706a"></script>
@@ -767,7 +938,7 @@
     <script src="/palette-providers.js?v=20260705a"></script>
     <script src="/command-palette.js?v=20260705a"></script>
     <script src="/navigation-surface.js?v=20260713b"></script>
-    <script src="/settings-schema.js?v=20260705b"></script>
+    <script src="/settings-schema.js?v=20260718a"></script>
     <script src="/terminal-renderer.js?v=20260705a"></script>
     <script src="/settings-ui.js?v=20260705a"></script>
     <script src="/settings-runtime.js?v=20260616b"></script>
@@ -784,6 +955,6 @@
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260713k"></script>
+    <script src="/app.js?v=20260718b"></script>
   </body>
 </html>

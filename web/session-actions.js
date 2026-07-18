@@ -30,7 +30,11 @@ function planSessionRowAction(session, options) {
     return { kind: "focus", label: "Focus", statusClass };
   }
   if (live) {
-    return { kind: "attach", label: "Attach", statusClass };
+    return {
+      kind: "attach",
+      label: session?.terminationScheduledAt ? "Restore" : "Attach",
+      statusClass,
+    };
   }
   return { kind: "open-here", label: "Open here", statusClass };
 }

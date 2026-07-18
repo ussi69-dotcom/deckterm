@@ -6,6 +6,10 @@ const {
   defaultsOf,
   coerceValue,
 } = require("./settings-schema.js");
+const {
+  COMPLETION_SOUND_PATTERNS,
+  shouldPlayCompletionSound,
+} = require("./notification-sounds.js");
 
 const byKey = (key) => SETTINGS_SCHEMA.find((d) => d.key === key);
 
@@ -88,6 +92,23 @@ describe("SETTINGS_SCHEMA shape", () => {
     );
     expect(values).toEqual(["auto", "default"]);
   });
+
+  test("completion notifications expose mode and several sounds", () => {
+    const mode = byKey("notifications.soundMode");
+    const sound = byKey("notifications.sound");
+    expect(mode.default).toBe("unfocused");
+    expect(mode.options.map((option) => option.value)).toEqual([
+      "always",
+      "unfocused",
+      "off",
+    ]);
+    expect(sound.options.map((option) => option.value)).toEqual([
+      "chime",
+      "ping",
+      "bell",
+      "pop",
+    ]);
+  });
 });
 
 describe("categoriesOf", () => {
@@ -99,6 +120,7 @@ describe("categoriesOf", () => {
       "Git",
       "Files",
       "Tasks",
+      "Notifications",
       "Advanced",
     ]);
   });
@@ -255,5 +277,48 @@ describe("coerceValue", () => {
     expect(coerceValue(byKey("git.diffMode"), "nope")).toBe(
       byKey("git.diffMode").default,
     );
+  });
+});
+
+describe("completion sound policy", () => {
+  test("distinguishes focused and unfocused pages", () => {
+    expect(
+      shouldPlayCompletionSound("off", {
+        documentHidden: true,
+        documentFocused: false,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPlayCompletionSound("always", {
+        documentHidden: false,
+        documentFocused: true,
+      }),
+    ).toBe(true);
+    expect(
+      shouldPlayCompletionSound("unfocused", {
+        documentHidden: false,
+        documentFocused: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldPlayCompletionSound("unfocused", {
+        documentHidden: true,
+        documentFocused: true,
+      }),
+    ).toBe(true);
+  });
+
+  test("ships four non-empty synthesized sound patterns", () => {
+    expect(Object.keys(COMPLETION_SOUND_PATTERNS)).toEqual([
+      "chime",
+      "ping",
+      "bell",
+      "pop",
+    ]);
+    for (const pattern of Object.values(COMPLETION_SOUND_PATTERNS)) {
+      expect(pattern.length).toBeGreaterThan(0);
+      expect(pattern.every((note) => note.frequency > 0)).toBe(true);
+      expect(pattern.every((note) => note.duration > 0)).toBe(true);
+    }
   });
 });

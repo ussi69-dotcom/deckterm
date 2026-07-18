@@ -42,9 +42,7 @@ afterEach(async () => {
   }
 
   await Promise.all(
-    tempDirs
-      .splice(0)
-      .map((dir) => rm(dir, { recursive: true, force: true })),
+    tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })),
   );
 });
 
@@ -86,6 +84,7 @@ function spawnServer(opts: {
   stateDir: string;
   workRoot: string;
   tmuxBackend: boolean;
+  closeGraceMs?: number;
 }): Bun.Subprocess {
   const env: Record<string, string | undefined> = {
     ...process.env,
@@ -109,6 +108,7 @@ function spawnServer(opts: {
     // repopulated from the repo .env by the child's `bun run` auto-load.
     DECKTERM_PUBLISH_MODE: "local",
     DECKTERM_OS_ISOLATION: "0",
+    DECKTERM_TAB_CLOSE_GRACE_MS: String(opts.closeGraceMs ?? 15 * 60 * 1000),
   };
 
   const child = Bun.spawn(["bun", "run", "backend/index.ts"], {
@@ -134,12 +134,21 @@ async function waitForHealth(port: number): Promise<void> {
   throw new Error(`Server on port ${port} never became healthy`);
 }
 
-async function startHarness(opts: { tmuxBackend: boolean }): Promise<Harness> {
+async function startHarness(opts: {
+  tmuxBackend: boolean;
+  closeGraceMs?: number;
+}): Promise<Harness> {
   const { stateDir, workRoot } = await makeDirs();
   const port = await getFreePort();
   const tmuxSocket = join(stateDir, "tmux", `deckterm_p${port}.sock`);
   if (opts.tmuxBackend) tmuxSockets.push(tmuxSocket);
-  const child = spawnServer({ port, stateDir, workRoot, tmuxBackend: opts.tmuxBackend });
+  const child = spawnServer({
+    port,
+    stateDir,
+    workRoot,
+    tmuxBackend: opts.tmuxBackend,
+    closeGraceMs: opts.closeGraceMs,
+  });
   await waitForHealth(port);
   return { port, stateDir, workRoot, tmuxSocket, child };
 }
@@ -176,8 +185,17 @@ interface WsHandle {
   closed: Promise<void>;
 }
 
-async function attachWs(h: Harness, id: string): Promise<WsHandle> {
-  const ws = new WebSocket(`ws://127.0.0.1:${h.port}/ws/terminals/${id}`);
+async function attachWs(
+  h: Harness,
+  id: string,
+  clientId: string | null = null,
+): Promise<WsHandle> {
+  const clientQuery = clientId
+    ? `?clientId=${encodeURIComponent(clientId)}`
+    : "";
+  const ws = new WebSocket(
+    `ws://127.0.0.1:${h.port}/ws/terminals/${id}${clientQuery}`,
+  );
   const messages: string[] = [];
   ws.addEventListener("message", (event) => {
     if (typeof event.data === "string") messages.push(event.data);
@@ -269,9 +287,10 @@ async function tmuxPanePids(socket: string): Promise<Map<string, string>> {
 function dbSessionStatuses(stateDir: string): Map<string, string> {
   const db = new Database(join(stateDir, "deckterm.db"), { readonly: true });
   try {
-    const rows = db
-      .query("SELECT id, status FROM terminal_sessions")
-      .all() as { id: string; status: string }[];
+    const rows = db.query("SELECT id, status FROM terminal_sessions").all() as {
+      id: string;
+      status: string;
+    }[];
     return new Map(rows.map((row) => [row.id, row.status]));
   } finally {
     db.close();
@@ -283,6 +302,83 @@ async function listTerminals(h: Harness): Promise<{ id: string }[]> {
   expect(res.status).toBe(200);
   return (await res.json()) as { id: string }[];
 }
+
+async function scheduleClose(
+  h: Harness,
+  id: string,
+  clientId: string,
+): Promise<{
+  terminationScheduledAt: number | null;
+  preservedByOtherClient?: boolean;
+}> {
+  const response = await fetch(
+    `http://127.0.0.1:${h.port}/api/terminals/${id}/close-later`,
+    {
+      method: "POST",
+      headers: { "x-deckterm-client-id": clientId },
+    },
+  );
+  expect(response.status).toBe(200);
+  return (await response.json()) as {
+    terminationScheduledAt: number | null;
+    preservedByOtherClient?: boolean;
+  };
+}
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "scheduled tab close ends a detached session after the grace window",
+  async () => {
+    const h = await startHarness({ tmuxBackend: true, closeGraceMs: 500 });
+    const id = await createTerminal(h);
+    const scheduled = await scheduleClose(h, id, "closing-client");
+    expect(typeof scheduled.terminationScheduledAt).toBe("number");
+
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if (dbSessionStatuses(h.stateDir).get(id) === "ended") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(dbSessionStatuses(h.stateDir).get(id)).toBe("ended");
+    const listed = (await listTerminals(h)) as Array<{
+      id: string;
+      sessionStatus?: string;
+    }>;
+    expect(listed.find((terminal) => terminal.id === id)?.sessionStatus).toBe(
+      "ended",
+    );
+  },
+  15000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "an attached or foreign client prevents scheduled termination",
+  async () => {
+    const h = await startHarness({ tmuxBackend: true, closeGraceMs: 500 });
+    const id = await createTerminal(h);
+    const attached = await attachWs(h, id, "same-client");
+
+    const scheduled = await scheduleClose(h, id, "same-client");
+    expect(typeof scheduled.terminationScheduledAt).toBe("number");
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    const afterSweep = (await listTerminals(h)) as Array<{
+      id: string;
+      sessionStatus?: string;
+      terminationScheduledAt?: number | null;
+    }>;
+    expect(afterSweep.find((terminal) => terminal.id === id)).toMatchObject({
+      sessionStatus: "active",
+      terminationScheduledAt: null,
+    });
+
+    const foreign = await scheduleClose(h, id, "other-client");
+    expect(foreign).toMatchObject({
+      terminationScheduledAt: null,
+      preservedByOtherClient: true,
+    });
+    expect(dbSessionStatuses(h.stateDir).get(id)).toBe("active");
+    attached.ws.close();
+  },
+  15000,
+);
 
 test.skipIf(!TMUX_AVAILABLE)(
   "SIGTERM preserves live tmux sessions (rows stay active, tmux identity unchanged, restart recovers all)",

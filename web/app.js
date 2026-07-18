@@ -518,10 +518,7 @@ class ReconnectingWebSocket {
     // Replacing a connecting/open transport must invalidate it before close
     // can synchronously fire. Every callback below is generation-bound, so a
     // late event from this previous socket cannot mutate the new connection.
-    if (
-      previousSocket &&
-      previousSocket.readyState < WebSocket.CLOSING
-    ) {
+    if (previousSocket && previousSocket.readyState < WebSocket.CLOSING) {
       try {
         previousSocket.close();
       } catch {}
@@ -804,13 +801,7 @@ class ReconnectingWebSocket {
 // =============================================================================
 
 class Tile {
-  constructor(
-    id,
-    terminalId,
-    container,
-    onCloseRequest,
-    onDetachRequest,
-  ) {
+  constructor(id, terminalId, container, onCloseRequest, onDetachRequest) {
     this.id = id;
     this.terminalId = terminalId;
     this.container = container;
@@ -5152,7 +5143,14 @@ class TerminalManager {
     this.telemetryRefreshInterval = null;
     this.viewportSyncFrame = 0;
     this.viewportFocusTimer = null;
-    this.notificationsEnabled = true;
+    this.notificationMode =
+      settingsDefaults["notifications.soundMode"] || "unfocused";
+    this.notificationSound = settingsDefaults["notifications.sound"] || "chime";
+    this.notificationLastEnabledMode =
+      this.notificationMode === "off" ? "unfocused" : this.notificationMode;
+    this.notificationSettingsInitialized = false;
+    this.notificationSoundPlayer =
+      window.NotificationSounds?.createCompletionSoundPlayer?.() || null;
     this.clientInstanceId = this.getOrCreateClientInstanceId();
     this._sessionCatalog = [];
     this.sessionsReturnFocus = null;
@@ -5248,6 +5246,7 @@ class TerminalManager {
     // synchronous legacy localStorage read here.
 
     this.initTaskSignalBadge();
+    this.initCompletionSoundControl();
     this.initSessionsDock();
     this.initSettingsRuntime();
     this.initIdeShell();
@@ -5878,10 +5877,7 @@ class TerminalManager {
     // space on full action labels. Beyond four, reserve enough room for the
     // existing two-row layout at its 96px minimum.
     if (count <= 4) return widthFor(count, 144);
-    return Math.max(
-      widthFor(4, 144),
-      widthFor(Math.ceil(count / 2), 96),
-    );
+    return Math.max(widthFor(4, 144), widthFor(Math.ceil(count / 2), 96));
   }
 
   syncDesktopTabLayout() {
@@ -6069,12 +6065,8 @@ class TerminalManager {
     }
 
     const widthsByTier = this.measureDesktopActionWidthsByTier(actionBar);
-    const actionWidth = Math.ceil(
-      actionBar.getBoundingClientRect().width || 0,
-    );
-    const tabsWidth = Math.ceil(
-      this.tabs?.getBoundingClientRect().width || 0,
-    );
+    const actionWidth = Math.ceil(actionBar.getBoundingClientRect().width || 0);
+    const tabsWidth = Math.ceil(this.tabs?.getBoundingClientRect().width || 0);
     const tabCount = this.tabs?.querySelectorAll(".tab").length || 0;
     const availableWidth = Math.max(
       0,
@@ -6130,9 +6122,8 @@ class TerminalManager {
 
     const mode = this.getActiveChromeMode();
     const actionIds = this.getToolsSheetActionIds(mode);
-    const fontSizePinned = this.getLayoutPinnedActionIds(mode).includes(
-      "font-size",
-    );
+    const fontSizePinned =
+      this.getLayoutPinnedActionIds(mode).includes("font-size");
     grid.replaceChildren();
     grid.dataset.mode = mode;
     grid.dataset.empty = "false";
@@ -6590,6 +6581,7 @@ class TerminalManager {
         this.switchTo(sessionId);
         break;
       case "attach":
+        await this.cancelScheduledTerminalClose(sessionId);
         await this.reconnectToTerminal(
           sessionId,
           session.cwd,
@@ -6625,6 +6617,11 @@ class TerminalManager {
       .getElementById("sessions-btn")
       ?.setAttribute("aria-expanded", "true");
     void this.refreshSessionsPanel();
+    clearInterval(this.sessionsCountdownTimer);
+    this.sessionsCountdownTimer = setInterval(
+      () => this.updateSessionTerminationCountdowns(),
+      1000,
+    );
     this.syncSurfaceButtonState();
     panel
       .querySelector("#sessions-panel-close")
@@ -6636,6 +6633,8 @@ class TerminalManager {
     if (!panel) return;
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    clearInterval(this.sessionsCountdownTimer);
+    this.sessionsCountdownTimer = null;
     document
       .getElementById("sessions-btn")
       ?.setAttribute("aria-expanded", "false");
@@ -6662,9 +6661,7 @@ class TerminalManager {
       : 0;
     badge.hidden = available === 0;
     badge.textContent = available > 99 ? "99+" : String(available || "");
-    const label = available
-      ? `Sessions, ${available} available`
-      : "Sessions";
+    const label = available ? `Sessions, ${available} available` : "Sessions";
     trigger.setAttribute("aria-label", label);
     trigger.title = label;
   }
@@ -6697,18 +6694,63 @@ class TerminalManager {
           const mode = s.mode || "write";
           const cwd = esc(s.cwd || "");
           const dot = action.statusClass === "active" ? "●" : "○";
+          const terminationScheduledAt = Number(s.terminationScheduledAt) || 0;
+          const terminationLine = terminationScheduledAt
+            ? `<small class="session-termination-countdown" data-termination-at="${terminationScheduledAt}"></small>`
+            : "";
           return `<div class="session-row" role="button" tabindex="0" data-session-id="${s.id}">
           <div class="session-row-main">
             <strong><span class="session-badge ${action.statusClass}">${dot}</span> ${s.id.slice(0, 8)}</strong>
             <div class="session-row-cwd">${cwd}</div>
             <small>${esc(status)} · ${esc(mode)}${s.sessionName ? " · tmux" : ""}</small>
+            ${terminationLine}
           </div>
           <span class="session-row-action" aria-hidden="true">${action.label}</span>
         </div>`;
         })
         .join("");
+      this.updateSessionTerminationCountdowns();
     } catch (err) {
       list.innerHTML = `<div class='task-item'>Failed to load sessions: ${err.message}</div>`;
+    }
+  }
+
+  updateSessionTerminationCountdowns() {
+    let expired = false;
+    document.querySelectorAll("[data-termination-at]").forEach((element) => {
+      const remainingMs = Number(element.dataset.terminationAt) - Date.now();
+      if (remainingMs <= 0) {
+        element.textContent = "Ending now…";
+        expired = true;
+        return;
+      }
+      const totalSeconds = Math.ceil(remainingMs / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      element.textContent = `Restorable · ends in ${minutes}:${String(seconds).padStart(2, "0")}`;
+    });
+    if (expired && !this.sessionsExpiryRefreshPending) {
+      this.sessionsExpiryRefreshPending = true;
+      setTimeout(() => {
+        this.sessionsExpiryRefreshPending = false;
+        if (!this.getSessionsPanel()?.classList.contains("hidden")) {
+          void this.refreshSessionsPanel();
+        }
+      }, 1500);
+    }
+  }
+
+  async cancelScheduledTerminalClose(sessionId) {
+    try {
+      await fetch(
+        `/api/terminals/${encodeURIComponent(sessionId)}/close-later`,
+        {
+          method: "DELETE",
+          headers: { "x-deckterm-client-id": this.clientInstanceId },
+        },
+      );
+    } catch {
+      // The WebSocket attach path also cancels the deadline server-side.
     }
   }
 
@@ -6871,11 +6913,101 @@ class TerminalManager {
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
         "terminal.renderer": (value) => this.applyRendererSetting(value),
+        "notifications.soundMode": (value) =>
+          this.applyCompletionSoundMode(value),
+        "notifications.sound": (value) =>
+          this.applyCompletionSoundSelection(value),
       },
     });
     // Settings load + migration are async; apply once they resolve so the store
     // is populated with the canonical (and migrated) values.
-    void this.settingsReady.then(() => this.settingsRuntime?.applyAll());
+    void this.settingsReady.then(() => {
+      this.settingsRuntime?.applyAll();
+      this.notificationSettingsInitialized = true;
+    });
+  }
+
+  initCompletionSoundControl() {
+    const button = document.getElementById("notification-sound-toggle");
+    button?.addEventListener("click", () => this.toggleCompletionSounds());
+
+    // Browsers require a user gesture before Web Audio may start. Terminal
+    // use naturally provides one; priming here avoids losing the first finish.
+    const unlock = () => void this.notificationSoundPlayer?.unlock?.();
+    document.addEventListener("pointerdown", unlock, {
+      once: true,
+      capture: true,
+    });
+    document.addEventListener("keydown", unlock, { once: true, capture: true });
+    this.updateCompletionSoundButton();
+  }
+
+  applyCompletionSoundMode(value) {
+    const mode = ["always", "unfocused", "off"].includes(value)
+      ? value
+      : "unfocused";
+    this.notificationMode = mode;
+    if (mode !== "off") this.notificationLastEnabledMode = mode;
+    this.updateCompletionSoundButton();
+  }
+
+  applyCompletionSoundSelection(value) {
+    const sound = ["chime", "ping", "bell", "pop"].includes(value)
+      ? value
+      : "chime";
+    this.notificationSound = sound;
+    if (this.notificationSettingsInitialized) {
+      void this.notificationSoundPlayer?.play?.(sound);
+    }
+  }
+
+  toggleCompletionSounds() {
+    const next =
+      this.notificationMode === "off"
+        ? this.notificationLastEnabledMode || "unfocused"
+        : "off";
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("notifications.soundMode", next);
+    } else {
+      this.settingsStore?.set("notifications.soundMode", next);
+      this.applyCompletionSoundMode(next);
+    }
+  }
+
+  updateCompletionSoundButton() {
+    const button = document.getElementById("notification-sound-toggle");
+    if (!button) return;
+    const labels = {
+      always: "Completion sounds: always",
+      unfocused: "Completion sounds: only when DeckTerm is unfocused",
+      off: "Completion sounds: off",
+    };
+    const label = labels[this.notificationMode] || labels.unfocused;
+    button.dataset.mode = this.notificationMode;
+    button.title = `${label}. Click to ${this.notificationMode === "off" ? "turn on" : "turn off"}.`;
+    button.setAttribute("aria-label", button.title);
+    button.setAttribute(
+      "aria-pressed",
+      this.notificationMode === "off" ? "false" : "true",
+    );
+  }
+
+  playCompletionSound() {
+    const shouldPlay =
+      window.NotificationSounds?.shouldPlayCompletionSound?.(
+        this.notificationMode,
+        {
+          documentHidden: Boolean(document.hidden),
+          documentFocused:
+            typeof document.hasFocus === "function"
+              ? document.hasFocus()
+              : true,
+        },
+      ) || false;
+    if (shouldPlay) {
+      void this.notificationSoundPlayer?.play?.(this.notificationSound);
+    }
+    return shouldPlay;
   }
 
   applyAccentColor(name) {
@@ -9625,7 +9757,9 @@ class TerminalManager {
   }
 
   normalizeConnectionStatus(status) {
-    const normalized = String(status || "").trim().toLowerCase();
+    const normalized = String(status || "")
+      .trim()
+      .toLowerCase();
     if (normalized === "connected") return "connected";
     if (normalized === "connecting" || normalized === "reconnecting") {
       return normalized;
@@ -9787,6 +9921,7 @@ class TerminalManager {
               typeof next.lastExitCode === "number" ? next.lastExitCode : null,
             agentName: next.agentName || null,
             agentState: next.agentState || null,
+            agentTurnCompletedAt: next.agentTurnCompletedAt || null,
           });
           terminal.ports = normalizeWorkspacePorts(next.ports);
           terminal.isWorktree = Boolean(next.isWorktree);
@@ -10031,6 +10166,9 @@ class TerminalManager {
     if (!terminal) return;
 
     const prevRunning = Boolean(terminal.running ?? terminal.busy);
+    const prevAgentActive = ["thinking", "responding"].includes(
+      String(terminal.agentState || "").toLowerCase(),
+    );
     const nextRunning = Boolean(nextState.running);
     const nextExitCode =
       typeof nextState.lastExitCode === "number"
@@ -10044,14 +10182,33 @@ class TerminalManager {
       typeof nextState.agentState === "string" && nextState.agentState
         ? nextState.agentState
         : null;
+    const nextAgentActive = ["thinking", "responding"].includes(
+      String(nextAgentState || "").toLowerCase(),
+    );
+    const previousAgentTurnCompletedAt = Number(
+      terminal.agentTurnCompletedAt || 0,
+    );
+    const nextAgentTurnCompletedAt = Object.prototype.hasOwnProperty.call(
+      nextState,
+      "agentTurnCompletedAt",
+    )
+      ? Number(nextState.agentTurnCompletedAt || 0)
+      : previousAgentTurnCompletedAt;
+    const completedAgentTurn =
+      nextAgentTurnCompletedAt > 0 &&
+      nextAgentTurnCompletedAt !== previousAgentTurnCompletedAt;
 
     terminal.running = nextRunning;
     terminal.busy = nextRunning;
     terminal.lastExitCode = nextExitCode;
     terminal.agentName = nextAgentName;
     terminal.agentState = nextAgentState;
+    terminal.agentTurnCompletedAt = nextAgentTurnCompletedAt || null;
 
-    if (prevRunning && !nextRunning) {
+    if (
+      completedAgentTurn ||
+      ((prevRunning || prevAgentActive) && !nextRunning && !nextAgentActive)
+    ) {
       this.maybeNotifyCommandFinished(terminal);
     }
 
@@ -10059,7 +10216,7 @@ class TerminalManager {
   }
 
   maybeNotifyCommandFinished(terminal) {
-    if (!this.notificationsEnabled) return;
+    this.playCompletionSound();
     if (typeof Notification === "undefined") return;
     if (Notification.permission !== "granted") return;
     if (!document.hidden) return;
@@ -11820,7 +11977,8 @@ class TerminalManager {
       const reconnectableTerminals = serverTerminals.filter(
         (terminal) =>
           terminal?.sessionStatus !== "ended" &&
-          terminal?.status !== "inactive",
+          terminal?.status !== "inactive" &&
+          !terminal?.terminationScheduledAt,
       );
 
       if (reconnectableTerminals.length > 0) {
@@ -11860,6 +12018,7 @@ class TerminalManager {
             {
               backendMode: terminalInfo.backendMode || null,
               supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
+              agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
             },
           );
         }
@@ -11877,6 +12036,7 @@ class TerminalManager {
       isReconnection = true,
       backendMode = null,
       supportsLinkedView = false,
+      agentTurnCompletedAt = null,
     } = options;
     // Use saved workspace info if available, otherwise create new
     let workspaceId;
@@ -12032,6 +12192,7 @@ class TerminalManager {
       lastExitCode: null,
       agentName: null,
       agentState: null,
+      agentTurnCompletedAt,
       ports: [],
       isWorktree: false,
       recentTools: [],
@@ -12931,7 +13092,7 @@ class TerminalManager {
     const t = this.terminals.get(id);
     const waitingForReplay = Boolean(
       status === "connected" &&
-        (t?.awaitingReconnectReady || t?.ws?.awaitingReconnectReady),
+      (t?.awaitingReconnectReady || t?.ws?.awaitingReconnectReady),
     );
     const effectiveStatus = waitingForReplay ? "reconnecting" : status;
 
@@ -13397,6 +13558,7 @@ class TerminalManager {
         lastExitCode: null,
         agentName: null,
         agentState: null,
+        agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
         ports: [],
         isWorktree: false,
         recentTools: [],
@@ -13893,9 +14055,7 @@ class TerminalManager {
     const activeWorkspaceId = this.terminals.get(this.activeId)?.workspaceId;
     const currentIndex = Math.max(
       0,
-      tabs.findIndex(
-        (tab) => tab.dataset.workspaceId === activeWorkspaceId,
-      ),
+      tabs.findIndex((tab) => tab.dataset.workspaceId === activeWorkspaceId),
     );
     const newIndex = (currentIndex + direction + tabs.length) % tabs.length;
     const targetTab = tabs[newIndex];
@@ -13909,6 +14069,7 @@ class TerminalManager {
   async closeTerminal(id) {
     const t = this.terminals.get(id);
     if (!t) return;
+    const terminalLabel = this.formatCwdLabel(t.cwd || "Terminal");
     const closingWorkspaceId = t.workspaceId;
     const wasActive = id === this.activeId;
 
@@ -13944,9 +14105,8 @@ class TerminalManager {
     this.terminals.delete(id);
     this.sessionRegistry.remove(id);
 
-    const workspaceFallback = this.resolveWorkspaceTerminalId(
-      closingWorkspaceId,
-    );
+    const workspaceFallback =
+      this.resolveWorkspaceTerminalId(closingWorkspaceId);
     if (workspaceFallback) {
       this.workspaceLastActive.set(closingWorkspaceId, workspaceFallback);
       this.retargetWorkspaceTab(closingWorkspaceId, workspaceFallback);
@@ -13970,10 +14130,55 @@ class TerminalManager {
     this.updateLinkedViewButton();
 
     try {
-      await fetch(`/api/terminals/${encodeURIComponent(id)}`, {
-        method: "DELETE",
+      const response = await fetch(
+        `/api/terminals/${encodeURIComponent(id)}/close-later`,
+        {
+          method: "POST",
+          headers: { "x-deckterm-client-id": this.clientInstanceId },
+        },
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const result = await response.json();
+      this.showSessionCloseToast(
+        terminalLabel,
+        result.terminationScheduledAt,
+        Boolean(result.preservedByOtherClient),
+      );
+      this.queueTelemetryRefresh(0);
+    } catch (err) {
+      console.warn("Could not schedule terminal close:", err);
+      this.showSessionCloseToast(terminalLabel, null);
+    }
+  }
+
+  showSessionCloseToast(
+    label,
+    terminationScheduledAt,
+    preservedByOtherClient = false,
+  ) {
+    let toast = document.getElementById("session-close-toast");
+    if (!toast) {
+      toast = document.createElement("button");
+      toast.type = "button";
+      toast.id = "session-close-toast";
+      toast.className = "task-toast hidden";
+      toast.addEventListener("click", () => {
+        toast.classList.add("hidden");
+        this.openSessionsPanel();
       });
-    } catch {}
+      document.getElementById("app")?.appendChild(toast);
+    }
+    toast.textContent = preservedByOtherClient
+      ? `${label} closed here and remains active in another client. You can restore it from Sessions.`
+      : terminationScheduledAt
+        ? `${label} closed. Restore it from Sessions within 15 minutes.`
+        : `${label} closed, but automatic termination could not be scheduled. It remains in Sessions.`;
+    toast.classList.remove("hidden");
+    clearTimeout(this.sessionCloseToastTimer);
+    this.sessionCloseToastTimer = setTimeout(
+      () => toast.classList.add("hidden"),
+      9000,
+    );
   }
 
   sendResize(id, colsOverride = null, rowsOverride = null, options = {}) {

@@ -72,6 +72,7 @@ export type ShellIntegrationEvent =
   | { type: "running-done"; exitCode: number | null }
   | { type: "agent-start"; agentName: AgentName }
   | { type: "agent-done"; agentName: AgentName; exitCode: number | null }
+  | { type: "agent-turn-complete"; agentName: "codex" }
   | { type: "tool-used"; name: string; summary: string };
 
 type WorktreeDetector = (cwd: string) => Promise<boolean>;
@@ -104,6 +105,16 @@ const RECOVERED_AGENT_CMD_PATTERNS: Array<[AgentName, RegExp]> = [
   ["codex", /(^|[\/\s])codex(?=[\/\s]|$)/i],
 ];
 const IDLE_SHELL_COMMANDS = new Set(["bash", "fish", "sh", "zsh"]);
+
+function hasCodexTurnCompleteTitle(chunk: string): boolean {
+  for (const match of chunk.matchAll(
+    /\x1b\]0;([^\x07\x1b]*)(?:\x07|\x1b\\)/gu,
+  )) {
+    const title = (match[1] || "").trim();
+    if (title && !/^[\u2800-\u28ff]/u.test(title)) return true;
+  }
+  return false;
+}
 
 function normalizeAgentName(value: string): AgentName | null {
   const normalized = value.trim().toLowerCase();
@@ -410,6 +421,7 @@ export function parseShellIntegrationChunk(
 } {
   const input = `${state.carry || ""}${chunk || ""}`;
   const events: ShellIntegrationEvent[] = [];
+  const codexWasActive = state.agentName === "codex";
   let output = "";
   let cursor = 0;
   let running = state.running;
@@ -499,6 +511,13 @@ export function parseShellIntegrationChunk(
     }
 
     cursor = suffixIndex + SHELL_MARKER_SUFFIX.length;
+  }
+
+  // Codex keeps its TUI process alive between turns. Its exact turn boundary
+  // is the title reset from a braille-spinner title to the plain workspace
+  // title. Keep the OSC bytes in output for xterm; this event is metadata only.
+  if (codexWasActive && hasCodexTurnCompleteTitle(input)) {
+    events.push({ type: "agent-turn-complete", agentName: "codex" });
   }
 
   return {

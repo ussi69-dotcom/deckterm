@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   bootstrapFirstAdmin,
+  cancelTerminalSessionTermination,
   getFoundationUserById,
   getTerminalSession,
   grantScopedCapability,
@@ -10,6 +11,7 @@ import {
   initializeFoundationState,
   markTerminalSessionEnded,
   recordTerminalSession,
+  scheduleTerminalSessionTermination,
 } from "./services/foundation-state";
 import {
   authorizeTerminalSessionAccess,
@@ -164,9 +166,39 @@ test("foundation C1 records and ends terminal session metadata", async () => {
     createdAt: "2026-05-13T10:00:00.000Z",
     updatedAt: "2026-05-13T10:00:00.000Z",
     endedAt: null,
+    terminationScheduledAt: null,
     lastEventId: 0,
     execKind: null,
     osUid: null,
+  });
+
+  scheduleTerminalSessionTermination(
+    state.db,
+    "term_abc",
+    new Date("2026-05-13T10:15:00Z"),
+    new Date("2026-05-13T10:01:00Z"),
+  );
+  expect(getTerminalSession(state.db, "term_abc")).toMatchObject({
+    terminationScheduledAt: "2026-05-13T10:15:00.000Z",
+  });
+  recordTerminalSession(state.db, {
+    id: "term_abc",
+    actorUserId: "user_admin",
+    rootId,
+    cwd: projectRoot,
+    status: "active",
+    now: new Date("2026-05-13T10:01:30Z"),
+  });
+  expect(getTerminalSession(state.db, "term_abc")).toMatchObject({
+    terminationScheduledAt: "2026-05-13T10:15:00.000Z",
+  });
+  cancelTerminalSessionTermination(
+    state.db,
+    "term_abc",
+    new Date("2026-05-13T10:02:00Z"),
+  );
+  expect(getTerminalSession(state.db, "term_abc")).toMatchObject({
+    terminationScheduledAt: null,
   });
 
   markTerminalSessionEnded(
@@ -281,6 +313,20 @@ test("foundation C1 exposes a minimal route capability registry", () => {
     resourceId: "term_123",
   });
   expect(getRouteCapability("POST", "/api/terminals/term_123/resize")).toEqual({
+    capability: "terminal.manage",
+    resourceType: "terminal",
+    resourceId: "term_123",
+  });
+  expect(
+    getRouteCapability("POST", "/api/terminals/term_123/close-later"),
+  ).toEqual({
+    capability: "terminal.manage",
+    resourceType: "terminal",
+    resourceId: "term_123",
+  });
+  expect(
+    getRouteCapability("DELETE", "/api/terminals/term_123/close-later"),
+  ).toEqual({
     capability: "terminal.manage",
     resourceType: "terminal",
     resourceId: "term_123",

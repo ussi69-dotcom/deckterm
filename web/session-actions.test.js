@@ -21,6 +21,21 @@ test("live session that is not open locally attaches", () => {
   expect(action.statusClass).toBe("active");
 });
 
+test("scheduled live session is presented as restorable", () => {
+  const action = planSessionRowAction(
+    {
+      id: "abc",
+      status: "active",
+      sessionStatus: "active",
+      terminationScheduledAt: Date.now() + 60_000,
+    },
+    { isLocallyOpen: false },
+  );
+  expect(action.kind).toBe("attach");
+  expect(action.label).toBe("Restore");
+  expect(action.statusClass).toBe("active");
+});
+
 test("ended session opens a new terminal in its cwd", () => {
   const action = planSessionRowAction(
     { id: "abc", status: "active", sessionStatus: "ended" },

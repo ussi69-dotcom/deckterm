@@ -8,6 +8,8 @@ import {
   waitForNoClass,
 } from "./fixtures";
 
+const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
+
 /**
  * Dimension Overlay Tests
  *
@@ -23,7 +25,7 @@ test.describe("Dimension Overlay", () => {
 
   test("dimension overlay exists on terminal creation", async ({ page }) => {
     // Navigate to the terminal application
-    await page.goto("http://localhost:4174");
+    await page.goto(APP_URL);
 
     // Wait for the terminal to fully load
     await waitForTerminal(page);
@@ -36,7 +38,7 @@ test.describe("Dimension Overlay", () => {
 
   test("dimension overlay appears on resize", async ({ page }) => {
     // Navigate to the terminal application
-    await page.goto("http://localhost:4174");
+    await page.goto(APP_URL);
 
     // Wait for the terminal to fully load
     await waitForTerminal(page);
@@ -61,7 +63,7 @@ test.describe("Dimension Overlay", () => {
 
   test("dimension overlay fades after 1 second", async ({ page }) => {
     // Navigate to the terminal application
-    await page.goto("http://localhost:4174");
+    await page.goto(APP_URL);
 
     // Wait for the terminal to fully load
     await waitForTerminal(page);
@@ -87,7 +89,7 @@ test.describe("Dimension Overlay", () => {
 
   test("dimension overlay updates on multiple resizes", async ({ page }) => {
     // Navigate to the terminal application
-    await page.goto("http://localhost:4174");
+    await page.goto(APP_URL);
 
     // Wait for the terminal to fully load
     await waitForTerminal(page);

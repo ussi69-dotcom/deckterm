@@ -46,7 +46,9 @@ test.describe("Sessions drawer attach / open-here", () => {
     await expect(panel).toHaveClass(/hidden/);
     await expect(sessionsTrigger).toHaveAttribute("aria-expanded", "false");
     await expect(sessionsTrigger).not.toBeFocused();
-    await expect(page.locator(".tile.active .xterm-helper-textarea")).toBeFocused();
+    await expect(
+      page.locator(".tile.active .xterm-helper-textarea"),
+    ).toBeFocused();
 
     const activeAfter = await page.evaluate(
       () => (window as any).terminalManager?.activeId,
@@ -97,5 +99,48 @@ test.describe("Sessions drawer attach / open-here", () => {
     expect(plan.kind).toBe("attach");
     expect(plan.label).toBe("Attach");
     expect(plan.statusClass).toBe("active");
+  });
+
+  test("a closed workspace remains restorable for 15 minutes", async ({
+    page,
+  }) => {
+    test.setTimeout(60000);
+    await resetAppState(page, APP_URL);
+    await waitForTerminal(page);
+
+    const terminalId = await page.evaluate(
+      () => (window as any).terminalManager.activeId as string,
+    );
+    await page.locator("#terminals-tabs .tab-close").click();
+    await expect(page.locator("#session-close-toast")).toContainText(
+      "Restore it from Sessions within 15 minutes",
+    );
+    await expect(page.locator("#sessions-available-badge")).not.toBeHidden();
+
+    await page.locator("#sessions-btn").click();
+    const row = page.locator(
+      `#sessions-list .session-row[data-session-id="${terminalId}"]`,
+    );
+    await expect(row).toBeVisible();
+    await expect(row.locator(".session-row-action")).toHaveText("Restore");
+    await expect(row.locator(".session-termination-countdown")).toContainText(
+      "Restorable · ends in",
+    );
+
+    await row.click();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          (id) => (window as any).terminalManager.terminals.has(id),
+          terminalId,
+        ),
+      )
+      .toBe(true);
+    const restored = await page.evaluate(async (id) => {
+      const response = await fetch("/api/terminals");
+      const sessions = await response.json();
+      return sessions.find((session: any) => session.id === id);
+    }, terminalId);
+    expect(restored?.terminationScheduledAt).toBeNull();
   });
 });
