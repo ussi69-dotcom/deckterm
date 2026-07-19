@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "DeckTerm",
+  "short_name": "DeckTerm",
+  "description": "Persistent browser terminal workspace",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0d1117",
+  "theme_color": "#238636",
+  "icons": [
+    {
+      "src": "/app-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

@@ -97,6 +97,16 @@ DeckTerm can distinguish general running commands from supported agent CLIs:
 
 The state model is driven by shell integration markers plus agent output heuristics.
 
+### 8. Completion alerts
+
+- Four synthesized completion tones with Always, Only when unfocused, and Off modes
+- Normal, Loud, and Maximum in-page volume levels
+- Per-device Web Push for completed commands and agent turns
+- Generic lock-screen wording that does not expose a command, working directory, or terminal output
+- Desktop and Android browser support through standards-based Web Push
+- iPhone/iPad support when DeckTerm is installed as a Home Screen web app and permission is granted from that installed app
+- The bell in the toolbar remains the quick sound toggle; push enrollment lives in **Settings → Notifications** because browser permission must follow a direct user action
+
 ## User Interface Inventory
 
 Primary toolbar actions in the current product:
@@ -165,6 +175,12 @@ Core endpoints currently present:
 ### Clipboard API
 
 - `POST /api/clipboard/image`
+
+### Notification APIs
+
+- `GET /api/notifications/push`
+- `POST /api/notifications/push`
+- `DELETE /api/notifications/push`
 
 > The API surface above is a partial inventory (terminal/file/git/clipboard). It
 > has grown since this list was written — foundation (`/api/foundation/status`,

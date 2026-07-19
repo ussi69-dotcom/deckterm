@@ -58,6 +58,10 @@ const B6_RETENTION_RUNS_MIGRATION = 8;
 // Graceful tab close: keep an active terminal restorable for a short window,
 // with the deadline persisted so a DeckTerm service restart does not lose it.
 const TERMINAL_TERMINATION_DEADLINE_MIGRATION = 9;
+// Per-device Web Push subscriptions. The endpoint and browser encryption keys
+// are credentials: callers may create/delete their own rows but never list the
+// stored values through the HTTP API.
+const PUSH_SUBSCRIPTIONS_MIGRATION = 10;
 
 export type ScopedGrantCapability =
   | "terminal.create"
@@ -94,6 +98,17 @@ export type RecordedTerminalEvent = {
   data: string | null;
   dataJson: Record<string, unknown> | null;
   createdAt: string;
+};
+
+export type PushSubscriptionRecord = {
+  id: string;
+  userId: string;
+  endpoint: string;
+  p256dh: string;
+  auth: string;
+  expirationTime: number | null;
+  createdAt: string;
+  updatedAt: string;
 };
 
 const ADMIN_DEFAULT_GRANTS: Array<{
@@ -250,6 +265,21 @@ export function migrateFoundationDb(db: Database): void {
 
     CREATE UNIQUE INDEX IF NOT EXISTS idx_os_mappings_active_uid
       ON user_os_mappings(os_uid) WHERE status = 'active';
+
+    CREATE TABLE IF NOT EXISTS push_subscriptions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      endpoint TEXT NOT NULL UNIQUE,
+      p256dh TEXT NOT NULL,
+      auth TEXT NOT NULL,
+      expiration_time INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user_id
+      ON push_subscriptions(user_id);
   `);
 
   const existing = db
@@ -395,6 +425,15 @@ export function migrateFoundationDb(db: Database): void {
     db.query(
       "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
     ).run(TERMINAL_TERMINATION_DEADLINE_MIGRATION, new Date().toISOString());
+  }
+
+  const pushSubscriptionsExisting = db
+    .query("SELECT version FROM schema_migrations WHERE version = ?")
+    .get(PUSH_SUBSCRIPTIONS_MIGRATION);
+  if (!pushSubscriptionsExisting) {
+    db.query(
+      "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+    ).run(PUSH_SUBSCRIPTIONS_MIGRATION, new Date().toISOString());
   }
 }
 
@@ -864,6 +903,106 @@ export function setUserSettings(
     if (value === null) remove.run(userId, key);
     else upsert.run(userId, key, JSON.stringify(value), timestamp);
   }
+}
+
+export function upsertPushSubscription(
+  db: Database,
+  subscription: {
+    userId: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    expirationTime?: number | null;
+    now?: Date;
+  },
+): { ok: true; id: string } | { ok: false; reason: "endpoint_conflict" } {
+  const existing = db
+    .query("SELECT id FROM push_subscriptions WHERE endpoint = ?")
+    .get(subscription.endpoint) as { id: string } | null;
+  const id = existing?.id || createId("push");
+  const timestamp = isoDate(subscription.now || new Date());
+  const result = db
+    .query(
+      `INSERT INTO push_subscriptions
+        (id, user_id, endpoint, p256dh, auth, expiration_time, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(endpoint) DO UPDATE SET
+         p256dh = excluded.p256dh,
+         auth = excluded.auth,
+         expiration_time = excluded.expiration_time,
+         updated_at = excluded.updated_at
+       WHERE push_subscriptions.user_id = excluded.user_id`,
+    )
+    .run(
+      id,
+      subscription.userId,
+      subscription.endpoint,
+      subscription.p256dh,
+      subscription.auth,
+      subscription.expirationTime ?? null,
+      timestamp,
+      timestamp,
+    );
+  if (result.changes === 0) {
+    return { ok: false, reason: "endpoint_conflict" };
+  }
+  return { ok: true, id };
+}
+
+export function listPushSubscriptionsForUser(
+  db: Database,
+  userId: string,
+): PushSubscriptionRecord[] {
+  const rows = db
+    .query(
+      `SELECT id, user_id, endpoint, p256dh, auth, expiration_time,
+              created_at, updated_at
+       FROM push_subscriptions
+       WHERE user_id = ?
+       ORDER BY created_at ASC`,
+    )
+    .all(userId) as Array<{
+    id: string;
+    user_id: string;
+    endpoint: string;
+    p256dh: string;
+    auth: string;
+    expiration_time: number | null;
+    created_at: string;
+    updated_at: string;
+  }>;
+  return rows.map((row) => ({
+    id: row.id,
+    userId: row.user_id,
+    endpoint: row.endpoint,
+    p256dh: row.p256dh,
+    auth: row.auth,
+    expirationTime: row.expiration_time,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }));
+}
+
+export function deletePushSubscriptionForUser(
+  db: Database,
+  userId: string,
+  endpoint: string,
+): boolean {
+  const result = db
+    .query("DELETE FROM push_subscriptions WHERE user_id = ? AND endpoint = ?")
+    .run(userId, endpoint);
+  return result.changes > 0;
+}
+
+export function deletePushSubscriptionById(
+  db: Database,
+  userId: string,
+  id: string,
+): boolean {
+  const result = db
+    .query("DELETE FROM push_subscriptions WHERE user_id = ? AND id = ?")
+    .run(userId, id);
+  return result.changes > 0;
 }
 
 export function markTerminalSessionEnded(

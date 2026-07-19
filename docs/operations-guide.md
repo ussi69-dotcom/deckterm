@@ -79,6 +79,28 @@ Key properties:
 - runs from [`/home/deploy/deckterm_dev`](/home/deploy/deckterm_dev)
 - used for all active browser testing on `4174`
 
+## Completion push notifications
+
+**Plain-language guide:** the open web page can play a tone, but background Web Push is delivered by the operating system even when the page sleeps or closes. The server signs those messages with one long-lived VAPID key pair. Every phone or computer still needs to be enabled separately in **Settings → Notifications**.
+
+Generate the key pair once:
+
+```bash
+bun run push:vapid
+```
+
+Store the resulting values in the runtime environment (production uses `/home/deploy/apps/deckterm/shared/prod.env`; development uses its service environment):
+
+```text
+DECKTERM_VAPID_PUBLIC_KEY=<publicKey>
+DECKTERM_VAPID_PRIVATE_KEY=<privateKey>
+DECKTERM_VAPID_SUBJECT=mailto:<operational-contact>
+```
+
+The private key is a secret: do not commit it, paste it into issues, or rotate it casually. Replacing the key pair invalidates existing browser subscriptions, so every device must enable push again. The public key endpoint intentionally returns only the public half.
+
+After changing the runtime environment, restart the relevant service and verify `GET /api/notifications/push` reports `configured: true` while authenticated. On iPhone/iPad, add DeckTerm to the Home Screen, open that installed app, then enable push from its Settings; a normal Safari tab cannot receive background Web Push.
+
 ## GitHub Actions
 
 ### CI

@@ -214,6 +214,34 @@ const SETTINGS_SCHEMA = [
     ],
     searchText: "notification sound audio tone chime ping bell pop preview",
   },
+  {
+    key: "notifications.soundVolume",
+    category: "Notifications",
+    label: "Completion volume",
+    description:
+      "Volume of the in-page completion tone. System notification volume is controlled by the device.",
+    type: "select",
+    default: "loud",
+    options: [
+      { value: "normal", label: "Normal" },
+      { value: "loud", label: "Loud" },
+      { value: "maximum", label: "Maximum" },
+    ],
+    searchText:
+      "notification sound volume audio loud louder maximum system mobile",
+  },
+  {
+    key: "notifications.pushEnabled",
+    category: "Notifications",
+    label: "Push notifications on this device",
+    description:
+      "Receive an operating-system alert even when DeckTerm is sleeping or closed. Enable each device separately.",
+    type: "toggle",
+    default: false,
+    deviceLocal: true,
+    searchText:
+      "push notification desktop mobile phone device background service worker permission pwa",
+  },
 
   // ── Advanced ──────────────────────────────────────────────────────────────
   {

@@ -40,6 +40,9 @@ jobs:
       - name: Type check
         run: bun x tsc --noEmit
 
+      - name: Run push notification tests
+        run: bun run test:push
+
       - name: Run unit tests
         run: bun run test:unit
 

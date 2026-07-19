@@ -56,6 +56,9 @@ jobs:
       - name: Install tmux
         run: sudo apt-get update && sudo apt-get install -y tmux
 
+      - name: Run push notification tests
+        run: bun run test:push
+
       - name: Run unit tests
         run: bun run test:unit
 

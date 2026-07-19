@@ -919,7 +919,7 @@ body {
   left: 0;
   top: var(--resize-handle);
   bottom: var(--resize-handle);
-  width: var(--resize-handle);
+  width: 4px;
   cursor: ew-resize;
 }
 
@@ -927,7 +927,8 @@ body {
   right: 0;
   top: var(--resize-handle);
   bottom: var(--resize-handle);
-  width: var(--resize-handle);
+  /* Leave the terminal's 14px scrollbar thumb exposed. */
+  width: 4px;
   cursor: ew-resize;
 }
 
@@ -5836,7 +5837,7 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   left: 0;
   top: var(--resize-handle);
   bottom: var(--resize-handle);
-  width: var(--resize-handle);
+  width: 4px;
   cursor: ew-resize;
 }
 
@@ -5844,7 +5845,9 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   right: 0;
   top: var(--resize-handle);
   bottom: var(--resize-handle);
-  width: var(--resize-handle);
+  /* Keep the scrollbar lane usable. The old 12px resize hitbox covered most
+     of a 14px scrollbar, so grabbing the thumb resized the window instead. */
+  width: 4px;
   cursor: ew-resize;
 }
 
@@ -7712,6 +7715,7 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 12px 16px 24px;
 }
 

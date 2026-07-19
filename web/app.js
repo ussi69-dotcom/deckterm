@@ -4899,8 +4899,24 @@ class SettingsManager {
         this.listEl.appendChild(heading);
       }
       for (const def of group.entries) {
-        const stored = this.settingsStore?.get(def.key, def.default);
+        const pushStatus =
+          def.key === "notifications.pushEnabled"
+            ? window.terminalManager?.pushNotifications?.getStatus?.()
+            : null;
+        const stored = pushStatus
+          ? pushStatus.enabled
+          : this.settingsStore?.get(def.key, def.default);
         const descriptor = this.ui.buildControlDescriptor(def, stored);
+        if (descriptor && pushStatus) {
+          descriptor.value = pushStatus.enabled;
+          descriptor.description = pushStatus.description;
+          descriptor.disabled =
+            pushStatus.busy ||
+            (!pushStatus.enabled &&
+              ["unsupported", "unavailable", "blocked"].includes(
+                pushStatus.state,
+              ));
+        }
         if (descriptor)
           this.listEl.appendChild(this.renderControlRow(descriptor));
       }
@@ -4982,14 +4998,23 @@ class SettingsManager {
     el.id = id;
     el.dataset.settingKey = descriptor.key;
     el.dataset.settingType = descriptor.type;
+    el.disabled = Boolean(descriptor.disabled);
     return el;
   }
 
-  handleControlChange(e) {
+  async handleControlChange(e) {
     const el = e.target.closest("[data-setting-key]");
     if (!el) return;
     const key = el.dataset.settingKey;
     const raw = el.type === "checkbox" ? el.checked : el.value;
+    if (key === "notifications.pushEnabled") {
+      el.disabled = true;
+      await window.terminalManager?.pushNotifications?.setEnabled?.(
+        Boolean(raw),
+      );
+      this.renderList();
+      return;
+    }
     if (this.runtime) {
       this.runtime.apply(key, raw);
     } else if (this.settingsStore) {
@@ -5146,11 +5171,18 @@ class TerminalManager {
     this.notificationMode =
       settingsDefaults["notifications.soundMode"] || "unfocused";
     this.notificationSound = settingsDefaults["notifications.sound"] || "chime";
+    this.notificationVolume =
+      settingsDefaults["notifications.soundVolume"] || "loud";
     this.notificationLastEnabledMode =
       this.notificationMode === "off" ? "unfocused" : this.notificationMode;
     this.notificationSettingsInitialized = false;
     this.notificationSoundPlayer =
       window.NotificationSounds?.createCompletionSoundPlayer?.() || null;
+    this.pushNotifications = window.PushNotifications?.PushNotificationManager
+      ? new window.PushNotifications.PushNotificationManager({
+          onChange: () => this.settingsManager?.renderList?.(),
+        })
+      : null;
     this.clientInstanceId = this.getOrCreateClientInstanceId();
     this._sessionCatalog = [];
     this.sessionsReturnFocus = null;
@@ -5247,6 +5279,7 @@ class TerminalManager {
 
     this.initTaskSignalBadge();
     this.initCompletionSoundControl();
+    void this.pushNotifications?.initialize?.();
     this.initSessionsDock();
     this.initSettingsRuntime();
     this.initIdeShell();
@@ -6917,6 +6950,8 @@ class TerminalManager {
           this.applyCompletionSoundMode(value),
         "notifications.sound": (value) =>
           this.applyCompletionSoundSelection(value),
+        "notifications.soundVolume": (value) =>
+          this.applyCompletionSoundVolume(value),
       },
     });
     // Settings load + migration are async; apply once they resolve so the store
@@ -6957,7 +6992,17 @@ class TerminalManager {
       : "chime";
     this.notificationSound = sound;
     if (this.notificationSettingsInitialized) {
-      void this.notificationSoundPlayer?.play?.(sound);
+      void this.notificationSoundPlayer?.play?.(sound, this.notificationVolume);
+    }
+  }
+
+  applyCompletionSoundVolume(value) {
+    const volume = ["normal", "loud", "maximum"].includes(value)
+      ? value
+      : "loud";
+    this.notificationVolume = volume;
+    if (this.notificationSettingsInitialized) {
+      void this.notificationSoundPlayer?.play?.(this.notificationSound, volume);
     }
   }
 
@@ -7005,7 +7050,10 @@ class TerminalManager {
         },
       ) || false;
     if (shouldPlay) {
-      void this.notificationSoundPlayer?.play?.(this.notificationSound);
+      void this.notificationSoundPlayer?.play?.(
+        this.notificationSound,
+        this.notificationVolume,
+      );
     }
     return shouldPlay;
   }
@@ -10229,6 +10277,14 @@ class TerminalManager {
         ? `${label}: command completed successfully`
         : `${label}: command exited with code ${exitCode}`;
 
+    if (this.pushNotifications?.hasActiveSubscription?.()) return;
+    if (this.pushNotifications?.showLocalFallback) {
+      void this.pushNotifications.showLocalFallback("Command finished", {
+        body,
+        tag: `deckterm-local-${terminal.id}`,
+      });
+      return;
+    }
     try {
       new Notification("Command finished", { body });
     } catch (err) {

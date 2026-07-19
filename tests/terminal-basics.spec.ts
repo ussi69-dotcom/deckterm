@@ -52,6 +52,34 @@ test.describe("Terminal Basics", () => {
     await expect(xtermViewport).toBeVisible();
   });
 
+  test("right resize hitbox leaves the terminal scrollbar grabbable", async ({
+    page,
+  }) => {
+    await page.goto(BASE_URL);
+    await waitForTerminal(page);
+
+    const geometry = await page.evaluate(() => {
+      const viewport = document.querySelector(".xterm-viewport");
+      const tile = viewport?.closest(".tile");
+      const handle = tile?.querySelector(".tile-resize-right");
+      if (!viewport || !handle) return null;
+      const viewportRect = viewport.getBoundingClientRect();
+      const handleRect = handle.getBoundingClientRect();
+      return {
+        handleWidth: handleRect.width,
+        overlap: Math.max(
+          0,
+          Math.min(viewportRect.right, handleRect.right) -
+            Math.max(viewportRect.left, handleRect.left),
+        ),
+      };
+    });
+
+    expect(geometry).not.toBeNull();
+    expect(geometry?.handleWidth).toBeLessThanOrEqual(4);
+    expect(geometry?.overlap).toBeLessThanOrEqual(4);
+  });
+
   test("terminal fills container (no gaps)", async ({ page }) => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);

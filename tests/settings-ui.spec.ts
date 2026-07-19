@@ -108,10 +108,19 @@ test.describe("Settings window (VS Code style)", () => {
       'select[data-setting-key="notifications.soundMode"]',
     );
     const sound = win.locator('select[data-setting-key="notifications.sound"]');
+    const volume = win.locator(
+      'select[data-setting-key="notifications.soundVolume"]',
+    );
+    const push = win.locator(
+      'input[data-setting-key="notifications.pushEnabled"]',
+    );
     await expect(mode).toHaveValue("unfocused");
     await expect(sound.locator("option")).toHaveCount(4);
+    await expect(volume).toHaveValue("loud");
+    await expect(push).toBeVisible();
     await mode.selectOption("always");
     await sound.selectOption("ping");
+    await volume.selectOption("maximum");
 
     const bell = page.locator("#notification-sound-toggle");
     await expect(bell).toHaveAttribute("data-mode", "always");
