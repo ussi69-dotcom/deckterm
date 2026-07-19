@@ -8,6 +8,7 @@ const {
 } = require("./settings-schema.js");
 const {
   COMPLETION_SOUND_PATTERNS,
+  COMPLETION_VOLUME_MULTIPLIERS,
   shouldPlayCompletionSound,
 } = require("./notification-sounds.js");
 
@@ -93,9 +94,11 @@ describe("SETTINGS_SCHEMA shape", () => {
     expect(values).toEqual(["auto", "default"]);
   });
 
-  test("completion notifications expose mode and several sounds", () => {
+  test("completion notifications expose mode, volume, push, and several sounds", () => {
     const mode = byKey("notifications.soundMode");
     const sound = byKey("notifications.sound");
+    const volume = byKey("notifications.soundVolume");
+    const push = byKey("notifications.pushEnabled");
     expect(mode.default).toBe("unfocused");
     expect(mode.options.map((option) => option.value)).toEqual([
       "always",
@@ -108,6 +111,14 @@ describe("SETTINGS_SCHEMA shape", () => {
       "bell",
       "pop",
     ]);
+    expect(volume.default).toBe("loud");
+    expect(volume.options.map((option) => option.value)).toEqual([
+      "normal",
+      "loud",
+      "maximum",
+    ]);
+    expect(push.type).toBe("toggle");
+    expect(push.deviceLocal).toBe(true);
   });
 });
 
@@ -320,5 +331,15 @@ describe("completion sound policy", () => {
       expect(pattern.every((note) => note.frequency > 0)).toBe(true);
       expect(pattern.every((note) => note.duration > 0)).toBe(true);
     }
+  });
+
+  test("offers progressively louder capped volume multipliers", () => {
+    expect(COMPLETION_VOLUME_MULTIPLIERS.normal).toBeGreaterThan(1);
+    expect(COMPLETION_VOLUME_MULTIPLIERS.loud).toBeGreaterThan(
+      COMPLETION_VOLUME_MULTIPLIERS.normal,
+    );
+    expect(COMPLETION_VOLUME_MULTIPLIERS.maximum).toBeGreaterThan(
+      COMPLETION_VOLUME_MULTIPLIERS.loud,
+    );
   });
 });

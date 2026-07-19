@@ -31,6 +31,12 @@ const COMPLETION_SOUND_PATTERNS = Object.freeze({
   ]),
 });
 
+const COMPLETION_VOLUME_MULTIPLIERS = Object.freeze({
+  normal: 1.75,
+  loud: 2.6,
+  maximum: 3.5,
+});
+
 function shouldPlayCompletionSound(
   mode,
   { documentHidden = false, documentFocused = true } = {},
@@ -71,11 +77,14 @@ function createCompletionSoundPlayer({ windowRef } = {}) {
     return audioContext.state !== "closed";
   }
 
-  async function play(soundName = "chime") {
+  async function play(soundName = "chime", volumeName = "loud") {
     const audioContext = getContext();
     if (!audioContext || !(await unlock())) return false;
     const pattern =
       COMPLETION_SOUND_PATTERNS[soundName] || COMPLETION_SOUND_PATTERNS.chime;
+    const volume =
+      COMPLETION_VOLUME_MULTIPLIERS[volumeName] ||
+      COMPLETION_VOLUME_MULTIPLIERS.loud;
     const startAt = audioContext.currentTime + 0.015;
 
     try {
@@ -87,7 +96,10 @@ function createCompletionSoundPlayer({ windowRef } = {}) {
         oscillator.type = "sine";
         oscillator.frequency.setValueAtTime(note.frequency, noteStart);
         gain.gain.setValueAtTime(0.0001, noteStart);
-        gain.gain.exponentialRampToValueAtTime(note.gain, noteStart + 0.012);
+        gain.gain.exponentialRampToValueAtTime(
+          Math.min(0.65, note.gain * volume),
+          noteStart + 0.012,
+        );
         gain.gain.exponentialRampToValueAtTime(0.0001, noteEnd);
         oscillator.connect(gain);
         gain.connect(audioContext.destination);
@@ -105,6 +117,7 @@ function createCompletionSoundPlayer({ windowRef } = {}) {
 
 const NotificationSounds = {
   COMPLETION_SOUND_PATTERNS,
+  COMPLETION_VOLUME_MULTIPLIERS,
   shouldPlayCompletionSound,
   createCompletionSoundPlayer,
 };

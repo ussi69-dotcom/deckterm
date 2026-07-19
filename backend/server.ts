@@ -84,6 +84,7 @@ import {
   appendTerminalEvent,
   cancelTerminalSessionTermination,
   createInvitedUser,
+  deletePushSubscriptionForUser,
   disableOrphanGrantPrincipal,
   getFoundationUserById,
   getScopedGrantById,
@@ -109,6 +110,7 @@ import {
   setUserDisabled,
   setUserRole,
   setUserSettings,
+  upsertPushSubscription,
   writeAuditEvent,
   type FoundationState,
   type FoundationUser,
@@ -116,6 +118,11 @@ import {
   type RecordedTerminalSession,
   type ScopedGrantCapability,
 } from "./services/foundation-state";
+import {
+  dispatchCompletionPush,
+  resolveWebPushConfig,
+  validatePushSubscriptionInput,
+} from "./services/push-notifications";
 import {
   authorizeTerminalAttach,
   authorizeTerminalSessionAccess,
@@ -633,6 +640,8 @@ function applyParsedShellIntegrationState(
   parsed: ReturnType<typeof parseShellIntegrationChunk>,
   { emitOutput = true }: { emitOutput?: boolean } = {},
 ) {
+  const wasRunning = term.running;
+  let completedAgentTurn = false;
   term.shellIntegrationCarry = parsed.state.carry;
   let stateChanged = false;
   if (term.running !== parsed.state.running) {
@@ -681,11 +690,19 @@ function applyParsedShellIntegrationState(
     if (event.type === "agent-turn-complete" && term.agentHasUserPrompt) {
       term.agentHasUserPrompt = false;
       term.agentTurnCompletedAt = Date.now();
+      completedAgentTurn = true;
       stateChanged = true;
     }
   }
   if (stateChanged) {
     broadcastTerminalState(term);
+  }
+  // Only live output can create a notification. Replayed tmux capture is used
+  // to rebuild state after reconnect and must never replay an old alert.
+  if (emitOutput && completedAgentTurn) {
+    notifyCompletionPush(term, "agent");
+  } else if (emitOutput && wasRunning && !term.running) {
+    notifyCompletionPush(term, "command");
   }
 
   // Surface agent-done edges (agent finished, terminal still alive) to
@@ -1194,6 +1211,30 @@ async function getFoundationState(): Promise<FoundationState> {
     });
   }
   return foundationStatePromise;
+}
+
+function notifyCompletionPush(term: Terminal, kind: "agent" | "command") {
+  void getFoundationState()
+    .then((state) =>
+      dispatchCompletionPush({
+        db: state.db,
+        config: resolveWebPushConfig(process.env),
+        userId: term.ownerId,
+        terminalId: term.id,
+        kind,
+      }),
+    )
+    .then((result) => {
+      if (result.failed > 0) {
+        console.warn(
+          `[push] completion delivery failed for ${result.failed}/${result.attempted} subscription(s)`,
+        );
+      }
+    })
+    .catch(() => {
+      // Never include an endpoint, encryption key, payload, or owner id here.
+      console.warn("[push] completion delivery failed before dispatch");
+    });
 }
 
 async function requireFoundationCapability({
@@ -3868,6 +3909,35 @@ function getCurrentUser(c: {
     ownerEmail: actor.email,
     ownerSource: actor.source,
   };
+}
+
+async function requirePushNotificationUser(c: {
+  get: (key: string) => CloudflareAccessPayload | undefined;
+  req?: {
+    header: (name: string) => string | undefined;
+    url?: string;
+  };
+}): Promise<
+  | { ok: true; state: FoundationState; userId: string }
+  | { ok: false; status: 403; reason: string }
+> {
+  const actor = getCurrentActor(c);
+  const state = await getFoundationState();
+  try {
+    const canonical = resolveCanonicalOwnerId(state, actor);
+    if (!canonical.user) {
+      return { ok: false, status: 403, reason: "known_user_required" };
+    }
+    if (canonical.user.disabled) {
+      return { ok: false, status: 403, reason: "user_disabled" };
+    }
+    return { ok: true, state, userId: canonical.ownerId };
+  } catch (error) {
+    if (error instanceof IdentityConflictError) {
+      return { ok: false, status: 403, reason: "identity_conflict" };
+    }
+    throw error;
+  }
 }
 
 async function getFoundationStatus(c: {
@@ -8455,6 +8525,113 @@ export function createWebApp() {
     clearTimeout(timeoutId);
     return { ok: code === 0, output, stderr, code };
   }
+
+  // Standards-based Web Push. Enabling is per device, while ownership is
+  // canonical per DeckTerm user. Subscription endpoints and encryption keys
+  // are credentials and are intentionally absent from every response/audit.
+  app.get("/api/notifications/push", async (c) => {
+    const gate = await requirePushNotificationUser(c);
+    if (!gate.ok) {
+      return c.json(
+        { error: "Push notifications unavailable", reason: gate.reason },
+        gate.status,
+      );
+    }
+    const config = resolveWebPushConfig(process.env);
+    return c.json({
+      configured: Boolean(config),
+      publicKey: config?.publicKey || null,
+    });
+  });
+
+  app.post("/api/notifications/push", async (c) => {
+    const gate = await requirePushNotificationUser(c);
+    if (!gate.ok) {
+      return c.json(
+        { error: "Push notifications unavailable", reason: gate.reason },
+        gate.status,
+      );
+    }
+    if (!resolveWebPushConfig(process.env)) {
+      return c.json(
+        {
+          error: "Push notifications are not configured",
+          reason: "not_configured",
+        },
+        503,
+      );
+    }
+    const body = await c.req.json().catch(() => null);
+    const validated = validatePushSubscriptionInput(
+      (body as { subscription?: unknown } | null)?.subscription,
+    );
+    if (!validated.ok) {
+      return c.json(
+        { error: "Invalid push subscription", reason: validated.reason },
+        400,
+      );
+    }
+    const result = upsertPushSubscription(gate.state.db, {
+      userId: gate.userId,
+      endpoint: validated.subscription.endpoint,
+      p256dh: validated.subscription.keys.p256dh,
+      auth: validated.subscription.keys.auth,
+      expirationTime: validated.subscription.expirationTime,
+    });
+    if (!result.ok) {
+      writeAuditEvent(gate.state.db, {
+        actorUserId: gate.userId,
+        action: "push.subscribe",
+        resourceType: "push_subscription",
+        decision: "deny",
+        reason: result.reason,
+      });
+      return c.json(
+        {
+          error:
+            "This browser subscription belongs to another DeckTerm account",
+          reason: result.reason,
+        },
+        409,
+      );
+    }
+    writeAuditEvent(gate.state.db, {
+      actorUserId: gate.userId,
+      action: "push.subscribe",
+      resourceType: "push_subscription",
+      resourceId: result.id,
+      decision: "allow",
+    });
+    return c.json({ ok: true });
+  });
+
+  app.delete("/api/notifications/push", async (c) => {
+    const gate = await requirePushNotificationUser(c);
+    if (!gate.ok) {
+      return c.json(
+        { error: "Push notifications unavailable", reason: gate.reason },
+        gate.status,
+      );
+    }
+    const body = await c.req.json().catch(() => null);
+    const endpoint = (body as { endpoint?: unknown } | null)?.endpoint;
+    if (typeof endpoint !== "string" || !endpoint || endpoint.length > 2048) {
+      return c.json({ error: "Push endpoint required" }, 400);
+    }
+    const removed = deletePushSubscriptionForUser(
+      gate.state.db,
+      gate.userId,
+      endpoint,
+    );
+    writeAuditEvent(gate.state.db, {
+      actorUserId: gate.userId,
+      action: "push.unsubscribe",
+      resourceType: "push_subscription",
+      decision: "allow",
+      reason: removed ? "removed" : "already_absent",
+    });
+    return c.json({ ok: true, removed });
+  });
 
   // GET /api/settings — actor-scoped UI settings (windows layout, dock, prefs)
   app.get("/api/settings", async (c) => {
