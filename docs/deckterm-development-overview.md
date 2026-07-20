@@ -1,6 +1,64 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-07-20 viz sekce 0aa**
+
+## 0aa. Delta 2026-07-08 → 2026-07-19 — Reaper fix · lifecycle hardening · completion alerts · Web Push
+
+Pět skupin změn od Tracku D (HEAD `7fe43f6`, 2026-07-06) do dnešního HEAD `df31659` (PR #24).
+
+### Reaper: PTY výstup jako příznak aktivity (`9a11b9f`, 2026-07-08)
+
+Idle/detached reapers měřily liveness jen z `lastActivityAt` (bumped na user
+*input*). Job streamující PTY výstup přes noc bez vstupu byl zabíjen jako idle.
+Přidán `lastOutputAt`, sdílený helper `idleMsSince()`, detached reaper přepnut na
+čistou inaktivitu. Nové unit testy `backend/services/session-idle.test.ts`.
+
+### Session workspace reversibilita + UX sprint (`c1be9fd`…`7f19c27`, 2026-07-13)
+
+- **`c1be9fd`** — merged sessions reversible: pane focus/paste na vlastní terminál,
+  detach bez PTY recreation, hardened sdílený Playwright fixture.
+- **`ebcf763`** — session hardening + kompaktní terminal controls: e2e run namespace,
+  přepracovaný toolbar, nové E2E (workspace-pane, reconnect-tab-status, mobile-regressions).
+- **`e1b9ba0`** — vizuální mezery a spolehlivost testů.
+- **`eae8a9d`** — deduplikace linked view + pin font stepper.
+- **`f8f181d`** — reconnect: stabilizace obnovených tmux session (settle logika).
+- **`7f19c27`** — odstraněn terminal activity banner (55 ř. JS, 130 ř. CSS).
+- **`c507929`/`319c946`** — CI + deploy: povolení development e2e namespace.
+
+### Lifecycle hardening (`f2e223a`/`2c63e23`/`ea3aef4`, 2026-07-16)
+
+P1 fix: SIGTERM mohl falešně označit živé tmux session jako `ended`. Opraveno:
+
+- Shutdown je **idempotentní latch** — WS zavřeny bez exit message (klient se
+  reconnectne), tmux-backed rows se při shutdownu **nezapisují** (startup reconcile
+  je jediný zdroj pravdy), raw-mode rows ukončeny synchronně.
+- Raw-mode startup reconcile: každý aktivní row ukončen (raw PTY nepřežijí crash/SIGKILL).
+- `startup-failure.test.ts` dostaly izolovaný temp `DECKTERM_STATE_DIR`; `startWebServer`
+  sonduje port **před** DB touch (druhá instance na stejném portu selže čistě).
+- Test harness: `backend/shutdown-lifecycle.test.ts` (child-process, izolovaný tmux socket).
+- Plán: `docs/plans/2026-07-16-tmux-restart-lifecycle.md`.
+
+### Session completion alerts (`543ac3d`, 2026-07-18)
+
+In-browser upozornění na dokončení agent tasku: `web/notification-sounds.js` (audio),
+completion alert overlay + close grace v `web/app.js`, nová nastavení v `web/settings-schema.js`,
+backend telemetry extension. Nové E2E `tests/settings-ui.spec.ts`.
+
+### Web Push notifikace (`a97c982`, 2026-07-19)
+
+Plný Web Push stack (1 727 insertions):
+
+- **Backend:** `backend/services/push-notifications.ts` (VAPID, delivery), push
+  subscriptions v SQLite (foundation-state migrace), server routes (subscribe/unsubscribe/test).
+  Unit testy: `push-api.test.ts` + `push-notifications.test.ts` (226 řádků).
+- **Frontend:** `web/push-notifications.js` (246 ř.), `web/service-worker.js` (54 ř.),
+  `web/manifest.webmanifest`, `web/app-icon.svg`.
+- **Docs:** `docs/operations-guide.md` (VAPID setup), `docs/product-guide.md`,
+  `docs/plans/2026-07-19-web-push-completion-alerts.md`.
+
+Doručí notifikaci i při zavřeném tabu / na mobilu — doplněk k in-browser alertům.
+
+---
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -444,7 +502,7 @@ Po "push to main" vždy ověř, že workflow **Deploy Main** prošel, než prohl
 ### Testy
 
 - `bun run test:unit` — kanonický correctness gate. Nový `*.test.ts/js` **musí** být přidán do `test:unit` v `package.json`, jinak ho CI přeskočí.
-- `tsc --noEmit` na čistém HEAD **padá** (pre-existing errors) — neslouží jako gate, testy ano.
+- `bun x tsc --noEmit` na čistém HEAD **zelené a hard CI gate** (od 2026-07-02, Track A6a). Testy jsou primární correctness gate; tsc je formální typový gate.
 - E2E: `bun run test:e2e:smoke` / `test:e2e` / `test:all`.
 
 ---
