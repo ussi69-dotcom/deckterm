@@ -182,6 +182,7 @@ import {
   hasExplicitLegacyDevActorMode,
   type DeckTermActor,
 } from "./services/foundation-actors";
+import { buildBashIntegrationRcContents } from "./shell-integration";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -4244,64 +4245,7 @@ async function ensureBashIntegrationRc(): Promise<string> {
 
   bashIntegrationRcPathPromise = (async () => {
     const rcPath = "/tmp/deckterm-bash-integration.rc";
-    const rcContents = [
-      "if [ -f /etc/profile ]; then",
-      "  . /etc/profile",
-      "fi",
-      'if [ -f "$HOME/.bash_profile" ]; then',
-      '  . "$HOME/.bash_profile"',
-      'elif [ -f "$HOME/.bash_login" ]; then',
-      '  . "$HOME/.bash_login"',
-      'elif [ -f "$HOME/.profile" ]; then',
-      '  . "$HOME/.profile"',
-      "fi",
-      "if [ -f /etc/bash.bashrc ]; then",
-      "  . /etc/bash.bashrc",
-      "fi",
-      'if [ -f "$HOME/.bashrc" ]; then',
-      '  . "$HOME/.bashrc"',
-      "fi",
-      "__deckterm_running_start() {",
-      "  printf '\\033]9;9;deckterm;running;start\\a'",
-      "}",
-      "__deckterm_emit_marker() {",
-      "  printf '\\033]9;9;deckterm;%s\\a' \"$1\"",
-      "}",
-      "__deckterm_running_done() {",
-      "  local exit_code=$?",
-      '  if [ "${__deckterm_prompt_seen:-0}" -eq 0 ]; then',
-      "    __deckterm_prompt_seen=1",
-      "    return",
-      "  fi",
-      "  printf '\\033]9;9;deckterm;running;done;%s\\a' \"$exit_code\"",
-      "}",
-      "__deckterm_run_agent() {",
-      '  local agent_name="$1"',
-      "  shift",
-      '  __deckterm_emit_marker "agent;${agent_name};start"',
-      '  command "$agent_name" "$@"',
-      "  local exit_code=$?",
-      '  __deckterm_emit_marker "agent;${agent_name};done;${exit_code}"',
-      '  return "$exit_code"',
-      "}",
-      "if command -v codex >/dev/null 2>&1; then",
-      '  codex() { __deckterm_run_agent codex "$@"; }',
-      "fi",
-      "if command -v claude >/dev/null 2>&1; then",
-      '  claude() { __deckterm_run_agent claude "$@"; }',
-      "fi",
-      'case ";${PROMPT_COMMAND};" in',
-      '  *";__deckterm_running_done;"*) ;;',
-      '  "")',
-      '    PROMPT_COMMAND="__deckterm_running_done"',
-      "    ;;",
-      "  *)",
-      '    PROMPT_COMMAND="__deckterm_running_done; ${PROMPT_COMMAND}"',
-      "    ;;",
-      "esac",
-      "PS0=$'\\033]9;9;deckterm;running;start\\a'",
-      "",
-    ].join("\n");
+    const rcContents = buildBashIntegrationRcContents();
     await Bun.write(rcPath, rcContents);
     return rcPath;
   })();
