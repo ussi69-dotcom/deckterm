@@ -1,6 +1,20 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-07-24 viz sekce 0x** · Delta 2026-07-05 viz sekce 0y
+
+## 0x. Delta 2026-07-24 — Codex scrollback zachován (`--no-alt-screen`) + extrakce `shell-integration.ts`
+
+Commit `a8aa5ea` (2026-07-24). Bash integrace RC extrahovana z `server.ts` do
+`backend/shell-integration.ts` (`buildBashIntegrationRcContents()`). Klíčová
+oprava: Codex wrapper v RC nyní předává `--no-alt-screen`, takže Codex nespouští
+alternátní screen buffer — celý výstup sezení (tool cally, výsledky, odpovědi)
+zůstane ve scrollbacku DeckTermu. Claude wrapper zůstává beze změny (bez příznaku).
+Nový `backend/shell-integration.test.ts` (2 testy, přidán do `test:unit`).
+
+**Proč:** DeckTerm je browser terminál orientovaný na scrollback; výchozí
+alternate-screen Codexu po ukončení smaže celý výstup ze scrollbacku — po agentu
+nezůstane žádná stopa, nelze zkontrolovat co provedl. `--no-alt-screen` drží
+výstup inline a opustí alternátní screen jen při potřebě (interactive TUI fáze).
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -491,5 +505,3 @@ Nejbližší logické pokračování po C2: dotáhnout multisession backlog (sek
 - `docs/operations-guide.md` — prostředí, CI/CD, deploy/rollback, security model.
 - `docs/product-guide.md` — produktový pohled.
 - `docs/plans/2026-05-12-comparable-projects-research.md` — srovnání s konkurencí.
-  </content>
-  </invoke>
