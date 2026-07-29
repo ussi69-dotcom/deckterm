@@ -86,6 +86,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await createProc.exited;
 
     await this.hideStatusBar(sessionName);
+    await this.ensureHistoryLimit();
     await this.resize(sessionName, cols, rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
@@ -285,6 +286,22 @@ export class TmuxTerminalBackend implements TerminalBackend {
       "off",
     ]);
     await hideStatusProc.exited;
+  }
+
+  // tmux's default history-limit (2000 lines) is far below the frontend's
+  // xterm.js scrollback (10000, see web/app.js) and gets exhausted within a
+  // single long-lived agent session, silently evicting old output (including
+  // completed Codex/Claude responses) long before the alt-screen fix's
+  // failure mode ever triggers. -g applies server-wide, so this is a no-op
+  // once set but safe to repeat on every session create.
+  private async ensureHistoryLimit(): Promise<void> {
+    const proc = await this.spawnTmux([
+      "set-option",
+      "-g",
+      "history-limit",
+      "10000",
+    ]);
+    await proc.exited;
   }
 
   private getPipePath(sessionName: string): string {

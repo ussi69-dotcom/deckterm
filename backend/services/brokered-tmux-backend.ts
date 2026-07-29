@@ -127,6 +127,7 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     }
 
     await this.hideStatusBar(sessionName);
+    await this.ensureHistoryLimit(sessionName);
     await this.resize(sessionName, cols, rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
@@ -337,6 +338,18 @@ export class BrokeredTmuxBackend implements TerminalBackend {
       sessionName,
       "status",
       "off",
+    ]);
+  }
+
+  // See TmuxTerminalBackend.ensureHistoryLimit — same tmux default (2000
+  // lines) vs. frontend scrollback (10000) mismatch applies to brokered
+  // per-uid tmux servers too.
+  private async ensureHistoryLimit(sessionName: string): Promise<void> {
+    await this.control(sessionName, [
+      "set-option",
+      "-g",
+      "history-limit",
+      "10000",
     ]);
   }
 
