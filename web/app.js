@@ -2199,6 +2199,18 @@ class ExtraKeysManager {
     dbg("[ExtraKeys] Active terminal:", this.tm.activeId, "ws:", !!active?.ws);
     if (!active?.ws) return;
 
+    const tmuxScrollRequest =
+      active.backendMode === "tmux"
+        ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(key)
+        : null;
+    if (tmuxScrollRequest) {
+      active.ws.send(
+        JSON.stringify({ type: "scrollback", ...tmuxScrollRequest }),
+      );
+      this.resetModifiers();
+      return;
+    }
+
     let sequence = KEY_SEQUENCES[key] || key;
 
     if (this.modifiers.ctrl && key.length === 1) {
@@ -12226,6 +12238,11 @@ class TerminalManager {
       inputState,
     );
     const pasteFallbackCleanup = this.attachClipboardPasteFallback(ws, element);
+    const tmuxScrollbackCleanup = this.attachTmuxScrollbackWheel(
+      ws,
+      element,
+      backendMode,
+    );
     dbg("[ExtraKeys] attachMobileInputFallback (reconnect)", {
       id,
       attached: !!inputFallbackCleanup,
@@ -12267,6 +12284,7 @@ class TerminalManager {
       osc7Disposable,
       inputFallbackCleanup,
       pasteFallbackCleanup,
+      tmuxScrollbackCleanup,
       activationCleanup,
       inputState,
       hasConnected: false, // Track if WebSocket has ever successfully connected
@@ -12703,6 +12721,51 @@ class TerminalManager {
     };
   }
 
+  attachTmuxScrollbackWheel(ws, element, backendMode) {
+    if (backendMode !== "tmux") return null;
+    let pendingLines = 0;
+    let pendingFrame = 0;
+    const flush = () => {
+      pendingFrame = 0;
+      const lines = pendingLines;
+      pendingLines = 0;
+      if (!lines) return;
+      ws.send(
+        JSON.stringify({
+          type: "scrollback",
+          direction: lines > 0 ? "up" : "down",
+          lines: Math.abs(lines),
+        }),
+      );
+    };
+    const wheelHandler = (event) => {
+      if (event.ctrlKey || event.metaKey) return;
+      const request =
+        window.ExtraKeysScroll?.getTmuxScrollRequestFromWheel?.(
+          event.deltaY,
+          event.deltaMode,
+        );
+      if (!request) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const signedLines =
+        request.direction === "up" ? request.lines : -request.lines;
+      pendingLines = Math.max(
+        -100,
+        Math.min(100, pendingLines + signedLines),
+      );
+      if (!pendingFrame) pendingFrame = requestAnimationFrame(flush);
+    };
+    element.addEventListener("wheel", wheelHandler, {
+      capture: true,
+      passive: false,
+    });
+    return () => {
+      if (pendingFrame) cancelAnimationFrame(pendingFrame);
+      element.removeEventListener("wheel", wheelHandler, true);
+    };
+  }
+
   createXtermInstance(id) {
     const terminal = new Terminal({
       theme: {
@@ -12785,6 +12848,26 @@ class TerminalManager {
         if (switched) {
           event.preventDefault();
           this.handledPaneShortcutEvents.add(event);
+          return false;
+        }
+      }
+
+      if (
+        event.type === "keydown" &&
+        !event.altKey &&
+        !event.ctrlKey &&
+        !event.metaKey
+      ) {
+        const termData = this.terminals.get(id);
+        const scrollRequest =
+          termData?.backendMode === "tmux"
+            ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(event.key)
+            : null;
+        if (scrollRequest) {
+          event.preventDefault();
+          termData.ws?.send(
+            JSON.stringify({ type: "scrollback", ...scrollRequest }),
+          );
           return false;
         }
       }
@@ -13590,6 +13673,11 @@ class TerminalManager {
         ws,
         element,
       );
+      const tmuxScrollbackCleanup = this.attachTmuxScrollbackWheel(
+        ws,
+        element,
+        terminalInfo.backendMode,
+      );
       dbg("[ExtraKeys] attachMobileInputFallback (create)", {
         id,
         attached: !!inputFallbackCleanup,
@@ -13633,6 +13721,7 @@ class TerminalManager {
         osc7Disposable,
         inputFallbackCleanup,
         pasteFallbackCleanup,
+        tmuxScrollbackCleanup,
         activationCleanup,
         inputState,
         awaitingReconnectReady: false,
@@ -14134,6 +14223,7 @@ class TerminalManager {
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
+    t.tmuxScrollbackCleanup?.();
     t.activationCleanup?.();
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);

@@ -116,6 +116,10 @@ export class RawTerminalBackend implements TerminalBackend {
     // Raw Bun.Terminal sessions are resized by the server's terminal handle.
   }
 
+  async scrollHistory(): Promise<boolean> {
+    return false;
+  }
+
   async kill(sessionName: string): Promise<void> {
     if (this.brokered.has(sessionName)) {
       // Tear down the broker-created transient scope (which reaps the shell),

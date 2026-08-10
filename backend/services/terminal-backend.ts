@@ -1,6 +1,7 @@
 import type { Subprocess } from "bun";
 
 export type TerminalBackendMode = "raw" | "tmux";
+export type TerminalScrollDirection = "up" | "down";
 
 export type TerminalBackendSession = {
   id: string;
@@ -70,6 +71,12 @@ export interface TerminalBackend {
   capture(sessionName: string): Promise<string>;
 
   resize(sessionName: string, cols: number, rows: number): Promise<void>;
+
+  scrollHistory(
+    sessionName: string,
+    direction: TerminalScrollDirection,
+    lines: number,
+  ): Promise<boolean>;
 
   kill(sessionName: string): Promise<void>;
 }

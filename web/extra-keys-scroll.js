@@ -22,15 +22,56 @@ function shouldScrollToPromptForKey(key) {
   return !SCROLLBACK_KEYS.has(key);
 }
 
+/**
+ * Converts a browser wheel gesture into DeckTerm's bounded tmux scrollback
+ * control message. Positive deltaY means scrolling toward newer output.
+ */
+function getTmuxScrollRequestFromWheel(deltaY, deltaMode = 0) {
+  if (!Number.isFinite(deltaY) || deltaY === 0) return null;
+  const magnitude = Math.abs(deltaY);
+  const rawLines =
+    deltaMode === 2
+      ? magnitude * 24
+      : deltaMode === 1
+        ? magnitude
+        : magnitude / 32;
+  return {
+    direction: deltaY < 0 ? "up" : "down",
+    lines: Math.max(1, Math.min(100, Math.ceil(rawLines))),
+  };
+}
+
+function getTmuxScrollRequestFromKey(key) {
+  if (key === "PGUP" || key === "PageUp") {
+    return { direction: "up", lines: 24 };
+  }
+  if (key === "PGDN" || key === "PageDown") {
+    return { direction: "down", lines: 24 };
+  }
+  return null;
+}
+
 if (typeof window !== "undefined") {
-  window.ExtraKeysScroll = { SCROLLBACK_KEYS, shouldScrollToPromptForKey };
+  window.ExtraKeysScroll = {
+    SCROLLBACK_KEYS,
+    shouldScrollToPromptForKey,
+    getTmuxScrollRequestFromWheel,
+    getTmuxScrollRequestFromKey,
+  };
 }
 
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { SCROLLBACK_KEYS, shouldScrollToPromptForKey };
+  module.exports = {
+    SCROLLBACK_KEYS,
+    shouldScrollToPromptForKey,
+    getTmuxScrollRequestFromWheel,
+    getTmuxScrollRequestFromKey,
+  };
 }
 
 if (typeof exports !== "undefined") {
   exports.SCROLLBACK_KEYS = SCROLLBACK_KEYS;
   exports.shouldScrollToPromptForKey = shouldScrollToPromptForKey;
+  exports.getTmuxScrollRequestFromWheel = getTmuxScrollRequestFromWheel;
+  exports.getTmuxScrollRequestFromKey = getTmuxScrollRequestFromKey;
 }

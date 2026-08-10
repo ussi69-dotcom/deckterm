@@ -8,6 +8,7 @@ import type {
   TerminalBackendAttachOptions,
   TerminalBackendAttachResult,
   TerminalBackendSession,
+  TerminalScrollDirection,
 } from "./terminal-backend";
 
 export type TmuxSessionInfo = {
@@ -175,6 +176,34 @@ export class TmuxTerminalBackend implements TerminalBackend {
       waitForClient: options.waitForClient,
       socketPath: this.socketPath,
     });
+  }
+
+  async scrollHistory(
+    sessionName: string,
+    direction: TerminalScrollDirection,
+    lines: number,
+  ): Promise<boolean> {
+    const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    if (direction === "up") {
+      const copyModeProc = await this.spawnTmux([
+        "copy-mode",
+        "-e",
+        "-t",
+        sessionName,
+      ]);
+      if ((await copyModeProc.exited) !== 0) return false;
+    }
+
+    const scrollProc = await this.spawnTmux([
+      "send-keys",
+      "-X",
+      "-N",
+      String(count),
+      "-t",
+      sessionName,
+      direction === "up" ? "scroll-up" : "scroll-down",
+    ]);
+    return (await scrollProc.exited) === 0;
   }
 
   async kill(sessionName: string): Promise<void> {

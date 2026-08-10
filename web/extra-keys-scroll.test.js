@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
-import { shouldScrollToPromptForKey } from "./extra-keys-scroll.js";
+import {
+  getTmuxScrollRequestFromKey,
+  getTmuxScrollRequestFromWheel,
+  shouldScrollToPromptForKey,
+} from "./extra-keys-scroll.js";
 
 test("shouldScrollToPromptForKey returns false for PGUP (scrollback key)", () => {
   expect(shouldScrollToPromptForKey("PGUP")).toBe(false);
@@ -31,4 +35,32 @@ test("shouldScrollToPromptForKey returns true for arrow keys (UP/DOWN/LEFT/RIGHT
 test("shouldScrollToPromptForKey returns true for DEL and INS", () => {
   expect(shouldScrollToPromptForKey("DEL")).toBe(true);
   expect(shouldScrollToPromptForKey("INS")).toBe(true);
+});
+
+test("tmux wheel requests preserve direction and normalize browser units", () => {
+  expect(getTmuxScrollRequestFromWheel(-64, 0)).toEqual({
+    direction: "up",
+    lines: 2,
+  });
+  expect(getTmuxScrollRequestFromWheel(3, 1)).toEqual({
+    direction: "down",
+    lines: 3,
+  });
+  expect(getTmuxScrollRequestFromWheel(-1, 2)).toEqual({
+    direction: "up",
+    lines: 24,
+  });
+  expect(getTmuxScrollRequestFromWheel(0, 0)).toBeNull();
+});
+
+test("tmux PageUp and PageDown requests move one page", () => {
+  expect(getTmuxScrollRequestFromKey("PageUp")).toEqual({
+    direction: "up",
+    lines: 24,
+  });
+  expect(getTmuxScrollRequestFromKey("PGDN")).toEqual({
+    direction: "down",
+    lines: 24,
+  });
+  expect(getTmuxScrollRequestFromKey("Enter")).toBeNull();
 });
