@@ -180,7 +180,7 @@ export class BrokeredTmuxBackend implements TerminalBackend {
       "-e",
       "-p",
       "-S",
-      "-2000",
+      "-10000",
       "-t",
       sessionName,
     ]);

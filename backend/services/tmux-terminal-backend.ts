@@ -136,7 +136,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   async capture(sessionName: string): Promise<string> {
     const captureProc = await this.spawnTmux(
-      ["capture-pane", "-ep", "-S", "-2000", "-t", sessionName],
+      ["capture-pane", "-ep", "-S", "-10000", "-t", sessionName],
       { stdout: "pipe", stderr: "pipe" },
     );
     const output = await new Response((captureProc as any).stdout).text();
