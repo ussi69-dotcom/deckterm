@@ -184,6 +184,18 @@ export class TmuxTerminalBackend implements TerminalBackend {
     lines: number,
   ): Promise<boolean> {
     const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    // Alternate-screen panes have no tmux history: copy-mode there is an
+    // empty [0/0] dead end that also steals subsequent input. Refuse.
+    const stateProc = await this.spawnTmux([
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{alternate_on}",
+    ]);
+    const stateExit = await stateProc.exited;
+    const paneState = await new Response((stateProc as any).stdout).text();
+    if (stateExit !== 0 || paneState.trim() === "1") return false;
     if (direction === "up") {
       const copyModeProc = await this.spawnTmux([
         "copy-mode",

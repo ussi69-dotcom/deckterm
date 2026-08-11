@@ -2199,13 +2199,13 @@ class ExtraKeysManager {
     dbg("[ExtraKeys] Active terminal:", this.tm.activeId, "ws:", !!active?.ws);
     if (!active?.ws) return;
 
-    // Alternate-screen apps handle PgUp/PgDn themselves; tmux history is
-    // empty there (see shouldRouteScrollToTmux).
+    // Mouse-owning apps (Claude Code) handle PgUp/PgDn themselves; only
+    // route keys to tmux history otherwise (see shouldRouteScrollToTmux).
     const tmuxScrollRequest =
       active.backendMode === "tmux" &&
       window.ExtraKeysScroll?.shouldRouteScrollToTmux?.(
         active.backendMode,
-        active.terminal?.buffer?.active?.type,
+        active.terminal?.modes?.mouseTrackingMode,
       ) !== false
         ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(key)
         : null;
@@ -12248,7 +12248,7 @@ class TerminalManager {
       ws,
       element,
       backendMode,
-      () => terminal.buffer?.active?.type,
+      () => terminal.modes?.mouseTrackingMode,
     );
     dbg("[ExtraKeys] attachMobileInputFallback (reconnect)", {
       id,
@@ -12728,7 +12728,7 @@ class TerminalManager {
     };
   }
 
-  attachTmuxScrollbackWheel(ws, element, backendMode, getBufferType) {
+  attachTmuxScrollbackWheel(ws, element, backendMode, getMouseTrackingMode) {
     if (backendMode !== "tmux") return null;
     let pendingLines = 0;
     let pendingFrame = 0;
@@ -12747,28 +12747,26 @@ class TerminalManager {
     };
     const wheelHandler = (event) => {
       if (event.ctrlKey || event.metaKey) return;
-      // Alternate-screen apps (Claude Code, Codex, vim) own their scrolling;
-      // tmux has no history for the alternate screen, so copy-mode there is
-      // an empty [0/0]. Let the wheel fall through to xterm.js instead.
-      const bufferType = getBufferType?.();
+      // Apps that took the mouse (Claude Code, Codex, vim+mouse) scroll
+      // themselves: fall through so xterm.js sends them SGR mouse events.
+      const mouseTrackingMode = getMouseTrackingMode?.();
       const routeToTmux = window.ExtraKeysScroll?.shouldRouteScrollToTmux
-        ? window.ExtraKeysScroll.shouldRouteScrollToTmux(backendMode, bufferType)
-        : bufferType !== "alternate";
+        ? window.ExtraKeysScroll.shouldRouteScrollToTmux(
+            backendMode,
+            mouseTrackingMode,
+          )
+        : (mouseTrackingMode ?? "none") === "none";
       if (!routeToTmux) return;
-      const request =
-        window.ExtraKeysScroll?.getTmuxScrollRequestFromWheel?.(
-          event.deltaY,
-          event.deltaMode,
-        );
+      const request = window.ExtraKeysScroll?.getTmuxScrollRequestFromWheel?.(
+        event.deltaY,
+        event.deltaMode,
+      );
       if (!request) return;
       event.preventDefault();
       event.stopPropagation();
       const signedLines =
         request.direction === "up" ? request.lines : -request.lines;
-      pendingLines = Math.max(
-        -100,
-        Math.min(100, pendingLines + signedLines),
-      );
+      pendingLines = Math.max(-100, Math.min(100, pendingLines + signedLines));
       if (!pendingFrame) pendingFrame = requestAnimationFrame(flush);
     };
     element.addEventListener("wheel", wheelHandler, {
@@ -12874,13 +12872,13 @@ class TerminalManager {
         !event.metaKey
       ) {
         const termData = this.terminals.get(id);
-        // Alternate-screen apps handle PgUp/PgDn themselves; tmux history is
-        // empty there (see shouldRouteScrollToTmux).
+        // Mouse-owning apps (Claude Code) handle PgUp/PgDn themselves; only
+        // route keys to tmux history otherwise (see shouldRouteScrollToTmux).
         const scrollRequest =
           termData?.backendMode === "tmux" &&
           window.ExtraKeysScroll?.shouldRouteScrollToTmux?.(
             termData.backendMode,
-            termData.terminal?.buffer?.active?.type,
+            termData.terminal?.modes?.mouseTrackingMode,
           ) !== false
             ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(event.key)
             : null;
@@ -13698,7 +13696,7 @@ class TerminalManager {
         ws,
         element,
         terminalInfo.backendMode,
-        () => terminal.buffer?.active?.type,
+        () => terminal.modes?.mouseTrackingMode,
       );
       dbg("[ExtraKeys] attachMobileInputFallback (create)", {
         id,

@@ -90,3 +90,59 @@ test.skipIf(!TMUX_AVAILABLE)(
     expect(new TextDecoder().decode(live.stdout).trim()).toBe("0|");
   },
 );
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "scrollHistory refuses copy-mode for alternate-screen panes",
+  async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "deckterm-tmux-altscroll-"));
+    const socketPath = join(tempDir, "tmux.sock");
+    const sessionName = "deckterm_altscroll_test";
+    const created = tmux(socketPath, [
+      "new-session",
+      "-d",
+      "-s",
+      sessionName,
+      "-x",
+      "80",
+      "-y",
+      "10",
+      "bash",
+      "-lc",
+      "printf '\\033[?1049h'; exec sleep 30",
+    ]);
+    expect(created.exitCode).toBe(0);
+
+    let altOn = "";
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const state = tmux(socketPath, [
+        "display-message",
+        "-p",
+        "-t",
+        sessionName,
+        "#{alternate_on}",
+      ]);
+      altOn = new TextDecoder().decode(state.stdout).trim();
+      if (altOn === "1") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(altOn).toBe("1");
+
+    const backend = new TmuxTerminalBackend({
+      namespace: "altscroll-test",
+      socketPath,
+      pipeDir: tempDir,
+      shellCommandResolver: async () => ["/bin/bash", "-l"],
+    });
+    const scrolled = await backend.scrollHistory(sessionName, "up", 10);
+    expect(scrolled).toBe(false);
+
+    const mode = tmux(socketPath, [
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{pane_in_mode}",
+    ]);
+    expect(new TextDecoder().decode(mode.stdout).trim()).toBe("0");
+  },
+);

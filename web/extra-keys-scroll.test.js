@@ -66,19 +66,22 @@ test("tmux PageUp and PageDown requests move one page", () => {
   expect(getTmuxScrollRequestFromKey("Enter")).toBeNull();
 });
 
-test("tmux scroll routing applies to tmux panes on the normal buffer", () => {
-  expect(shouldRouteScrollToTmux("tmux", "normal")).toBe(true);
+test("tmux scroll routing applies when the pane app did not take the mouse", () => {
+  expect(shouldRouteScrollToTmux("tmux", "none")).toBe(true);
 });
 
-test("tmux scroll routing skips alternate-screen apps so they scroll themselves", () => {
-  expect(shouldRouteScrollToTmux("tmux", "alternate")).toBe(false);
+test("tmux scroll routing yields to apps that enabled mouse tracking", () => {
+  expect(shouldRouteScrollToTmux("tmux", "vt200")).toBe(false);
+  expect(shouldRouteScrollToTmux("tmux", "any")).toBe(false);
+  expect(shouldRouteScrollToTmux("tmux", "drag")).toBe(false);
+  expect(shouldRouteScrollToTmux("tmux", "x10")).toBe(false);
 });
 
 test("tmux scroll routing skips non-tmux backends entirely", () => {
-  expect(shouldRouteScrollToTmux("raw", "normal")).toBe(false);
-  expect(shouldRouteScrollToTmux(null, "normal")).toBe(false);
+  expect(shouldRouteScrollToTmux("raw", "none")).toBe(false);
+  expect(shouldRouteScrollToTmux(null, "none")).toBe(false);
 });
 
-test("tmux scroll routing defaults to tmux history when buffer type is unknown", () => {
+test("tmux scroll routing defaults to tmux history when mouse mode is unknown", () => {
   expect(shouldRouteScrollToTmux("tmux", undefined)).toBe(true);
 });

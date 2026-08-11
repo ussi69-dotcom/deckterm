@@ -43,18 +43,20 @@ function getTmuxScrollRequestFromWheel(deltaY, deltaMode = 0) {
 
 /**
  * True when scroll gestures over a pane should be routed to tmux history
- * scrollback. Alternate-screen apps (Claude Code, Codex, vim, less) own
- * their scrolling: tmux keeps no history for the alternate screen, so
- * copy-mode there shows an empty [0/0] with nowhere to go. Let those apps
- * receive the wheel/PgUp events instead (xterm.js alternateScroll turns
- * the wheel into arrow keys for them).
+ * scrollback. Apps that enabled mouse tracking (Claude Code, Codex, vim
+ * with mouse) own their scrolling: tmux forwards their mouse request to
+ * the client, so xterm.js reports a non-"none" mouseTrackingMode, and the
+ * wheel/PgUp events must fall through so xterm.js delivers them (as SGR
+ * mouse / key input) to the app. Note the xterm buffer type is NOT usable
+ * as this signal: the tmux client keeps xterm.js on the alternate buffer
+ * for every pane, TUI or plain shell alike.
  *
  * @param {string|null} backendMode  terminal backend ("tmux", "raw", ...)
- * @param {string|undefined} bufferType  xterm.js buffer.active.type
+ * @param {string|undefined} mouseTrackingMode  xterm.js modes.mouseTrackingMode
  * @returns {boolean}
  */
-function shouldRouteScrollToTmux(backendMode, bufferType) {
-  return backendMode === "tmux" && bufferType !== "alternate";
+function shouldRouteScrollToTmux(backendMode, mouseTrackingMode) {
+  return backendMode === "tmux" && (mouseTrackingMode ?? "none") === "none";
 }
 
 function getTmuxScrollRequestFromKey(key) {
