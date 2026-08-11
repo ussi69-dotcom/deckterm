@@ -2199,8 +2199,14 @@ class ExtraKeysManager {
     dbg("[ExtraKeys] Active terminal:", this.tm.activeId, "ws:", !!active?.ws);
     if (!active?.ws) return;
 
+    // Alternate-screen apps handle PgUp/PgDn themselves; tmux history is
+    // empty there (see shouldRouteScrollToTmux).
     const tmuxScrollRequest =
-      active.backendMode === "tmux"
+      active.backendMode === "tmux" &&
+      window.ExtraKeysScroll?.shouldRouteScrollToTmux?.(
+        active.backendMode,
+        active.terminal?.buffer?.active?.type,
+      ) !== false
         ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(key)
         : null;
     if (tmuxScrollRequest) {
@@ -12242,6 +12248,7 @@ class TerminalManager {
       ws,
       element,
       backendMode,
+      () => terminal.buffer?.active?.type,
     );
     dbg("[ExtraKeys] attachMobileInputFallback (reconnect)", {
       id,
@@ -12721,7 +12728,7 @@ class TerminalManager {
     };
   }
 
-  attachTmuxScrollbackWheel(ws, element, backendMode) {
+  attachTmuxScrollbackWheel(ws, element, backendMode, getBufferType) {
     if (backendMode !== "tmux") return null;
     let pendingLines = 0;
     let pendingFrame = 0;
@@ -12740,6 +12747,14 @@ class TerminalManager {
     };
     const wheelHandler = (event) => {
       if (event.ctrlKey || event.metaKey) return;
+      // Alternate-screen apps (Claude Code, Codex, vim) own their scrolling;
+      // tmux has no history for the alternate screen, so copy-mode there is
+      // an empty [0/0]. Let the wheel fall through to xterm.js instead.
+      const bufferType = getBufferType?.();
+      const routeToTmux = window.ExtraKeysScroll?.shouldRouteScrollToTmux
+        ? window.ExtraKeysScroll.shouldRouteScrollToTmux(backendMode, bufferType)
+        : bufferType !== "alternate";
+      if (!routeToTmux) return;
       const request =
         window.ExtraKeysScroll?.getTmuxScrollRequestFromWheel?.(
           event.deltaY,
@@ -12859,8 +12874,14 @@ class TerminalManager {
         !event.metaKey
       ) {
         const termData = this.terminals.get(id);
+        // Alternate-screen apps handle PgUp/PgDn themselves; tmux history is
+        // empty there (see shouldRouteScrollToTmux).
         const scrollRequest =
-          termData?.backendMode === "tmux"
+          termData?.backendMode === "tmux" &&
+          window.ExtraKeysScroll?.shouldRouteScrollToTmux?.(
+            termData.backendMode,
+            termData.terminal?.buffer?.active?.type,
+          ) !== false
             ? window.ExtraKeysScroll?.getTmuxScrollRequestFromKey?.(event.key)
             : null;
         if (scrollRequest) {
@@ -13677,6 +13698,7 @@ class TerminalManager {
         ws,
         element,
         terminalInfo.backendMode,
+        () => terminal.buffer?.active?.type,
       );
       dbg("[ExtraKeys] attachMobileInputFallback (create)", {
         id,

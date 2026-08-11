@@ -41,6 +41,22 @@ function getTmuxScrollRequestFromWheel(deltaY, deltaMode = 0) {
   };
 }
 
+/**
+ * True when scroll gestures over a pane should be routed to tmux history
+ * scrollback. Alternate-screen apps (Claude Code, Codex, vim, less) own
+ * their scrolling: tmux keeps no history for the alternate screen, so
+ * copy-mode there shows an empty [0/0] with nowhere to go. Let those apps
+ * receive the wheel/PgUp events instead (xterm.js alternateScroll turns
+ * the wheel into arrow keys for them).
+ *
+ * @param {string|null} backendMode  terminal backend ("tmux", "raw", ...)
+ * @param {string|undefined} bufferType  xterm.js buffer.active.type
+ * @returns {boolean}
+ */
+function shouldRouteScrollToTmux(backendMode, bufferType) {
+  return backendMode === "tmux" && bufferType !== "alternate";
+}
+
 function getTmuxScrollRequestFromKey(key) {
   if (key === "PGUP" || key === "PageUp") {
     return { direction: "up", lines: 24 };
@@ -55,6 +71,7 @@ if (typeof window !== "undefined") {
   window.ExtraKeysScroll = {
     SCROLLBACK_KEYS,
     shouldScrollToPromptForKey,
+    shouldRouteScrollToTmux,
     getTmuxScrollRequestFromWheel,
     getTmuxScrollRequestFromKey,
   };
@@ -64,6 +81,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     SCROLLBACK_KEYS,
     shouldScrollToPromptForKey,
+    shouldRouteScrollToTmux,
     getTmuxScrollRequestFromWheel,
     getTmuxScrollRequestFromKey,
   };
@@ -72,6 +90,7 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.SCROLLBACK_KEYS = SCROLLBACK_KEYS;
   exports.shouldScrollToPromptForKey = shouldScrollToPromptForKey;
+  exports.shouldRouteScrollToTmux = shouldRouteScrollToTmux;
   exports.getTmuxScrollRequestFromWheel = getTmuxScrollRequestFromWheel;
   exports.getTmuxScrollRequestFromKey = getTmuxScrollRequestFromKey;
 }
