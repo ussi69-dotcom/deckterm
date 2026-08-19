@@ -44,6 +44,7 @@ import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-cap
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
 import { TmuxTerminalBackend } from "./services/tmux-terminal-backend";
 import type { TerminalBackend } from "./services/terminal-backend";
+import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
   TaskRunnerError,
   buildJudgeCommand,
@@ -4672,7 +4673,9 @@ async function sendTmuxPaneCapture(
   const output = await captureTmuxPane(sessionName);
   if (!output || ws.readyState !== 1) return false;
 
-  ws.send(`${clearFirst ? "\x1b[2J\x1b[H" : ""}${output}`);
+  ws.send(
+    `${clearFirst ? "\x1b[2J\x1b[H" : ""}${formatTmuxCaptureForTerminal(output)}`,
+  );
   debug(
     `[reconnect] Sent ${output.length} bytes from tmux ${reason} for ${terminalId}`,
   );
@@ -5010,7 +5013,9 @@ async function createManagedTerminal({
   terminals.set(id, managedTerminal);
   getTerminalSockets(id);
   if (initialScrollback) {
-    appendScrollback(id, initialScrollback);
+    // Recovery keeps the raw snapshot above for runtime-state inference, but
+    // the fallback is terminal-bound and therefore needs terminal newlines.
+    appendScrollback(id, formatTmuxCaptureForTerminal(initialScrollback));
   }
   if (managedTerminal.agentState === "responding") {
     scheduleAgentThinkingFallback(managedTerminal);
@@ -10357,16 +10362,14 @@ export async function startWebServer(host: string, port: number) {
                   TMUX_BACKEND &&
                   term.sessionName
                 ) {
-                  void scrollTmuxSessionHistory(
-                    term,
-                    direction,
-                    lines,
-                  ).catch((err) => {
-                    debug(
-                      `[tmux] scrollback ${direction} failed for ${terminalId}:`,
-                      err,
-                    );
-                  });
+                  void scrollTmuxSessionHistory(term, direction, lines).catch(
+                    (err) => {
+                      debug(
+                        `[tmux] scrollback ${direction} failed for ${terminalId}:`,
+                        err,
+                      );
+                    },
+                  );
                 }
                 return;
               }

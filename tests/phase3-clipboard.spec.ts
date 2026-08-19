@@ -477,6 +477,238 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     }
   });
 
+  test("held drag reverses from the top edge and scrolls back down", async ({
+    page,
+  }) => {
+    const before = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const lines = Array.from(
+        { length: 220 },
+        (_, index) => `EDGE-REVERSE-${String(index).padStart(3, "0")}\r\n`,
+      ).join("");
+
+      await new Promise<void>((resolve) => {
+        active.terminal.write(lines, () => {
+          active.terminal.scrollToBottom();
+          resolve();
+        });
+      });
+
+      return {
+        viewportY: active.terminal.buffer.active.viewportY,
+        rows: active.terminal.rows,
+      };
+    });
+
+    const screen = page.locator(".tile.active .xterm-screen:visible").first();
+    const box = await screen.boundingBox();
+    if (!box) throw new Error("Active terminal screen has no bounding box");
+
+    await page.mouse.move(box.x + 8, box.y + box.height * 0.65);
+    await page.mouse.down();
+    try {
+      await page.mouse.move(box.x + 8, box.y + 2, { steps: 12 });
+      await page.waitForFunction((startY) => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return active.terminal.buffer.active.viewportY < startY - 10;
+      }, before.viewportY);
+
+      const topViewportY = await page.evaluate(() => {
+        const tm = window.terminalManager;
+        return tm.terminals.get(tm.activeId).terminal.buffer.active.viewportY;
+      });
+
+      // Do not release the mouse. Moving to the reachable inner bottom edge
+      // must reverse the same selection and keep scrolling toward live output.
+      await page.mouse.move(box.x + 8, box.y + box.height - 2, { steps: 12 });
+      await page.waitForFunction((startY) => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return active.terminal.buffer.active.viewportY > startY + 10;
+      }, topViewportY);
+
+      const after = await page.evaluate(() => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return {
+          viewportY: active.terminal.buffer.active.viewportY,
+          selection: active.terminal.getSelection(),
+        };
+      });
+
+      expect(after.viewportY).toBeGreaterThan(topViewportY + 10);
+      expect(after.selection).toContain("EDGE-REVERSE");
+    } finally {
+      await page.mouse.up();
+    }
+  });
+
+  test("downward drag uses the visible edge when the xterm screen is clipped", async ({
+    page,
+  }) => {
+    const before = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const lines = Array.from(
+        { length: 220 },
+        (_, index) => `EDGE-CLIPPED-${String(index).padStart(3, "0")}\r\n`,
+      ).join("");
+
+      await new Promise<void>((resolve) => {
+        active.terminal.write(lines, () => {
+          active.terminal.scrollToLine(
+            Math.max(
+              0,
+              active.terminal.buffer.active.baseY - active.terminal.rows * 3,
+            ),
+          );
+          resolve();
+        });
+      });
+
+      const screen = active.element.querySelector(".xterm-screen");
+      const rect = screen.getBoundingClientRect();
+      screen.getBoundingClientRect = () =>
+        new DOMRect(rect.x, rect.y, rect.width, rect.height + 80);
+
+      return {
+        viewportY: active.terminal.buffer.active.viewportY,
+      };
+    });
+
+    const screen = page.locator(".tile.active .xterm-screen:visible").first();
+    const box = await screen.boundingBox();
+    if (!box) throw new Error("Active terminal screen has no bounding box");
+
+    await page.mouse.move(box.x + 8, box.y + box.height * 0.35);
+    await page.mouse.down();
+    try {
+      // The mocked xterm rect extends below the viewport. This point is near
+      // the real visible edge but remains far from the mocked raw bottom.
+      await page.mouse.move(box.x + 8, box.y + box.height - 2, { steps: 12 });
+      await page.waitForFunction((startY) => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return active.terminal.buffer.active.viewportY > startY + 10;
+      }, before.viewportY);
+    } finally {
+      await page.mouse.up();
+    }
+  });
+
+  test("edge auto-scroll stops when the browser loses focus", async ({
+    page,
+  }) => {
+    const before = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const lines = Array.from(
+        { length: 600 },
+        (_, index) => `EDGE-BLUR-${String(index).padStart(3, "0")}\r\n`,
+      ).join("");
+      await new Promise<void>((resolve) => {
+        active.terminal.write(lines, () => {
+          active.terminal.scrollToBottom();
+          resolve();
+        });
+      });
+      return active.terminal.buffer.active.viewportY;
+    });
+
+    const screen = page.locator(".tile.active .xterm-screen:visible").first();
+    const box = await screen.boundingBox();
+    if (!box) throw new Error("Active terminal screen has no bounding box");
+
+    await page.mouse.move(box.x + 8, box.y + box.height * 0.65);
+    await page.mouse.down();
+    try {
+      await page.mouse.move(box.x + 8, box.y + 2, { steps: 12 });
+      await page.waitForFunction((startY) => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return active.terminal.buffer.active.viewportY < startY - 10;
+      }, before);
+
+      await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+      await page.waitForTimeout(100);
+      const stoppedAt = await page.evaluate(() => {
+        const tm = window.terminalManager;
+        return tm.terminals.get(tm.activeId).terminal.buffer.active.viewportY;
+      });
+      await page.waitForTimeout(250);
+      const later = await page.evaluate(() => {
+        const tm = window.terminalManager;
+        return tm.terminals.get(tm.activeId).terminal.buffer.active.viewportY;
+      });
+
+      expect(later).toBe(stoppedAt);
+    } finally {
+      await page.mouse.up();
+    }
+  });
+
+  test("tmux replay returns captured rows to column zero", async ({ page }) => {
+    await page.evaluate(() => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      active.ws.send(
+        JSON.stringify({
+          type: "input",
+          data: "printf 'REPLAY-COL-A\\nREPLAY-COL-B\\n'\r",
+        }),
+      );
+    });
+
+    await page.waitForFunction(() => {
+      const tm = window.terminalManager;
+      const terminal = tm.terminals.get(tm.activeId).terminal;
+      return Array.from({ length: terminal.buffer.active.length }).some(
+        (_, row) =>
+          terminal.buffer.active
+            .getLine(row)
+            ?.translateToString(true)
+            .trim() === "REPLAY-COL-B",
+      );
+    });
+
+    await page.reload();
+    await waitForTerminal(page);
+    await page.waitForFunction(() => {
+      const tm = window.terminalManager;
+      const terminal = tm.terminals.get(tm.activeId).terminal;
+      return Array.from({ length: terminal.buffer.active.length }).some(
+        (_, row) =>
+          terminal.buffer.active
+            .getLine(row)
+            ?.translateToString(true)
+            .trim() === "REPLAY-COL-B",
+      );
+    });
+
+    const replayColumns = await page.evaluate(() => {
+      const tm = window.terminalManager;
+      const terminal = tm.terminals.get(tm.activeId).terminal;
+      const columns: Record<string, number> = {};
+      for (let row = 0; row < terminal.buffer.active.length; row += 1) {
+        const line = terminal.buffer.active
+          .getLine(row)
+          ?.translateToString(true);
+        const trimmed = line?.trim();
+        if (trimmed === "REPLAY-COL-A" || trimmed === "REPLAY-COL-B") {
+          columns[trimmed] = line.search(/\S/);
+        }
+      }
+      return columns;
+    });
+
+    expect(replayColumns).toEqual({
+      "REPLAY-COL-A": 0,
+      "REPLAY-COL-B": 0,
+    });
+  });
+
   test("pasteClipboard degrades gracefully when async clipboard is unavailable", async ({
     page,
   }) => {

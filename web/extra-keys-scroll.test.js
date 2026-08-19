@@ -104,3 +104,9 @@ test("selection edge proxy yields to xterm once the pointer is outside", () => {
   expect(getSelectionEdgeProxyY(99, rect)).toBeNull();
   expect(getSelectionEdgeProxyY(401, rect)).toBeNull();
 });
+
+test("selection edge proxy uses the reachable viewport edge for a clipped screen", () => {
+  const rect = { top: 100, bottom: 430 };
+  const viewport = { top: 0, bottom: 400 };
+  expect(getSelectionEdgeProxyY(399, rect, 24, 6, viewport)).toBe(436);
+});
