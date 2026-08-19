@@ -122,9 +122,12 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
   });
 
   test("pasteClipboard uploads image clipboard content", async ({ page }) => {
-    await page.evaluate(() => {
+    await page.evaluate(async () => {
       const tm = window.terminalManager;
       const active = tm.terminals.get(tm.activeId);
+      await new Promise<void>((resolve) => {
+        active.terminal.write("\x1b[?2004h", resolve);
+      });
 
       const imageBlob = new Blob([Uint8Array.from([137, 80, 78, 71])], {
         type: "image/png",
@@ -205,7 +208,9 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
         return [];
       }
     });
-    expect(terminalInputs).toEqual(["/tmp/deckterm-clipboard/fake.png "]);
+    expect(terminalInputs).toEqual([
+      "\x1b[200~/tmp/deckterm-clipboard/fake.png \x1b[201~",
+    ]);
   });
 
   test("native paste event uploads image clipboard content on touch devices", async ({
