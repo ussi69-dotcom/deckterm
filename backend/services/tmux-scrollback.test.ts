@@ -3,9 +3,22 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TmuxTerminalBackend } from "./tmux-terminal-backend";
+import { formatTmuxCaptureForTerminal } from "./terminal-replay";
 
 const TMUX_AVAILABLE = Boolean(Bun.which("tmux"));
 let tempDir: string | null = null;
+
+test("tmux capture replay returns to column zero on every row", () => {
+  expect(formatTmuxCaptureForTerminal("alpha\nbeta\n")).toBe(
+    "alpha\r\nbeta\r\n",
+  );
+});
+
+test("tmux capture replay does not duplicate existing carriage returns", () => {
+  expect(formatTmuxCaptureForTerminal("alpha\r\nbeta\n")).toBe(
+    "alpha\r\nbeta\r\n",
+  );
+});
 
 function tmux(socketPath: string, args: string[]) {
   return Bun.spawnSync(["tmux", "-S", socketPath, ...args], {

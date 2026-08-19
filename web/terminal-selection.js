@@ -19,6 +19,7 @@ function getSelectionEdgeProxyY(
   rect,
   edgeSize = DEFAULT_EDGE_SIZE,
   maxProxyDistance = MAX_PROXY_DISTANCE,
+  viewportBounds = null,
 ) {
   if (
     !Number.isFinite(clientY) ||
@@ -27,21 +28,38 @@ function getSelectionEdgeProxyY(
     rect.bottom <= rect.top ||
     edgeSize <= 0 ||
     maxProxyDistance <= 0 ||
-    clientY < rect.top ||
-    clientY > rect.bottom
+    (viewportBounds &&
+      (!Number.isFinite(viewportBounds.top) ||
+        !Number.isFinite(viewportBounds.bottom)))
   ) {
     return null;
   }
 
-  if (clientY <= rect.top + edgeSize) {
-    const proximity = Math.min(1, (rect.top + edgeSize - clientY) / edgeSize);
+  // A fitted terminal can extend a few pixels below the browser viewport.
+  // Use the reachable intersection as the activation zone, but keep the
+  // synthetic target outside the real xterm screen so xterm sees a drag.
+  const visibleTop = Math.max(rect.top, viewportBounds?.top ?? rect.top);
+  const visibleBottom = Math.min(
+    rect.bottom,
+    viewportBounds?.bottom ?? rect.bottom,
+  );
+  if (
+    visibleBottom <= visibleTop ||
+    clientY < visibleTop ||
+    clientY > visibleBottom
+  ) {
+    return null;
+  }
+
+  if (clientY <= visibleTop + edgeSize) {
+    const proximity = Math.min(1, (visibleTop + edgeSize - clientY) / edgeSize);
     return rect.top - Math.max(1, Math.ceil(proximity * maxProxyDistance));
   }
 
-  if (clientY >= rect.bottom - edgeSize) {
+  if (clientY >= visibleBottom - edgeSize) {
     const proximity = Math.min(
       1,
-      (clientY - (rect.bottom - edgeSize)) / edgeSize,
+      (clientY - (visibleBottom - edgeSize)) / edgeSize,
     );
     return rect.bottom + Math.max(1, Math.ceil(proximity * maxProxyDistance));
   }
@@ -66,17 +84,44 @@ function attachSelectionEdgeAutoScroll(terminal, element) {
     latestMove = null;
   };
 
-  const stopSelection = () => {
+  const stopSelection = (event = null) => {
+    const wasSelecting = selecting;
     selecting = false;
     cancelProxyFrame();
     ownerDocument.removeEventListener("mousemove", handleMouseMove, true);
     ownerDocument.removeEventListener("mouseup", stopSelection, true);
+    ownerDocument.removeEventListener("pointercancel", stopSelection, true);
+    ownerDocument.removeEventListener(
+      "visibilitychange",
+      handleVisibilityChange,
+      true,
+    );
+    ownerWindow.removeEventListener("blur", stopSelection, true);
+    ownerWindow.removeEventListener("pagehide", stopSelection, true);
+
+    // xterm owns its own 50ms drag-scroll timer. A real mouseup reaches its
+    // listener after this capture listener; cancellation events do not, so
+    // synthesize the release after our listeners are detached.
+    if (wasSelecting && event?.type !== "mouseup") {
+      ownerDocument.dispatchEvent(
+        new ownerWindow.MouseEvent("mouseup", {
+          bubbles: true,
+          cancelable: true,
+          view: ownerWindow,
+          button: 0,
+          buttons: 0,
+        }),
+      );
+    }
   };
+
+  function handleVisibilityChange(event) {
+    if (ownerDocument.hidden) stopSelection(event);
+  }
 
   const flushProxyMove = () => {
     proxyFrame = 0;
     const move = latestMove;
-    latestMove = null;
     if (!selecting || !move) return;
 
     // Check after xterm handled the real move. On the first move this is when
@@ -85,9 +130,16 @@ function attachSelectionEdgeAutoScroll(terminal, element) {
       terminal.hasSelection?.() || Boolean(terminal.getSelectionPosition?.());
     if (!hasSelection) return;
 
+    const visualViewport = ownerWindow.visualViewport;
+    const viewportTop = visualViewport?.offsetTop ?? 0;
+    const viewportBottom =
+      viewportTop + (visualViewport?.height ?? ownerWindow.innerHeight);
     const proxyY = getSelectionEdgeProxyY(
       move.clientY,
       screen.getBoundingClientRect(),
+      DEFAULT_EDGE_SIZE,
+      MAX_PROXY_DISTANCE,
+      { top: viewportTop, bottom: viewportBottom },
     );
     if (proxyY == null) return;
 
@@ -106,6 +158,13 @@ function attachSelectionEdgeAutoScroll(terminal, element) {
     });
     proxyEvents.add(proxyEvent);
     ownerDocument.dispatchEvent(proxyEvent);
+
+    // Keep refreshing the proxy while the pointer is held in the edge zone.
+    // At a browser-window boundary there may be no further native mousemove;
+    // repeating the last valid move also makes direction changes reliable.
+    if (selecting && latestMove === move) {
+      proxyFrame = ownerWindow.requestAnimationFrame(flushProxyMove);
+    }
   };
 
   function handleMouseMove(event) {
@@ -136,6 +195,14 @@ function attachSelectionEdgeAutoScroll(terminal, element) {
     selecting = true;
     ownerDocument.addEventListener("mousemove", handleMouseMove, true);
     ownerDocument.addEventListener("mouseup", stopSelection, true);
+    ownerDocument.addEventListener("pointercancel", stopSelection, true);
+    ownerDocument.addEventListener(
+      "visibilitychange",
+      handleVisibilityChange,
+      true,
+    );
+    ownerWindow.addEventListener("blur", stopSelection, true);
+    ownerWindow.addEventListener("pagehide", stopSelection, true);
   };
 
   screen.addEventListener("mousedown", startSelection);
