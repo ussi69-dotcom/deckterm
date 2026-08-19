@@ -8,6 +8,7 @@ import type {
   TerminalBackendAttachOptions,
   TerminalBackendAttachResult,
   TerminalBackendSession,
+  TerminalScrollDirection,
 } from "./terminal-backend";
 
 export type TmuxSessionInfo = {
@@ -135,7 +136,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   async capture(sessionName: string): Promise<string> {
     const captureProc = await this.spawnTmux(
-      ["capture-pane", "-ep", "-S", "-2000", "-t", sessionName],
+      ["capture-pane", "-ep", "-S", "-10000", "-t", sessionName],
       { stdout: "pipe", stderr: "pipe" },
     );
     const output = await new Response((captureProc as any).stdout).text();
@@ -175,6 +176,46 @@ export class TmuxTerminalBackend implements TerminalBackend {
       waitForClient: options.waitForClient,
       socketPath: this.socketPath,
     });
+  }
+
+  async scrollHistory(
+    sessionName: string,
+    direction: TerminalScrollDirection,
+    lines: number,
+  ): Promise<boolean> {
+    const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    // Alternate-screen panes have no tmux history: copy-mode there is an
+    // empty [0/0] dead end that also steals subsequent input. Refuse.
+    const stateProc = await this.spawnTmux([
+      "display-message",
+      "-p",
+      "-t",
+      sessionName,
+      "#{alternate_on}",
+    ]);
+    const stateExit = await stateProc.exited;
+    const paneState = await new Response((stateProc as any).stdout).text();
+    if (stateExit !== 0 || paneState.trim() === "1") return false;
+    if (direction === "up") {
+      const copyModeProc = await this.spawnTmux([
+        "copy-mode",
+        "-e",
+        "-t",
+        sessionName,
+      ]);
+      if ((await copyModeProc.exited) !== 0) return false;
+    }
+
+    const scrollProc = await this.spawnTmux([
+      "send-keys",
+      "-X",
+      "-N",
+      String(count),
+      "-t",
+      sessionName,
+      direction === "up" ? "scroll-up" : "scroll-down",
+    ]);
+    return (await scrollProc.exited) === 0;
   }
 
   async kill(sessionName: string): Promise<void> {

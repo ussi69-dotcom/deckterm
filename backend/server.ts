@@ -256,6 +256,8 @@ type Terminal = {
   // to the same broker path instead of the legacy service-account backend.
   exec?: BrokeredExecContext;
   backend?: TerminalBackend;
+  scrollHistoryPending?: number;
+  scrollHistoryRunning?: Promise<void>;
 };
 
 type TerminalWsData = {
@@ -4608,6 +4610,44 @@ async function syncTmuxSessionSize(
 ): Promise<void> {
   if (!tmuxTerminalBackend) return;
   await tmuxTerminalBackend.resize(sessionName, cols, rows, options);
+}
+
+async function scrollTmuxSessionHistory(
+  term: Terminal,
+  direction: "up" | "down",
+  lines: number,
+): Promise<void> {
+  if (!TMUX_BACKEND || !term.sessionName) return;
+  const backend = term.backend ?? tmuxTerminalBackend;
+  if (!backend) return;
+  const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+  const signedCount = direction === "up" ? count : -count;
+  term.scrollHistoryPending = Math.max(
+    -100,
+    Math.min(100, (term.scrollHistoryPending ?? 0) + signedCount),
+  );
+  if (term.scrollHistoryRunning) {
+    await term.scrollHistoryRunning;
+    return;
+  }
+
+  const running = (async () => {
+    while (term.scrollHistoryPending) {
+      const pending = term.scrollHistoryPending;
+      term.scrollHistoryPending = 0;
+      await backend.scrollHistory(
+        term.sessionName!,
+        pending > 0 ? "up" : "down",
+        Math.abs(pending),
+      );
+    }
+  })();
+  term.scrollHistoryRunning = running;
+  await term.scrollHistoryRunning.finally(() => {
+    if (term.scrollHistoryRunning === running) {
+      delete term.scrollHistoryRunning;
+    }
+  });
 }
 
 async function sendTmuxPaneCapture(
@@ -10302,6 +10342,32 @@ export async function startWebServer(host: string, port: number) {
               const parsed = JSON.parse(message);
               if (parsed.type === "ping") {
                 ws.send(JSON.stringify({ type: "pong" }));
+                return;
+              }
+              if (parsed.type === "scrollback") {
+                const direction =
+                  parsed.direction === "up" || parsed.direction === "down"
+                    ? parsed.direction
+                    : null;
+                const lines = Number(parsed.lines);
+                if (
+                  direction &&
+                  Number.isFinite(lines) &&
+                  lines >= 1 &&
+                  TMUX_BACKEND &&
+                  term.sessionName
+                ) {
+                  void scrollTmuxSessionHistory(
+                    term,
+                    direction,
+                    lines,
+                  ).catch((err) => {
+                    debug(
+                      `[tmux] scrollback ${direction} failed for ${terminalId}:`,
+                      err,
+                    );
+                  });
+                }
                 return;
               }
               if (parsed.type === "resize") {

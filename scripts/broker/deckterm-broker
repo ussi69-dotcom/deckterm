@@ -553,6 +553,31 @@ def build_tmux_subcmd_argv(sub, operands, pw, cwd, cols, rows):
             out += ["-S", str(f["-S"])]
         out += ["-t", f["-t"]]
         return out
+    if sub == "copy-mode":
+        f = _t_flags(
+            operands,
+            bool_flags={"-e"},
+            value_flags={"-t": _t_name},
+        )
+        if "-t" not in f or not f.get("-e"):
+            die("copy-mode only supports: -e -t <name>")
+        return ["copy-mode", "-e", "-t", f["-t"]]
+    if sub == "send-keys":
+        if not operands:
+            die("send-keys requires a copy-mode action")
+        action = operands[-1]
+        if action not in ("scroll-up", "scroll-down"):
+            die("send-keys copy-mode action not allowed: %r" % action)
+        f = _t_flags(
+            operands[:-1],
+            bool_flags={"-X"},
+            value_flags={"-N": _t_int, "-t": _t_name},
+        )
+        if (not f.get("-X") or "-N" not in f or "-t" not in f
+                or f["-N"] < 1 or f["-N"] > 100):
+            die("send-keys only supports: -X -N <1..100> -t <name> scroll-up|scroll-down")
+        return ["send-keys", "-X", "-N", str(f["-N"]), "-t", f["-t"],
+                action]
     if sub in ("resize-window", "resize-pane", "resize-client"):
         f = _t_flags(operands, bool_flags=set(),
                      value_flags={"-t": _t_name, "-x": _t_int, "-y": _t_int})

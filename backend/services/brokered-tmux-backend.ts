@@ -15,6 +15,7 @@ import type {
   TerminalBackendAttachOptions,
   TerminalBackendAttachResult,
   TerminalBackendSession,
+  TerminalScrollDirection,
 } from "./terminal-backend";
 import type { TmuxPipeDelta, TmuxSessionInfo } from "./tmux-terminal-backend";
 
@@ -179,7 +180,7 @@ export class BrokeredTmuxBackend implements TerminalBackend {
       "-e",
       "-p",
       "-S",
-      "-2000",
+      "-10000",
       "-t",
       sessionName,
     ]);
@@ -212,6 +213,34 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     ]);
     // Client-size sync (tmux-client-size) opens the socket directly and is not
     // available in brokered mode; the resize-window/pane above bound the pane.
+  }
+
+  async scrollHistory(
+    sessionName: string,
+    direction: TerminalScrollDirection,
+    lines: number,
+  ): Promise<boolean> {
+    const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    if (direction === "up") {
+      const copyMode = await this.control(sessionName, [
+        "copy-mode",
+        "-e",
+        "-t",
+        sessionName,
+      ]);
+      if (copyMode.code !== 0) return false;
+    }
+
+    const scroll = await this.control(sessionName, [
+      "send-keys",
+      "-X",
+      "-N",
+      String(count),
+      "-t",
+      sessionName,
+      direction === "up" ? "scroll-up" : "scroll-down",
+    ]);
+    return scroll.code === 0;
   }
 
   async kill(sessionName: string): Promise<void> {

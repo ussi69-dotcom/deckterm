@@ -146,6 +146,43 @@ test("sessionExists maps has-session exit code", async () => {
   expect(await b.sessionExists("deckterm_decktermdev_s1")).toBe(false);
 });
 
+test("scrollHistory enters tmux copy mode and bounds the line count", async () => {
+  const b = backend();
+  expect(
+    await b.scrollHistory("deckterm_decktermdev_s1", "up", 500),
+  ).toBe(true);
+  expect(
+    calls
+      .filter((c) => c.fn === "brokerExec")
+      .map((c) => c.opts.profileArgs),
+  ).toEqual([
+    ["copy-mode", "-e", "-t", "deckterm_decktermdev_s1"],
+    [
+      "send-keys",
+      "-X",
+      "-N",
+      "100",
+      "-t",
+      "deckterm_decktermdev_s1",
+      "scroll-up",
+    ],
+  ]);
+
+  calls.length = 0;
+  expect(
+    await b.scrollHistory("deckterm_decktermdev_s1", "down", 12),
+  ).toBe(true);
+  expect(calls[0]?.opts.profileArgs).toEqual([
+    "send-keys",
+    "-X",
+    "-N",
+    "12",
+    "-t",
+    "deckterm_decktermdev_s1",
+    "scroll-down",
+  ]);
+});
+
 test("cache returns one backend instance per uid", () => {
   const cache = new BrokeredTmuxBackendCache({
     namespace: "deckterm-dev",
