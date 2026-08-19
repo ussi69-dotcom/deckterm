@@ -5,6 +5,7 @@ import {
   shouldRouteScrollToTmux,
   shouldScrollToPromptForKey,
 } from "./extra-keys-scroll.js";
+import { getSelectionEdgeProxyY } from "./terminal-selection.js";
 
 test("shouldScrollToPromptForKey returns false for PGUP (scrollback key)", () => {
   expect(shouldScrollToPromptForKey("PGUP")).toBe(false);
@@ -84,4 +85,22 @@ test("tmux scroll routing skips non-tmux backends entirely", () => {
 
 test("tmux scroll routing defaults to tmux history when mouse mode is unknown", () => {
   expect(shouldRouteScrollToTmux("tmux", undefined)).toBe(true);
+});
+
+test("selection edge proxy stays inactive in the terminal middle", () => {
+  expect(getSelectionEdgeProxyY(250, { top: 100, bottom: 400 })).toBeNull();
+});
+
+test("selection edge proxy maps the inner top and bottom zones outside", () => {
+  const rect = { top: 100, bottom: 400 };
+  expect(getSelectionEdgeProxyY(123, rect)).toBe(99);
+  expect(getSelectionEdgeProxyY(100, rect)).toBe(94);
+  expect(getSelectionEdgeProxyY(377, rect)).toBe(401);
+  expect(getSelectionEdgeProxyY(400, rect)).toBe(406);
+});
+
+test("selection edge proxy yields to xterm once the pointer is outside", () => {
+  const rect = { top: 100, bottom: 400 };
+  expect(getSelectionEdgeProxyY(99, rect)).toBeNull();
+  expect(getSelectionEdgeProxyY(401, rect)).toBeNull();
 });

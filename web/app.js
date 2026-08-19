@@ -2763,11 +2763,18 @@ class ClipboardManager {
   }
 
   // Handle Ctrl+V paste with size warning and image support
-  async handlePaste(terminalWs, clipboardData = null) {
+  async handlePaste(
+    terminalWs,
+    clipboardData = null,
+    terminal = null,
+    inputState = null,
+  ) {
     if (clipboardData) {
       const handled = await this.handleClipboardDataTransfer(
         clipboardData,
         terminalWs,
+        terminal,
+        inputState,
       );
       if (handled) return;
     }
@@ -2778,7 +2785,15 @@ class ClipboardManager {
     try {
       if (typeof clipboardApi?.read === "function") {
         const clipboardItems = await clipboardApi.read();
-        if (await this.handleClipboardItems(clipboardItems, terminalWs)) return;
+        if (
+          await this.handleClipboardItems(
+            clipboardItems,
+            terminalWs,
+            terminal,
+            inputState,
+          )
+        )
+          return;
       }
     } catch (err) {
       clipboardReadError = err;
@@ -2789,7 +2804,7 @@ class ClipboardManager {
       if (typeof clipboardApi?.readText === "function") {
         const text = await clipboardApi.readText();
         if (text) {
-          this.handleTextPaste(text, terminalWs);
+          this.handleTextPaste(text, terminalWs, terminal, inputState);
           return;
         }
       }
@@ -2819,12 +2834,17 @@ class ClipboardManager {
     );
   }
 
-  async handleClipboardItems(clipboardItems, terminalWs) {
+  async handleClipboardItems(
+    clipboardItems,
+    terminalWs,
+    terminal = null,
+    inputState = null,
+  ) {
     for (const item of clipboardItems) {
       const imageType = item.types.find((t) => t.startsWith("image/"));
       if (imageType) {
         const blob = await item.getType(imageType);
-        await this.handleImagePaste(blob, terminalWs);
+        await this.handleImagePaste(blob, terminalWs, terminal, inputState);
         return true;
       }
 
@@ -2832,7 +2852,7 @@ class ClipboardManager {
         const blob = await item.getType("text/plain");
         const text = await blob.text();
         if (!text) continue;
-        this.handleTextPaste(text, terminalWs);
+        this.handleTextPaste(text, terminalWs, terminal, inputState);
         return true;
       }
     }
@@ -2840,7 +2860,12 @@ class ClipboardManager {
     return false;
   }
 
-  async handleClipboardDataTransfer(clipboardData, terminalWs) {
+  async handleClipboardDataTransfer(
+    clipboardData,
+    terminalWs,
+    terminal = null,
+    inputState = null,
+  ) {
     if (!clipboardData) return false;
 
     const items = Array.from(clipboardData.items || []);
@@ -2850,32 +2875,43 @@ class ClipboardManager {
     if (imageItem) {
       const file = imageItem.getAsFile?.();
       if (file) {
-        await this.handleImagePaste(file, terminalWs);
+        await this.handleImagePaste(file, terminalWs, terminal, inputState);
         return true;
       }
     }
 
     const text = clipboardData.getData?.("text/plain");
     if (text) {
-      this.handleTextPaste(text, terminalWs);
+      this.handleTextPaste(text, terminalWs, terminal, inputState);
       return true;
     }
 
     return false;
   }
 
-  handleTextPaste(text, terminalWs) {
+  handleTextPaste(text, terminalWs, terminal = null, inputState = null) {
     const sizeBytes = new Blob([text]).size;
     const sizeKB = sizeBytes / 1024;
 
     if (sizeKB > 5) {
-      this.showPasteConfirmation(text, sizeBytes, terminalWs);
+      this.showPasteConfirmation(
+        text,
+        sizeBytes,
+        terminalWs,
+        terminal,
+        inputState,
+      );
     } else {
-      this.executePaste(text, terminalWs);
+      this.executePaste(text, terminalWs, terminal, inputState);
     }
   }
 
-  async handleImagePaste(blob, terminalWs) {
+  async handleImagePaste(
+    blob,
+    terminalWs,
+    terminal = null,
+    inputState = null,
+  ) {
     this.showToast("Uploading image...", "pending");
 
     try {
@@ -2895,7 +2931,7 @@ class ClipboardManager {
       const result = await response.json();
 
       // Send path to terminal
-      this.executePaste(result.path + " ", terminalWs);
+      this.executePaste(result.path + " ", terminalWs, terminal, inputState);
       this.showToast(`Image saved: ${result.filename}`, "success");
     } catch (err) {
       console.error("Image upload failed:", err);
@@ -2903,7 +2939,13 @@ class ClipboardManager {
     }
   }
 
-  showPasteConfirmation(text, sizeBytes, terminalWs) {
+  showPasteConfirmation(
+    text,
+    sizeBytes,
+    terminalWs,
+    terminal = null,
+    inputState = null,
+  ) {
     const modal = document.getElementById("paste-modal");
     const sizeEl = document.getElementById("paste-size");
     const previewEl = document.getElementById("paste-preview");
@@ -2936,14 +2978,33 @@ class ClipboardManager {
 
     confirmBtn.onclick = () => {
       cleanup();
-      this.executePaste(text, terminalWs);
+      this.executePaste(text, terminalWs, terminal, inputState);
     };
 
     cancelBtn.onclick = cleanup;
     closeBtn.onclick = cleanup;
   }
 
-  executePaste(text, terminalWs) {
+  executePaste(text, terminalWs, terminal = null, inputState = null) {
+    // Route text through xterm's public paste API whenever the terminal is
+    // available. It normalizes newlines and adds bracketed-paste markers when
+    // the running TUI requested them. Writing clipboard text straight to the
+    // PTY bypasses that contract, so Codex can interpret every pasted newline
+    // as a separate Enter and queue the remaining lines.
+    if (typeof terminal?.paste === "function" && inputState) {
+      // terminal.paste() emits synchronously through terminal.onData(). Mark
+      // that emission so the shared mobile-input pipeline can send xterm's
+      // transformed payload unchanged instead of treating it as keyboard
+      // input (fallback-echo dedupe and sticky modifiers do not apply to
+      // clipboard contents).
+      inputState.pasteDepth += 1;
+      try {
+        terminal.paste(text);
+      } finally {
+        inputState.pasteDepth -= 1;
+      }
+      return;
+    }
     if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
       terminalWs.send(JSON.stringify({ type: "input", data: text }));
     }
@@ -12179,6 +12240,11 @@ class TerminalManager {
     const terminal = this.createXtermInstance(id);
     terminal.open(element);
     const activationCleanup = this.bindTerminalActivation(id, element);
+    const selectionEdgeCleanup =
+      window.TerminalSelection?.attachSelectionEdgeAutoScroll?.(
+        terminal,
+        element,
+      ) || null;
     const webglAddon = this.setupTerminalRenderer(id, terminal);
     const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
@@ -12226,6 +12292,13 @@ class TerminalManager {
       if (dbg)
         dbg.textContent = `onData1: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
 
+      if (inputState.pasteDepth > 0) {
+        inputState.lastOnDataAt = performance.now();
+        inputState.lastOnDataValue = data;
+        ws.send(JSON.stringify({ type: "input", data }));
+        return;
+      }
+
       const dedupedData = this.consumePendingFallbackEcho(inputState, data);
       if (!dedupedData) {
         if (dbg) dbg.textContent = "onData1: SKIP (fallback echo)";
@@ -12243,7 +12316,12 @@ class TerminalManager {
       element,
       inputState,
     );
-    const pasteFallbackCleanup = this.attachClipboardPasteFallback(ws, element);
+    const pasteFallbackCleanup = this.attachClipboardPasteFallback(
+      ws,
+      element,
+      terminal,
+      inputState,
+    );
     const tmuxScrollbackCleanup = this.attachTmuxScrollbackWheel(
       ws,
       element,
@@ -12293,6 +12371,7 @@ class TerminalManager {
       pasteFallbackCleanup,
       tmuxScrollbackCleanup,
       activationCleanup,
+      selectionEdgeCleanup,
       inputState,
       hasConnected: false, // Track if WebSocket has ever successfully connected
       isReconnection,
@@ -12357,6 +12436,7 @@ class TerminalManager {
       lastFallbackAt: 0,
       lastFallbackData: "",
       pendingFallbackEcho: "",
+      pasteDepth: 0,
     };
   }
 
@@ -12697,7 +12777,12 @@ class TerminalManager {
     };
   }
 
-  attachClipboardPasteFallback(ws, element) {
+  attachClipboardPasteFallback(
+    ws,
+    element,
+    terminal = null,
+    inputState = null,
+  ) {
     if (!ws || !element) return null;
 
     const textarea = element.querySelector(".xterm-helper-textarea");
@@ -12714,7 +12799,7 @@ class TerminalManager {
       // before xterm's descendant listeners, then halt the event here.
       event.stopImmediatePropagation();
       this.clipboardManager
-        .handlePaste(ws, event.clipboardData)
+        .handlePaste(ws, event.clipboardData, terminal, inputState)
         .catch((err) => {
           console.error("Clipboard paste fallback failed:", err);
         });
@@ -12921,7 +13006,12 @@ class TerminalManager {
         event.preventDefault();
         const termData = this.terminals.get(id);
         if (termData?.ws) {
-          this.clipboardManager.handlePaste(termData.ws);
+          this.clipboardManager.handlePaste(
+            termData.ws,
+            null,
+            termData.terminal,
+            termData.inputState,
+          );
         }
         return false; // Prevent default xterm handling
       }
@@ -13633,6 +13723,11 @@ class TerminalManager {
       const terminal = this.createXtermInstance(id);
       terminal.open(element);
       const activationCleanup = this.bindTerminalActivation(id, element);
+      const selectionEdgeCleanup =
+        window.TerminalSelection?.attachSelectionEdgeAutoScroll?.(
+          terminal,
+          element,
+        ) || null;
       const webglAddon = this.setupTerminalRenderer(id, terminal);
       const osc7Disposable = this.attachOsc7Handler(id, terminal);
 
@@ -13665,6 +13760,13 @@ class TerminalManager {
           debugEl.textContent = `onData: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
         }
 
+        if (inputState.pasteDepth > 0) {
+          inputState.lastOnDataAt = performance.now();
+          inputState.lastOnDataValue = data;
+          ws.send(JSON.stringify({ type: "input", data }));
+          return;
+        }
+
         const dedupedData = this.consumePendingFallbackEcho(inputState, data);
         if (!dedupedData) {
           if (debugEl) {
@@ -13691,6 +13793,8 @@ class TerminalManager {
       const pasteFallbackCleanup = this.attachClipboardPasteFallback(
         ws,
         element,
+        terminal,
+        inputState,
       );
       const tmuxScrollbackCleanup = this.attachTmuxScrollbackWheel(
         ws,
@@ -13743,6 +13847,7 @@ class TerminalManager {
         pasteFallbackCleanup,
         tmuxScrollbackCleanup,
         activationCleanup,
+        selectionEdgeCleanup,
         inputState,
         awaitingReconnectReady: false,
         connectionStatus: "connecting",
@@ -14245,6 +14350,7 @@ class TerminalManager {
     t.pasteFallbackCleanup?.();
     t.tmuxScrollbackCleanup?.();
     t.activationCleanup?.();
+    t.selectionEdgeCleanup?.();
     if (t.resizeObserver) t.resizeObserver.disconnect();
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
@@ -14468,7 +14574,12 @@ class TerminalManager {
     const active = this.terminals.get(this.activeId);
     if (!active?.ws) return;
     try {
-      await this.clipboardManager.handlePaste(active.ws);
+      await this.clipboardManager.handlePaste(
+        active.ws,
+        null,
+        active.terminal,
+        active.inputState,
+      );
     } catch (err) {
       console.error("Paste failed:", err);
     }

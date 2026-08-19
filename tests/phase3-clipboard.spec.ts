@@ -172,11 +172,22 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
         window.__sentPayloads.push(String(payload));
         return realSend(payload);
       };
+
+      // Clipboard contents must not inherit the mobile sticky-key state.
+      tm.extraKeys.modifiers.ctrl = true;
     });
 
-    await page.evaluate(() => window.terminalManager.pasteClipboard());
+    try {
+      await page.evaluate(() => window.terminalManager.pasteClipboard());
 
-    await page.waitForFunction(() => (window.__uploadCalls || []).length === 1);
+      await page.waitForFunction(
+        () => (window.__uploadCalls || []).length === 1,
+      );
+    } finally {
+      await page.evaluate(() => {
+        window.terminalManager.extraKeys.modifiers.ctrl = false;
+      });
+    }
 
     const result = await page.evaluate(() => ({
       uploadCalls: window.__uploadCalls || [],
@@ -186,11 +197,15 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     expect(result.uploadCalls).toHaveLength(1);
     expect(result.uploadCalls[0].method).toBe("POST");
     expect(result.uploadCalls[0].isFormData).toBe(true);
-    expect(
-      result.sentPayloads.some((payload) =>
-        payload.includes("/tmp/deckterm-clipboard/fake.png "),
-      ),
-    ).toBe(true);
+    const terminalInputs = result.sentPayloads.flatMap((payload) => {
+      try {
+        const parsed = JSON.parse(payload);
+        return parsed.type === "input" ? [parsed.data] : [];
+      } catch {
+        return [];
+      }
+    });
+    expect(terminalInputs).toEqual(["/tmp/deckterm-clipboard/fake.png "]);
   });
 
   test("native paste event uploads image clipboard content on touch devices", async ({
@@ -283,7 +298,7 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     ).toBe(true);
   });
 
-  test("native paste event sends text exactly once (no double paste)", async ({
+  test("native multiline paste keeps bracketed-paste framing and sends once", async ({
     page,
   }) => {
     // Regression: a native `paste` event (right-click / Ctrl+Shift+V) used to
@@ -295,6 +310,9 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
       const tm = window.terminalManager;
       const active = tm.terminals.get(tm.activeId);
       const textarea = active.element.querySelector(".xterm-helper-textarea");
+      await new Promise<void>((resolve) => {
+        active.terminal.write("\x1b[?2004h", resolve);
+      });
 
       const captured: string[] = [];
       const realSend = active.ws.send.bind(active.ws);
@@ -303,7 +321,7 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
         return realSend(payload);
       };
 
-      const text = "echo double-paste-canary";
+      const text = "alpha\nbeta\ngamma";
       const clipboardData = {
         items: [{ kind: "string", type: "text/plain" }],
         getData: (type: string) => (type === "text/plain" ? text : ""),
@@ -323,16 +341,135 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
       return captured;
     });
 
-    const canaryInputs = sentPayloads.filter((payload) => {
-      if (!payload.includes("double-paste-canary")) return false;
+    const terminalInputs = sentPayloads.flatMap((payload) => {
       try {
-        return JSON.parse(payload).type === "input";
+        const parsed = JSON.parse(payload);
+        return parsed.type === "input" ? [parsed.data] : [];
       } catch {
-        return false;
+        return [];
       }
     });
 
-    expect(canaryInputs).toHaveLength(1);
+    expect(terminalInputs).toEqual(["\x1b[200~alpha\rbeta\rgamma\x1b[201~"]);
+  });
+
+  test("multiline paste bypasses fallback dedupe and sticky modifiers", async ({
+    page,
+  }) => {
+    const sentPayloads = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const textarea = active.element.querySelector(".xterm-helper-textarea");
+
+      // Explicitly use ordinary (non-bracketed) paste so the payload starts
+      // with the same text as pendingFallbackEcho. This reproduces the mobile
+      // dedupe collision found during review.
+      await new Promise<void>((resolve) => {
+        active.terminal.write("\x1b[?2004l", resolve);
+      });
+      active.inputState.pendingFallbackEcho = "alpha";
+      tm.extraKeys.modifiers.ctrl = true;
+
+      const captured: string[] = [];
+      const realSend = active.ws.send.bind(active.ws);
+      active.ws.send = (payload) => {
+        captured.push(String(payload));
+        return realSend(payload);
+      };
+
+      try {
+        const text = "alpha\nbeta";
+        const clipboardData = {
+          items: [{ kind: "string", type: "text/plain" }],
+          getData: (type: string) => (type === "text/plain" ? text : ""),
+        };
+        const pasteEvent = new Event("paste", {
+          bubbles: true,
+          cancelable: true,
+        });
+        Object.defineProperty(pasteEvent, "clipboardData", {
+          configurable: true,
+          value: clipboardData,
+        });
+        textarea.dispatchEvent(pasteEvent);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      } finally {
+        tm.extraKeys.modifiers.ctrl = false;
+      }
+
+      return captured;
+    });
+
+    const terminalInputs = sentPayloads.flatMap((payload) => {
+      try {
+        const parsed = JSON.parse(payload);
+        return parsed.type === "input" ? [parsed.data] : [];
+      } catch {
+        return [];
+      }
+    });
+
+    expect(terminalInputs).toEqual(["alpha\rbeta"]);
+  });
+
+  test("drag selection auto-scrolls while the pointer stays inside the top edge", async ({
+    page,
+  }) => {
+    const before = await page.evaluate(async () => {
+      const tm = window.terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      const lines = Array.from(
+        { length: 180 },
+        (_, index) => `EDGE-CANARY-${String(index).padStart(3, "0")}\r\n`,
+      ).join("");
+
+      await new Promise<void>((resolve) => {
+        active.terminal.write(lines, () => {
+          active.terminal.scrollToBottom();
+          resolve();
+        });
+      });
+
+      return {
+        viewportY: active.terminal.buffer.active.viewportY,
+        rows: active.terminal.rows,
+      };
+    });
+
+    expect(before.viewportY).toBeGreaterThan(before.rows);
+
+    const screen = page.locator(".tile.active .xterm-screen:visible").first();
+    const box = await screen.boundingBox();
+    if (!box) throw new Error("Active terminal screen has no bounding box");
+
+    await page.mouse.move(box.x + 8, box.y + box.height * 0.65);
+    await page.mouse.down();
+    try {
+      // Stay inside the screen. Vanilla xterm only starts drag scrolling once
+      // clientY is outside the screen, which is unreachable when the pane ends
+      // at the browser edge.
+      await page.mouse.move(box.x + 8, box.y + 2, { steps: 12 });
+      await page.waitForFunction((startY) => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return active.terminal.buffer.active.viewportY < startY - 10;
+      }, before.viewportY);
+
+      const after = await page.evaluate(() => {
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(tm.activeId);
+        return {
+          viewportY: active.terminal.buffer.active.viewportY,
+          selection: active.terminal.getSelection(),
+        };
+      });
+
+      expect(after.viewportY).toBeLessThan(before.viewportY - 10);
+      expect(after.selection.split("\n").length).toBeGreaterThan(before.rows);
+      expect(after.selection).toContain("EDGE-CANARY");
+    } finally {
+      await page.mouse.up();
+    }
   });
 
   test("pasteClipboard degrades gracefully when async clipboard is unavailable", async ({
