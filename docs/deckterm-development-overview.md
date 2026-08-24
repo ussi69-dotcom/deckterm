@@ -1,6 +1,14 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Nejnovější delta 2026-08-19 viz sekce 0x**
+
+## 0x. Delta 2026-08-19 — Terminal selection edge auto-scroll + multiline paste přes `terminal.paste()` + tmux replay CRLF (HEAD: `09681f0`)
+
+Krátký sprint reagující na dva reporty: (a) drag-selection v terminálovém pane zarovnaném ke spodní hraně viewportu neautoscrolloval a (b) multi-line paste přes Ctrl+V se v Codex TUI rozpadal na jednotlivé Enter události.
+
+- **Selection edge-zone auto-scroll** (`db3662c`, dokončeno v `09681f0`): nový modul `web/terminal-selection.js`. Pure helper `getSelectionEdgeProxyY(clientY, rect, edgeSize=24, maxProxyDistance=6)` mapuje in-bounds pointer v horní/dolní edge zóně na just-outside clientY (proximity-scaled max 6 px). `attachSelectionEdgeAutoScroll(terminal, element)` posluchá pointerdown/pointermove/pointerup přes `.xterm-screen`, `rAF`-throttluje propagaci proxy eventu a přes `WeakSet` označuje vlastní syntetické eventy, aby se nezacyklily. xterm.js zůstává vlastníkem selection state, rychlosti scrollu, renderu i clipboardu — jen mu podstrčíme „venek" tam, kde pane končí přesně na hraně viewportu.
+- **Multi-line paste přes xterm public API** (`db3662c`): `ClipboardManager` v `web/app.js` (`handlePaste`/`handleClipboardItems`/`handleClipboardDataTransfer`/`handleTextPaste`/`handleImagePaste`/`showPasteConfirmation`/`executePaste`) rozšířen o volitelné parametry `terminal` a `inputState`. `executePaste()` teď volá `terminal.paste(text)`, když je terminál k dispozici — xterm.js normalizuje newlines a přidá bracketed-paste markery, pokud běžící TUI (Codex) `\e[?2004h` požaduje. Nový `pasteDepth` counter v mobilním input pipeline zajišťuje, že transformovaný payload jdoucí z `terminal.onData()` se pošle beze změny (fallback-echo dedupe a sticky modifiers se na obsah clipboardu neaplikují). Doplněny testy `tests/phase3-clipboard.spec.ts` + `web/extra-keys-scroll.test.js`; deterministický image-paste polish v `0a08e53`.
+- **tmux capture-pane replay CRLF** (`09681f0`): nový boundary helper `backend/services/terminal-replay.ts` — `formatTmuxCaptureForTerminal(capture)` konvertuje `\n` → `\r\n` (nededuplikuje již existující `\r\n`). Zapojen do `sendTmuxPaneCapture()` v `backend/server.ts` (reconnect replay) i do initial scrollback fallbacku v `createManagedTerminal()`. Nativní PTY control sequences se přes helper nevedou — helper zpracovává jen textové tmux snapshoty. Kryto novými unit testy v `backend/services/tmux-scrollback.test.ts` (návrat na sloupec 0 na každém řádku; žádná duplikace existujících CR). Bez fixu se replay driftoval horizontálně, protože tmux `capture-pane` emituje řádky pouze LF-oddělené a terminál interpretuje LF jako „move down" bez návratu na sloupec 0.
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -218,7 +226,11 @@ b1c8324  feat(tmux): opaque session names            ← C1b-01
 38b082c  feat: terminal.write mode + events log      ← C1b-05 & C1b-06
 bb256e0  feat(ui): sessions drawer + mode indicators ← C1b-07
 a908737  feat(cleanup): zombie reconciliation + reapers + OS isolation warnings ← C1b-08
-ac208cd  feat(security): file/git/task gates + doctor hardening ← C2  (HEAD)
+ac208cd  feat(security): file/git/task gates + doctor hardening ← C2
+…
+db3662c  fix: terminal selection edge auto-scroll + multi-line paste via terminal.paste() (2026-08-19)
+0a08e53  test: bracketed image paste deterministic (2026-08-19)
+09681f0  fix: tmux capture-pane replay CRLF (formatTmuxCaptureForTerminal) + selection lifecycle polish  (HEAD)
 ```
 
 ---
