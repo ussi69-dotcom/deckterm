@@ -30,7 +30,26 @@ export type TmuxTerminalBackendOptions = {
   pipeDir?: string;
   shellCommandResolver: () => Promise<string[]>;
   env?: Record<string, string | undefined>;
+  // When true, refuse to let tmux start the server implicitly. See
+  // assertExternalServerRunning() for why that matters in production.
+  requireExternalServer?: boolean;
 };
+
+export class TmuxServerUnavailableError extends Error {
+  readonly socketPath: string;
+
+  constructor(socketPath: string) {
+    super(
+      `no tmux server on ${socketPath}. The server runs in its own systemd ` +
+        `unit so that sessions survive a backend restart; starting it here ` +
+        `would put it back inside deckterm.service's control group, where the ` +
+        `next restart destroys every session. Start it with: ` +
+        `systemctl start deckterm-tmux.service`,
+    );
+    this.name = "TmuxServerUnavailableError";
+    this.socketPath = socketPath;
+  }
+}
 
 export class TmuxTerminalBackend implements TerminalBackend {
   readonly mode = "tmux" as const;
@@ -39,6 +58,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
   readonly pipeDir: string;
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
+  private readonly requireExternalServer: boolean;
   private socketDirectoryReady: Promise<void> | null = null;
 
   constructor(options: TmuxTerminalBackendOptions) {
@@ -47,6 +67,34 @@ export class TmuxTerminalBackend implements TerminalBackend {
     this.pipeDir = options.pipeDir || "/tmp/deckterm-tmux-pipes";
     this.shellCommandResolver = options.shellCommandResolver;
     this.baseEnv = options.env || process.env;
+    this.requireExternalServer = options.requireExternalServer === true;
+  }
+
+  /**
+   * Fails fast when the tmux server is expected to be supplied by its own
+   * systemd unit but is not running.
+   *
+   * Only `new-session` starts a tmux server implicitly, so this is the one
+   * place that needs the check — and it is exactly the place where an implicit
+   * start would silently reintroduce the bug this design exists to prevent: a
+   * server parented by the backend, inside deckterm.service's control group,
+   * destroyed together with the service on the next restart.
+   *
+   * `list-sessions` exits 0 against a running server even when it holds no
+   * sessions (the unit sets `exit-empty off` precisely so an idle server stays
+   * up), and nonzero when no server answers the socket.
+   */
+  private async assertExternalServerRunning(): Promise<void> {
+    if (!this.requireExternalServer) {
+      return;
+    }
+    const proc = await this.spawnTmux(["list-sessions"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if ((await proc.exited) !== 0) {
+      throw new TmuxServerUnavailableError(this.socketPath);
+    }
   }
 
   async createSession(
@@ -62,6 +110,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
       terminalId: id,
     });
     const shellCommand = await this.shellCommandResolver();
+    await this.assertExternalServerRunning();
     const createProc = await this.spawnTmux(
       [
         "new-session",

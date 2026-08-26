@@ -414,6 +414,14 @@ const TMUX_SOCKET_PATH = getTmuxSocketPath({
   stateDir: DECKTERM_STATE_DIR,
 });
 const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
+// In production the tmux server is supplied by deckterm-tmux.service, so that
+// sessions survive a restart of this service. Letting tmux start the server
+// implicitly here would parent it to deckterm.service instead, and the next
+// restart — including an automatic one from needrestart after a library
+// upgrade — would destroy every session. Left off by default so a local
+// checkout still works with no unit installed.
+const TMUX_REQUIRE_EXTERNAL_SERVER =
+  process.env.TMUX_REQUIRE_EXTERNAL_SERVER === "1";
 const terminalBackend: TerminalBackend = TMUX_BACKEND
   ? new TmuxTerminalBackend({
       namespace: TMUX_SESSION_NAMESPACE,
@@ -421,6 +429,7 @@ const terminalBackend: TerminalBackend = TMUX_BACKEND
       pipeDir: TMUX_PIPE_DIR,
       shellCommandResolver: resolveShellCommand,
       env: process.env,
+      requireExternalServer: TMUX_REQUIRE_EXTERNAL_SERVER,
     })
   : new RawTerminalBackend({
       shellCommandResolver: resolveShellCommand,
