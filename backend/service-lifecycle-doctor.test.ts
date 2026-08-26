@@ -117,6 +117,43 @@ describe("Setup Doctor × service lifecycle", () => {
     expect(report.status).toBe("ok");
   });
 
+  test("without an explicit env file the doctor reads the unit's EnvironmentFile", async () => {
+    const f = await fixture();
+    await writeFile(join(f.needrestartDir, "needrestart.conf"), "#$nrconf{restart} = 'i';\n");
+    // A stale .env in cwd must NOT win over the unit's file.
+    await writeFile(join(f.dir, ".env"), "PORT=9999\nHOST=0.0.0.0\nTMUX_BACKEND=0\n");
+    const report = await runOnboardingDoctor({
+      cwd: f.dir,
+      scriptPath: f.script,
+      env: f.env,
+      needrestartConfigDir: f.needrestartDir,
+      lifecycle: {
+        unit: "deckterm.service",
+        scope: "system",
+        killMode: "process",
+        environmentFiles: [f.unitEnv],
+      },
+    });
+    expect(report.envFile).toBe(f.unitEnv);
+    expect(report.config.port).toBe("4174");
+    expect(report.config.tmuxBackend).toBe(true);
+  });
+
+  test("outside systemd (lifecycle null) the doctor falls back to .env in cwd", async () => {
+    const f = await fixture();
+    await writeFile(
+      join(f.dir, ".env"),
+      "PORT=4174\nHOST=127.0.0.1\nTMUX_BACKEND=1\nTRUSTED_ORIGINS=http://localhost:4174\n",
+    );
+    const report = await runOnboardingDoctor({
+      cwd: f.dir,
+      scriptPath: f.script,
+      env: f.env,
+      lifecycle: null,
+    });
+    expect(report.envFile).toBe(join(f.dir, ".env"));
+  });
+
   test("outside systemd (lifecycle null) no host checks are emitted", async () => {
     const f = await fixture();
     const report = await runOnboardingDoctor({

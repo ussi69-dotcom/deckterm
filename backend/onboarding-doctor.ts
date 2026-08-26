@@ -7,6 +7,7 @@ import {
   evaluateTmuxPersistence,
   getServiceLifecycle,
   readNeedrestartConfig,
+  resolveDoctorEnvFile,
   type ServiceLifecycle,
 } from "./service-lifecycle";
 
@@ -1103,15 +1104,31 @@ function buildRequestContext({
   };
 }
 
+// Shared by doctor / apply / remediate so they read AND write the same file.
+// Backlog P2: under systemd the config the service *actually* runs with is
+// the unit's EnvironmentFile=, not `.env` in the working directory — a stale
+// checkout .env made the doctor report a healthy deploy as broken.
+async function resolveDoctorContext(options: RunDoctorOptions) {
+  const cwd = options.cwd || process.cwd();
+  const env = options.env || process.env;
+  const lifecycle =
+    env.DECKTERM_DOCTOR_LIFECYCLE === "0"
+      ? null
+      : options.lifecycle !== undefined
+        ? options.lifecycle
+        : await getServiceLifecycle();
+  const envFile = resolveDoctorEnvFile({
+    cwd,
+    explicit: options.envFile || env.DECKTERM_DOCTOR_ENV,
+    lifecycle,
+  });
+  return { cwd, env, lifecycle, envFile };
+}
+
 export async function runOnboardingDoctor(
   options: RunDoctorOptions = {},
 ): Promise<OnboardingDoctorResult> {
-  const cwd = options.cwd || process.cwd();
-  const env = options.env || process.env;
-  const envFile = resolve(
-    cwd,
-    options.envFile || env.DECKTERM_DOCTOR_ENV || ".env",
-  );
+  const { cwd, env, lifecycle, envFile } = await resolveDoctorContext(options);
   const scriptPath = resolve(
     cwd,
     options.scriptPath || env.DECKTERM_DOCTOR_SCRIPT || "scripts/doctor.sh",
@@ -1161,12 +1178,6 @@ export async function runOnboardingDoctor(
     ];
   }
 
-  const lifecycle =
-    env.DECKTERM_DOCTOR_LIFECYCLE === "0"
-      ? null
-      : options.lifecycle !== undefined
-        ? options.lifecycle
-        : await getServiceLifecycle();
   checks = [
     ...checks,
     ...(await buildDeploymentChecks({
@@ -1214,12 +1225,7 @@ export async function runOnboardingDoctor(
 export async function applyOnboardingProfile(
   options: ApplyOnboardingOptions = {},
 ): Promise<OnboardingApplyResult> {
-  const cwd = options.cwd || process.cwd();
-  const env = options.env || process.env;
-  const envFile = resolve(
-    cwd,
-    options.envFile || env.DECKTERM_DOCTOR_ENV || ".env",
-  );
+  const { cwd, env, envFile } = await resolveDoctorContext(options);
   const profile = normalizePublishMode(options.profile);
   const config = await readEnvConfig({ envFile, env });
   const updates = buildApplyEnvUpdates({ config, env, profile, options });
@@ -1256,12 +1262,7 @@ export async function applyOnboardingRemediation(
   applied: string[];
   report?: OnboardingDoctorResult;
 }> {
-  const cwd = options.cwd || process.cwd();
-  const env = options.env || process.env;
-  const envFile = resolve(
-    cwd,
-    options.envFile || env.DECKTERM_DOCTOR_ENV || ".env",
-  );
+  const { cwd, env, envFile } = await resolveDoctorContext(options);
 
   const config = await readEnvConfig({ envFile, env });
   const profile = normalizePublishMode(options.profile || config.publishMode);
