@@ -1,6 +1,14 @@
 import { constants } from "node:fs";
 import { access, readFile, writeFile, stat, chmod } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
+import {
+  evaluateHomeRootCoverage,
+  evaluateNeedrestartConfig,
+  evaluateTmuxPersistence,
+  getServiceLifecycle,
+  readNeedrestartConfig,
+  type ServiceLifecycle,
+} from "./service-lifecycle";
 
 export type DoctorCheckStatus = "ok" | "warning" | "failed";
 export type DoctorPublishMode =
@@ -118,6 +126,15 @@ type RunDoctorOptions = {
   profile?: string;
   publicOrigin?: string;
   requestContext?: Partial<DoctorRequestContext>;
+  /**
+   * Host lifecycle facts (systemd unit, KillMode, EnvironmentFiles). Omit to
+   * detect from the running process; pass `null` to assert "not under
+   * systemd". `DECKTERM_DOCTOR_LIFECYCLE=0` in env disables detection and the
+   * needrestart read entirely (tests, CI runners inside foreign units).
+   */
+  lifecycle?: ServiceLifecycle | null;
+  /** needrestart config directory (default /etc/needrestart). */
+  needrestartConfigDir?: string;
 };
 
 type ApplyOnboardingOptions = RunDoctorOptions & {
@@ -344,9 +361,13 @@ function createConfigCheck(
 async function buildDeploymentChecks({
   config,
   env,
+  lifecycle,
+  needrestartConfigDir,
 }: {
   config: DoctorConfig;
   env: NodeJS.ProcessEnv;
+  lifecycle: ServiceLifecycle | null;
+  needrestartConfigDir?: string;
 }): Promise<DoctorCheck[]> {
   const checks: DoctorCheck[] = [];
   const proxyMode =
@@ -525,6 +546,31 @@ async function buildDeploymentChecks({
       ),
     );
   } catch {}
+
+  // Host lifecycle facts a fresh install keeps rediscovering: KillMode
+  // (tmux survives restarts), needrestart auto-restart mode, and whether the
+  // service home is a usable terminal cwd. Best-effort; each degrades to
+  // "no check" when the fact cannot be read.
+  const lifecycleChecks = [
+    evaluateTmuxPersistence({
+      tmuxBackend: config.tmuxBackend,
+      unit: lifecycle?.unit ?? null,
+      killMode: lifecycle?.killMode ?? null,
+    }),
+    evaluateNeedrestartConfig({
+      confText: lifecycle
+        ? await readNeedrestartConfig(needrestartConfigDir)
+        : null,
+      unit: lifecycle?.unit ?? null,
+    }),
+    evaluateHomeRootCoverage({
+      home: env.HOME || "",
+      allowedRoots: config.allowedFileRoots,
+    }),
+  ];
+  for (const check of lifecycleChecks) {
+    if (check) checks.push(check);
+  }
 
   return checks;
 }
@@ -1115,7 +1161,21 @@ export async function runOnboardingDoctor(
     ];
   }
 
-  checks = [...checks, ...(await buildDeploymentChecks({ config, env }))];
+  const lifecycle =
+    env.DECKTERM_DOCTOR_LIFECYCLE === "0"
+      ? null
+      : options.lifecycle !== undefined
+        ? options.lifecycle
+        : await getServiceLifecycle();
+  checks = [
+    ...checks,
+    ...(await buildDeploymentChecks({
+      config,
+      env,
+      lifecycle,
+      needrestartConfigDir: options.needrestartConfigDir,
+    })),
+  ];
   applyLiveCloudflareEvidence(checks, requestContext);
   const liveJwtRescue =
     requestContext.viaCloudflare &&
