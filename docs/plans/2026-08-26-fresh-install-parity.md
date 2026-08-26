@@ -293,3 +293,42 @@ test("doctor env file: explicit override wins, then the unit's EnvironmentFile, 
 3. Negative check for the KillMode warning without touching a real unit: `systemd-run --user --unit dtprobe-km -p KillMode=control-group --setenv=PORT=4199 --setenv=TMUX_BACKEND=1 --setenv=DECKTERM_STATE_DIR=$HOME/.deckterm-probe --setenv=DECKTERM_LEGACY_NO_BOOTSTRAP=1 --setenv=DECKTERM_RUNTIME_ENV=development -p WorkingDirectory=$PWD /home/deploy/.bun/bin/bun run backend/index.ts`; `journalctl --user -u dtprobe-km` must show the `[lifecycle]` warning; then `systemctl --user stop dtprobe-km` and `rm -rf ~/.deckterm-probe`.
 4. `bun run test:unit`, `bun x tsc --noEmit`, `bun run test:e2e:smoke` (this session's shell is on the prod tmux socket, so the dev e2e reset cannot kill it — re-check `$TMUX` first).
 5. `git push origin dev`. OK sync: development-log entry + backlog: mark P0/P1(home root)/P2(doctor env) addressed, keep P1 "errors name the rejected value" and P3 token TTL open; note the prod drop-in follow-up.
+
+---
+
+## Delivery record (2026-08-26)
+
+Commits on `dev`: `3c8fa5c` plan · `f0dfe71` reaper defaults · `65b5ec3` shipped unit +
+needrestart + docs · `58666b2` service-lifecycle self-check + default-cwd fallback ·
+`9cc50fa` Finish setup · `0a6183d` doctor env file.
+
+Deviations from the plan, and why:
+
+- **Home-root check is informational (`ok`), not a warning.** The terminal-create route
+  now falls back to the first allowed root when `$HOME` is outside
+  `ALLOWED_FILE_ROOTS` (`pickDefaultTerminalCwd`), so a deliberately restricted
+  deployment stays green; the message still names both paths and where terminals land.
+  A warning would have flipped every restricted-roots doctor report (and 4 existing
+  API tests) to "Needs changes" for a configuration that works.
+- **Lifecycle detection is injectable / switchable** (`runOnboardingDoctor({ lifecycle })`,
+  `DECKTERM_DOCTOR_LIFECYCLE=0`): the doctor's KillMode check depends on the cgroup the
+  process happens to run in, which on a CI runner could be a foreign `.service`. Profile
+  tests pin it off; `service-lifecycle-doctor.test.ts` covers the integration with
+  injected data and a temp needrestart config dir.
+- **Doctor/apply/remediate share `resolveDoctorContext()`** so the wizard reads and writes
+  the same file (the unit's `EnvironmentFile=` under systemd).
+
+Verified live on dev 4174: `[reaper] policy idle=24h detached=72h` and
+`[lifecycle] deckterm-dev.service keeps the tmux server alive across restarts
+(KillMode=process)` in the journal; the three new doctor checks green; dev drop-in
+`deckterm-dev.service.d/idle-timeout.conf` **removed** (service env carries no
+`TERMINAL_IDLE_*`, policy still 24h/72h from code). Negative check: a throwaway
+`systemd-run --user` unit with `KillMode=control-group` on port 4199 logged the
+`[lifecycle] … will NOT survive …` warning and the doctor reported the check as
+`warning`; unit stopped and state dir removed.
+
+Follow-ups: delete the **prod** drop-in `~/.config/systemd/user/deckterm.service.d/idle-timeout.conf`
+after this reaches `main` (prod still runs the 2h/8h defaults until then); backlog P1
+"errors name the rejected value" and P3 token TTL display remain open; the dedicated
+server's `feature/tmux-server-outside-service-cgroup` branch needs the needrestart
+override and env propagation before it is deployed anywhere.
