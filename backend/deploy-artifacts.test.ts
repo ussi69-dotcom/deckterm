@@ -28,6 +28,18 @@ describe("needrestart override", () => {
   });
 });
 
+describe("shipped .env.example", () => {
+  const example = read(".env.example");
+
+  test("does not pin the old 2h/8h reaper ceilings a fresh install would copy back", () => {
+    // Active (uncommented) assignments only — commented hints are fine.
+    const active = example
+      .split("\n")
+      .filter((line) => /^\s*(TERMINAL_IDLE_TIMEOUT_MS|DECKTERM_ORPHAN_TTL_HOURS)=/.test(line));
+    expect(active).toEqual([]);
+  });
+});
+
 describe("dedicated-server install doc", () => {
   const doc = read("docs/install-dedicated-server.md");
 
