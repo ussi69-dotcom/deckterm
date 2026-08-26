@@ -3991,6 +3991,9 @@ async function getFoundationStatus(c: {
       bootstrapped: state.bootstrap.bootstrapped,
       mode: state.bootstrap.mode,
       expectedEmail: state.bootstrap.expectedEmail,
+      // Path only (the token file itself is 0600): lets the Setup panel tell
+      // a first-time operator where the one-time token lives.
+      tokenPath: state.bootstrap.bootstrapped ? null : state.bootstrap.tokenPath,
     },
     roots: state.roots.map((root) => ({
       id: root.id,

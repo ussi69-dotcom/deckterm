@@ -7501,8 +7501,80 @@ class TerminalManager {
     disclaimer.style.borderLeft = "2px solid var(--border-color, #30363d)";
     disclaimer.style.paddingLeft = "0.75rem";
 
-    section.append(header, rows, disclaimer);
+    section.append(header, rows);
+
+    // Backlog P0: a fresh install can render, authenticate and show READY yet
+    // cannot open a terminal until POST /api/bootstrap has run. Offer it here.
+    const bootstrapPlan =
+      typeof window.SetupBootstrap?.planBootstrapAction === "function"
+        ? window.SetupBootstrap.planBootstrapAction(foundation.bootstrap)
+        : null;
+    if (bootstrapPlan) {
+      const action = document.createElement("div");
+      action.className = "setup-bootstrap-action";
+      const hint = document.createElement("p");
+      hint.className = "setup-bootstrap-hint";
+      hint.textContent = bootstrapPlan.hint;
+      action.appendChild(hint);
+      const controls = document.createElement("div");
+      controls.className = "setup-bootstrap-controls";
+      if (bootstrapPlan.needsToken) {
+        const input = document.createElement("input");
+        input.type = "password";
+        input.id = "setup-bootstrap-token";
+        input.autocomplete = "off";
+        input.placeholder = "Bootstrap token";
+        input.setAttribute("aria-label", "Bootstrap token");
+        controls.appendChild(input);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.id = "setup-finish-bootstrap";
+      button.className = "btn btn-primary";
+      button.textContent = bootstrapPlan.label;
+      button.addEventListener("click", () => this.finishSetupBootstrap());
+      controls.appendChild(button);
+      action.appendChild(controls);
+      section.appendChild(action);
+    }
+
+    section.appendChild(disclaimer);
     target.appendChild(section);
+  }
+
+  async finishSetupBootstrap() {
+    if (this.setupState.loading) return;
+    this.setupState.loading = true;
+    this.setSetupStatus("Finishing setup...");
+    try {
+      const token = document.getElementById("setup-bootstrap-token")?.value;
+      const body = window.SetupBootstrap?.buildBootstrapRequest
+        ? window.SetupBootstrap.buildBootstrapRequest(token)
+        : {};
+      const res = await fetch("/api/bootstrap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // The server's reason IS the diagnosis ("Bootstrap token expired",
+        // "Bootstrap token not found", "identity mismatch") — show it verbatim.
+        throw new Error(payload.error || payload.message || "Bootstrap failed");
+      }
+      this.setupState.loading = false;
+      this.setSetupStatus(
+        `Setup finished — ${payload.user?.email || "you"} is now the owner.`,
+      );
+      await this.runSetupDoctor();
+      return;
+    } catch (err) {
+      this.setSetupStatus(
+        err instanceof Error ? err.message : "Bootstrap failed",
+      );
+    } finally {
+      this.setupState.loading = false;
+    }
   }
 
   renderSetupOutputSection(text) {

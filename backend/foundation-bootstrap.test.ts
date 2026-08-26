@@ -118,7 +118,12 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
       actor: { id: "anonymous", email: "anonymous", source: "legacy_dev" },
       cloudflareAccessRequired: false,
     },
-    bootstrap: { bootstrapped: false, mode: "token" },
+    bootstrap: {
+      bootstrapped: false,
+      mode: "token",
+      // Path only — the Setup panel's "Finish setup" hint points here.
+      tokenPath: expect.stringMatching(/\/bootstrap-token$/),
+    },
     roots: [
       {
         name: projectRoot.split("/").pop(),
