@@ -67,7 +67,7 @@ import {
   runWalCheckpoint,
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
-import { idleMsSince } from "./services/session-idle";
+import { idleMsSince, resolveReaperDefaults } from "./services/session-idle";
 import { listHarnessSummaries } from "./services/agent-harnesses";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
@@ -326,12 +326,10 @@ const RATE_LIMIT_GLOBAL_MAX = Math.max(
     10,
   ) || 4 * RATE_LIMIT_PER_USER_MAX,
 );
-const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS || String(2 * 60 * 60 * 1000),
-  10,
-); // 2 hours default
-const DECKTERM_ORPHAN_TTL_MS_DEFAULT =
-  parseInt(process.env.DECKTERM_ORPHAN_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
+// Reaper ceilings (24h idle / 72h detached by default; see session-idle.ts).
+const REAPER_DEFAULTS = resolveReaperDefaults(process.env);
+const TERMINAL_IDLE_TIMEOUT_MS = REAPER_DEFAULTS.idleTimeoutMs;
+const DECKTERM_ORPHAN_TTL_MS_DEFAULT = REAPER_DEFAULTS.detachedTtlMs;
 const TERMINAL_TAB_CLOSE_GRACE_MS = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TAB_CLOSE_GRACE_MS || String(15 * 60 * 1000),
@@ -10469,6 +10467,9 @@ export async function startWebServer(host: string, port: number) {
   });
 
   console.log(`🚀 DeckTerm running at http://${host}:${port}`);
+  console.log(
+    `[reaper] policy idle=${Math.round(TERMINAL_IDLE_TIMEOUT_MS / 3_600_000)}h detached=${Math.round(DECKTERM_ORPHAN_TTL_MS_DEFAULT / 3_600_000)}h`,
+  );
 
   const cleanupIdleTerminals = async () => {
     const now = Date.now();
@@ -10477,7 +10478,7 @@ export async function startWebServer(host: string, port: number) {
       const sockets = terminalSockets.get(id);
       const activeSocketsCount = sockets ? sockets.size : 0;
 
-      // Only clean up idle active/attached terminals. Detached terminals are reaped after 8 hours!
+      // Only clean up idle active/attached terminals; detached ones are handled by reapDetachedSessions (DECKTERM_ORPHAN_TTL_HOURS).
       if (activeSocketsCount > 0) {
         // Idle measured from the later of input/output: a terminal actively
         // streaming output (a running job on a tab left open) is not idle.
