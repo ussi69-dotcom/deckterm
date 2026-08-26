@@ -37,6 +37,13 @@ It runs from:
 - working directory: `/home/deploy/apps/deckterm/prod/current`
 - environment file: `/home/deploy/apps/deckterm/shared/prod.env`
 
+The template is `deploy/systemd/deckterm-prod.service.example`. Two lines in it
+are load-bearing for persistent sessions and must survive local edits:
+`KillMode=process` (tmux outlives a restart) and the `Environment=PATH=` line
+(agent CLIs in `~/.local/bin`). Pair it with
+`deploy/needrestart/deckterm.conf` so unattended upgrades never restart the
+unit — see `docs/install-dedicated-server.md` §4b.
+
 ## GitHub configuration
 
 ### Required repository secrets
