@@ -582,3 +582,41 @@ test("a file row has exactly one .file-actions with 4 buttons and an untruncated
     expect(nameChild.textContent).toBe(longName);
   });
 });
+// --- Byte sizes ≥ 1 GiB render as gigabytes, not four-digit megabytes ---
+
+test("the size cell shows GB for files of 1 GiB and up", () => {
+  withFakeDocument(() => {
+    const controller = new FileExplorerController({
+      viewport: { innerWidth: 1280 },
+    });
+    const snapshot = {
+      workspaceId: "ws-a",
+      selectedItem: null,
+      decorations: {},
+      folderDecorations: {},
+    };
+    const sizeTextFor = (size, extra = {}) => {
+      const row = controller.createItemElement(
+        {
+          name: "blob.bin",
+          path: "/tmp/workspace-a/blob.bin",
+          isDir: false,
+          isParent: false,
+          size,
+          ...extra,
+        },
+        snapshot,
+      );
+      return row.children.find((child) => child.className === "file-size")
+        .textContent;
+    };
+
+    // The regression: 1.5 GiB used to render as "1536.0 MB".
+    expect(sizeTextFor(1536 * 1024 * 1024)).toBe("1.5 GB");
+    expect(sizeTextFor(1024 * 1024 * 1024)).toBe("1.0 GB");
+    // Smaller tiers are unchanged, and a missing/zero size stays blank.
+    expect(sizeTextFor(1234)).toBe("1.2 KB");
+    expect(sizeTextFor(5 * 1024 * 1024)).toBe("5.0 MB");
+    expect(sizeTextFor(0)).toBe("");
+  });
+});

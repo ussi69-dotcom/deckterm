@@ -2953,13 +2953,12 @@ class ClipboardManager {
     const cancelBtn = document.getElementById("paste-cancel");
     const closeBtn = modal.querySelector(".modal-close");
 
-    // Format size
+    // Format size — sub-KB keeps the spelled-out "bytes"; the KB/MB/GB ladder
+    // comes from the shared formatter (web/format-bytes.js).
     const sizeStr =
       sizeBytes < 1024
         ? `${sizeBytes} bytes`
-        : sizeBytes < 1024 * 1024
-          ? `${(sizeBytes / 1024).toFixed(1)} KB`
-          : `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+        : window.FormatBytes.formatByteSize(sizeBytes);
 
     // SECURITY: Use textContent to prevent XSS from clipboard content
     sizeEl.textContent = sizeStr;
