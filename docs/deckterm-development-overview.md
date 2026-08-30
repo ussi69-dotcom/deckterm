@@ -141,12 +141,16 @@ max. pro task runs, až po UX. Plán noci: `docs/plans/2026-06-10-overnight-qol-
   Prod dostal `KillMode=process` 2026-06-20. **2026-08-26 (fresh-install parity,
   `docs/plans/2026-08-26-fresh-install-parity.md`):** tyhle opravy žily jen v konfiguraci
   OVH boxu (ručně editované unity, drop-iny) — první čistá instalace (dedikace) je
-  všechny znovu objevila. Teď jsou v produktu: reaper defaulty 24 h/72 h v kódu, shipnutá
+  všechny znovu objevila. Teď jsou v produktu: shipnutá
   unita `deploy/systemd/deckterm-prod.service.example` má `KillMode=process` + PATH,
   `deploy/needrestart/deckterm.conf`, `backend/service-lifecycle.ts` (startup `[lifecycle]`
   warning + Setup Doctor checky KillMode/needrestart/home root), terminál bez cwd startuje
   v prvním povoleném rootu, tlačítko „Finish setup" volá `POST /api/bootstrap`, doctor čte
-  `EnvironmentFile=` běžící unity.
+  `EnvironmentFile=` běžící unity. **2026-08-30:** reaper defaulty 24 h/72 h z téhle
+  dávky nahrazeny úplným vypnutím — session končí jen zavřením křížkem
+  (`docs/plans/2026-08-30-session-lifetime-defaults-design.md`). Strop jen odkládá
+  ztrátu: tichá session čekající na odpověď vypadá stejně jako opuštěná, ať je hranice
+  2 h nebo 24 h. Zbytek téhle dávky (KillMode, needrestart, doctor checky) platí dál.
 - **test:unit červený lokálně** — testy dědily env z DeckTerm service (legacy bypass,
   tunnel mode); fix `5fcd118` izoluje env ve foundation testech.
 - **Reconnect klasifikace** běžela jen na 3. pokusu a neuměla ended-in-catalog ⇒ klient

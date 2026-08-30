@@ -67,7 +67,11 @@ import {
   runWalCheckpoint,
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
-import { idleMsSince, resolveReaperDefaults } from "./services/session-idle";
+import { idleMsSince } from "./services/session-idle";
+import {
+  isReaperEnabled,
+  resolveReaperWindows,
+} from "./services/session-reaper-policy";
 import {
   evaluateTmuxPersistence,
   getServiceLifecycle,
@@ -331,10 +335,15 @@ const RATE_LIMIT_GLOBAL_MAX = Math.max(
     10,
   ) || 4 * RATE_LIMIT_PER_USER_MAX,
 );
-// Reaper ceilings (24h idle / 72h detached by default; see session-idle.ts).
-const REAPER_DEFAULTS = resolveReaperDefaults(process.env);
-const TERMINAL_IDLE_TIMEOUT_MS = REAPER_DEFAULTS.idleTimeoutMs;
-const DECKTERM_ORPHAN_TTL_MS_DEFAULT = REAPER_DEFAULTS.detachedTtlMs;
+// Both time-based reapers are disabled unless a deployment configures a
+// window; closing the tab is what ends a session. See session-reaper-policy.ts
+// for why, and for what a positive value restores. This supersedes the 24h/72h
+// ceilings dev shipped in f0dfe71 — a ceiling still ends a live session that
+// merely looked quiet, it just takes a day to do it.
+const {
+  idleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+  detachedTtlMs: DECKTERM_ORPHAN_TTL_MS_DEFAULT,
+} = resolveReaperWindows(process.env);
 const TERMINAL_TAB_CLOSE_GRACE_MS = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TAB_CLOSE_GRACE_MS || String(15 * 60 * 1000),
@@ -417,6 +426,14 @@ const TMUX_SOCKET_PATH = getTmuxSocketPath({
   stateDir: DECKTERM_STATE_DIR,
 });
 const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
+// In production the tmux server is supplied by deckterm-tmux.service, so that
+// sessions survive a restart of this service. Letting tmux start the server
+// implicitly here would parent it to deckterm.service instead, and the next
+// restart — including an automatic one from needrestart after a library
+// upgrade — would destroy every session. Left off by default so a local
+// checkout still works with no unit installed.
+const TMUX_REQUIRE_EXTERNAL_SERVER =
+  process.env.TMUX_REQUIRE_EXTERNAL_SERVER === "1";
 const terminalBackend: TerminalBackend = TMUX_BACKEND
   ? new TmuxTerminalBackend({
       namespace: TMUX_SESSION_NAMESPACE,
@@ -424,6 +441,7 @@ const terminalBackend: TerminalBackend = TMUX_BACKEND
       pipeDir: TMUX_PIPE_DIR,
       shellCommandResolver: resolveShellCommand,
       env: process.env,
+      requireExternalServer: TMUX_REQUIRE_EXTERNAL_SERVER,
     })
   : new RawTerminalBackend({
       shellCommandResolver: resolveShellCommand,
@@ -478,7 +496,10 @@ const ALLOWED_FILESYSTEM_ROOTS = (
   .filter(Boolean);
 
 // Clipboard image configuration
-const CLIPBOARD_IMAGES_DIR = "/tmp/deckterm-clipboard";
+// Include the service uid so a stale directory left by another DeckTerm
+// instance (for example a root-run test or an older deployment account) cannot
+// make every image paste fail the ownership check below.
+const CLIPBOARD_IMAGES_DIR = `/tmp/deckterm-clipboard-${process.getuid?.() ?? "unknown"}`;
 const CLIPBOARD_IMAGE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const CLIPBOARD_IMAGE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -821,6 +842,10 @@ const rateLimitState = createTerminalRateLimiter({
 // C3 adds the admin-managed per-user policy store + UX on this seam. The
 // `policy.` settings prefix is reserved (rejected in PUT /api/settings) so
 // nothing can squat on it via actor-scoped self-service before C3.
+//
+// Both windows are 0 (= never reap) unless the deployment sets them; the
+// callers check with isReaperEnabled() before comparing. See
+// services/session-reaper-policy.ts.
 function resolveSessionPolicy(_ownerId: string): {
   idleTimeoutMs: number;
   detachedTtlMs: number;
@@ -3993,7 +4018,9 @@ async function getFoundationStatus(c: {
       expectedEmail: state.bootstrap.expectedEmail,
       // Path only (the token file itself is 0600): lets the Setup panel tell
       // a first-time operator where the one-time token lives.
-      tokenPath: state.bootstrap.bootstrapped ? null : state.bootstrap.tokenPath,
+      tokenPath: state.bootstrap.bootstrapped
+        ? null
+        : state.bootstrap.tokenPath,
     },
     roots: state.roots.map((root) => ({
       id: root.id,
@@ -10484,8 +10511,10 @@ export async function startWebServer(host: string, port: number) {
   });
 
   console.log(`🚀 DeckTerm running at http://${host}:${port}`);
+  const reaperWindowLabel = (ms: number) =>
+    isReaperEnabled(ms) ? `${Math.round(ms / 3_600_000)}h` : "never";
   console.log(
-    `[reaper] policy idle=${Math.round(TERMINAL_IDLE_TIMEOUT_MS / 3_600_000)}h detached=${Math.round(DECKTERM_ORPHAN_TTL_MS_DEFAULT / 3_600_000)}h`,
+    `[reaper] policy idle=${reaperWindowLabel(TERMINAL_IDLE_TIMEOUT_MS)} detached=${reaperWindowLabel(DECKTERM_ORPHAN_TTL_MS_DEFAULT)} (a tab closed with the X still ends after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min)`,
   );
   // Warning-only host self-check: a unit without KillMode=process kills the
   // tmux server on every restart — the one thing the tmux backend exists to
@@ -10513,13 +10542,21 @@ export async function startWebServer(host: string, port: number) {
       const sockets = terminalSockets.get(id);
       const activeSocketsCount = sockets ? sockets.size : 0;
 
-      // Only clean up idle active/attached terminals; detached ones are handled by reapDetachedSessions (DECKTERM_ORPHAN_TTL_HOURS).
+      // Only attached terminals; detached ones belong to reapDetachedSessions.
       if (activeSocketsCount > 0) {
+        // Disabled unless the deployment configures a window. An attached
+        // terminal quiet at a prompt — an agent waiting for the operator to
+        // answer — is indistinguishable from an abandoned one, and ending it
+        // is the worse mistake. Resolved per owner because C3 makes the policy
+        // per user on this seam, so the check cannot move to the constant.
+        const { idleTimeoutMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(idleTimeoutMs)) continue;
+
         // Idle measured from the later of input/output: a terminal actively
         // streaming output (a running job on a tab left open) is not idle.
         const idleTime = idleMsSince(term, now);
 
-        if (idleTime > resolveSessionPolicy(term.ownerId).idleTimeoutMs) {
+        if (idleTime > idleTimeoutMs) {
           console.log(
             `[cleanup] Closing idle active terminal ${id} (idle: ${Math.round(idleTime / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
@@ -10567,6 +10604,13 @@ export async function startWebServer(host: string, port: number) {
 
       // Only reap detached sessions (0 active connections)
       if (activeSocketsCount === 0 && term.lastDetachedAt) {
+        // Disabled unless the deployment configures a window. A closed laptop
+        // is not a closed session: the ✕ is how a user says they are done, and
+        // reapScheduledTerminalClosures handles that intention. See
+        // session-reaper-policy.ts.
+        const { detachedTtlMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(detachedTtlMs)) continue;
+
         // Reap a detached session only once it has produced neither input NOR
         // live output for the detached TTL. Basing this on inactivity (not on
         // how long the browser has been gone) is what lets an unattended job
@@ -10574,7 +10618,7 @@ export async function startWebServer(host: string, port: number) {
         // PTY output keeps `lastOutputAt` fresh via the persistent attach.
         const inactiveMs = idleMsSince(term, now);
 
-        if (inactiveMs > resolveSessionPolicy(term.ownerId).detachedTtlMs) {
+        if (inactiveMs > detachedTtlMs) {
           console.log(
             `[reaper] Reaping expired detached terminal ${id} (inactive: ${Math.round(inactiveMs / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );

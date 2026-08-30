@@ -28,38 +28,3 @@ export function effectiveActivityAt(term: SessionActivity): number {
 export function idleMsSince(term: SessionActivity, now: number): number {
   return now - effectiveActivityAt(term);
 }
-
-// Reaper ceilings. The defaults are the values proven on the tuned production
-// host — they used to live only in a systemd drop-in there, so every fresh
-// install silently ran with 2h/8h and "regularly lost sessions". 24h keeps an
-// unattended overnight job alive; 72h bounds a shell nobody comes back to.
-export const DEFAULT_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
-export const DEFAULT_DETACHED_TTL_HOURS = 72;
-
-function positiveInt(raw: string | undefined, fallback: number): number {
-  const parsed = Number.parseInt(String(raw ?? ""), 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
-export interface ReaperDefaults {
-  /** Attached-but-idle terminals are closed after this many ms. */
-  idleTimeoutMs: number;
-  /** Detached terminals with neither input nor output are reaped after this. */
-  detachedTtlMs: number;
-}
-
-export function resolveReaperDefaults(
-  env: Record<string, string | undefined>,
-): ReaperDefaults {
-  return {
-    idleTimeoutMs: positiveInt(
-      env.TERMINAL_IDLE_TIMEOUT_MS,
-      DEFAULT_IDLE_TIMEOUT_MS,
-    ),
-    detachedTtlMs:
-      positiveInt(env.DECKTERM_ORPHAN_TTL_HOURS, DEFAULT_DETACHED_TTL_HOURS) *
-      60 *
-      60 *
-      1000,
-  };
-}

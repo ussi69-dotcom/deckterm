@@ -2,6 +2,13 @@
 
 > **For Claude:** Execute task-by-task with TDD (`superpowers:executing-plans` style). Commit per task on `dev` (verify `git branch --show-current` first). Every new `*.test.ts` / `*.test.js` goes into `test:unit` in `package.json` or CI skips it.
 
+> **Superseded in part, 2026-08-30.** This plan's reaper step (24 h/72 h ceilings as
+> code defaults) was replaced by disabling both time-based reapers entirely — a session
+> now ends only when the user closes it. A ceiling only delays the loss, because a quiet
+> session waiting for an answer looks the same as an abandoned one at 24 h as at 2 h. See
+> `docs/plans/2026-08-30-session-lifetime-defaults-design.md`. Everything else in this
+> plan — `KillMode=process`, needrestart, the Setup Doctor checks, bootstrap — stands.
+
 **Goal:** A DeckTerm installed from this repo on a brand-new machine behaves like the tuned OVH box — sessions survive restarts and idle windows, the Setup panel can finish bootstrap, and the Setup Doctor names the host-level gaps (KillMode, needrestart, `$HOME` root) instead of leaving them to be discovered weeks later.
 
 **Why:** Every session-survival fix on OVH-PL-LAB-01 was applied as *host configuration* (hand-edited units 2026-06-12/06-20, `idle-timeout.conf` drop-ins 2026-07-08, manual bootstrap via the browser console, long-set `ALLOWED_FILE_ROOTS`) and never as repo defaults or shipped templates. The first from-scratch install (the dedicated server, 2026-08-23 field notes in the OK backlog "PRIORITY — first run on a new server") hit all of them at once: `deploy/systemd/deckterm-prod.service.example` (2026-03-30) has no `KillMode=process`, the code defaults reap at 2 h / 8 h, `web/` never calls `POST /api/bootstrap`, and nothing warns about any of it.

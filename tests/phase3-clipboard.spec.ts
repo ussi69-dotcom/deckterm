@@ -117,7 +117,9 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     expect(response.ok()).toBeTruthy();
     const json = await response.json();
     expect(json.success).toBe(true);
-    expect(json.path).toContain("/tmp/deckterm-clipboard/");
+    expect(json.path).toMatch(
+      /^\/tmp\/deckterm-clipboard-\d+\/clipboard-\d+-[a-z0-9]+\.png$/,
+    );
     expect(json.filename).toMatch(/^clipboard-\d+-[a-z0-9]+\.png$/);
   });
 
