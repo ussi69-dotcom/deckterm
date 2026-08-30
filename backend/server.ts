@@ -484,7 +484,10 @@ const ALLOWED_FILESYSTEM_ROOTS = (
   .filter(Boolean);
 
 // Clipboard image configuration
-const CLIPBOARD_IMAGES_DIR = "/tmp/deckterm-clipboard";
+// Include the service uid so a stale directory left by another DeckTerm
+// instance (for example a root-run test or an older deployment account) cannot
+// make every image paste fail the ownership check below.
+const CLIPBOARD_IMAGES_DIR = `/tmp/deckterm-clipboard-${process.getuid?.() ?? "unknown"}`;
 const CLIPBOARD_IMAGE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const CLIPBOARD_IMAGE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
