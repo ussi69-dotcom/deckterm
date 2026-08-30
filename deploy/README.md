@@ -38,6 +38,18 @@ Both run from:
 - working directory: `/home/deploy/apps/deckterm/prod/current`
 - environment file: `/home/deploy/apps/deckterm/shared/prod.env`
 
+The template is `deploy/systemd/deckterm-prod.service.example`. Two lines in it
+are load-bearing for persistent sessions and must survive local edits:
+`KillMode=process` (tmux outlives a restart) and the `Environment=PATH=` line
+(agent CLIs in `~/.local/bin`). Pair it with
+`deploy/needrestart/deckterm.conf` so unattended upgrades never restart the
+unit — see `docs/install-dedicated-server.md` §4b.
+
+`KillMode=process` and the tmux unit below are belt and braces, and both
+are worth having: the unit keeps the server out of the backend's control
+group in the first place, while `KillMode=process` protects a host that has
+not adopted the unit yet.
+
 ## The tmux server runs in its own unit
 
 Terminal sessions live in a tmux server. If that server is started implicitly by

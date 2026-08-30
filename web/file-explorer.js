@@ -176,12 +176,33 @@ function getDefaultOpenWindowImpl() {
   };
 }
 
+// ── format-bytes bridge (browser global OR CommonJS under bun) ───────────────
+function resolveFormatByteSize() {
+  if (typeof window !== "undefined" && window.FormatBytes?.formatByteSize) {
+    return window.FormatBytes.formatByteSize;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./format-bytes").formatByteSize;
+    } catch {
+      // fall through to the inline copy
+    }
+  }
+  return (bytes) => {
+    const value = Number(bytes);
+    if (!Number.isFinite(value)) return "";
+    if (value < 1024) return `${value} B`;
+    if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+    if (value < 1024 * 1024 * 1024)
+      return `${(value / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(value / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  };
+}
+
 function formatFileSize(bytes) {
   const nextBytes = Number(bytes);
   if (!Number.isFinite(nextBytes) || nextBytes <= 0) return "";
-  if (nextBytes < 1024) return `${nextBytes} B`;
-  if (nextBytes < 1024 * 1024) return `${(nextBytes / 1024).toFixed(1)} KB`;
-  return `${(nextBytes / (1024 * 1024)).toFixed(1)} MB`;
+  return resolveFormatByteSize()(nextBytes);
 }
 
 function getItemIcon(item) {

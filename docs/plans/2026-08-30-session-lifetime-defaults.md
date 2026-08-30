@@ -27,10 +27,17 @@ defaults again.
 - `reapScheduledTerminalClosures` (the ✕ path) is untouched, including its
   15-minute restore window and the "another client still has it open" guard.
 
-**`package.json`** — registers `session-reaper-policy.test.ts`, and also
-`tmux-server-launch.test.ts` + `services/tmux-server-requirement.test.ts`, which
-commit 971c5fb added but never listed in `test:unit`. CI was silently skipping
-those two.
+**`backend/services/session-idle.ts`** — `resolveReaperDefaults()` and its tests
+are removed. `dev` added them in `f0dfe71` to ship 24h/72h ceilings as code
+defaults; `session-reaper-policy.ts` now owns that question. See the design doc
+for what is kept from that work.
+
+**`package.json`** — the union of both branches' test lists: `dev`'s new
+`deploy-artifacts`, `service-lifecycle`, `service-lifecycle-doctor`,
+`setup-bootstrap` and `format-bytes` entries, plus `session-reaper-policy.test.ts`
+and the two files commit 971c5fb added without ever listing —
+`tmux-server-launch.test.ts` and `services/tmux-server-requirement.test.ts`. CI
+was silently skipping those two.
 
 **`.env.example`, `README.md`** — new defaults, `0` documented as "never", and
 `DECKTERM_ORPHAN_TTL_HOURS` / `DECKTERM_TAB_CLOSE_GRACE_MS` documented for the

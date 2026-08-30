@@ -2434,6 +2434,33 @@ body.touch-input-mode .xterm .composition-view.active {
   color: var(--text-secondary);
 }
 
+.setup-bootstrap-action {
+  margin-top: 0.85rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border-color, #30363d);
+  border-radius: 8px;
+}
+
+.setup-bootstrap-hint {
+  margin: 0 0 0.6rem;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  line-height: 1.35;
+}
+
+.setup-bootstrap-controls {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.setup-bootstrap-controls input {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+
+
 .setup-remediation pre,
 .setup-snippet pre {
   max-height: 220px;

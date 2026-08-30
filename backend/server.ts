@@ -72,6 +72,11 @@ import {
   isReaperEnabled,
   resolveReaperWindows,
 } from "./services/session-reaper-policy";
+import {
+  evaluateTmuxPersistence,
+  getServiceLifecycle,
+  pickDefaultTerminalCwd,
+} from "./service-lifecycle";
 import { listHarnessSummaries } from "./services/agent-harnesses";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
@@ -332,7 +337,9 @@ const RATE_LIMIT_GLOBAL_MAX = Math.max(
 );
 // Both time-based reapers are disabled unless a deployment configures a
 // window; closing the tab is what ends a session. See session-reaper-policy.ts
-// for why, and for what a positive value restores.
+// for why, and for what a positive value restores. This supersedes the 24h/72h
+// ceilings dev shipped in f0dfe71 — a ceiling still ends a live session that
+// merely looked quiet, it just takes a day to do it.
 const {
   idleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
   detachedTtlMs: DECKTERM_ORPHAN_TTL_MS_DEFAULT,
@@ -4009,6 +4016,11 @@ async function getFoundationStatus(c: {
       bootstrapped: state.bootstrap.bootstrapped,
       mode: state.bootstrap.mode,
       expectedEmail: state.bootstrap.expectedEmail,
+      // Path only (the token file itself is 0600): lets the Setup panel tell
+      // a first-time operator where the one-time token lives.
+      tokenPath: state.bootstrap.bootstrapped
+        ? null
+        : state.bootstrap.tokenPath,
     },
     roots: state.roots.map((root) => ({
       id: root.id,
@@ -6917,7 +6929,16 @@ export function createWebApp() {
     if (!routeCapability) {
       return c.json({ error: "Missing route capability" }, 500);
     }
-    const requestedCwd = body.cwd || process.env.HOME || "/";
+    // No explicit cwd: start in the service home when it is an allowed root,
+    // else in the first allowed root. Defaulting blindly to $HOME rejected a
+    // fresh install's very first terminal ("Forbidden terminal root") whenever
+    // ALLOWED_FILE_ROOTS was set to a project directory instead.
+    const requestedCwd =
+      body.cwd ||
+      pickDefaultTerminalCwd({
+        home: process.env.HOME || "",
+        allowedRoots: await getAllowedRealRoots(),
+      });
     // Resolve the start dir first (side-effect-free) so BOTH capability checks
     // key on the resolved root's id, mirroring requireFileAccess. Before S1
     // (Alice/Bob e2e), terminal.create was checked on (terminal, "*") and
@@ -10490,6 +10511,29 @@ export async function startWebServer(host: string, port: number) {
   });
 
   console.log(`🚀 DeckTerm running at http://${host}:${port}`);
+  const reaperWindowLabel = (ms: number) =>
+    isReaperEnabled(ms) ? `${Math.round(ms / 3_600_000)}h` : "never";
+  console.log(
+    `[reaper] policy idle=${reaperWindowLabel(TERMINAL_IDLE_TIMEOUT_MS)} detached=${reaperWindowLabel(DECKTERM_ORPHAN_TTL_MS_DEFAULT)} (a tab closed with the X still ends after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min)`,
+  );
+  // Warning-only host self-check: a unit without KillMode=process kills the
+  // tmux server on every restart — the one thing the tmux backend exists to
+  // prevent. Fire-and-forget; never blocks or fails startup.
+  void getServiceLifecycle()
+    .then((lifecycle) => {
+      const check = evaluateTmuxPersistence({
+        tmuxBackend: TMUX_BACKEND,
+        unit: lifecycle?.unit ?? null,
+        killMode: lifecycle?.killMode ?? null,
+      });
+      if (!check) return;
+      if (check.status === "warning") {
+        console.warn(`[lifecycle] ${check.message}`);
+      } else {
+        console.log(`[lifecycle] ${check.message}`);
+      }
+    })
+    .catch(() => {});
 
   const cleanupIdleTerminals = async () => {
     const now = Date.now();

@@ -16,9 +16,17 @@ Type=simple
 User=deploy
 WorkingDirectory=/home/deploy/apps/deckterm/prod/current
 EnvironmentFile=/home/deploy/apps/deckterm/shared/prod.env
+# ~/.local/bin carries the agent CLIs (claude, codex) the harness registry
+# probes; without it the Setup panel reports them unavailable.
+Environment=PATH=/home/deploy/.local/bin:/home/deploy/.bun/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/home/deploy/.bun/bin/bun run start
 Restart=always
 RestartSec=3
+# Required for tmux-backed session persistence: the tmux server is a child of
+# bun, and the default KillMode=control-group would kill it (and every shell
+# in it) on each service restart. KillMode=process stops only bun; the tmux
+# server survives and the restarted backend re-adopts its sessions.
+KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=10
 NoNewPrivileges=true

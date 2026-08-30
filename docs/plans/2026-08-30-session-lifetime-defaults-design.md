@@ -70,6 +70,36 @@ ends every live session is the worst outcome this configuration can produce.
 Anything that is not a positive finite number — unset, empty, `0`, negative, or
 garbage — now disables that sweep. Positive values are unaffected.
 
+## Supersedes the 24h/72h ceilings
+
+`dev` reached the same seam first. Commit `f0dfe71` (2026-08-26) moved the
+windows out of a host-only systemd drop-in and into code as **24 h attached /
+72 h detached**, on the correct observation that a fresh install was silently
+running 2 h/8 h and losing sessions. That fixed the parity problem and made the
+failure a day slower.
+
+It does not fix the failure. A ceiling still ends a live session that merely
+looked quiet — the R9700 sessions above were killed at ~2 h, and the same
+operator waiting overnight for an agent's question hits 24 h the same way, with
+the same absence of any signal that it is about to happen. The operator's
+decision on 2026-08-30, after living with it, was that only an explicit close
+should end a session.
+
+So this supersedes `f0dfe71`: `resolveReaperDefaults()` in `session-idle.ts` is
+removed along with its tests, and `session-reaper-policy.ts` is the single
+answer to "how long may a session live". Two modules resolving the same
+environment variables to different defaults is how the next collision happens.
+
+What is *kept* from that line of work, because it is complementary rather than
+competing:
+
+- `KillMode=process` and the `Environment=PATH=` line in the shipped unit
+  template, plus `deploy/needrestart/deckterm.conf` (`65b5ec3`). These protect a
+  host that has not adopted `deckterm-tmux.service` yet.
+- The startup policy log line, adapted to print `never` rather than `0h`, and to
+  name the tab-close window that does still end sessions.
+- The service-lifecycle self-check and the doctor's `KillMode` check.
+
 ## Trade-offs, accepted
 
 - **`MAX_TERMINALS_PER_USER` (10) becomes the only backstop against

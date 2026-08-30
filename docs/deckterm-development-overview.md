@@ -138,8 +138,15 @@ max. pro task runs, až po UX. Plán noci: `docs/plans/2026-06-10-overnight-qol-
   mají namespace `deckterm`) + `KillMode=control-group` ⇒ každý restart služby zabil tmux
   server i sessions druhé instance. Fix `2618203`: socket je `$DECKTERM_STATE_DIR/tmux/…`,
   dev unit má `KillMode=process` (tmux přežívá restart — ověřeno živě vč. obnovy scrollbacku).
-  **Prod čeká:** KillMode + jednorázová ztráta starých sessions při příštím deployi —
-  runbook `docs/plans/2026-06-12-cloudflare-access-switch-runbook.md`.
+  Prod dostal `KillMode=process` 2026-06-20. **2026-08-26 (fresh-install parity,
+  `docs/plans/2026-08-26-fresh-install-parity.md`):** tyhle opravy žily jen v konfiguraci
+  OVH boxu (ručně editované unity, drop-iny) — první čistá instalace (dedikace) je
+  všechny znovu objevila. Teď jsou v produktu: reaper defaulty 24 h/72 h v kódu, shipnutá
+  unita `deploy/systemd/deckterm-prod.service.example` má `KillMode=process` + PATH,
+  `deploy/needrestart/deckterm.conf`, `backend/service-lifecycle.ts` (startup `[lifecycle]`
+  warning + Setup Doctor checky KillMode/needrestart/home root), terminál bez cwd startuje
+  v prvním povoleném rootu, tlačítko „Finish setup" volá `POST /api/bootstrap`, doctor čte
+  `EnvironmentFile=` běžící unity.
 - **test:unit červený lokálně** — testy dědily env z DeckTerm service (legacy bypass,
   tunnel mode); fix `5fcd118` izoluje env ve foundation testech.
 - **Reconnect klasifikace** běžela jen na 3. pokusu a neuměla ended-in-catalog ⇒ klient
