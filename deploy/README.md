@@ -74,8 +74,12 @@ is what ends them, which is the point.
 sudo cp deploy/systemd/deckterm-tmux.service.example \
         /etc/systemd/system/deckterm-tmux.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now deckterm-tmux.service
+sudo systemctl enable deckterm-tmux.service
 ```
+
+On a box that has never run DeckTerm, `systemctl start deckterm-tmux.service`
+now and you are done. **On a box with a running backend, the order matters and
+the obvious order is wrong** — see the migration section below.
 
 Then add to `prod.env`:
 
@@ -97,6 +101,42 @@ Sessions cannot be moved between control groups. Adopting this costs **one last
 restart that destroys the current sessions** — after that they are protected.
 Check what is running in them first; scrollback is kept in
 `/tmp/deckterm-tmux-pipes/*.log`, but only until the next reboot.
+
+Do **not** start the tmux unit and then restart the backend. A tmux server is
+already running on this socket inside the backend's control group, and
+`tmux start-server` against an occupied socket is a no-op: the client connects,
+sets `exit-empty` on the *old* server and exits, leaving the new unit with no
+process for `Type=forking` to adopt. The restart then kills the old server, the
+backend finds none and starts another one straight back inside its own control
+group. Nothing looks wrong until the next restart destroys sessions again.
+
+Stop the backend first, so the old server dies with it, then start the tmux unit
+into the freed socket, then bring the backend back:
+
+```bash
+sudo systemctl stop deckterm.service      # the destructive step
+sudo systemctl start deckterm-tmux.service
+sudo systemctl start deckterm.service
+```
+
+Run that sequence from **outside** `deckterm.service`'s control group — a shell
+inside it is killed by the first line, halfway through the cutover:
+
+```bash
+sudo systemd-run --unit=deckterm-cutover --collect bash -c '
+  systemctl stop deckterm.service
+  systemctl start deckterm-tmux.service
+  systemctl start deckterm.service'
+```
+
+Then confirm where the server actually landed. This is the check that matters,
+because every failure mode above ends with a *working* DeckTerm that has quietly
+lost the protection:
+
+```bash
+pgrep -f 'tmux -S' | head -1 | xargs -I{} cat /proc/{}/cgroup
+# expect 0::/system.slice/deckterm-tmux.service
+```
 
 ### The socket path is derived, never hardcoded
 
