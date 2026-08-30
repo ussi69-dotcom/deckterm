@@ -68,6 +68,10 @@ import {
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
 import { idleMsSince } from "./services/session-idle";
+import {
+  isReaperEnabled,
+  resolveReaperWindows,
+} from "./services/session-reaper-policy";
 import { listHarnessSummaries } from "./services/agent-harnesses";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
@@ -326,12 +330,13 @@ const RATE_LIMIT_GLOBAL_MAX = Math.max(
     10,
   ) || 4 * RATE_LIMIT_PER_USER_MAX,
 );
-const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS || String(2 * 60 * 60 * 1000),
-  10,
-); // 2 hours default
-const DECKTERM_ORPHAN_TTL_MS_DEFAULT =
-  parseInt(process.env.DECKTERM_ORPHAN_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
+// Both time-based reapers are disabled unless a deployment configures a
+// window; closing the tab is what ends a session. See session-reaper-policy.ts
+// for why, and for what a positive value restores.
+const {
+  idleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+  detachedTtlMs: DECKTERM_ORPHAN_TTL_MS_DEFAULT,
+} = resolveReaperWindows(process.env);
 const TERMINAL_TAB_CLOSE_GRACE_MS = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TAB_CLOSE_GRACE_MS || String(15 * 60 * 1000),
@@ -830,6 +835,10 @@ const rateLimitState = createTerminalRateLimiter({
 // C3 adds the admin-managed per-user policy store + UX on this seam. The
 // `policy.` settings prefix is reserved (rejected in PUT /api/settings) so
 // nothing can squat on it via actor-scoped self-service before C3.
+//
+// Both windows are 0 (= never reap) unless the deployment sets them; the
+// callers check with isReaperEnabled() before comparing. See
+// services/session-reaper-policy.ts.
 function resolveSessionPolicy(_ownerId: string): {
   idleTimeoutMs: number;
   detachedTtlMs: number;
@@ -10489,13 +10498,21 @@ export async function startWebServer(host: string, port: number) {
       const sockets = terminalSockets.get(id);
       const activeSocketsCount = sockets ? sockets.size : 0;
 
-      // Only clean up idle active/attached terminals. Detached terminals are reaped after 8 hours!
+      // Only attached terminals; detached ones belong to reapDetachedSessions.
       if (activeSocketsCount > 0) {
+        // Disabled unless the deployment configures a window. An attached
+        // terminal quiet at a prompt — an agent waiting for the operator to
+        // answer — is indistinguishable from an abandoned one, and ending it
+        // is the worse mistake. Resolved per owner because C3 makes the policy
+        // per user on this seam, so the check cannot move to the constant.
+        const { idleTimeoutMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(idleTimeoutMs)) continue;
+
         // Idle measured from the later of input/output: a terminal actively
         // streaming output (a running job on a tab left open) is not idle.
         const idleTime = idleMsSince(term, now);
 
-        if (idleTime > resolveSessionPolicy(term.ownerId).idleTimeoutMs) {
+        if (idleTime > idleTimeoutMs) {
           console.log(
             `[cleanup] Closing idle active terminal ${id} (idle: ${Math.round(idleTime / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
@@ -10543,6 +10560,13 @@ export async function startWebServer(host: string, port: number) {
 
       // Only reap detached sessions (0 active connections)
       if (activeSocketsCount === 0 && term.lastDetachedAt) {
+        // Disabled unless the deployment configures a window. A closed laptop
+        // is not a closed session: the ✕ is how a user says they are done, and
+        // reapScheduledTerminalClosures handles that intention. See
+        // session-reaper-policy.ts.
+        const { detachedTtlMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(detachedTtlMs)) continue;
+
         // Reap a detached session only once it has produced neither input NOR
         // live output for the detached TTL. Basing this on inactivity (not on
         // how long the browser has been gone) is what lets an unattended job
@@ -10550,7 +10574,7 @@ export async function startWebServer(host: string, port: number) {
         // PTY output keeps `lastOutputAt` fresh via the persistent attach.
         const inactiveMs = idleMsSince(term, now);
 
-        if (inactiveMs > resolveSessionPolicy(term.ownerId).detachedTtlMs) {
+        if (inactiveMs > detachedTtlMs) {
           console.log(
             `[reaper] Reaping expired detached terminal ${id} (inactive: ${Math.round(inactiveMs / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
