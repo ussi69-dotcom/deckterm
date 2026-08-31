@@ -1,6 +1,41 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-08-31 viz sekce 0x**
+
+## 0x. Delta 2026-08-31 — tmux v separátním systemd unit · session lifetime · fresh-install parity
+
+### tmux v `deckterm-tmux.service` (2026-08-26, `971c5fb`)
+
+tmux server dostal vlastní cgroup (`deckterm-tmux.service`). Dosud byl child `deckterm.service`
+— KillMode=control-group kill zabitím backendu vzal i všechny terminálové procesy.
+Konkrétní incident: unattended libcurl upgrade spustil needrestart → restart služby →
+zánik 3 živých session. Nový `backend/tmux-server-launch.ts` je entry point unit;
+`TMUX_REQUIRE_EXTERNAL_SERVER=1` zakazuje backendu startat server sám.
+
+### Fresh-install parity (2026-08-26, `f0dfe71`…`ea3687c`)
+
+Opravy, které dřív žily jen v konfiguraci OVH boxu, jsou nyní v produktu:
+
+- `deploy/systemd/deckterm-prod.service.example` má `KillMode=process` + PATH (`65b5ec3`)
+- `deploy/needrestart/deckterm.conf` — exemption pro needrestart (`65b5ec3`)
+- reaper defaults 24 h/72 h zabudovány do `session-idle.ts` (`f0dfe71`)
+- `backend/service-lifecycle.ts` — Setup Doctor checks: KillMode, needrestart, home root (`58666b2`)
+- Setup panel "Finish setup" volá `POST /api/bootstrap` (`9cc50fa`)
+- Doctor čte `EnvironmentFile=` z unit místo `.env` v cwd (`0a6183d`)
+- `.env.example` neobsahuje zakomentované staré reaper hodnoty (`ea3687c`)
+
+### Session končí jen zavřením uživatelem (2026-08-30, `79c51f8`)
+
+Idle sweep (2h/8h) byl vypnut jako default. Incident: 3 aktivní session ukončeny
+sweepem v jeden den — agent čekající u promptu vypadá identicky jako opuštěný shell.
+Hodnota 0 (a unset) teď znamená nikdy. Nový `backend/services/session-reaper-policy.ts`.
+
+### Drobné opravy (2026-08-29–30)
+
+- GB zobrazení v file explorer + paste modal pro soubory ≥ 1 GiB, `web/format-bytes.js` (`f885244`)
+- Clipboard image dir scopován na uid: `/tmp/deckterm-clipboard-<uid>` (`3b4a6cd`)
+
+---
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
