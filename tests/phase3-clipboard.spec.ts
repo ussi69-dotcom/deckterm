@@ -110,6 +110,7 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     const response = await request.post(`${APP_URL}/api/clipboard/image`, {
       headers: {
         "Content-Type": "image/png",
+        "X-DeckTerm-Request": "1",
       },
       data: pngBuffer,
     });
@@ -117,7 +118,10 @@ test.describe("Phase 3: Clipboard Overhaul", () => {
     expect(response.ok()).toBeTruthy();
     const json = await response.json();
     expect(json.success).toBe(true);
-    expect(json.path).toContain("/tmp/deckterm-clipboard/");
+    // Clipboard storage follows the configured private state directory; dev,
+    // production and preflight must never share the old global /tmp folder.
+    expect(json.path).toMatch(/\/clipboard\/clipboard-\d+-[a-z0-9]+\.png$/);
+    expect(json.path).not.toContain("/tmp/deckterm-clipboard/");
     expect(json.filename).toMatch(/^clipboard-\d+-[a-z0-9]+\.png$/);
   });
 

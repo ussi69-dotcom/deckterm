@@ -20,6 +20,39 @@ describe("shipped systemd unit", () => {
   });
 });
 
+describe("backup timer templates", () => {
+  const service = read("ops/systemd/deckterm-backup.service");
+  const timer = read("ops/systemd/deckterm-backup.timer");
+  const devService = read("ops/systemd/deckterm-backup-dev.service");
+  const devTimer = read("ops/systemd/deckterm-backup-dev.timer");
+
+  test("runs the verified backup wrapper against production state with a private umask", () => {
+    expect(service).toMatch(/^UMask=0077$/m);
+    expect(service).toMatch(
+      /^Environment=DECKTERM_STATE_DIR=\/home\/deploy\/\.deckterm$/m,
+    );
+    expect(service).toMatch(/ExecStart=.*scripts\/backup-state\.sh$/m);
+  });
+
+  test("is persistent and daily but remains an operator-installed template", () => {
+    expect(timer).toMatch(/^OnCalendar=.*$/m);
+    expect(timer).toMatch(/^Persistent=true$/m);
+    expect(timer).toMatch(/^Unit=deckterm-backup\.service$/m);
+  });
+
+  test("has a separate development pair with the dev state and checkout paths", () => {
+    expect(devService).toMatch(/^UMask=0077$/m);
+    expect(devService).toMatch(
+      /^Environment=DECKTERM_STATE_DIR=\/home\/deploy\/\.deckterm-dev$/m,
+    );
+    expect(devService).toMatch(
+      /^ExecStart=\/home\/deploy\/deckterm_dev\/scripts\/backup-state\.sh$/m,
+    );
+    expect(devTimer).toMatch(/^Persistent=true$/m);
+    expect(devTimer).toMatch(/^Unit=deckterm-backup-dev\.service$/m);
+  });
+});
+
 describe("needrestart override", () => {
   const conf = read("deploy/needrestart/deckterm.conf");
 
@@ -35,7 +68,9 @@ describe("shipped .env.example", () => {
     // Active (uncommented) assignments only — commented hints are fine.
     const active = example
       .split("\n")
-      .filter((line) => /^\s*(TERMINAL_IDLE_TIMEOUT_MS|DECKTERM_ORPHAN_TTL_HOURS)=/.test(line));
+      .filter((line) =>
+        /^\s*(TERMINAL_IDLE_TIMEOUT_MS|DECKTERM_ORPHAN_TTL_HOURS)=/.test(line),
+      );
     expect(active).toEqual([]);
   });
 });

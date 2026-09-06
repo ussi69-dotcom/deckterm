@@ -1,3 +1,30 @@
+import {
+  initTrashSchema,
+  isReservedTrashPath,
+  containsManagedTrash,
+  trashPath,
+  listTrashItems,
+  restoreTrashItem,
+  purgeTrashItem,
+  purgeExpiredTrashItems,
+  FileTrashError,
+  type FileTrashBinding,
+} from "./services/file-trash";
+import {
+  boundedRequest,
+  transferBudget,
+  TransferError,
+  UPLOAD_MAX_BYTES,
+  MULTIPART_OVERHEAD_BYTES,
+  streamLegacyDownload,
+  downloadHeaders,
+} from "./services/transfers";
+import { acquireStateOwnership } from "./services/state-ownership";
+import {
+  browserRequestAllowed,
+  configuredBrowserBoundary,
+  SECURITY_HEADERS,
+} from "./services/browser-boundary";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
@@ -416,7 +443,7 @@ const TMUX_SOCKET_PATH = getTmuxSocketPath({
   namespace: TMUX_SESSION_NAMESPACE,
   stateDir: DECKTERM_STATE_DIR,
 });
-const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
+const TMUX_PIPE_DIR = join(DECKTERM_STATE_DIR, "tmux-pipes");
 const terminalBackend: TerminalBackend = TMUX_BACKEND
   ? new TmuxTerminalBackend({
       namespace: TMUX_SESSION_NAMESPACE,
@@ -478,7 +505,7 @@ const ALLOWED_FILESYSTEM_ROOTS = (
   .filter(Boolean);
 
 // Clipboard image configuration
-const CLIPBOARD_IMAGES_DIR = "/tmp/deckterm-clipboard";
+const CLIPBOARD_IMAGES_DIR = join(DECKTERM_STATE_DIR, "clipboard");
 const CLIPBOARD_IMAGE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const CLIPBOARD_IMAGE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -883,11 +910,7 @@ async function cleanupClipboardImages() {
   }
 }
 
-// Run cleanup every 15 minutes
-setInterval(cleanupClipboardImages, 15 * 60 * 1000);
-// Ensure directory exists on startup (best-effort; the upload route re-validates
-// and fails the request if the dir is unsafe, rather than crashing the server).
-ensureClipboardDir().catch(() => {});
+// Clipboard initialization and cleanup start only after exclusive state ownership.
 
 export async function reconcileSessionsOnStartup(
   db: Database,
@@ -1215,6 +1238,9 @@ async function getFoundationState(): Promise<FoundationState> {
       stateDir: DECKTERM_STATE_DIR,
       allowedFileRoots: ALLOWED_FILESYSTEM_ROOTS,
       env: process.env,
+    }).then((state) => {
+      initTrashSchema(state.db);
+      return state;
     });
   }
   return foundationStatePromise;
@@ -1905,13 +1931,16 @@ async function resolveAllowedPath(
   inputPath: string,
   opts: { allowMissing?: boolean } = {},
 ): Promise<string | null> {
-  if (!inputPath) return null;
+  if (!inputPath || isReservedTrashPath(inputPath)) return null;
   const fs = await import("fs/promises");
   const candidatePath = resolve(inputPath);
   const roots = await getAllowedRealRoots();
   try {
     const realPath = await fs.realpath(candidatePath);
-    return isWithinAllowedRoots(realPath, roots) ? realPath : null;
+    return !isReservedTrashPath(realPath) &&
+      isWithinAllowedRoots(realPath, roots)
+      ? realPath
+      : null;
   } catch (err: unknown) {
     const error = err as { code?: string };
     if (!opts.allowMissing || error.code !== "ENOENT") {
@@ -1919,7 +1948,10 @@ async function resolveAllowedPath(
     }
     try {
       const realParent = await fs.realpath(dirname(candidatePath));
-      if (!isWithinAllowedRoots(realParent, roots)) {
+      if (
+        isReservedTrashPath(realParent) ||
+        !isWithinAllowedRoots(realParent, roots)
+      ) {
         return null;
       }
       const rel = relative(realParent, candidatePath);
@@ -1948,14 +1980,17 @@ async function resolveAllowedPath(
 async function resolveTerminalStartDir(
   inputPath: string,
 ): Promise<string | null> {
-  if (!inputPath) return null;
+  if (!inputPath || isReservedTrashPath(inputPath)) return null;
   const fs = await import("fs/promises");
   const roots = await getAllowedRealRoots();
   let candidate = resolve(inputPath);
   while (true) {
     try {
       const realPath = await fs.realpath(candidate);
-      return isWithinAllowedRoots(realPath, roots) ? realPath : null;
+      return !isReservedTrashPath(realPath) &&
+        isWithinAllowedRoots(realPath, roots)
+        ? realPath
+        : null;
     } catch (err: unknown) {
       if ((err as { code?: string }).code !== "ENOENT") return null;
       const parent = dirname(candidate);
@@ -2009,6 +2044,7 @@ const SEARCH_SECRET_EXCLUDES = [
 
 // Directories never recursed into (noise + perf).
 const SEARCH_EXCLUDE_DIRS = [
+  ".deckterm-trash",
   ".git",
   "node_modules",
   "dist",
@@ -2708,9 +2744,11 @@ async function canonicalReplaceCandidate(
   absPath: string,
   root: string,
 ): Promise<string | null> {
+  if (isReservedTrashPath(absPath)) return null;
   if (ctx.kind === "legacy") {
     try {
       const real = await realpath(absPath);
+      if (isReservedTrashPath(real)) return null;
       if (real === root || real.startsWith(`${root}/`)) return real;
       return null;
     } catch {
@@ -3491,6 +3529,12 @@ async function resolveScopedFsPath(
   | { ok: true; root: string; relPath: string; rootId: string }
   | { ok: false; status: number; body: Record<string, unknown> }
 > {
+  if (isReservedTrashPath(clientPath))
+    return {
+      ok: false,
+      status: 403,
+      body: { error: "Trash paths are reserved; use Trash to restore an item" },
+    };
   const state = await getFoundationState();
 
   if (ctx.kind === "legacy") {
@@ -3701,6 +3745,8 @@ function fsErrorResponse(c: any, err: unknown, fallbackMsg: string): Response {
       bad_request: 400,
       isolation_busy: 429,
       broker_unavailable: 503,
+      unsupported: 503,
+      identity_changed: 409,
       io_error: 400,
     };
     const status = map[err.code] ?? 400;
@@ -3718,6 +3764,16 @@ const detectGitWorktree = createGitWorktreeDetector({
   resolveAllowedPath,
 });
 
+let accessVerifier: ReturnType<typeof cloudflareAccess> | undefined;
+function getAccessVerifier() {
+  return (accessVerifier ??= cloudflareAccess(
+    CF_ACCESS_TEAM_NAME,
+    CF_ACCESS_AUD.split(",")
+      .map((aud) => aud.trim())
+      .filter(Boolean),
+  ));
+}
+
 async function authenticateWebSocketRequest(req: Request): Promise<{
   ok: boolean;
   status?: number;
@@ -3726,7 +3782,18 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
   ownerEmail: string;
   actor?: DeckTermActor;
 }> {
-  const jwt = req.headers.get("cf-access-jwt-assertion");
+  const bearer = /^Bearer\s+(\S+)$/i.exec(
+    req.headers.get("authorization") || "",
+  )?.[1];
+  if (bearer && !CF_ACCESS_TEAM_NAME)
+    return {
+      ok: false,
+      status: 401,
+      message: "Bearer validation is not configured",
+      ownerId: "",
+      ownerEmail: "",
+    };
+  const jwt = bearer || req.headers.get("cf-access-jwt-assertion");
   if (CF_ACCESS_REQUIRED && !jwt) {
     return {
       ok: false,
@@ -3746,21 +3813,27 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
   };
   if (jwt && CF_ACCESS_TEAM_NAME) {
     try {
-      const { cloudflareAccess: verifyJWT } =
-        await import("@hono/cloudflare-access");
       const mockContext = {
-        req: { header: (name: string) => req.headers.get(name) },
+        req: {
+          header: (name: string) =>
+            name.toLowerCase() === "cf-access-jwt-assertion"
+              ? jwt
+              : req.headers.get(name),
+        },
+        text: (message: string, status: number) =>
+          new Response(message, { status }),
         set: (key: string, value: CloudflareAccessPayload) => {
           if (key === "accessPayload") {
             accessPayloadHolder.value = value;
           }
         },
       };
-      const middleware = verifyJWT(CF_ACCESS_TEAM_NAME);
+      const middleware = getAccessVerifier();
       await middleware(mockContext as never, async () => {});
       if (
+        !accessPayloadHolder.value ||
         !isCloudflareAudienceAllowed(
-          accessPayloadHolder.value?.aud,
+          accessPayloadHolder.value.aud,
           CF_ACCESS_AUD,
         )
       ) {
@@ -3993,7 +4066,9 @@ async function getFoundationStatus(c: {
       expectedEmail: state.bootstrap.expectedEmail,
       // Path only (the token file itself is 0600): lets the Setup panel tell
       // a first-time operator where the one-time token lives.
-      tokenPath: state.bootstrap.bootstrapped ? null : state.bootstrap.tokenPath,
+      tokenPath: state.bootstrap.bootstrapped
+        ? null
+        : state.bootstrap.tokenPath,
     },
     roots: state.roots.map((root) => ({
       id: root.id,
@@ -5321,15 +5396,42 @@ export function createWebApp() {
     return c.json(response, 500);
   });
 
-  const hasTrustedOrigins = TRUSTED_ORIGINS.length > 0;
+  const browserBoundary = configuredBrowserBoundary(process.env);
+  app.use("/*", async (c, next) => {
+    for (const [name, value] of Object.entries(SECURITY_HEADERS))
+      c.header(name, value);
+    if (
+      c.req.path.startsWith("/api/") &&
+      !browserRequestAllowed(c.req.raw, browserBoundary)
+    ) {
+      return c.json(
+        { error: "Untrusted origin or missing X-DeckTerm-Request header" },
+        403,
+      );
+    }
+    await next();
+  });
+  const hasTrustedOrigins = browserBoundary.trustedOrigins.length > 0;
   app.use(
     "/*",
     cors({
       origin: hasTrustedOrigins
         ? (origin) =>
-            origin && TRUSTED_ORIGINS.includes(origin) ? origin : null
+            origin && browserBoundary.trustedOrigins.includes(origin)
+              ? origin
+              : null
         : "*",
       credentials: hasTrustedOrigins,
+      allowHeaders: ["Content-Type", "Authorization", "X-DeckTerm-Request"],
+      allowMethods: [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+      ],
     }),
   );
 
@@ -5339,7 +5441,7 @@ export function createWebApp() {
   // exemption exposes nothing publicly (edge traffic still passes the CF
   // Access policy). See backend/health-allowlist.test.ts.
   if (CF_ACCESS_REQUIRED && CF_ACCESS_TEAM_NAME) {
-    const cfAccessMiddleware = cloudflareAccess(CF_ACCESS_TEAM_NAME);
+    const cfAccessMiddleware = getAccessVerifier();
     app.use("/*", async (c, next) => {
       if (c.req.path === "/api/health") {
         await next();
@@ -5359,6 +5461,43 @@ export function createWebApp() {
       await next();
     });
   }
+
+  app.use("/api/*", async (c, next) => {
+    const limit =
+      c.req.path === "/api/files/upload"
+        ? UPLOAD_MAX_BYTES + MULTIPART_OVERHEAD_BYTES
+        : c.req.path === "/api/clipboard/image"
+          ? CLIPBOARD_IMAGE_MAX_SIZE + MULTIPART_OVERHEAD_BYTES
+          : null;
+    if (limit === null || c.req.method !== "POST") return next();
+    let release: (() => void) | undefined;
+    try {
+      release = transferBudget.acquire(getCurrentUser(c).ownerId);
+      c.req.raw = await boundedRequest(c.req.raw, limit);
+      await next();
+    } catch (error) {
+      if (error instanceof TransferError)
+        return c.json({ error: error.message }, error.status);
+      throw error;
+    } finally {
+      release?.();
+    }
+  });
+
+  app.use("/api/*", async (c, next) => {
+    if (
+      (c.req.path === "/api/browse" || c.req.path.startsWith("/api/files")) &&
+      [c.req.query("path"), c.req.query("cwd")].some(
+        (path) => path && isReservedTrashPath(path),
+      )
+    ) {
+      return c.json(
+        { error: "Trash paths are reserved; use Trash to restore an item" },
+        403,
+      );
+    }
+    await next();
+  });
 
   // No-cache headers - bypass CF cache
   app.use("/*", async (c, next) => {
@@ -7963,44 +8102,49 @@ export function createWebApp() {
     return c.json({ files, truncated });
   });
 
-  // File download
+  // Downloads share a bounded per-actor/global budget with uploads.
   app.get("/api/files/download", async (c) => {
     const requestedPath = c.req.query("path");
-    if (!requestedPath) {
-      return c.json({ error: "Path required" }, 400);
-    }
+    if (!requestedPath) return c.json({ error: "Path required" }, 400);
     const execCtx = await resolveExecFsContext(c, "files");
-    if (!execCtx.ok) {
+    if (!execCtx.ok)
       return c.json(execCtx.body, { status: execCtx.status as any });
-    }
     const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
     if (!scoped.ok)
       return c.json(scoped.body, { status: scoped.status as any });
-    const fx = getFsExecutor(execCtx.ctx);
-
+    let release: (() => void) | undefined;
     try {
-      const st = await fx.statPath(scoped.root, scoped.relPath);
-      if (st.kind !== "file") {
-        return c.json({ error: "Not a file" }, 400);
+      release = transferBudget.acquire(getCurrentUser(c).ownerId);
+      if (execCtx.ctx.kind === "legacy") {
+        const response = await streamLegacyDownload(
+          scoped.root,
+          scoped.relPath,
+          c.req.raw.signal,
+          release,
+        );
+        release = undefined; // stream EOF/cancel owns the descriptor and budget
+        return response;
       }
-      // Download reuses the editor byte cap under isolation (B4 §2.2 / Codex #12);
-      // legacy is uncapped so pass through the observed size.
-      const cap =
-        execCtx.ctx.kind === "brokered" ? EDITOR_MAX_FILE_BYTES : st.size + 1;
-      const { content } = await fx.read(scoped.root, scoped.relPath, cap);
-      const filename = basename(scoped.relPath || scoped.root);
-
+      // The broker protocol remains capped at the existing editor limit.
+      const { content } = await getFsExecutor(execCtx.ctx).read(
+        scoped.root,
+        scoped.relPath,
+        EDITOR_MAX_FILE_BYTES,
+      );
       return new Response(new Uint8Array(content), {
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "Content-Disposition": `attachment; filename="${filename}"`,
-          "Content-Length": String(content.length),
-        },
+        headers: downloadHeaders(
+          basename(scoped.relPath || scoped.root),
+          content.length,
+        ),
       });
-    } catch (err) {
-      if (err instanceof FsExecError)
-        return fsErrorResponse(c, err, "Cannot read file");
+    } catch (error) {
+      if (error instanceof TransferError)
+        return c.json({ error: error.message }, error.status);
+      if (error instanceof FsExecError)
+        return fsErrorResponse(c, error, "Cannot read file");
       return c.json({ error: "Cannot read file" }, 400);
+    } finally {
+      release?.();
     }
   });
 
@@ -8106,7 +8250,18 @@ export function createWebApp() {
         }
       }
 
-      await fx.write(scoped.root, scoped.relPath, Buffer.from(content, "utf8"));
+      if (body.createOnly === true)
+        await fx.create(
+          scoped.root,
+          scoped.relPath,
+          Buffer.from(content, "utf8"),
+        );
+      else
+        await fx.write(
+          scoped.root,
+          scoped.relPath,
+          Buffer.from(content, "utf8"),
+        );
       const saved = await fx.statPath(scoped.root, scoped.relPath);
 
       const state = await getFoundationState();
@@ -8121,6 +8276,8 @@ export function createWebApp() {
 
       return c.json({ ok: true, path: displayPath, mtimeMs: saved.mtimeMs });
     } catch (err) {
+      if (err instanceof FsExecError && err.code === "exists")
+        return c.json({ error: "File already exists" }, 409);
       if (err instanceof FsExecError)
         return fsErrorResponse(c, err, "Cannot write file");
       return c.json({ error: "Cannot write file", message: String(err) }, 500);
@@ -8270,14 +8427,24 @@ export function createWebApp() {
       const formData = await c.req.formData();
       const file = formData.get("file") as File | null;
 
-      if (!file) {
+      if (!(file instanceof File))
         return c.json({ error: "No file provided" }, 400);
-      }
+      const uploadCap =
+        execCtx.ctx.kind === "brokered"
+          ? EDITOR_MAX_FILE_BYTES
+          : UPLOAD_MAX_BYTES;
+      if (file.size > uploadCap)
+        return c.json(
+          { error: `File too large (max ${uploadCap / 1024 / 1024}MB)` },
+          413,
+        );
 
       const fileName = basename(file.name);
       const destRel = scoped.relPath
         ? `${scoped.relPath}/${fileName}`
         : fileName;
+      if (isReservedTrashPath(destRel))
+        return c.json({ error: "Trash path is reserved" }, 403);
       const buffer = await file.arrayBuffer();
       await fx.write(scoped.root, destRel, Buffer.from(buffer));
 
@@ -8330,7 +8497,7 @@ export function createWebApp() {
     }
   });
 
-  // Delete file or directory
+  // Delete means move to the actor-bound, same-root Trash; never a permanent fallback.
   app.delete("/api/files", async (c) => {
     const requestedPath = c.req.query("path");
     if (!requestedPath) {
@@ -8343,7 +8510,7 @@ export function createWebApp() {
     const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
     if (!scoped.ok)
       return c.json(scoped.body, { status: scoped.status as any });
-    const fx = getFsExecutor(execCtx.ctx);
+    const state = await getFoundationState();
 
     // Security: never delete a root itself. The reconstructed abs path guards the
     // legacy realpath'd roots; brokered additionally can never target the root
@@ -8355,21 +8522,107 @@ export function createWebApp() {
     if (
       scoped.relPath === "" ||
       absPath === "/" ||
-      protectedRoots.includes(absPath)
+      protectedRoots.includes(absPath) ||
+      containsManagedTrash(
+        absPath,
+        state.roots.map((root) => root.path),
+      )
     ) {
       return c.json({ error: "Cannot delete root or home directory" }, 403);
     }
 
     try {
-      const st = await fx.statPath(scoped.root, scoped.relPath);
-      await fx.remove(scoped.root, scoped.relPath, st.kind === "dir");
-      return c.json({ ok: true });
+      const binding: FileTrashBinding = {
+        actorId: resolveCanonicalOwnerId(state, getCurrentActor(c)).ownerId,
+        rootId: scoped.rootId,
+        root: scoped.root,
+        fsContext: execCtx.ctx,
+      };
+      // Cleanup is bounded and only follows an authenticated, explicit write.
+      await purgeExpiredTrashItems(state.db, binding, { limit: 10 });
+      const item = await trashPath(state.db, binding, scoped.relPath);
+      writeAuditEvent(state.db, {
+        actorUserId: binding.actorId,
+        action: "file.trash",
+        resourceType: "root",
+        resourceId: scoped.rootId,
+        decision: "allow",
+        data: { itemId: item.id },
+      });
+      return c.json({ ok: true, trash: item, root: scoped.root });
     } catch (err) {
+      if (err instanceof FileTrashError)
+        return c.json(
+          { error: err.message, reason: err.code },
+          err.code === "collision" ? 409 : 403,
+        );
       if (err instanceof FsExecError)
-        return fsErrorResponse(c, err, "Failed to delete");
+        return fsErrorResponse(c, err, "Could not move to Trash");
       return c.json({ error: "Failed to delete" }, 500);
     }
   });
+
+  const trashRequest = async (c: any, action: "list" | "restore" | "purge") => {
+    const body = action === "list" ? {} : await c.req.json().catch(() => ({}));
+    const requestedRoot = action === "list" ? c.req.query("path") : body.root;
+    if (typeof requestedRoot !== "string" || !requestedRoot)
+      return c.json({ error: "Root path required" }, 400);
+    if (action !== "list" && typeof body.id !== "string")
+      return c.json({ error: "Trash item id required" }, 400);
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) return c.json(execCtx.body, execCtx.status);
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedRoot);
+    if (!scoped.ok) return c.json(scoped.body, scoped.status);
+    const state = await getFoundationState();
+    const binding: FileTrashBinding = {
+      actorId: resolveCanonicalOwnerId(state, getCurrentActor(c)).ownerId,
+      rootId: scoped.rootId,
+      root: scoped.root,
+      fsContext: execCtx.ctx,
+    };
+    try {
+      if (action === "list")
+        return c.json({
+          root: scoped.root,
+          items: await listTrashItems(state.db, binding),
+        });
+      const item =
+        action === "restore"
+          ? await restoreTrashItem(state.db, binding, body.id)
+          : await purgeTrashItem(state.db, binding, body.id);
+      writeAuditEvent(state.db, {
+        actorUserId: binding.actorId,
+        action: `file.trash.${action}`,
+        resourceType: "root",
+        resourceId: scoped.rootId,
+        decision: "allow",
+        data: { itemId: item.id },
+      });
+      return c.json({
+        ok: true,
+        item,
+        ...(action === "restore"
+          ? { path: join(scoped.root, item.originalRelPath) }
+          : {}),
+      });
+    } catch (error) {
+      if (error instanceof FileTrashError)
+        return c.json(
+          { error: error.message, reason: error.code },
+          error.code === "not_found"
+            ? 404
+            : error.code === "binding_changed"
+              ? 403
+              : 409,
+        );
+      if (error instanceof FsExecError)
+        return fsErrorResponse(c, error, "Trash operation failed");
+      throw error;
+    }
+  };
+  app.get("/api/files/trash", (c) => trashRequest(c, "list"));
+  app.post("/api/files/trash/restore", (c) => trashRequest(c, "restore"));
+  app.post("/api/files/trash/purge", (c) => trashRequest(c, "purge"));
 
   // Rename file or directory
   app.post("/api/files/rename", async (c) => {
@@ -8391,6 +8644,22 @@ export function createWebApp() {
     });
     if (!scopedTo.ok)
       return c.json(scopedTo.body, { status: scopedTo.status as any });
+    const renameState = await getFoundationState();
+    const sourcePath = scopedFrom.relPath
+      ? join(scopedFrom.root, scopedFrom.relPath)
+      : scopedFrom.root;
+    if (
+      scopedFrom.relPath === "" ||
+      containsManagedTrash(
+        sourcePath,
+        renameState.roots.map((root) => root.path),
+      )
+    ) {
+      return c.json(
+        { error: "Cannot rename a registered root or its parent" },
+        403,
+      );
+    }
     // BROKERED only: the helper resolves both endpoints beneath ONE root fd, so a
     // cross-root move is refused. LEGACY preserves the prior behavior (each
     // endpoint access-checked independently, fs.rename across allowed roots works
@@ -9715,9 +9984,10 @@ export function createWebApp() {
         const formData = await c.req.formData();
         const file = formData.get("image") as File | null;
 
-        if (!file) {
+        if (!(file instanceof File))
           return c.json({ error: "No image file provided" }, 400);
-        }
+        if (!ALLOWED_IMAGE_TYPES.includes(file.type))
+          return c.json({ error: "Invalid image type" }, 400);
 
         if (file.size > CLIPBOARD_IMAGE_MAX_SIZE) {
           return c.json({ error: "Image too large (max 10MB)" }, 400);
@@ -9823,7 +10093,31 @@ export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
   return { ok: true, terminal: await restore() };
 }
 
+// Keep the lease strongly reachable even when the entrypoint discards the Bun
+// server wrapper. Native server liveness is not a JavaScript GC ownership root.
+const activeStateOwners = new Set<{ release(): void }>();
 export async function startWebServer(host: string, port: number) {
+  const lease = acquireStateOwnership(DECKTERM_STATE_DIR);
+  const ownership = {
+    release() {
+      lease.release();
+      activeStateOwners.delete(ownership);
+    },
+  };
+  activeStateOwners.add(ownership);
+  try {
+    return await startOwnedWebServer(host, port, ownership);
+  } catch (error) {
+    ownership.release();
+    throw error;
+  }
+}
+
+async function startOwnedWebServer(
+  host: string,
+  port: number,
+  ownership: { release(): void },
+) {
   if (CF_ACCESS_REQUIRED && !CF_ACCESS_TEAM_NAME) {
     throw new Error(
       "CF_ACCESS_REQUIRED=1 but CF_ACCESS_TEAM_NAME is empty. Server-side JWT validation cannot run; refusing to start in a silently-unprotected state. Set CF_ACCESS_TEAM_NAME or unset CF_ACCESS_REQUIRED.",
@@ -9835,6 +10129,20 @@ export async function startWebServer(host: string, port: number) {
     );
   }
 
+  if (CF_ACCESS_TEAM_NAME) getAccessVerifier();
+  const boundary = configuredBrowserBoundary({
+    ...process.env,
+    HOST: host,
+    PORT: String(port),
+  });
+  if (
+    (CF_ACCESS_REQUIRED ||
+      !["", "local"].includes(process.env.DECKTERM_PUBLISH_MODE || "") ||
+      !isLoopbackHost(host)) &&
+    TRUSTED_ORIGINS.length === 0
+  ) {
+    throw new Error("Public and proxy modes require explicit TRUSTED_ORIGINS");
+  }
   // B2 (§4.4.1, B1 §1.2, invariant §7.15): `cloudflare-tunnel` publish mode
   // trusts an edge proxy for identity. On a NON-loopback bind that trust is
   // only sound if a real proxy fronts the port; refuse to start bound to a
@@ -9865,7 +10173,11 @@ export async function startWebServer(host: string, port: number) {
     process.env.CI === "true" ||
     process.env.NODE_ENV === "test" ||
     process.env.BUN_ENV === "test";
-  if (process.env.DECKTERM_OS_ISOLATION === "1" && !isCiOrTestEnv) {
+  if (
+    process.env.DECKTERM_OS_ISOLATION === "1" &&
+    !isCiOrTestEnv &&
+    process.env.DECKTERM_PREFLIGHT !== "1"
+  ) {
     const brokerOk = await brokerCheck(process.env);
     if (!brokerOk) {
       throw new Error(
@@ -9977,12 +10289,46 @@ export async function startWebServer(host: string, port: number) {
     });
   }
 
+  // Release validation migrates only its private snapshot. Do not construct the
+  // full app: task bridges, recovery, brokers and timers are operational effects.
+  if (process.env.DECKTERM_PREFLIGHT === "1") {
+    if (!isLoopbackHost(host)) throw new Error("Preflight must bind loopback");
+    const state = await getFoundationState();
+    const integrity = state.db.query("PRAGMA quick_check").get() as {
+      quick_check: string;
+    };
+    if (integrity.quick_check !== "ok")
+      throw new Error("Preflight database integrity failed");
+    const candidate = Bun.serve({
+      hostname: host,
+      port,
+      fetch(request) {
+        if (
+          request.method !== "GET" ||
+          new URL(request.url).pathname !== "/api/health"
+        )
+          return new Response("Preflight only", { status: 404 });
+        return Response.json({
+          status: "ok",
+          release: DECKTERM_RELEASE,
+          preflight: true,
+          terminals: 0,
+        });
+      },
+    });
+    const stop = candidate.stop.bind(candidate);
+    candidate.stop = async (force) => {
+      await stop(force);
+      ownership.release();
+    };
+    return candidate;
+  }
+
   // Fail fast if the port is already taken BEFORE touching recorded
   // sessions: a second instance pointed at the same state dir must not
   // reconcile (= write to) a live instance's rows (observed 2026-07-16: an
   // unpinned test-spawned child ended the dev instance's session row).
-  // Residual: a process bound to a DIFFERENT port but sharing the state dir
-  // still needs a real instance-ownership lock — backlogged.
+  // The state ownership lock also excludes instances using a different port.
   if (port !== 0) {
     const { createServer } = await import("node:net");
     await new Promise<void>((resolvePort, rejectPort) => {
@@ -10018,14 +10364,22 @@ export async function startWebServer(host: string, port: number) {
     }
   }
 
+  await ensureClipboardDir();
   const app = createWebApp();
 
   const server = Bun.serve<WsData>({
     port,
     hostname: host,
+    maxRequestBodySize: 26 * 1024 * 1024,
 
     async fetch(req, server) {
       const url = new URL(req.url);
+      if (
+        url.pathname.startsWith("/ws/") &&
+        !browserRequestAllowed(req, boundary, true)
+      ) {
+        return new Response("Untrusted WebSocket origin", { status: 403 });
+      }
 
       if (url.pathname.startsWith("/ws/terminals/")) {
         const id = url.pathname.split("/").pop();
@@ -10646,9 +11000,12 @@ export async function startWebServer(host: string, port: number) {
     }
   };
 
-  setInterval(cleanupIdleTerminals, 5 * 60 * 1000);
-  setInterval(reapDetachedSessions, 15 * 60 * 1000);
-  setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS);
+  const lifecycleTimers = [
+    setInterval(cleanupClipboardImages, 15 * 60 * 1000),
+    setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
+    setInterval(reapDetachedSessions, 15 * 60 * 1000),
+    setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+  ];
 
   // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
   // durable `retention_runs` bookkeeping, so cadence survives restarts and a
@@ -10703,8 +11060,10 @@ export async function startWebServer(host: string, port: number) {
       console.error(`[retention] tick failed:`, err);
     }
   };
-  setInterval(retentionTick, 60 * 60 * 1000);
-  setTimeout(retentionTick, 60 * 1000);
+  lifecycleTimers.push(
+    setInterval(retentionTick, 60 * 60 * 1000),
+    setTimeout(retentionTick, 60 * 1000),
+  );
 
   // Deliberate service shutdown (deploy/restart). Tmux-backed sessions
   // survive the restart (state-dir-scoped socket + KillMode=process), so we
@@ -10742,10 +11101,28 @@ export async function startWebServer(host: string, port: number) {
         term.proc.kill();
       } catch {}
     }
+    ownership.release();
     process.exit(0);
   };
-  process.on("SIGINT", () => shutdownGracefully("SIGINT"));
-  process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
+  const onInt = () => shutdownGracefully("SIGINT");
+  const onTerm = () => shutdownGracefully("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  const stop = server.stop.bind(server);
+  server.stop = async (force) => {
+    await stop(force);
+    for (const timer of lifecycleTimers) clearTimeout(timer);
+    process.off("SIGINT", onInt);
+    process.off("SIGTERM", onTerm);
+    // A draining server retains ownership until process exit. Do not let a new
+    // writer enter while existing requests or sockets still access the state.
+    if (
+      server.pendingRequests === 0 &&
+      server.pendingWebSockets === 0 &&
+      terminals.size === 0
+    )
+      ownership.release();
+  };
 
   return server;
 }

@@ -1,6 +1,8 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import {
   mkdtemp,
+  mkdir,
   rm,
   writeFile,
   symlink,
@@ -646,4 +648,31 @@ test("global truncation: more than REPLACE_MAX_FILES candidates marks every file
   // And the file on disk is untouched.
   const survived = await readFile(firstPath, "utf8");
   expect(survived).toBe("NEEDLE_MANY\n");
+});
+
+test("replace refuses explicit Trash paths and leaves their contents intact", async () => {
+  const trashDir = join(allowedRoot, ".deckterm-trash");
+  await mkdir(trashDir, { recursive: true, mode: 0o700 });
+  const path = join(trashDir, "reserved-item");
+  await writeFile(path, "reserved sentinel\n");
+  const { res, data } = await preview({
+    cwd: allowedRoot,
+    query: "sentinel",
+    replacement: "changed",
+    paths: [path],
+  });
+  expect(res.status).toBe(200);
+  expect(data.files.some((file: any) => file.path === path)).toBe(false);
+  expect(await readFile(path, "utf8")).toBe("reserved sentinel\n");
+  const alias = join(allowedRoot, "trash-alias");
+  await symlink(trashDir, alias);
+  const aliasResult = await preview({
+    cwd: allowedRoot,
+    query: "sentinel",
+    replacement: "changed",
+    paths: [join(alias, "reserved-item")],
+  });
+  expect(aliasResult.res.status).toBe(200);
+  expect(aliasResult.data.files).toHaveLength(0);
+  expect(await readFile(path, "utf8")).toBe("reserved sentinel\n");
 });

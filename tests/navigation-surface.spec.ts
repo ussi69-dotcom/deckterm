@@ -183,13 +183,15 @@ test.describe("Shell action hierarchy on desktop", () => {
     const folderName = `palette-folder-${Date.now()}`;
 
     await createWorkspaceInDir(page, repoDir);
-    await page.evaluate((nextName) => {
-      window.prompt = () => nextName;
-    }, folderName);
-
     await openCommandPalette(page);
     await page.locator("#command-palette-input").fill("New Folder Here");
     await page.keyboard.press("Enter");
+    const dialog = page.getByRole("dialog", {
+      name: "New folder",
+      exact: true,
+    });
+    await dialog.getByLabel("Folder name:", { exact: true }).fill(folderName);
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
 
     await expect
       .poll(async () => {

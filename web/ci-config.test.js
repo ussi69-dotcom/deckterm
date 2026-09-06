@@ -47,6 +47,8 @@ test("deploy scripts target user-level systemd services", () => {
   const deployScript = readText("../scripts/deploy_release.sh");
   const rollbackScript = readText("../scripts/rollback_release.sh");
 
-  expect(deployScript).toContain("systemctl --user restart");
-  expect(rollbackScript).toContain("systemctl --user restart");
+  for (const script of [deployScript, rollbackScript]) {
+    expect(script).toContain("systemctl_bin=${SYSTEMCTL_BIN:-systemctl}");
+    expect(script).toContain('"$systemctl_bin" --user restart');
+  }
 });

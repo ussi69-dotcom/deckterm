@@ -258,8 +258,8 @@ test("applyE2ERunActorNamespace rejects a valid cookie outside the exact harness
         DECKTERM_LEGACY_NO_BOOTSTRAP: "1",
       },
       actor: {
-        id: accessPayload.sub,
-        email: accessPayload.email,
+        id: accessPayload.sub!,
+        email: accessPayload.email!,
         source: "cloudflare_access" as const,
       },
     },

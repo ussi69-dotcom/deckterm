@@ -1,0 +1,197 @@
+{
+  "scope": "Isolated local development browser audit; settings writes virtualized",
+  "normalNavigationPageExceptions": 0,
+  "scenes": [
+    {
+      "name": "desktop-terminal",
+      "viewport": {
+        "w": 1440,
+        "h": 900,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "desktop-tools",
+      "viewport": {
+        "w": 1440,
+        "h": 900,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "desktop-settings",
+      "viewport": {
+        "w": 1440,
+        "h": 900,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "desktop-palette",
+      "viewport": {
+        "w": 1440,
+        "h": 900,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "desktop-ide",
+      "viewport": {
+        "w": 1440,
+        "h": 900,
+        "scroll": 1440
+      }
+    },
+    {
+      "name": "mobile-terminal",
+      "viewport": {
+        "w": 390,
+        "h": 844,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "mobile-tools",
+      "viewport": {
+        "w": 390,
+        "h": 844,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "mobile-settings",
+      "viewport": {
+        "w": 390,
+        "h": 844,
+        "scroll": 390
+      }
+    },
+    {
+      "name": "mobile-cdn-blocked",
+      "viewport": {
+        "w": 390,
+        "h": 844,
+        "scroll": 390
+      }
+    }
+  ],
+  "settingsOpenFocus": {
+    "tag": "BODY",
+    "id": "",
+    "cls": ""
+  },
+  "settingsTabFocus": [
+    {
+      "tag": "DIV",
+      "id": "",
+      "inside": false
+    },
+    {
+      "tag": "TEXTAREA",
+      "id": "",
+      "inside": false
+    },
+    {
+      "tag": "TEXTAREA",
+      "id": "",
+      "inside": false
+    }
+  ],
+  "desktopSettingsStillVisibleAfterEscapeFromSearch": true,
+  "scrollback": {
+    "stored": 2345,
+    "actual": [10000]
+  },
+  "gitDiff": {
+    "setting": "inline",
+    "consumerKey": "split"
+  },
+  "mobileSettingsEscape": {
+    "before": true,
+    "after": true
+  },
+  "cdnBlockedControls": [
+    {
+      "id": "toolbar-toggle",
+      "text": "\u2261",
+      "title": "Menu",
+      "aria": null,
+      "width": 36,
+      "height": 36,
+      "svg": false
+    },
+    {
+      "id": "new-terminal",
+      "text": "+\n              New",
+      "title": "New Terminal (Ctrl+N)",
+      "aria": null,
+      "width": 44,
+      "height": 44,
+      "svg": false
+    },
+    {
+      "id": "sessions-btn",
+      "text": "",
+      "title": "Sessions",
+      "aria": "Sessions",
+      "width": 44,
+      "height": 44,
+      "svg": false
+    },
+    {
+      "id": "notification-sound-toggle",
+      "text": "",
+      "title": "Completion sounds: only when DeckTerm is unfocused. Click to turn off.",
+      "aria": "Completion sounds: only when DeckTerm is unfocused. Click to turn off.",
+      "width": 40,
+      "height": 40,
+      "svg": false
+    },
+    {
+      "id": "mobile-files-btn",
+      "text": "\ud83d\udcc2Files",
+      "title": "Files",
+      "aria": "Files",
+      "width": 85.5,
+      "height": 58,
+      "svg": false
+    },
+    {
+      "id": "mobile-git-btn",
+      "text": "Git",
+      "title": "Git",
+      "aria": "Git",
+      "width": 85.5,
+      "height": 58,
+      "svg": false
+    },
+    {
+      "id": "mobile-paste-btn",
+      "text": "\ud83d\udce5Paste",
+      "title": "Paste",
+      "aria": "Paste",
+      "width": 85.5,
+      "height": 58,
+      "svg": false
+    },
+    {
+      "id": "mobile-more-btn",
+      "text": "More",
+      "title": "More",
+      "aria": "More",
+      "width": 85.5,
+      "height": 58,
+      "svg": false
+    }
+  ],
+  "networkObservations": [
+    "Lucide was deliberately blocked during the fallback test",
+    "One notification status request was aborted during reload"
+  ],
+  "finalProbeTemporaryTerminalCleanup": {
+    "count": 1,
+    "allSuccessful": true
+  },
+  "initialAndFinalDevTerminalCount": 0,
+  "redaction": "Raw DOM text, host file inventory, session identifiers, and request URLs intentionally omitted"
+}

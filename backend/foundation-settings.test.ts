@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";

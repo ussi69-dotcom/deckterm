@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { expect, test } from "bun:test";
 
 // /api/health must stay reachable without a Cloudflare Access JWT: the deploy

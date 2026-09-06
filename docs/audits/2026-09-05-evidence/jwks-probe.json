@@ -1,0 +1,12 @@
+{
+  "package": "@hono/cloudflare-access",
+  "installedVersion": "0.3.1",
+  "method": "Isolated temporary RSA public JWK, mocked fetch and Date.now, malformed local tokens; no real credentials or application requests",
+  "observedFetchCounts": {
+    "afterCold": 1,
+    "afterFresh": 2,
+    "afterExpired": 2
+  },
+  "source": "node_modules/@hono/cloudflare-access/dist/index.js:13-17",
+  "interpretation": "Fresh cache fetched again; expired cache did not refresh"
+}

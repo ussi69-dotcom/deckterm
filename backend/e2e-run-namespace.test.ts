@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -160,9 +161,7 @@ test("server-enforced run actors isolate catalogs and terminal mutations", async
       expect(response.status).toBe(404);
     }
 
-    const external = (await catalog()).find(
-      (entry) => entry.id === externalId,
-    );
+    const external = (await catalog()).find((entry) => entry.id === externalId);
     expect(external).toMatchObject({ id: externalId, active: true });
     expect((await catalog(RUN_A)).map((entry) => entry.id)).toEqual([runAId]);
 
@@ -178,7 +177,11 @@ test("server-enforced run actors isolate catalogs and terminal mutations", async
     expect(ownResize.status).toBe(200);
   } finally {
     for (const item of cleanup.reverse()) {
-      await request(`/api/terminals/${item.id}`, { method: "DELETE" }, item.runId)
+      await request(
+        `/api/terminals/${item.id}`,
+        { method: "DELETE" },
+        item.runId,
+      )
         .then(() => {})
         .catch(() => {});
     }

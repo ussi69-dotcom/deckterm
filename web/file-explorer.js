@@ -237,7 +237,24 @@ class FileExplorerController {
       (typeof fetch === "function" ? fetch.bind(globalThis) : null);
     this.alertImpl = alertImpl || getDefaultAlertImpl();
     this.confirmImpl = confirmImpl || getDefaultConfirmImpl();
-    this.promptImpl = promptImpl || getDefaultPromptImpl();
+    // Explicit adapters remain available for callers/tests; the browser uses a
+    // labelled modal form rather than a native prompt with no validation.
+    this.promptImpl = promptImpl;
+    this.cancelNameDialog = null;
+    this.focusPathByWorkspace = new Map();
+    this.pendingListFocus = null;
+    this.requestedMode = null;
+    this.modalActive = false;
+    this.modalOpener = null;
+    this.modalOpenerId = null;
+    this.modalFocusGeneration = 0;
+    this.fileFeedbackGeneration = 0;
+    this.fileLocationGeneration = 0;
+    this.fileNotice = null;
+    this.fileNoticeEl = null;
+    this.trashButtonEl = null;
+    this.trashDialog = null;
+    this.pendingTrashMutations = new Set();
     this.openWindowImpl = openWindowImpl || getDefaultOpenWindowImpl();
     this.renderers = {
       breadcrumb:
@@ -306,6 +323,8 @@ class FileExplorerController {
         ? this.onRequestClose()
         : this.close();
     this.handleBackdropClick = this.handleBackdropClick.bind(this);
+    this.handleModalKeydown = this.handleModalKeydown.bind(this);
+    this.handleViewportResize = () => this.resize();
     this.handleUpload = this.handleUpload.bind(this);
     this.handleDragOver = this.handleDragOver.bind(this);
     this.handleDragLeave = this.handleDragLeave.bind(this);
@@ -399,6 +418,10 @@ class FileExplorerController {
   // bound to — the host keeps that markup. After this the view can be
   // mount()ed into another skeleton-bearing container.
   unmount() {
+    this.cancelNameDialog?.();
+    this.resetFileFeedback();
+    this.finishModalFocus({ restoreFocus: false });
+    this.pendingListFocus = null;
     this.unbindDom();
     this.root = null;
   }
@@ -416,6 +439,7 @@ class FileExplorerController {
   // measured widgets, so a re-render suffices to keep it consistent.
   resize() {
     if (!this.root) return;
+    this.mode = this.resolveMode(this.requestedMode);
     this.render();
   }
 
@@ -432,6 +456,20 @@ class FileExplorerController {
     this.mkdirBtnEl = this.root.querySelector("#file-explorer-mkdir-btn");
     this.newFileBtnEl = this.root.querySelector("#file-explorer-newfile-btn");
     this.refreshBtnEl = this.root.querySelector("#file-explorer-refresh-btn");
+    const toolbar = this.root.querySelector(".file-explorer-toolbar");
+    if (toolbar && typeof document !== "undefined") {
+      this.trashButtonEl = document.createElement("button");
+      this.trashButtonEl.type = "button";
+      this.trashButtonEl.id = "file-explorer-trash-btn";
+      this.trashButtonEl.className = "btn btn-secondary";
+      this.trashButtonEl.textContent = "Trash";
+      this.trashButtonEl.addEventListener("click", () => void this.openTrash());
+      toolbar.appendChild(this.trashButtonEl);
+      this.fileNoticeEl = document.createElement("div");
+      this.fileNoticeEl.className = "file-operation-notice";
+      this.fileNoticeEl.hidden = true;
+      toolbar.after(this.fileNoticeEl);
+    }
 
     const closeSelectors = [
       "#file-explorer-close",
@@ -446,6 +484,8 @@ class FileExplorerController {
     });
 
     this.backdropEl?.addEventListener("click", this.handleBackdropClick);
+    this.shellEl?.addEventListener("keydown", this.handleModalKeydown);
+    this.viewport?.addEventListener?.("resize", this.handleViewportResize);
 
     // Hold references to the per-mount closures so unmount() can detach them.
     this._boundUploadClick = () => this.uploadInputEl?.click();
@@ -471,10 +511,16 @@ class FileExplorerController {
   // Detach every listener bindDom() attached and drop cached DOM handles, so an
   // unmounted view leaks nothing and a later mount() can rebind cleanly.
   unbindDom() {
+    this.trashButtonEl?.remove();
+    this.fileNoticeEl?.remove();
+    this.trashButtonEl = null;
+    this.fileNoticeEl = null;
     this.closeButtons.forEach((button) => {
       button.removeEventListener?.("click", this.handleClose);
     });
     this.backdropEl?.removeEventListener?.("click", this.handleBackdropClick);
+    this.shellEl?.removeEventListener?.("keydown", this.handleModalKeydown);
+    this.viewport?.removeEventListener?.("resize", this.handleViewportResize);
     if (this._boundUploadClick) {
       this.uploadBtnEl?.removeEventListener?.("click", this._boundUploadClick);
     }
@@ -523,8 +569,133 @@ class FileExplorerController {
 
   handleBackdropClick(event) {
     if (event.target === this.backdropEl) {
-      this.close();
+      this.handleClose();
     }
+  }
+
+  modalFocusTargets() {
+    const candidates =
+      this.shellEl?.querySelectorAll?.(
+        "button, a[href], input, select, textarea, [tabindex]",
+      ) || [];
+    return Array.from(candidates).filter(
+      (element) =>
+        element.tabIndex >= 0 &&
+        !element.disabled &&
+        !element.hidden &&
+        !element.closest?.("[hidden], .hidden, [inert]") &&
+        (typeof element.getClientRects !== "function" ||
+          element.getClientRects().length > 0),
+    );
+  }
+
+  handleModalKeydown(event) {
+    if (!this.modalActive || !this.isOpen || this.mode !== "overlay") return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      this.handleClose();
+    } else if (event.key === "Tab") {
+      const targets = this.modalFocusTargets();
+      const active =
+        this.shellEl?.ownerDocument?.activeElement ||
+        (typeof document !== "undefined" ? document.activeElement : null);
+      const index = targets.indexOf(active);
+      if (
+        targets.length === 0 ||
+        index < 0 ||
+        (event.shiftKey && index === 0) ||
+        (!event.shiftKey && index === targets.length - 1)
+      ) {
+        event.preventDefault();
+        const target = event.shiftKey
+          ? targets[targets.length - 1]
+          : targets[0];
+        (target || this.shellEl)?.focus?.();
+      }
+      event.stopPropagation();
+    }
+  }
+
+  syncModalFocus() {
+    const active = Boolean(
+      this.isOpen && this.mode === "overlay" && this.shellEl,
+    );
+    if (active === this.modalActive) return;
+    if (!active) {
+      // Resizing into desktop mode must not move focus to a hidden mobile bar.
+      this.finishModalFocus({ restoreFocus: false });
+      return;
+    }
+    this.modalActive = true;
+    this.modalFocusGeneration += 1;
+    const doc =
+      this.shellEl.ownerDocument ||
+      (typeof document !== "undefined" ? document : null);
+    const focused = doc?.activeElement;
+    const candidate =
+      focused &&
+      focused !== doc.body &&
+      focused !== doc.documentElement &&
+      !this.root?.contains?.(focused)
+        ? focused
+        : this.getDefaultOpener?.();
+    this.modalOpener = candidate || null;
+    this.modalOpenerId = candidate?.id || null;
+    this.shellEl.tabIndex = -1;
+    (this.modalFocusTargets()[0] || this.shellEl).focus?.({
+      preventScroll: true,
+    });
+  }
+
+  finishModalFocus({ restoreFocus = true } = {}) {
+    if (!this.modalActive) return;
+    this.modalActive = false;
+    const generation = ++this.modalFocusGeneration;
+    const opener = this.modalOpener;
+    const openerId = this.modalOpenerId;
+    const shell = this.shellEl;
+    const doc =
+      shell?.ownerDocument ||
+      (typeof document !== "undefined" ? document : null);
+    const focused = doc?.activeElement;
+    const wasInside =
+      !focused || focused === doc?.body || shell?.contains?.(focused);
+    this.modalOpener = null;
+    this.modalOpenerId = null;
+    if (!restoreFocus || !wasInside) return;
+    // Run after the host has hidden its surrounding chrome. A newer modal or
+    // deliberately focused destination wins over this return-to-opener step.
+    queueMicrotask(() => {
+      if (
+        this.disposed ||
+        this.modalActive ||
+        generation !== this.modalFocusGeneration ||
+        this.mode !== "overlay" ||
+        getViewportWidth(this.viewport) > this.breakpoint
+      )
+        return;
+      const current = doc?.activeElement;
+      if (current && current !== doc?.body && !shell?.contains?.(current))
+        return;
+      const candidates = [
+        openerId && doc?.getElementById?.(openerId),
+        opener,
+        this.getDefaultOpener?.(),
+      ];
+      const target = candidates.find(
+        (entry) =>
+          entry &&
+          typeof entry.focus === "function" &&
+          entry.isConnected !== false &&
+          !entry.disabled &&
+          !entry.hidden &&
+          !entry.closest?.("[hidden], .hidden, [inert]") &&
+          (typeof entry.getClientRects !== "function" ||
+            entry.getClientRects().length > 0),
+      );
+      target?.focus?.({ preventScroll: true });
+    });
   }
 
   handleDragOver(event) {
@@ -605,12 +776,17 @@ class FileExplorerController {
     this.renderBreadcrumb();
     this.renderList();
     this.renderStatus();
+    this.syncModalFocus();
   }
 
   renderBreadcrumb() {
     const snapshot = this.buildSnapshot();
 
     if (this.breadcrumbEl) {
+      const focusedPath = this.breadcrumbEl.contains?.(document.activeElement)
+        ? document.activeElement?.dataset?.path
+        : null;
+      this.breadcrumbEl.setAttribute("aria-label", "Current folder");
       this.breadcrumbEl.innerHTML = "";
 
       if (!snapshot.path) {
@@ -628,13 +804,19 @@ class FileExplorerController {
           if (i > 0) {
             this.breadcrumbEl.appendChild(document.createTextNode(" / "));
           }
-          const link = document.createElement("a");
+          const link = document.createElement("button");
+          link.type = "button";
+          link.className = "file-breadcrumb-button";
           link.textContent = crumb.label;
           link.dataset.path = crumb.path;
+          link.setAttribute("aria-label", `Open folder ${crumb.label}`);
+          if (i === crumbs.length - 1)
+            link.setAttribute("aria-current", "location");
           // Capture crumb.path in a const so the closure captures the right value.
           const crumbPath = crumb.path;
           link.addEventListener("click", () => void this.loadDir(crumbPath));
           this.breadcrumbEl.appendChild(link);
+          if (focusedPath === crumb.path) link.focus?.();
         });
       }
     }
@@ -644,6 +826,18 @@ class FileExplorerController {
 
   renderList() {
     const snapshot = this.buildSnapshot();
+    const focused =
+      typeof document !== "undefined" ? document.activeElement : null;
+    const focusedRow = focused?.closest?.(".file-item");
+    const capturedListFocus = focusedRow && this.listEl?.contains?.(focusedRow);
+    if (capturedListFocus) {
+      this.pendingListFocus = {
+        workspaceId: this.listEl.dataset.workspaceId,
+        path: focusedRow.dataset.path,
+        action: focused.dataset.explorerAction || "open",
+        index: Array.from(this.listEl.children).indexOf(focusedRow),
+      };
+    }
 
     if (this.listEl?.dataset) {
       this.listEl.dataset.workspaceId = snapshot.workspaceId || "";
@@ -651,6 +845,16 @@ class FileExplorerController {
     }
 
     if (this.listEl) {
+      this.listEl.setAttribute("role", "list");
+      this.listEl.setAttribute(
+        "aria-label",
+        "Files. Use arrow keys to move between items.",
+      );
+      this.listEl.setAttribute(
+        "aria-busy",
+        snapshot.loading ? "true" : "false",
+      );
+      this.listEl.tabIndex = -1;
       this.listEl.innerHTML = "";
 
       if (snapshot.loading) {
@@ -674,9 +878,47 @@ class FileExplorerController {
           ),
         );
       } else {
+        const remembered = this.focusPathByWorkspace.get(snapshot.workspaceId);
+        if (!snapshot.items.some((item) => item.path === remembered)) {
+          this.focusPathByWorkspace.set(
+            snapshot.workspaceId,
+            snapshot.items[0].path,
+          );
+        }
         snapshot.items.forEach((item) => {
           this.listEl.appendChild(this.createItemElement(item, snapshot));
         });
+      }
+      const pending = this.pendingListFocus;
+      if (pending && pending.workspaceId !== snapshot.workspaceId) {
+        this.pendingListFocus = null;
+      } else if (pending) {
+        // A background refresh must never take focus back from a toolbar,
+        // another workspace, editor, or dialog the user has since entered.
+        const active = document.activeElement;
+        const canRestore =
+          capturedListFocus ||
+          !active ||
+          active === document.body ||
+          active === this.listEl;
+        if (!canRestore) this.pendingListFocus = null;
+        else if (!snapshot.loading) {
+          const rows = Array.from(
+            this.listEl.querySelectorAll?.(".file-item") || [],
+          );
+          const row =
+            rows.find((entry) => entry.dataset.path === pending.path) ||
+            rows[Math.min(pending.index, rows.length - 1)];
+          const buttons = Array.from(row?.querySelectorAll?.("button") || []);
+          const target =
+            buttons.find(
+              (button) => button.dataset.explorerAction === pending.action,
+            ) || buttons[0];
+          (target || this.listEl).focus?.({ preventScroll: true });
+          this.pendingListFocus = null;
+        } else {
+          this.listEl.focus?.({ preventScroll: true });
+        }
       }
     }
 
@@ -718,14 +960,62 @@ class FileExplorerController {
     if (isSelected) el.classList.add("selected");
     if (item.isDir) el.classList.add("is-dir");
     el.dataset.path = item.path;
+    el.setAttribute("role", "listitem");
 
     const iconEl = document.createElement("span");
     iconEl.className = "file-icon";
     iconEl.textContent = getItemIcon(item);
+    iconEl.setAttribute("aria-hidden", "true");
 
-    const nameEl = document.createElement("span");
-    nameEl.className = "file-name";
+    const nameEl = document.createElement("button");
+    nameEl.type = "button";
+    nameEl.className = "file-name file-open";
+    nameEl.dataset.explorerAction = "open";
+    nameEl.tabIndex =
+      this.focusPathByWorkspace.get(snapshot.workspaceId) === item.path
+        ? 0
+        : -1;
+    nameEl.setAttribute(
+      "aria-label",
+      item.isParent
+        ? "Open parent folder"
+        : `Open ${item.isDir ? "folder" : "file"} ${item.name}`,
+    );
     nameEl.textContent = item.name;
+    const rememberRowFocus = () => {
+      this.focusPathByWorkspace.set(snapshot.workspaceId, item.path);
+      for (const row of this.listEl?.querySelectorAll?.(".file-item") || []) {
+        for (const button of row.querySelectorAll("button")) {
+          button.tabIndex = row.dataset.path === item.path ? 0 : -1;
+        }
+      }
+    };
+    nameEl.addEventListener("focus", rememberRowFocus);
+    el.addEventListener("keydown", (event) => {
+      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)
+        return;
+      const keys = ["ArrowDown", "ArrowUp", "Home", "End"];
+      if (!keys.includes(event.key)) return;
+      event.preventDefault();
+      event.stopPropagation();
+      const buttons = Array.from(
+        this.listEl?.querySelectorAll?.(".file-open") || [],
+      );
+      const index = buttons.indexOf(nameEl);
+      const next =
+        event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? buttons.length - 1
+            : Math.max(
+                0,
+                Math.min(
+                  buttons.length - 1,
+                  index + (event.key === "ArrowDown" ? 1 : -1),
+                ),
+              );
+      buttons[next]?.focus();
+    });
 
     // Git status decoration (VS Code style): a single-letter badge + color
     // class threaded in via snapshot.decorations (keyed by absolute path).
@@ -829,6 +1119,12 @@ class FileExplorerController {
     if (folderBadgeEl) el.appendChild(folderBadgeEl);
     el.appendChild(sizeEl);
     el.appendChild(actionsEl);
+    for (const button of actionsEl.children) {
+      button.dataset.explorerAction = button.className.split(" ")[0];
+      button.tabIndex = nameEl.tabIndex;
+      button.setAttribute("aria-label", `${button.title} ${item.name}`);
+      button.addEventListener("focus", rememberRowFocus);
+    }
 
     el.addEventListener("click", () => {
       if (item.isDir) {
@@ -867,11 +1163,17 @@ class FileExplorerController {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!normalizedWorkspaceId) return null;
 
+    if (this.currentWorkspaceId !== normalizedWorkspaceId) {
+      this.cancelNameDialog?.();
+      this.resetFileFeedback();
+      this.pendingListFocus = null;
+    }
     this.currentWorkspaceId = normalizedWorkspaceId;
     // reveal:false retargets the explorer (workspace/root/path bookkeeping)
     // without forcing it visible — a committed cwd change must not pop the
     // explorer open, only navigate it for whenever the user opens it.
     if (options.reveal !== false) this.isOpen = true;
+    this.requestedMode = mode;
     this.mode = this.resolveMode(mode);
 
     const rememberedPath =
@@ -894,7 +1196,12 @@ class FileExplorerController {
     return rememberedPath;
   }
 
-  close() {
+  // Hosts notify this controller before/when hiding its surface. Passing
+  // restoreFocus:false is useful when another surface deliberately takes over.
+  close({ restoreFocus = true } = {}) {
+    this.cancelNameDialog?.();
+    this.resetFileFeedback();
+    this.finishModalFocus({ restoreFocus });
     this.isOpen = false;
     this.dragActive = false;
     this.render();
@@ -904,6 +1211,13 @@ class FileExplorerController {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     const normalizedPath = normalizeExplorerPath(path);
     if (!normalizedWorkspaceId || !normalizedPath) return null;
+
+    if (
+      normalizedWorkspaceId === this.currentWorkspaceId &&
+      normalizedPath !== this.currentPath
+    ) {
+      this.resetFileFeedback();
+    }
 
     this.store.setWorkspacePath(normalizedWorkspaceId, normalizedPath);
     if (normalizedWorkspaceId === this.currentWorkspaceId) {
@@ -1041,6 +1355,13 @@ class FileExplorerController {
 
     if (!normalizedWorkspaceId || !nextPath) return null;
 
+    if (
+      normalizedWorkspaceId === this.currentWorkspaceId &&
+      nextPath !== this.currentPath
+    ) {
+      this.resetFileFeedback();
+    }
+
     const requestId = ++this.loadSequence;
     this.pendingLoadByWorkspace.set(normalizedWorkspaceId, requestId);
 
@@ -1122,43 +1443,560 @@ class FileExplorerController {
     );
   }
 
+  resetFileFeedback({ locationChanged = true } = {}) {
+    this.fileFeedbackGeneration += 1;
+    if (locationChanged) this.fileLocationGeneration += 1;
+    this.fileNotice = null;
+    this.renderFileNotice();
+    this.closeTrash({ restoreFocus: false });
+  }
+
+  fileContext() {
+    return {
+      workspaceId: this.currentWorkspaceId,
+      path: this.currentPath,
+      generation: this.fileFeedbackGeneration,
+      locationGeneration: this.fileLocationGeneration,
+    };
+  }
+
+  isFileLocationCurrent(context) {
+    return (
+      !this.disposed &&
+      context.locationGeneration === this.fileLocationGeneration &&
+      context.workspaceId === this.currentWorkspaceId &&
+      context.path === this.currentPath
+    );
+  }
+
+  isFileContextCurrent(context) {
+    return (
+      this.isFileLocationCurrent(context) &&
+      context.generation === this.fileFeedbackGeneration
+    );
+  }
+
+  renderFileNotice() {
+    const container = this.fileNoticeEl;
+    if (!container) return;
+    const focusedUndo =
+      container.contains(document.activeElement) &&
+      document.activeElement?.classList?.contains("file-trash-undo");
+    container.innerHTML = "";
+    container.hidden = !this.fileNotice;
+    if (!this.fileNotice) return;
+    const message = document.createElement("span");
+    message.setAttribute("role", this.fileNotice.error ? "alert" : "status");
+    message.textContent = this.fileNotice.message;
+    container.appendChild(message);
+    if (this.fileNotice.undo) {
+      const undo = document.createElement("button");
+      undo.type = "button";
+      undo.className = "btn file-trash-undo";
+      undo.textContent = this.fileNotice.busy ? "Restoring…" : "Undo";
+      undo.setAttribute("aria-disabled", String(Boolean(this.fileNotice.busy)));
+      undo.addEventListener("click", () => void this.undoDelete());
+      container.appendChild(undo);
+      if (focusedUndo) undo.focus();
+    }
+  }
+
   async deleteItem(path, isDir = false, workspaceId = this.currentWorkspaceId) {
     const targetPath = normalizeExplorerPath(path);
     const normalizedWorkspaceId = String(workspaceId || "").trim();
-    if (!this.fetchImpl || !targetPath || !normalizedWorkspaceId) return false;
-
-    const shouldDelete = this.confirmImpl(
-      `Delete ${isDir ? "folder" : "file"}?\n${targetPath}`,
-    );
-    if (!shouldDelete) return false;
-
+    if (
+      this.disposed ||
+      !this.fetchImpl ||
+      !targetPath ||
+      !normalizedWorkspaceId ||
+      normalizedWorkspaceId !== this.currentWorkspaceId
+    )
+      return false;
+    if (
+      !this.confirmImpl(
+        `Move ${isDir ? "folder" : "file"} to Trash?\n${targetPath}\nYou can restore it from Trash until it is permanently deleted.`,
+      )
+    )
+      return false;
+    this.resetFileFeedback({ locationChanged: false });
+    const context = this.fileContext();
     try {
       const res = await this.fetchImpl(
         `/api/files?path=${encodeURIComponent(targetPath)}`,
         { method: "DELETE" },
       );
       const payload = await res.json().catch(() => ({}));
-      // Disposed mid-delete: store/DOM are gone — stop before touching them.
-      if (this.disposed) return false;
-      if (!res.ok) {
-        this.alertImpl(explainApiError(payload, "Failed to delete"));
-        return false;
-      }
-
-      const selectedItem = this.getSelectedItem(normalizedWorkspaceId);
-      if (selectedItem?.path === targetPath) {
+      if (!this.isFileLocationCurrent(context)) return false;
+      if (!res.ok || payload.error)
+        throw new Error(
+          explainApiError(payload, "Could not move item to Trash"),
+        );
+      if (!payload.trash?.id || !payload.root)
+        throw new Error(
+          "The server did not confirm a recoverable Trash item. Refresh the file list and check Trash.",
+        );
+      if (this.getSelectedItem(normalizedWorkspaceId)?.path === targetPath)
         this.setSelectedItem(normalizedWorkspaceId, null);
-      }
-
-      await this.loadDir(
-        this.getWorkspacePath(normalizedWorkspaceId) || "/",
-        normalizedWorkspaceId,
-      );
+      await this.loadDir(context.path, context.workspaceId);
+      if (!this.isFileLocationCurrent(context)) return false;
+      if (this.trashDialog) await this.loadTrashDialog(this.trashDialog);
+      if (!this.isFileLocationCurrent(context)) return false;
+      // A later action owns the notice, but cannot suppress this successful
+      // mutation's refresh of the folder that is still being viewed.
+      if (!this.isFileContextCurrent(context)) return true;
+      this.fileNotice = {
+        message: `Moved ${targetPath.split("/").pop()} to Trash.`,
+        undo: { id: payload.trash.id, root: payload.root },
+        context,
+      };
+      this.renderFileNotice();
       return true;
     } catch (err) {
-      this.alertImpl(`Failed: ${err instanceof Error ? err.message : err}`);
+      if (this.isFileContextCurrent(context)) {
+        this.fileNotice = {
+          error: true,
+          message:
+            err instanceof Error ? err.message : "Could not move item to Trash",
+        };
+        this.renderFileNotice();
+      }
       return false;
     }
+  }
+
+  async requestTrashMutation(operation, root, id) {
+    const key = JSON.stringify([root, id]);
+    if (this.pendingTrashMutations.has(key)) {
+      throw new Error("This item already has an operation in progress.");
+    }
+    const context = this.fileContext();
+    const originalDialog = this.trashDialog;
+    this.pendingTrashMutations.add(key);
+    try {
+      const res = await this.fetchImpl(`/api/files/trash/${operation}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root, id }),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || payload.error) {
+        const fallback =
+          operation === "restore" && res.status === 409
+            ? "A file already exists at the original path. Rename or move that file, then try restoring again."
+            : `Could not ${operation === "restore" ? "restore" : "permanently delete"} the Trash item.`;
+        throw new Error(explainApiError(payload, fallback));
+      }
+      // A dialog reopened while the mutation ran may have loaded its old
+      // contents. Refresh that view before releasing the per-item guard.
+      if (
+        this.isFileLocationCurrent(context) &&
+        this.trashDialog &&
+        this.trashDialog !== originalDialog
+      ) {
+        await this.loadTrashDialog(this.trashDialog);
+      }
+      return payload;
+    } finally {
+      this.pendingTrashMutations.delete(key);
+      if (this.trashDialog) this.renderTrashDialog(this.trashDialog);
+    }
+  }
+
+  async undoDelete() {
+    const notice = this.fileNotice;
+    if (
+      !notice?.undo ||
+      notice.busy ||
+      !this.isFileContextCurrent(notice.context)
+    )
+      return false;
+    notice.busy = true;
+    this.renderFileNotice();
+    try {
+      await this.requestTrashMutation(
+        "restore",
+        notice.undo.root,
+        notice.undo.id,
+      );
+      if (!this.isFileLocationCurrent(notice.context)) return false;
+      await this.loadDir(notice.context.path, notice.context.workspaceId);
+      if (!this.isFileLocationCurrent(notice.context)) return false;
+      if (
+        !this.isFileContextCurrent(notice.context) ||
+        this.fileNotice !== notice
+      )
+        return true;
+      const heldFocus =
+        typeof document !== "undefined" &&
+        this.fileNoticeEl?.contains?.(document.activeElement);
+      this.fileNotice = { message: "Item restored from Trash." };
+      this.renderFileNotice();
+      // Undo removes its own button; keep keyboard focus in the file list.
+      if (heldFocus)
+        this.listEl?.querySelector?.(".file-open[tabindex='0']")?.focus?.();
+      return true;
+    } catch (err) {
+      if (
+        this.isFileContextCurrent(notice.context) &&
+        this.fileNotice === notice
+      ) {
+        notice.busy = false;
+        notice.error = true;
+        notice.message =
+          err instanceof Error ? err.message : "Could not restore the item.";
+        this.renderFileNotice();
+      }
+      return false;
+    }
+  }
+
+  async openTrash() {
+    if (this.disposed || !this.fetchImpl || !this.currentPath) return false;
+    this.resetFileFeedback({ locationChanged: false });
+    const state = {
+      context: this.fileContext(),
+      root: null,
+      items: [],
+      loading: true,
+      busy: false,
+      error: "",
+      message: "Loading Trash…",
+      dialog: null,
+      opener: typeof document !== "undefined" ? document.activeElement : null,
+    };
+    this.trashDialog = state;
+    this.showTrashDialog(state);
+    return this.loadTrashDialog(state);
+  }
+
+  async loadTrashDialog(state) {
+    if (!this.isTrashDialogCurrent(state)) return false;
+    const requestId = (state.loadGeneration || 0) + 1;
+    state.loadGeneration = requestId;
+    state.loading = true;
+    state.error = "";
+    if (!state.busy) state.message = "Loading Trash…";
+    this.renderTrashDialog(state);
+    try {
+      const res = await this.fetchImpl(
+        `/api/files/trash?path=${encodeURIComponent(state.context.path)}`,
+      );
+      const payload = await res.json().catch(() => ({}));
+      if (
+        !this.isTrashDialogCurrent(state) ||
+        state.loadGeneration !== requestId
+      )
+        return false;
+      if (!res.ok || payload.error)
+        throw new Error(explainApiError(payload, "Could not load Trash"));
+      if (!payload.root || !Array.isArray(payload.items))
+        throw new Error("Invalid Trash response. Refresh and try again.");
+      state.root = payload.root;
+      state.items = payload.items;
+      state.loading = false;
+      if (!state.busy) state.message = "";
+      this.renderTrashDialog(state);
+      return true;
+    } catch (err) {
+      if (
+        this.isTrashDialogCurrent(state) &&
+        state.loadGeneration === requestId
+      ) {
+        state.loading = false;
+        state.items = [];
+        state.message = "";
+        state.error =
+          err instanceof Error ? err.message : "Could not load Trash";
+        this.renderTrashDialog(state);
+      }
+      return false;
+    }
+  }
+
+  isTrashDialogCurrent(state) {
+    return (
+      this.trashDialog === state && this.isFileContextCurrent(state.context)
+    );
+  }
+
+  showTrashDialog(state) {
+    if (typeof document === "undefined" || !document.body) return;
+    const dialog = document.createElement("dialog");
+    if (typeof dialog.showModal !== "function") return;
+    dialog.className = "file-name-dialog file-trash-dialog";
+    dialog.setAttribute("aria-label", "Trash");
+    const header = document.createElement("div");
+    header.className = "file-trash-header";
+    const title = document.createElement("h2");
+    title.textContent = "Trash";
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn btn-secondary";
+    close.textContent = "Close";
+    close.setAttribute("aria-label", "Close Trash");
+    close.addEventListener("click", () => this.closeTrash());
+    header.appendChild(title);
+    header.appendChild(close);
+    const location = document.createElement("p");
+    location.className = "file-name-dialog-location";
+    const policy = document.createElement("p");
+    policy.textContent =
+      "Restore items until they are permanently deleted. Older items are cleaned up when you next delete a file.";
+    const status = document.createElement("p");
+    status.setAttribute("role", "status");
+    const error = document.createElement("p");
+    error.className = "file-name-dialog-error";
+    error.setAttribute("role", "alert");
+    const list = document.createElement("ul");
+    list.className = "file-trash-list";
+    for (const child of [header, location, policy, status, error, list])
+      dialog.appendChild(child);
+    Object.assign(state, {
+      dialog,
+      location,
+      statusEl: status,
+      errorEl: error,
+      listEl: list,
+      closeButton: close,
+    });
+    dialog.addEventListener("keydown", (event) => event.stopPropagation());
+    dialog.addEventListener("cancel", (event) => {
+      event.preventDefault();
+      this.closeTrash();
+    });
+    dialog.addEventListener("click", (event) => {
+      if (event.target === dialog) this.closeTrash();
+    });
+    document.body.appendChild(dialog);
+    this.renderTrashDialog(state);
+    dialog.showModal();
+    close.focus();
+  }
+
+  closeTrash({ restoreFocus = true } = {}) {
+    const state = this.trashDialog;
+    if (!state) return;
+    this.trashDialog = null;
+    const active =
+      typeof document !== "undefined" ? document.activeElement : null;
+    const heldFocus = state.dialog?.contains?.(active);
+    state.dialog?.close();
+    state.dialog?.remove();
+    if (restoreFocus && heldFocus && state.opener?.isConnected)
+      state.opener.focus({ preventScroll: true });
+  }
+
+  renderTrashDialog(state) {
+    if (!this.isTrashDialogCurrent(state) || !state.dialog) return;
+    state.location.textContent = state.root || state.context.path;
+    state.statusEl.textContent =
+      state.message ||
+      (!state.loading && !state.error && state.items.length === 0
+        ? "Trash is empty."
+        : "");
+    state.errorEl.textContent = state.error;
+    const active = document.activeElement;
+    const focus = state.listEl.contains(active)
+      ? { id: active.dataset.trashId, action: active.dataset.trashAction }
+      : null;
+    state.listEl.innerHTML = "";
+    for (const item of state.items) {
+      const row = document.createElement("li");
+      row.dataset.trashId = item.id;
+      const name = document.createElement("strong");
+      name.textContent = item.originalRelPath;
+      const detail = document.createElement("span");
+      detail.className = "file-trash-detail";
+      const deletedAt = new Date(item.deletedAt);
+      const expiresAt = new Date(item.expiresAt);
+      const cleanupDate = Number.isNaN(expiresAt.getTime())
+        ? "Cleanup date unavailable"
+        : `Eligible for cleanup from ${expiresAt.toLocaleString()}`;
+      detail.textContent = `Deleted ${Number.isNaN(deletedAt.getTime()) ? "recently" : deletedAt.toLocaleString()} · ${cleanupDate}`;
+      const actions = document.createElement("div");
+      actions.className = "file-trash-actions";
+      for (const [operation, label] of [
+        ["restore", "Restore"],
+        ["purge", "Delete permanently"],
+      ]) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = operation === "purge" ? "btn danger" : "btn";
+        button.textContent = label;
+        button.setAttribute("aria-label", `${label} ${item.originalRelPath}`);
+        button.dataset.trashId = item.id;
+        button.dataset.trashAction = operation;
+        // Keep the current action focusable while the request runs; the shared
+        // handler rejects duplicate actions and aria-disabled announces why.
+        button.setAttribute(
+          "aria-disabled",
+          String(
+            state.busy ||
+              state.loading ||
+              this.pendingTrashMutations.has(
+                JSON.stringify([state.root, item.id]),
+              ),
+          ),
+        );
+        button.addEventListener(
+          "click",
+          () => void this.mutateTrashItem(operation, item, state),
+        );
+        actions.appendChild(button);
+      }
+      for (const child of [name, detail, actions]) row.appendChild(child);
+      state.listEl.appendChild(row);
+    }
+    if (focus) {
+      const buttons = Array.from(state.listEl.querySelectorAll("button"));
+      const target = buttons.find(
+        (button) =>
+          button.dataset.trashId === focus.id &&
+          button.dataset.trashAction === focus.action,
+      );
+      (target || buttons[0] || state.closeButton).focus();
+    }
+  }
+
+  async mutateTrashItem(operation, item, state = this.trashDialog) {
+    if (
+      !state ||
+      !this.isTrashDialogCurrent(state) ||
+      state.busy ||
+      state.loading ||
+      !state.root ||
+      this.pendingTrashMutations.has(JSON.stringify([state.root, item.id])) ||
+      !["restore", "purge"].includes(operation)
+    )
+      return false;
+    if (
+      operation === "purge" &&
+      !this.confirmImpl(
+        `Permanently delete ${item.originalRelPath}?\nThis cannot be undone.`,
+      )
+    )
+      return false;
+    state.busy = true;
+    state.error = "";
+    state.message =
+      operation === "restore" ? "Restoring…" : "Deleting permanently…";
+    this.renderTrashDialog(state);
+    try {
+      await this.requestTrashMutation(operation, state.root, item.id);
+      if (!this.isFileLocationCurrent(state.context)) return false;
+      if (operation === "restore")
+        await this.loadDir(state.context.path, state.context.workspaceId);
+      if (!this.isFileLocationCurrent(state.context)) return false;
+      if (!this.isTrashDialogCurrent(state)) return true;
+      state.items = state.items.filter((entry) => entry.id !== item.id);
+      state.busy = false;
+      state.message =
+        operation === "restore"
+          ? "Item restored."
+          : "Item permanently deleted.";
+      this.renderTrashDialog(state);
+      return true;
+    } catch (err) {
+      if (this.isTrashDialogCurrent(state)) {
+        state.busy = false;
+        state.message = "";
+        state.error =
+          err instanceof Error ? err.message : "The operation failed.";
+        this.renderTrashDialog(state);
+      }
+      return false;
+    }
+  }
+
+  async requestItemName(title, promptLabel, initialValue = "", directory = "") {
+    if (this.promptImpl) return this.promptImpl(promptLabel, initialValue);
+    if (typeof document === "undefined" || !document.body) {
+      return getDefaultPromptImpl()(promptLabel, initialValue);
+    }
+    const dialog = document.createElement("dialog");
+    if (typeof dialog.showModal !== "function") {
+      return getDefaultPromptImpl()(promptLabel, initialValue);
+    }
+    this.cancelNameDialog?.();
+    const previouslyFocused = document.activeElement;
+    dialog.className = "file-name-dialog";
+    dialog.setAttribute("aria-label", title);
+    const form = document.createElement("form");
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    const location = document.createElement("p");
+    location.className = "file-name-dialog-location";
+    location.textContent = directory;
+    const label = document.createElement("label");
+    label.textContent = promptLabel;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = "name";
+    input.required = true;
+    input.value = initialValue;
+    input.autocomplete = "off";
+    input.spellcheck = false;
+    label.appendChild(input);
+    const error = document.createElement("p");
+    error.className = "file-name-dialog-error";
+    error.setAttribute("role", "alert");
+    const actions = document.createElement("div");
+    actions.className = "file-name-dialog-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "primary";
+    submit.textContent = initialValue ? "Rename" : "Create";
+    actions.appendChild(cancel);
+    actions.appendChild(submit);
+    for (const child of [heading, location, label, error, actions])
+      form.appendChild(child);
+    dialog.appendChild(form);
+    document.body.appendChild(dialog);
+    return new Promise((resolveName) => {
+      let finished = false;
+      const finish = (value) => {
+        if (finished) return;
+        finished = true;
+        this.cancelNameDialog = null;
+        dialog.close();
+        dialog.remove();
+        if (previouslyFocused?.isConnected) previouslyFocused.focus();
+        resolveName(value);
+      };
+      this.cancelNameDialog = () => finish(null);
+      cancel.addEventListener("click", () => finish(null));
+      dialog.addEventListener("cancel", (event) => {
+        event.preventDefault();
+        finish(null);
+      });
+      dialog.addEventListener("keydown", (event) => {
+        // Keep modal keystrokes out of shell shortcuts and surface handlers.
+        event.stopPropagation();
+      });
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const value = input.value.trim();
+        if (
+          !value ||
+          value === "." ||
+          value === ".." ||
+          /[\\/\0]/.test(value)
+        ) {
+          error.textContent =
+            "Enter a name without slashes. Choose the destination folder before creating or renaming.";
+          input.setAttribute("aria-invalid", "true");
+          input.focus();
+          return;
+        }
+        finish(value);
+      });
+      dialog.showModal();
+      input.focus();
+      input.select();
+    });
   }
 
   async createFolder(
@@ -1166,6 +2004,7 @@ class FileExplorerController {
     folderName = null,
     workspaceId = this.currentWorkspaceId,
   ) {
+    if (this.disposed) return false;
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     const basePath =
       normalizeExplorerPath(path) ||
@@ -1175,9 +2014,17 @@ class FileExplorerController {
     const nextFolderName =
       typeof folderName === "string" ? folderName.trim() : "";
     const resolvedFolderName =
-      nextFolderName || String(this.promptImpl("Folder name:") || "").trim();
+      nextFolderName ||
+      String(
+        (await this.requestItemName(
+          "New folder",
+          "Folder name:",
+          "",
+          basePath,
+        )) || "",
+      ).trim();
 
-    if (!resolvedFolderName) return false;
+    if (this.disposed || !resolvedFolderName) return false;
 
     try {
       const targetPath = joinExplorerPath(basePath, resolvedFolderName);
@@ -1270,16 +2117,24 @@ class FileExplorerController {
 
     const nextFileName = typeof fileName === "string" ? fileName.trim() : "";
     const resolvedFileName =
-      nextFileName || String(this.promptImpl("File name:") || "").trim();
+      nextFileName ||
+      String(
+        (await this.requestItemName("New file", "File name:", "", basePath)) ||
+          "",
+      ).trim();
 
-    if (!resolvedFileName) return false;
+    if (this.disposed || !resolvedFileName) return false;
 
     try {
       const targetPath = joinExplorerPath(basePath, resolvedFileName);
       const res = await this.fetchImpl("/api/files/content", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: targetPath, content: "" }),
+        body: JSON.stringify({
+          path: targetPath,
+          content: "",
+          createOnly: true,
+        }),
       });
       const payload = await res.json().catch(() => ({}));
       // Disposed mid-create: skip the follow-up reload of the now-null store.
@@ -1305,13 +2160,17 @@ class FileExplorerController {
     const normalizedWorkspaceId = String(workspaceId || "").trim();
     if (!this.fetchImpl || !item?.path || !item?.name) return false;
 
-    const newName = String(
-      this.promptImpl("Rename to:", item.name) || "",
-    ).trim();
-    if (!newName || newName === item.name) return false;
-
     // Build the target path in the same directory as the source.
     const dirPath = item.path.split("/").slice(0, -1).join("/") || "/";
+    const newName = String(
+      (await this.requestItemName(
+        "Rename item",
+        "Rename to:",
+        item.name,
+        dirPath,
+      )) || "",
+    ).trim();
+    if (this.disposed || !newName || newName === item.name) return false;
     const toPath = joinExplorerPath(dirPath, newName);
 
     try {

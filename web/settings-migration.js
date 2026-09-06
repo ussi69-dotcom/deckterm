@@ -32,6 +32,12 @@ const LEGACY_KEY_MAP = {
   "opencode-web-dir": "files.defaultCwd",
 };
 
+// Earlier builds wrote the diff layout under this unadvertised key. Preserve a
+// chosen layout when moving to the schema's canonical git.diffMode key.
+const DEPRECATED_STORE_KEY_MAP = {
+  "git.diffLayout": "git.diffMode",
+};
+
 // Detect whether the store already holds a key, working for any store exposing
 // either has(key) or get(key, fallback) (presence-by-sentinel for the latter).
 const ABSENT = Symbol("absent");
@@ -81,9 +87,49 @@ function migrateLegacySettings(storage, store, schema) {
   return result;
 }
 
+function migrateDeprecatedStoreSettings(store, schema) {
+  const result = { migrated: [], activationMarked: false };
+  if (!store) return result;
+  const list = schema || MigrationSchema?.SETTINGS_SCHEMA || [];
+  const byKey = new Map(list.filter(Boolean).map((def) => [def.key, def]));
+  const coerce = MigrationSchema?.coerceValue || ((_def, raw) => raw);
+  for (const [oldKey, newKey] of Object.entries(DEPRECATED_STORE_KEY_MAP)) {
+    if (!storeHas(store, oldKey) || storeHas(store, newKey)) continue;
+    const value = store.get(oldKey, undefined);
+    store.set(newKey, coerce(byKey.get(newKey), value));
+    store.set(oldKey, null);
+    result.migrated.push(newKey);
+  }
+  // These controls were formerly stored but inert. Their first effective
+  // activation must preserve the historic safe behavior; later explicit user
+  // choices survive because this marker is never revisited.
+  const activationKey = "settings.effectiveControlsV1";
+  if (!storeHas(store, activationKey)) {
+    const interval = Number(store.get("git.autoFetchInterval", 0));
+    if (interval > 0) {
+      store.set("git.autoFetchInterval", 0);
+      result.migrated.push("git.autoFetchInterval");
+    }
+    if (store.get("workspace.confirmDestructive", true) === false) {
+      store.set("workspace.confirmDestructive", true);
+      result.migrated.push("workspace.confirmDestructive");
+    }
+    const scrollback = Number(store.get("terminal.scrollbackLimit", 10000));
+    if (Number.isFinite(scrollback) && scrollback < 10000) {
+      store.set("terminal.scrollbackLimit", 10000);
+      result.migrated.push("terminal.scrollbackLimit");
+    }
+    store.set(activationKey, true);
+    result.activationMarked = true;
+  }
+  return result;
+}
+
 const SettingsMigration = {
   migrateLegacySettings,
+  migrateDeprecatedStoreSettings,
   LEGACY_KEY_MAP,
+  DEPRECATED_STORE_KEY_MAP,
   MIGRATED_FLAG_KEY,
 };
 

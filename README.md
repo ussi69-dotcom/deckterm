@@ -9,11 +9,11 @@ It combines persistent tmux-backed shells, workspace tabs, split tiles, mobile-f
 - Persistent tmux-backed terminal sessions that survive browser reconnects and service restarts
 - Workspace tabs with split terminals, drag-to-merge behavior, linked views, and cwd-based color signals
 - Mobile-friendly terminal controls with extra keys, viewport-aware focus recovery, and image/text clipboard handling
-- Workspace-aware file explorer for browse, upload, download, mkdir, rename, and delete inside allowed roots
+- Workspace-aware file explorer for browse, upload, download, mkdir, rename, and reversible delete inside allowed roots
 - Built-in git panel and git APIs for status, diff, stage, unstage, commit, branch, checkout, log, and show
 - Agent-aware workspace badges such as `Codex` and `Codex Responding`
 - Supervised Task Runner for Codex/Claude task workspaces, check runs, judge prompts, and optional git worktrees
-- Release-based production deployment from `main` with CI verification and atomic rollout
+- Release-based production deployment from `main` with CI verification, private-state preflight, and atomic rollout
 
 ## Product Snapshot
 
@@ -75,13 +75,14 @@ nginx, systemd, and firewall guidance, see
 - Tasks opens a supervised Agent Runner surface for creating task workspaces, running checks, and launching worker/judge terminals
 - Desktop Files opens as a persistent right-side explorer while mobile Files opens as an overlay
 - Command palette stays focused on jump-layer and advanced commands rather than basic visible navigation
-- Search, font scaling, fullscreen, line wrap toggle, reconnect lifecycle overlay
+- Search, font scaling, fullscreen, line wrap toggle, reconnect lifecycle overlay, and actor-scoped settings
 - Linked view for tmux-backed sessions
 
 ### Mobile workflow
 
 - Extra keys bar with modifiers, arrows, navigation keys, and F-keys
-- Focus recovery when switching back to the active terminal
+- Focus recovery when switching back to the active terminal, including viewport changes
+- Keyboard and touch surfaces keep a visible opener for Escape, close, and focus return
 - Clipboard image upload and touch paste fallback
 - Layout fixes for narrow screens, virtual keyboards, and viewport shifts
 
@@ -91,6 +92,15 @@ nginx, systemd, and firewall guidance, see
 - Clipboard history panel
 - Large-paste warning flow
 - File explorer under allowed filesystem roots with per-workspace path memory
+- Delete moves a file or directory to an actor- and root-bound Trash on the same filesystem.
+  The Files surface offers Undo/restore; a permanent purge needs its own confirmation.
+  Restore refuses to overwrite an existing path, and expired items are cleaned up only as a
+  bounded follow-up to a later delete.
+
+Trash needs a private `.deckterm-trash` directory in each allowed root. It is deliberately
+owned `0700`: two different mapped Unix users sharing one writable root cannot share that
+Trash, so the later user receives an unavailable error and the source remains unchanged.
+DeckTerm never falls back to permanent deletion in that case.
 
 ### Git workflow
 
@@ -140,7 +150,7 @@ raw backend has no controlling tty, so the marker is silently dropped there.
 
 ## Security and Access
 
-DeckTerm supports Cloudflare Access JWT validation and trusted origins. Production should be treated as a protected internal tool, not a public terminal exposed directly to the internet.
+DeckTerm supports Cloudflare Access JWT validation and trusted origins. Production should be treated as a protected internal tool, not a public terminal exposed directly to the internet. The default bind address is loopback; public or proxy modes require exact `TRUSTED_ORIGINS` entries and Cloudflare Access requires both its team and audience settings.
 
 Relevant variables include:
 
@@ -150,6 +160,10 @@ Relevant variables include:
 - `TRUSTED_ORIGINS`
 - `ALLOWED_FILE_ROOTS`
 
+Every unsafe browser API request carries `X-DeckTerm-Request: 1`, added by the local client.
+The server applies an origin boundary, CORS, and a self-hosted-assets CSP; do not add a CDN
+script or replace the client marker with an ad-hoc fetch wrapper.
+
 ## Configuration
 
 Common runtime variables:
@@ -157,7 +171,7 @@ Common runtime variables:
 | Variable                              | Default                      | Purpose                                                                                                                                                                                                 |
 | ------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PORT`                                | `4174`                       | HTTP server port                                                                                                                                                                                        |
-| `HOST`                                | `0.0.0.0`                    | Bind address                                                                                                                                                                                            |
+| `HOST`                                | `127.0.0.1`                  | Bind address; use an explicit trusted-origin configuration before a public or proxy bind                                                                                                                |
 | `OPENCODE_WEB_DEBUG`                  | `0`                          | Debug logging                                                                                                                                                                                           |
 | `OPENCODE_WEB_MAX_TERMINALS`          | `10`                         | Global terminal cap                                                                                                                                                                                     |
 | `MAX_TERMINALS_PER_USER`              | `10`                         | Per-user cap                                                                                                                                                                                            |
@@ -211,6 +225,14 @@ Promotion model:
 3. Promote to `main`
 4. Let `Deploy Main` verify, package, and atomically deploy production
 
+The repository's release driver takes its backup, restore, preflight, and schema judgment
+tools from the active reviewed release. Its first adoption on an older installation is a
+separate reviewed bootstrap, because that older release does not yet contain the driver.
+See [docs/upgrade-and-backup-runbook.md](docs/upgrade-and-backup-runbook.md). The root-owned
+filesystem helper is also a separate host upgrade prerequisite only when
+`DECKTERM_OS_ISOLATION=1`; it is not installed by a normal application release.
+This describes the repository release flow, not the state of an installed production host.
+
 ## Testing
 
 ```bash
@@ -235,6 +257,7 @@ Project rule: browser tests target the dev environment on `4174`.
 - Frontend: Vanilla JS + xterm.js
 - Persistence: tmux
 - Auth: optional Cloudflare Access JWT validation
+- Browser assets: pinned local Lucide, diff2html, JetBrains Mono, and Nerd Font inputs
 
 ## License
 

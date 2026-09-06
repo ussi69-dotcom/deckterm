@@ -145,3 +145,17 @@ test("isDesktopSurfaceWidth uses the 768px breakpoint (A4a)", () => {
   expect(isDesktopSurfaceWidth(undefined)).toBe(false);
   expect(isDesktopSurfaceWidth("nonsense")).toBe(false);
 });
+
+test("absent or invalid snap settings preserve the default corner quadrants", () => {
+  const { normalizeSnapBehavior } = require("./surface-windows.js");
+  expect(normalizeSnapBehavior(undefined)).toBe("grid");
+  expect(normalizeSnapBehavior("invalid")).toBe("grid");
+  expect(normalizeSnapBehavior("off")).toBe("off");
+  expect(normalizeSnapBehavior("edges")).toBe("edges");
+  expect(boundsForSnapZone(computeSnapZone({ x: 1, y: 1 }))).toEqual({
+    x: 0,
+    y: 0,
+    width: 50,
+    height: 50,
+  });
+});
