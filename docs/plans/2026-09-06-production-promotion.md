@@ -1,16 +1,16 @@
 # DeckTerm one-time production promotion run card
 
-Status: prepared for review on 2026-09-06 UTC; **not executed**. This document does
-not authorize a deployment, service restart, timer installation, privileged helper
-installation, push, or off-host transfer.
+Status: **completed** under the owner's separate production authorization at 09:43:39 UTC on
+2026-09-06. This document remains the run card and execution record; it does not authorize a
+timer installation, privileged helper installation, push, or off-host transfer.
 
-Execution readiness is **blocked** until `REPAIR_RELEASE_SHA` and `ARCHIVE_SHA256` identify
-the final committed and reviewed repair. The local repair is currently uncommitted and has
-not been pushed. Do not request production approval while either value below is pending.
+The one-time bootstrap used the reviewed local source below rather than a pushed commit. The
+normal release driver is now active in production. Repository integration and publication
+remain separate work because the remote dev branch advanced independently.
 
 This run card is only for the first production release that contains the reviewed
-release-safety repair. The normal `Deploy Main` workflow deliberately stops because the
-active production release does not contain `scripts/release-state.ts` and
+release-safety repair. Before this promotion, the normal `Deploy Main` workflow would deliberately stop because the
+previously active production release did not contain `scripts/release-state.ts` and
 `scripts/restore-state.ts`. For this one promotion, the deploy driver and its sibling
 safety tools come from a private, digest-pinned copy of the exact reviewed revision. The
 incoming tree remains only `SOURCE_DIR`. After a successful promotion, later workflows
@@ -19,15 +19,15 @@ bootstrap is needed.
 
 ## Fixed boundary and release-specific inputs
 
-| Item                         | Value or required evidence                                            |
-| ---------------------------- | --------------------------------------------------------------------- |
-| Production root              | `/home/deploy/apps/deckterm/prod`                                     |
-| Shared environment           | `/home/deploy/apps/deckterm/shared/prod.env`                          |
-| Service and ports            | `deckterm.service`; live `4173`; candidate `4273`                     |
-| Observed `current` baseline  | `98f5175298adf7e6603ba90fca9d3d4aa170ab01`                            |
-| Observed `previous` baseline | `d809cabe462246c7705ed4ba0c13e2af4336fa92`                            |
-| Repair release               | `REPAIR_RELEASE_SHA`: pending the exact reviewed 40-character commit  |
-| Archive receipt              | `ARCHIVE_SHA256`: pending the SHA-256 of the packaged repair revision |
+| Item                         | Value or required evidence                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------- |
+| Production root              | `/home/deploy/apps/deckterm/prod`                                                     |
+| Shared environment           | `/home/deploy/apps/deckterm/shared/prod.env`                                          |
+| Service and ports            | `deckterm.service`; live `4173`; candidate `4273`                                     |
+| Observed `current` baseline  | `98f5175298adf7e6603ba90fca9d3d4aa170ab01`                                            |
+| Observed `previous` baseline | `d809cabe462246c7705ed4ba0c13e2af4336fa92`                                            |
+| Repair release               | `4eb15831027eb9d683e5d4fa97b75be62ef26035` (`fix/audit-repairs-20260906`, not pushed) |
+| Archive receipt              | `3aeeca6ff559bdab73a59d345db847156f8ee9800dd4d7c96f19c422c1c52f01`                    |
 
 The two baseline links and their `RELEASE_ID` files were inspected on 2026-09-06. That is
 filesystem evidence only. It does **not** claim that either release is still current,
@@ -36,17 +36,45 @@ re-establish the baseline inside the authorized change window. If any fixed path
 port, or service differs, stop and revise this run card rather than adapting it at the
 prompt.
 
-The repair release is ready for this procedure only after the final changes are committed,
-the exact diff and release scripts are approved, and the repository gates pass for that
-same commit. Use the `deckterm-<sha>.tgz` produced from `git archive` for that commit. Do
-not package a mutable or dirty checkout. Record the exact commit, archive SHA-256, review
-result, and gate result in the review packet before authorization is requested; copy those
-facts into the private on-host receipt during the authorized run.
+## Execution record
+
+The authorized bootstrap driver exited 0. Its private restored-state validation and inert
+preflight succeeded before promotion; the post-promotion exact health check reported the
+repair release and three terminals. The service main PID after promotion was `3952686`.
+Rollback schema contracts were compatible. Backup `20260906T094318Z` verified with integrity
+`ok` and database digest
+`6a530387cc44867bfdd23358e4462723bc2efc1ec6109116b7f55b4ecac48aeb`.
+
+Five selected physical tmux pane creation/PID/dead-state tuples and their selected catalog
+fields were identical before and after. The initial strict baseline exposed two physical panes
+whose catalog rows had already ended on 2026-08-10 and 2026-08-11. A separately reviewed
+supplement compared the three active and two already-ended selected tuples unchanged; it did
+not revive, kill, or correct a terminal or database row. Its exact systemd `WorkingDirectory`,
+`EnvironmentFiles`, and `KillMode` gates passed before and after. The supplement's script and
+review remain only in the private receipt, along with raw catalog and journal evidence.
+
+Independent post-promotion security review approved the deployment: all 434 released regular files
+and all six driver hashes matched the archive, selected tmux/catalog/service comparisons remained
+exact, and the live database integrity check was `ok`. The bounded service journal had 53 lines
+with no error, failure, or fatal record. Private application-boundary checks also found six
+representative deployed frontend/backend files matching the archive, unauthenticated loopback
+`/` and `/api/settings` returning `401`, and a public browser reaching Cloudflare Access sign-in.
+
+An authenticated manual browser render/action smoke remains pending because no authenticated
+browser session or cookie was available. No full browser suite was run against production port 4173.
+
+This procedure required an exact reviewed source and archive receipt, not a push. The deployed
+archive was verified against the release above and its digest before the authorized run. The
+private on-host receipt records the review and operational evidence; this repository retains
+only the safe summary in [the production promotion record](../audits/2026-09-06-production-promotion.md).
+
+The commands below are the retained procedure, not a request to rerun the completed bootstrap.
+The private receipt preserves the exact commands used and the reviewed continuity supplement.
 
 ## 1. Pin and transfer the reviewed artifact
 
-On the trusted review workstation, set the final values and verify the downloaded CI
-artifact. Each placeholder must be replaced before opening the production change window:
+On the trusted review workstation, set the final values and verify the packaged git archive. This run used a local archive
+of the committed revision; no CI artifact was downloaded. Each placeholder must be replaced before opening the production change window:
 
 ```bash
 REPAIR_RELEASE_SHA=PENDING_REVIEWED_40_HEX_COMMIT
@@ -240,12 +268,21 @@ creation time, null `ended_at`, execution kind, and OS UID. New terminals create
 window do not invalidate the subset comparison. Any missing or changed baseline row is a
 failed continuity gate even when health is green.
 
+**Execution addendum:** this strict active-row precondition did not describe the legacy
+baseline found in the authorized window: two of five selected physical panes already had ended
+catalog rows. The separately reviewed private supplement replaced that comparison with exact
+before/after preservation of all five selected tuples, classified as three active and two
+already-ended. It made no terminal, tmux, or database correction. The recorded result passed;
+the historical catalog discrepancy remains open rather than being hidden by this procedure.
+
 Then inspect the bounded service journal for this interval and perform one owner-selected
 gated application action. Record those results without copying credentials, environment
-values, terminal contents, or workspace inventories. This manually authorized bootstrap
-has its own receipt; do not rerun the failed `Deploy Main` job for the same SHA because its
-release directory now exists. The next new commit is the first normal workflow-managed
-promotion and must use the active reviewed driver.
+values, terminal contents, or workspace inventories. The journal evidence is private. The
+authenticated manual browser action was not executed because no authenticated session was
+available; it remains a follow-up, rather than a passed smoke. This manually authorized
+bootstrap has its own receipt; do not rerun the failed `Deploy Main` job for the same SHA
+because its release directory now exists. The next new commit is the first normal
+workflow-managed promotion and must use the active reviewed driver.
 
 ```bash
 journalctl --user -u deckterm.service --since "$(cat "$RECEIPT_ROOT/started-at.txt")" --until "$(cat "$RECEIPT_ROOT/completed-at.txt")" --no-pager > "$RECEIPT_ROOT/deckterm.journal"
@@ -304,9 +341,10 @@ The local timer does not provide disaster recovery by itself. The off-host desti
 failure-notification receiver are still pending owner selection. Do not invent or enable an
 off-host transfer as part of this promotion.
 
-## Preparation record
+## Scope record
 
-Creating this run card did not deploy or restart production, create a production backup,
-install a timer or privileged helper, change an isolation setting, push a commit, or copy
-data off host. The existing development backup timer and its 2026-09-06 isolated verified
-restore remain recorded in the main upgrade and backup runbook.
+Creating the run card itself made no production change. The later, separately authorized
+bootstrap did deploy and restart production and created its verified pre-promotion backup.
+It did not install a production timer or privileged helper, change isolation, push a commit,
+or copy data off host. The existing development backup timer and its 2026-09-06 isolated
+verified restore remain recorded in the main upgrade and backup runbook.
