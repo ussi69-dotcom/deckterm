@@ -353,6 +353,9 @@ export class Harness {
     init: RequestInit & { rawJwt?: string } = {},
   ): Promise<Response> {
     const headers = new Headers(init.headers);
+    // Same marker the real web client sends (web/api-client.js); without it
+    // the browser boundary rejects every mutating /api request with 403.
+    headers.set("X-DeckTerm-Request", "1");
     if (init.rawJwt) headers.set("cf-access-jwt-assertion", init.rawJwt);
     else if (persona)
       headers.set("cf-access-jwt-assertion", await this.mint(persona));
@@ -366,6 +369,7 @@ export class Harness {
     init: RequestInit = {},
   ): Promise<Response> {
     const headers = new Headers(init.headers);
+    headers.set("X-DeckTerm-Request", "1");
     if (email) headers.set("cf-access-authenticated-user-email", email);
     return fetch(`${this.baseUrl}${path}`, { ...init, headers });
   }
@@ -382,7 +386,9 @@ export class Harness {
   ): Promise<{ opened: boolean; closeCode?: number }> {
     const jwt = opts.rawJwt ?? (persona ? await this.mint(persona) : "");
     const url = `${this.baseUrl.replace(/^http/, "ws")}/ws/terminals/${terminalId}`;
-    const headers: Record<string, string> = {};
+    // A browser upgrade always carries its page origin; the boundary rejects
+    // originless cookie/JWT upgrades before authorization is even checked.
+    const headers: Record<string, string> = { origin: this.baseUrl };
     if (jwt) headers["cf-access-jwt-assertion"] = jwt;
     return await new Promise((resolve) => {
       let settled = false;
@@ -449,7 +455,7 @@ export class Harness {
 
     return await new Promise((resolve, reject) => {
       const ws = new WebSocket(url, {
-        headers: { "cf-access-jwt-assertion": jwt },
+        headers: { origin: this.baseUrl, "cf-access-jwt-assertion": jwt },
       } as never);
       let opened = false;
       ws.addEventListener("open", () => {
