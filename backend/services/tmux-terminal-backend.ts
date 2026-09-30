@@ -1,8 +1,11 @@
 import type { Subprocess } from "bun";
-import { chmod, mkdir, stat } from "node:fs/promises";
+import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { syncTmuxSessionClients } from "../tmux-client-size";
-import { buildTmuxSessionName } from "../tmux-session-names";
+import {
+  buildTmuxSessionName,
+  getTmuxSessionPrefix,
+} from "../tmux-session-names";
 import type {
   TerminalBackend,
   TerminalBackendAttachOptions,
@@ -30,7 +33,26 @@ export type TmuxTerminalBackendOptions = {
   pipeDir?: string;
   shellCommandResolver: () => Promise<string[]>;
   env?: Record<string, string | undefined>;
+  // When true, refuse to let tmux start the server implicitly. See
+  // assertExternalServerRunning() for why that matters in production.
+  requireExternalServer?: boolean;
 };
+
+export class TmuxServerUnavailableError extends Error {
+  readonly socketPath: string;
+
+  constructor(socketPath: string) {
+    super(
+      `no tmux server on ${socketPath}. The server runs in its own systemd ` +
+        `unit so that sessions survive a backend restart; starting it here ` +
+        `would put it back inside deckterm.service's control group, where the ` +
+        `next restart destroys every session. Start it with: ` +
+        `systemctl start deckterm-tmux.service`,
+    );
+    this.name = "TmuxServerUnavailableError";
+    this.socketPath = socketPath;
+  }
+}
 
 export class TmuxTerminalBackend implements TerminalBackend {
   readonly mode = "tmux" as const;
@@ -39,6 +61,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
   readonly pipeDir: string;
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
+  private readonly requireExternalServer: boolean;
   private socketDirectoryReady: Promise<void> | null = null;
 
   constructor(options: TmuxTerminalBackendOptions) {
@@ -47,6 +70,34 @@ export class TmuxTerminalBackend implements TerminalBackend {
     this.pipeDir = options.pipeDir || "/tmp/deckterm-tmux-pipes";
     this.shellCommandResolver = options.shellCommandResolver;
     this.baseEnv = options.env || process.env;
+    this.requireExternalServer = options.requireExternalServer === true;
+  }
+
+  /**
+   * Fails fast when the tmux server is expected to be supplied by its own
+   * systemd unit but is not running.
+   *
+   * Only `new-session` starts a tmux server implicitly, so this is the one
+   * place that needs the check — and it is exactly the place where an implicit
+   * start would silently reintroduce the bug this design exists to prevent: a
+   * server parented by the backend, inside deckterm.service's control group,
+   * destroyed together with the service on the next restart.
+   *
+   * `list-sessions` exits 0 against a running server even when it holds no
+   * sessions (the unit sets `exit-empty off` precisely so an idle server stays
+   * up), and nonzero when no server answers the socket.
+   */
+  private async assertExternalServerRunning(): Promise<void> {
+    if (!this.requireExternalServer) {
+      return;
+    }
+    const proc = await this.spawnTmux(["list-sessions"], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if ((await proc.exited) !== 0) {
+      throw new TmuxServerUnavailableError(this.socketPath);
+    }
   }
 
   async createSession(
@@ -62,6 +113,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
       terminalId: id,
     });
     const shellCommand = await this.shellCommandResolver();
+    await this.assertExternalServerRunning();
     const createProc = await this.spawnTmux(
       [
         "new-session",
@@ -226,6 +278,49 @@ export class TmuxTerminalBackend implements TerminalBackend {
         `tmux kill-session returned ${exitCode} for ${sessionName}`,
       );
     }
+    // The log is a full transcript of the session; once the session is gone
+    // nothing reads it again, and it used to accumulate forever.
+    await rm(this.getPipePath(sessionName), { force: true });
+  }
+
+  /**
+   * Deletes this namespace's `<session prefix>_*.log` pipe logs whose tmux
+   * session no longer exists. Sessions that ended while the service was down
+   * (or before logs were deleted on kill) leave these behind. Does nothing
+   * unless the tmux server answers: an unreachable server lists no sessions,
+   * which must not be read as "every log is an orphan". Returns the count.
+   */
+  async pruneOrphanPipeLogs(): Promise<number> {
+    const listProc = await this.spawnTmux(
+      ["list-sessions", "-F", "#{session_name}"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const output = await new Response((listProc as any).stdout).text();
+    if ((await listProc.exited) !== 0) return 0;
+    const live = new Set(
+      output
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((name) => `${name}.log`),
+    );
+    let entries: string[];
+    try {
+      entries = await readdir(this.pipeDir);
+    } catch {
+      return 0;
+    }
+    const prefix = `${getTmuxSessionPrefix(this.namespace)}_`;
+    let removed = 0;
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix) || !entry.endsWith(".log")) {
+        continue;
+      }
+      if (live.has(entry)) continue;
+      await rm(join(this.pipeDir, entry), { force: true });
+      removed += 1;
+    }
+    return removed;
   }
 
   async listSessions(prefix?: string): Promise<string[]> {
@@ -379,7 +474,9 @@ export class TmuxTerminalBackend implements TerminalBackend {
   private async ensurePipeCaptureLocked(
     sessionName: string,
   ): Promise<{ pipePath: string; pipeOffset: number }> {
-    await mkdir(this.pipeDir, { recursive: true });
+    // Pipe logs are full terminal transcripts: keep them private.
+    await mkdir(this.pipeDir, { recursive: true, mode: 0o700 });
+    await chmod(this.pipeDir, 0o700);
     const pipePath = this.getPipePath(sessionName);
     // `pipe-pane -o` TOGGLES on tmux 3.4: a second call closes an open pipe.
     // Since this runs on both create() and attach(), the pipe used to end up
@@ -394,9 +491,27 @@ export class TmuxTerminalBackend implements TerminalBackend {
       await new Response((checkProc as any).stdout).text()
     ).trim();
     await checkProc.exited;
-    if (pipeState !== "1") {
+    // The log file is created below before the pipe is armed, so an open pipe
+    // with no file here means the pane still writes somewhere else — an older
+    // release's /tmp location. Close that pipe and re-arm it here.
+    const pipeOpenHere = pipeState === "1" && (await fileExists(pipePath));
+    if (pipeState === "1" && !pipeOpenHere) {
+      const closeProc = await this.spawnTmux(["pipe-pane", "-t", sessionName], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      await closeProc.exited;
+    }
+    if (!pipeOpenHere) {
+      await writeFile(pipePath, "", { flag: "a", mode: 0o600 });
       const pipeProc = await this.spawnTmux(
-        ["pipe-pane", "-o", "-t", sessionName, `cat >> ${pipePath}`],
+        [
+          "pipe-pane",
+          "-o",
+          "-t",
+          sessionName,
+          `umask 077; exec cat >> ${shellQuote(pipePath)}`,
+        ],
         { stdout: "pipe", stderr: "pipe" },
       );
       await pipeProc.exited;
@@ -408,4 +523,17 @@ export class TmuxTerminalBackend implements TerminalBackend {
       return { pipePath, pipeOffset: 0 };
     }
   }
+}
+
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }

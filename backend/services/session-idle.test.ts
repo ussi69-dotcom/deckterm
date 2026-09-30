@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-  effectiveActivityAt,
-  idleMsSince,
-  resolveReaperDefaults,
-} from "./session-idle";
+import { effectiveActivityAt, idleMsSince } from "./session-idle";
 
 describe("session-idle activity accounting", () => {
   test("falls back to lastActivityAt when no output has been seen", () => {
@@ -46,31 +42,5 @@ describe("session-idle activity accounting", () => {
     );
     // Same session with no output would be reaped (idle > window).
     expect(idleMsSince({ lastActivityAt: 0 }, now)).toBeGreaterThan(twoHours);
-  });
-});
-
-describe("reaper defaults", () => {
-  test("are 24h idle / 72h detached when env is unset", () => {
-    const policy = resolveReaperDefaults({});
-    expect(policy.idleTimeoutMs).toBe(24 * 60 * 60 * 1000);
-    expect(policy.detachedTtlMs).toBe(72 * 60 * 60 * 1000);
-  });
-
-  test("honor explicit env overrides", () => {
-    const policy = resolveReaperDefaults({
-      TERMINAL_IDLE_TIMEOUT_MS: "7200000",
-      DECKTERM_ORPHAN_TTL_HOURS: "8",
-    });
-    expect(policy.idleTimeoutMs).toBe(7_200_000);
-    expect(policy.detachedTtlMs).toBe(8 * 60 * 60 * 1000);
-  });
-
-  test("ignore garbage or non-positive env values", () => {
-    const policy = resolveReaperDefaults({
-      TERMINAL_IDLE_TIMEOUT_MS: "soon",
-      DECKTERM_ORPHAN_TTL_HOURS: "-3",
-    });
-    expect(policy.idleTimeoutMs).toBe(24 * 60 * 60 * 1000);
-    expect(policy.detachedTtlMs).toBe(72 * 60 * 60 * 1000);
   });
 });

@@ -33,7 +33,7 @@ if (!stateDir) throw new Error("missing state dir");
 mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 mkdirSync(join(stateDir, "tmux"), { recursive: true, mode: 0o700 });
 mkdirSync(join(stateDir, "clipboard"), { recursive: true, mode: 0o700 });
-mkdirSync(join(stateDir, "tmux-pipes"), { recursive: true, mode: 0o700 });
+mkdirSync(join(stateDir, "tmux", "pipes"), { recursive: true, mode: 0o700 });
 const captureRoot = process.env.DECKTERM_CAPTURE_ROOT || join(stateDir, "capture");
 mkdirSync(captureRoot, { recursive: true, mode: 0o700 });
 const markerRelease = (() => {
@@ -49,7 +49,7 @@ db.close();
 appendFileSync(join(stateDir, "process-events.log"), JSON.stringify({ release, preflight }) + "\n");
 writeFileSync(join(stateDir, "tmux", String(process.env.TMUX_SESSION_NAMESPACE) + ".marker"), "tmux");
 writeFileSync(join(stateDir, "clipboard", "marker"), "clipboard");
-writeFileSync(join(stateDir, "tmux-pipes", "marker"), "pipe");
+writeFileSync(join(stateDir, "tmux", "pipes", "marker"), "pipe");
 writeFileSync(join(captureRoot, release + ".marker"), "capture");
 
 const reportedRelease = process.env.FAKE_HEALTH_RELEASE || release;
@@ -530,7 +530,7 @@ test("successful deploy isolates preflight, persists contracts, and rollback ver
     .split("\n")
     .map((line) => JSON.parse(line));
   expect(liveEvents).toEqual([{ release: "new-release", preflight: false }]);
-  expect(readdirSync(join(setup.liveState, "tmux"))).toEqual(["live.marker"]);
+  expect(readdirSync(join(setup.liveState, "tmux"))).toEqual(["live.marker", "pipes"]);
   expect(readdirSync(setup.liveCapture)).toEqual(["new-release.marker"]);
   const oldContract = join(
     setup.deployRoot,

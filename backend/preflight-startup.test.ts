@@ -107,7 +107,7 @@ test("preflight is inert and a second process cannot migrate/reconcile the same 
     }
     for (const path of [
       join(stateDir, "clipboard"),
-      join(stateDir, "tmux-pipes"),
+      join(stateDir, "tmux", "pipes"),
       join(dir, "capture"),
     ])
       await expect(access(path)).rejects.toThrow();

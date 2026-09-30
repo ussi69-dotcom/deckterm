@@ -1,6 +1,15 @@
 [Unit]
 Description=DeckTerm production service
 After=network.target
+# The tmux server lives in its own unit so that terminal sessions survive a
+# restart of this service — including an automatic one, such as needrestart
+# bouncing the backend after a shared-library security upgrade. Wants= rather
+# than Requires= so that a failed tmux server does not also stop the web UI;
+# with TMUX_REQUIRE_EXTERNAL_SERVER=1 the backend then refuses to create
+# terminals and says why, instead of silently starting a server in this
+# service's control group. See deploy/README.md.
+Wants=deckterm-tmux.service
+After=deckterm-tmux.service
 
 [Service]
 Type=simple
