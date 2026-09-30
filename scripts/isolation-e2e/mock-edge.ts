@@ -5,14 +5,14 @@
  * (`@hono/cloudflare-access`, used for both HTTP middleware and WS upgrades)
  * accepts.
  *
- * The trick: `@hono/cloudflare-access` builds the JWKS URL as
+ * `@hono/cloudflare-access` builds the JWKS URL as
  *   https://${CF_ACCESS_TEAM_NAME}.cloudflareaccess.com/cdn-cgi/access/certs
  * and requires `iss === https://${CF_ACCESS_TEAM_NAME}.cloudflareaccess.com`.
- * Setting CF_ACCESS_TEAM_NAME = "127.0.0.1:<port>/e2e" points that fetch at
- *   https://127.0.0.1:<port>/e2e.cloudflareaccess.com/cdn-cgi/access/certs
- * — this mock — with a matching `iss`. No product change, no header-auth
- * bypass: signature/iss/exp are all still verified against our real keypair,
- * and aud is checked server-side against CF_ACCESS_AUD.
+ * Since 0.4.0 the team name must be [A-Za-z0-9-] only, so the SUT runs with a
+ * plain team name and the test-only preload `jwks-redirect-preload.ts` sends
+ * that one certs URL (`certsUrl`) to this mock (`localCertsUrl`). No product
+ * change, no header-auth bypass: signature/iss/exp are all still verified
+ * against our real keypair, and aud is checked server-side against CF_ACCESS_AUD.
  *
  * TLS verification stays ON: the SUT trusts our one-run self-signed CA via
  * NODE_EXTRA_CA_CERTS (never NODE_TLS_REJECT_UNAUTHORIZED). The cert MUST carry
@@ -78,7 +78,17 @@ export class MockEdge {
 
   /** `CF_ACCESS_TEAM_NAME` value the SUT must run with. */
   get teamName(): string {
-    return `127.0.0.1:${this.port}/e2e`;
+    return "deckterm-e2e";
+  }
+
+  /** The URL the product fetches keys from (redirected to `localCertsUrl`). */
+  get certsUrl(): string {
+    return `${this.issuer}/cdn-cgi/access/certs`;
+  }
+
+  /** Where this mock actually serves the keys. */
+  get localCertsUrl(): string {
+    return `https://127.0.0.1:${this.port}/cdn-cgi/access/certs`;
   }
 
   /** The exact `iss` string the product will require. */

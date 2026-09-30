@@ -22,6 +22,8 @@ import {
 import { MockEdge, type Persona } from "./mock-edge.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
+// Test-only: sends the product's Cloudflare certs fetch to the mock edge.
+const JWKS_REDIRECT_PRELOAD = join(REPO_ROOT, "scripts", "isolation-e2e", "jwks-redirect-preload.ts");
 const AUD = "e2e-fixed-aud";
 
 export const PERSONAS = {
@@ -200,6 +202,8 @@ export class Harness {
       DECKTERM_OS_ISOLATION: "1",
       TMUX_BACKEND: "1",
       NODE_EXTRA_CA_CERTS: this.certPath,
+      DECKTERM_E2E_JWKS_FROM: this.edge.certsUrl,
+      DECKTERM_E2E_JWKS_TO: this.edge.localCertsUrl,
       DECKTERM_MIN_UID: "1000",
       DECKTERM_OS_USERS_GROUP: "deckterm-users",
     };
@@ -218,7 +222,7 @@ export class Harness {
     const env = baseEnv({ ...common, ...modeEnv });
     const child = spawn(
       "bun",
-      ["run", join(REPO_ROOT, "backend", "index.ts")],
+      ["--preload", JWKS_REDIRECT_PRELOAD, "run", join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
@@ -291,7 +295,7 @@ export class Harness {
     });
     const child = spawn(
       "bun",
-      ["run", join(REPO_ROOT, "backend", "index.ts")],
+      ["--preload", JWKS_REDIRECT_PRELOAD, "run", join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
