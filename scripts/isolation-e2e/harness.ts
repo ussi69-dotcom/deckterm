@@ -197,6 +197,8 @@ export class Harness {
       // Bind loopback: a test SUT is never public, and tunnel mode refuses a
       // non-loopback bind (the default HOST is 0.0.0.0 on a clean env).
       HOST: "127.0.0.1",
+      // Public and proxy modes refuse to start without explicit origins.
+      TRUSTED_ORIGINS: `http://127.0.0.1:${port}`,
       DECKTERM_STATE_DIR: this.stateDir,
       ALLOWED_FILE_ROOTS: "/home/dtalice:/home/dtbob",
       DECKTERM_OS_ISOLATION: "1",
@@ -284,6 +286,8 @@ export class Harness {
     const port = await findFreePort();
     const env = baseEnv({
       PORT: String(port),
+      // Set so a boot failure comes from the gate under test, not this guard.
+      TRUSTED_ORIGINS: `http://127.0.0.1:${port}`,
       DECKTERM_STATE_DIR:
         stateDir ?? mkdtempSync(join(this.tmpRoot, "negstate-")),
       ALLOWED_FILE_ROOTS: "/home/dtalice:/home/dtbob",
