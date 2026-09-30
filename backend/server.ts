@@ -425,7 +425,9 @@ const TMUX_SOCKET_PATH = getTmuxSocketPath({
   namespace: TMUX_SESSION_NAMESPACE,
   stateDir: DECKTERM_STATE_DIR,
 });
-const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
+// Pipe logs are full terminal transcripts. They sit next to the tmux socket in
+// the per-instance state dir (0700), not in a shared world-readable /tmp dir.
+const TMUX_PIPE_DIR = join(dirname(TMUX_SOCKET_PATH), "pipes");
 // In production the tmux server is supplied by deckterm-tmux.service, so that
 // sessions survive a restart of this service. Letting tmux start the server
 // implicitly here would parent it to deckterm.service instead, and the next
@@ -1044,6 +1046,10 @@ async function recoverTmuxSessions(): Promise<number> {
   try {
     const sessions =
       await tmuxTerminalBackend!.listSessions(TMUX_SESSION_PREFIX);
+    const prunedLogs = await tmuxTerminalBackend!.pruneOrphanPipeLogs(sessions);
+    if (prunedLogs > 0) {
+      console.log(`[tmux] Removed ${prunedLogs} orphaned pipe log(s)`);
+    }
     if (sessions.length === 0) return 0;
 
     let recovered = 0;

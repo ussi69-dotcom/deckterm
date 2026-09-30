@@ -95,8 +95,9 @@ than `Requires=` so a broken tmux server does not take the web UI down with it.
 
 Sessions cannot be moved between control groups. Adopting this costs **one last
 restart that destroys the current sessions** — after that they are protected.
-Check what is running in them first; scrollback is kept in
-`/tmp/deckterm-tmux-pipes/*.log`, but only until the next reboot.
+Check what is running in them first and save anything you need: each
+session's transcript (`$DECKTERM_STATE_DIR/tmux/pipes/<session>.log`) is deleted
+once the session is gone — on close, or at the latest on the next startup.
 
 ### The socket path is derived, never hardcoded
 
