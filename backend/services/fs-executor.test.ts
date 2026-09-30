@@ -106,6 +106,15 @@ describe("legacy executor", () => {
     await ex.write(root, "sub/b.txt", Buffer.from("world"));
     expect(readFileSync(join(root, "sub", "b.txt"), "utf8")).toBe("world");
   });
+  test("create is exclusive and leaves an existing file unchanged", async () => {
+    await ex.create(root, "sub/created.txt", Buffer.from("first"));
+    await expect(
+      ex.create(root, "sub/created.txt", Buffer.from("second")),
+    ).rejects.toMatchObject({ code: "exists" });
+    expect(readFileSync(join(root, "sub", "created.txt"), "utf8")).toBe(
+      "first",
+    );
+  });
   test("mkdir / rename / remove", async () => {
     await ex.mkdir(root, "d1");
     await ex.rename(root, "sub/b.txt", "d1/c.txt");
@@ -181,6 +190,29 @@ describe("brokered executor", () => {
     const req = JSON.parse(calls[0]!.stdin as string);
     expect(Buffer.from(req.contentB64, "base64").toString()).toBe("data");
     expect(req.expectedMode).toBe(0o600);
+  });
+
+  test("create uses a distinct helper op so an older helper fails closed", async () => {
+    const { fn, calls } = mockBroker((opts) => {
+      const req = JSON.parse(opts.stdin as string);
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: false,
+          code: "bad_request",
+          message: `unknown op: ${req.op}`,
+        }),
+        stderr: "",
+      };
+    });
+    const ex = getFsExecutor(
+      { kind: "brokered", ...IDENT },
+      { brokerExecFn: fn },
+    );
+    await expect(
+      ex.create("/home/alice", "new.txt", Buffer.from("data")),
+    ).rejects.toMatchObject({ code: "bad_request" });
+    expect(JSON.parse(calls[0]!.stdin as string).op).toBe("create");
   });
 
   test("helper {ok:false} maps to FsExecError with its code", async () => {

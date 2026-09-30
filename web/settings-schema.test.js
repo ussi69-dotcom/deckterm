@@ -94,6 +94,24 @@ describe("SETTINGS_SCHEMA shape", () => {
     expect(values).toEqual(["auto", "default"]);
   });
 
+  test("window snapping defaults to grid to preserve historic corner snapping", () => {
+    const def = byKey("windows.snapBehavior");
+    expect(def.default).toBe("grid");
+    expect(def.options.map((option) => option.value)).toEqual([
+      "off",
+      "edges",
+      "grid",
+    ]);
+  });
+
+  test("destructive confirmation is explicitly scoped to Git actions", () => {
+    const def = byKey("workspace.confirmDestructive");
+    expect(def.label).toBe("Confirm destructive Git actions");
+    expect(def.description).toContain("Git file change");
+    expect(def.description).toContain("Git stash");
+    expect(def.default).toBe(true);
+  });
+
   test("completion notifications expose mode, volume, push, and several sounds", () => {
     const mode = byKey("notifications.soundMode");
     const sound = byKey("notifications.sound");

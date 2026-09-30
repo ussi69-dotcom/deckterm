@@ -1,3 +1,30 @@
+import {
+  initTrashSchema,
+  isReservedTrashPath,
+  containsManagedTrash,
+  trashPath,
+  listTrashItems,
+  restoreTrashItem,
+  purgeTrashItem,
+  purgeExpiredTrashItems,
+  FileTrashError,
+  type FileTrashBinding,
+} from "./services/file-trash";
+import {
+  boundedRequest,
+  transferBudget,
+  TransferError,
+  UPLOAD_MAX_BYTES,
+  MULTIPART_OVERHEAD_BYTES,
+  streamLegacyDownload,
+  downloadHeaders,
+} from "./services/transfers";
+import { acquireStateOwnership } from "./services/state-ownership";
+import {
+  browserRequestAllowed,
+  configuredBrowserBoundary,
+  SECURITY_HEADERS,
+} from "./services/browser-boundary";
 import { Hono } from "hono";
 import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
@@ -25,6 +52,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { assertPortAvailable } from "./port-probe";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   classifyAgentOutputPhase,
@@ -68,6 +96,15 @@ import {
 } from "./services/retention";
 import { createTerminalRateLimiter } from "./services/terminal-rate-limiter";
 import { idleMsSince } from "./services/session-idle";
+import {
+  isReaperEnabled,
+  resolveReaperWindows,
+} from "./services/session-reaper-policy";
+import {
+  evaluateTmuxPersistence,
+  getServiceLifecycle,
+  pickDefaultTerminalCwd,
+} from "./service-lifecycle";
 import { listHarnessSummaries } from "./services/agent-harnesses";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
@@ -326,12 +363,15 @@ const RATE_LIMIT_GLOBAL_MAX = Math.max(
     10,
   ) || 4 * RATE_LIMIT_PER_USER_MAX,
 );
-const TERMINAL_IDLE_TIMEOUT_MS = parseInt(
-  process.env.TERMINAL_IDLE_TIMEOUT_MS || String(2 * 60 * 60 * 1000),
-  10,
-); // 2 hours default
-const DECKTERM_ORPHAN_TTL_MS_DEFAULT =
-  parseInt(process.env.DECKTERM_ORPHAN_TTL_HOURS || "8", 10) * 60 * 60 * 1000;
+// Both time-based reapers are disabled unless a deployment configures a
+// window; closing the tab is what ends a session. See session-reaper-policy.ts
+// for why, and for what a positive value restores. This supersedes the 24h/72h
+// ceilings dev shipped in f0dfe71 — a ceiling still ends a live session that
+// merely looked quiet, it just takes a day to do it.
+const {
+  idleTimeoutMs: TERMINAL_IDLE_TIMEOUT_MS,
+  detachedTtlMs: DECKTERM_ORPHAN_TTL_MS_DEFAULT,
+} = resolveReaperWindows(process.env);
 const TERMINAL_TAB_CLOSE_GRACE_MS = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TAB_CLOSE_GRACE_MS || String(15 * 60 * 1000),
@@ -413,7 +453,17 @@ const TMUX_SOCKET_PATH = getTmuxSocketPath({
   namespace: TMUX_SESSION_NAMESPACE,
   stateDir: DECKTERM_STATE_DIR,
 });
-const TMUX_PIPE_DIR = "/tmp/deckterm-tmux-pipes";
+// Pipe logs are full terminal transcripts. They sit next to the tmux socket in
+// the per-instance state dir (0700), not in a shared world-readable /tmp dir.
+const TMUX_PIPE_DIR = join(dirname(TMUX_SOCKET_PATH), "pipes");
+// In production the tmux server is supplied by deckterm-tmux.service, so that
+// sessions survive a restart of this service. Letting tmux start the server
+// implicitly here would parent it to deckterm.service instead, and the next
+// restart — including an automatic one from needrestart after a library
+// upgrade — would destroy every session. Left off by default so a local
+// checkout still works with no unit installed.
+const TMUX_REQUIRE_EXTERNAL_SERVER =
+  process.env.TMUX_REQUIRE_EXTERNAL_SERVER === "1";
 const terminalBackend: TerminalBackend = TMUX_BACKEND
   ? new TmuxTerminalBackend({
       namespace: TMUX_SESSION_NAMESPACE,
@@ -421,6 +471,7 @@ const terminalBackend: TerminalBackend = TMUX_BACKEND
       pipeDir: TMUX_PIPE_DIR,
       shellCommandResolver: resolveShellCommand,
       env: process.env,
+      requireExternalServer: TMUX_REQUIRE_EXTERNAL_SERVER,
     })
   : new RawTerminalBackend({
       shellCommandResolver: resolveShellCommand,
@@ -475,7 +526,7 @@ const ALLOWED_FILESYSTEM_ROOTS = (
   .filter(Boolean);
 
 // Clipboard image configuration
-const CLIPBOARD_IMAGES_DIR = "/tmp/deckterm-clipboard";
+const CLIPBOARD_IMAGES_DIR = join(DECKTERM_STATE_DIR, "clipboard");
 const CLIPBOARD_IMAGE_MAX_SIZE = 10 * 1024 * 1024; // 10MB
 const CLIPBOARD_IMAGE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -818,6 +869,10 @@ const rateLimitState = createTerminalRateLimiter({
 // C3 adds the admin-managed per-user policy store + UX on this seam. The
 // `policy.` settings prefix is reserved (rejected in PUT /api/settings) so
 // nothing can squat on it via actor-scoped self-service before C3.
+//
+// Both windows are 0 (= never reap) unless the deployment sets them; the
+// callers check with isReaperEnabled() before comparing. See
+// services/session-reaper-policy.ts.
 function resolveSessionPolicy(_ownerId: string): {
   idleTimeoutMs: number;
   detachedTtlMs: number;
@@ -880,11 +935,7 @@ async function cleanupClipboardImages() {
   }
 }
 
-// Run cleanup every 15 minutes
-setInterval(cleanupClipboardImages, 15 * 60 * 1000);
-// Ensure directory exists on startup (best-effort; the upload route re-validates
-// and fails the request if the dir is unsafe, rather than crashing the server).
-ensureClipboardDir().catch(() => {});
+// Clipboard initialization and cleanup start only after exclusive state ownership.
 
 export async function reconcileSessionsOnStartup(
   db: Database,
@@ -1016,6 +1067,10 @@ async function recoverTmuxSessions(): Promise<number> {
   try {
     const sessions =
       await tmuxTerminalBackend!.listSessions(TMUX_SESSION_PREFIX);
+    const prunedLogs = await tmuxTerminalBackend!.pruneOrphanPipeLogs();
+    if (prunedLogs > 0) {
+      console.log(`[tmux] Removed ${prunedLogs} orphaned pipe log(s)`);
+    }
     if (sessions.length === 0) return 0;
 
     let recovered = 0;
@@ -1212,6 +1267,9 @@ async function getFoundationState(): Promise<FoundationState> {
       stateDir: DECKTERM_STATE_DIR,
       allowedFileRoots: ALLOWED_FILESYSTEM_ROOTS,
       env: process.env,
+    }).then((state) => {
+      initTrashSchema(state.db);
+      return state;
     });
   }
   return foundationStatePromise;
@@ -1902,13 +1960,16 @@ async function resolveAllowedPath(
   inputPath: string,
   opts: { allowMissing?: boolean } = {},
 ): Promise<string | null> {
-  if (!inputPath) return null;
+  if (!inputPath || isReservedTrashPath(inputPath)) return null;
   const fs = await import("fs/promises");
   const candidatePath = resolve(inputPath);
   const roots = await getAllowedRealRoots();
   try {
     const realPath = await fs.realpath(candidatePath);
-    return isWithinAllowedRoots(realPath, roots) ? realPath : null;
+    return !isReservedTrashPath(realPath) &&
+      isWithinAllowedRoots(realPath, roots)
+      ? realPath
+      : null;
   } catch (err: unknown) {
     const error = err as { code?: string };
     if (!opts.allowMissing || error.code !== "ENOENT") {
@@ -1916,7 +1977,10 @@ async function resolveAllowedPath(
     }
     try {
       const realParent = await fs.realpath(dirname(candidatePath));
-      if (!isWithinAllowedRoots(realParent, roots)) {
+      if (
+        isReservedTrashPath(realParent) ||
+        !isWithinAllowedRoots(realParent, roots)
+      ) {
         return null;
       }
       const rel = relative(realParent, candidatePath);
@@ -1945,14 +2009,17 @@ async function resolveAllowedPath(
 async function resolveTerminalStartDir(
   inputPath: string,
 ): Promise<string | null> {
-  if (!inputPath) return null;
+  if (!inputPath || isReservedTrashPath(inputPath)) return null;
   const fs = await import("fs/promises");
   const roots = await getAllowedRealRoots();
   let candidate = resolve(inputPath);
   while (true) {
     try {
       const realPath = await fs.realpath(candidate);
-      return isWithinAllowedRoots(realPath, roots) ? realPath : null;
+      return !isReservedTrashPath(realPath) &&
+        isWithinAllowedRoots(realPath, roots)
+        ? realPath
+        : null;
     } catch (err: unknown) {
       if ((err as { code?: string }).code !== "ENOENT") return null;
       const parent = dirname(candidate);
@@ -2006,6 +2073,7 @@ const SEARCH_SECRET_EXCLUDES = [
 
 // Directories never recursed into (noise + perf).
 const SEARCH_EXCLUDE_DIRS = [
+  ".deckterm-trash",
   ".git",
   "node_modules",
   "dist",
@@ -2705,9 +2773,11 @@ async function canonicalReplaceCandidate(
   absPath: string,
   root: string,
 ): Promise<string | null> {
+  if (isReservedTrashPath(absPath)) return null;
   if (ctx.kind === "legacy") {
     try {
       const real = await realpath(absPath);
+      if (isReservedTrashPath(real)) return null;
       if (real === root || real.startsWith(`${root}/`)) return real;
       return null;
     } catch {
@@ -3488,6 +3558,12 @@ async function resolveScopedFsPath(
   | { ok: true; root: string; relPath: string; rootId: string }
   | { ok: false; status: number; body: Record<string, unknown> }
 > {
+  if (isReservedTrashPath(clientPath))
+    return {
+      ok: false,
+      status: 403,
+      body: { error: "Trash paths are reserved; use Trash to restore an item" },
+    };
   const state = await getFoundationState();
 
   if (ctx.kind === "legacy") {
@@ -3698,6 +3774,8 @@ function fsErrorResponse(c: any, err: unknown, fallbackMsg: string): Response {
       bad_request: 400,
       isolation_busy: 429,
       broker_unavailable: 503,
+      unsupported: 503,
+      identity_changed: 409,
       io_error: 400,
     };
     const status = map[err.code] ?? 400;
@@ -3715,6 +3793,16 @@ const detectGitWorktree = createGitWorktreeDetector({
   resolveAllowedPath,
 });
 
+let accessVerifier: ReturnType<typeof cloudflareAccess> | undefined;
+function getAccessVerifier() {
+  return (accessVerifier ??= cloudflareAccess(
+    CF_ACCESS_TEAM_NAME,
+    CF_ACCESS_AUD.split(",")
+      .map((aud) => aud.trim())
+      .filter(Boolean),
+  ));
+}
+
 async function authenticateWebSocketRequest(req: Request): Promise<{
   ok: boolean;
   status?: number;
@@ -3723,7 +3811,18 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
   ownerEmail: string;
   actor?: DeckTermActor;
 }> {
-  const jwt = req.headers.get("cf-access-jwt-assertion");
+  const bearer = /^Bearer\s+(\S+)$/i.exec(
+    req.headers.get("authorization") || "",
+  )?.[1];
+  if (bearer && !CF_ACCESS_TEAM_NAME)
+    return {
+      ok: false,
+      status: 401,
+      message: "Bearer validation is not configured",
+      ownerId: "",
+      ownerEmail: "",
+    };
+  const jwt = bearer || req.headers.get("cf-access-jwt-assertion");
   if (CF_ACCESS_REQUIRED && !jwt) {
     return {
       ok: false,
@@ -3743,21 +3842,27 @@ async function authenticateWebSocketRequest(req: Request): Promise<{
   };
   if (jwt && CF_ACCESS_TEAM_NAME) {
     try {
-      const { cloudflareAccess: verifyJWT } =
-        await import("@hono/cloudflare-access");
       const mockContext = {
-        req: { header: (name: string) => req.headers.get(name) },
+        req: {
+          header: (name: string) =>
+            name.toLowerCase() === "cf-access-jwt-assertion"
+              ? jwt
+              : req.headers.get(name),
+        },
+        text: (message: string, status: number) =>
+          new Response(message, { status }),
         set: (key: string, value: CloudflareAccessPayload) => {
           if (key === "accessPayload") {
             accessPayloadHolder.value = value;
           }
         },
       };
-      const middleware = verifyJWT(CF_ACCESS_TEAM_NAME);
+      const middleware = getAccessVerifier();
       await middleware(mockContext as never, async () => {});
       if (
+        !accessPayloadHolder.value ||
         !isCloudflareAudienceAllowed(
-          accessPayloadHolder.value?.aud,
+          accessPayloadHolder.value.aud,
           CF_ACCESS_AUD,
         )
       ) {
@@ -3988,6 +4093,11 @@ async function getFoundationStatus(c: {
       bootstrapped: state.bootstrap.bootstrapped,
       mode: state.bootstrap.mode,
       expectedEmail: state.bootstrap.expectedEmail,
+      // Path only (the token file itself is 0600): lets the Setup panel tell
+      // a first-time operator where the one-time token lives.
+      tokenPath: state.bootstrap.bootstrapped
+        ? null
+        : state.bootstrap.tokenPath,
     },
     roots: state.roots.map((root) => ({
       id: root.id,
@@ -5315,15 +5425,42 @@ export function createWebApp() {
     return c.json(response, 500);
   });
 
-  const hasTrustedOrigins = TRUSTED_ORIGINS.length > 0;
+  const browserBoundary = configuredBrowserBoundary(process.env);
+  app.use("/*", async (c, next) => {
+    for (const [name, value] of Object.entries(SECURITY_HEADERS))
+      c.header(name, value);
+    if (
+      c.req.path.startsWith("/api/") &&
+      !browserRequestAllowed(c.req.raw, browserBoundary)
+    ) {
+      return c.json(
+        { error: "Untrusted origin or missing X-DeckTerm-Request header" },
+        403,
+      );
+    }
+    await next();
+  });
+  const hasTrustedOrigins = browserBoundary.trustedOrigins.length > 0;
   app.use(
     "/*",
     cors({
       origin: hasTrustedOrigins
         ? (origin) =>
-            origin && TRUSTED_ORIGINS.includes(origin) ? origin : null
+            origin && browserBoundary.trustedOrigins.includes(origin)
+              ? origin
+              : null
         : "*",
       credentials: hasTrustedOrigins,
+      allowHeaders: ["Content-Type", "Authorization", "X-DeckTerm-Request"],
+      allowMethods: [
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+      ],
     }),
   );
 
@@ -5333,7 +5470,7 @@ export function createWebApp() {
   // exemption exposes nothing publicly (edge traffic still passes the CF
   // Access policy). See backend/health-allowlist.test.ts.
   if (CF_ACCESS_REQUIRED && CF_ACCESS_TEAM_NAME) {
-    const cfAccessMiddleware = cloudflareAccess(CF_ACCESS_TEAM_NAME);
+    const cfAccessMiddleware = getAccessVerifier();
     app.use("/*", async (c, next) => {
       if (c.req.path === "/api/health") {
         await next();
@@ -5353,6 +5490,43 @@ export function createWebApp() {
       await next();
     });
   }
+
+  app.use("/api/*", async (c, next) => {
+    const limit =
+      c.req.path === "/api/files/upload"
+        ? UPLOAD_MAX_BYTES + MULTIPART_OVERHEAD_BYTES
+        : c.req.path === "/api/clipboard/image"
+          ? CLIPBOARD_IMAGE_MAX_SIZE + MULTIPART_OVERHEAD_BYTES
+          : null;
+    if (limit === null || c.req.method !== "POST") return next();
+    let release: (() => void) | undefined;
+    try {
+      release = transferBudget.acquire(getCurrentUser(c).ownerId);
+      c.req.raw = await boundedRequest(c.req.raw, limit);
+      await next();
+    } catch (error) {
+      if (error instanceof TransferError)
+        return c.json({ error: error.message }, error.status);
+      throw error;
+    } finally {
+      release?.();
+    }
+  });
+
+  app.use("/api/*", async (c, next) => {
+    if (
+      (c.req.path === "/api/browse" || c.req.path.startsWith("/api/files")) &&
+      [c.req.query("path"), c.req.query("cwd")].some(
+        (path) => path && isReservedTrashPath(path),
+      )
+    ) {
+      return c.json(
+        { error: "Trash paths are reserved; use Trash to restore an item" },
+        403,
+      );
+    }
+    await next();
+  });
 
   // No-cache headers - bypass CF cache
   app.use("/*", async (c, next) => {
@@ -6896,7 +7070,16 @@ export function createWebApp() {
     if (!routeCapability) {
       return c.json({ error: "Missing route capability" }, 500);
     }
-    const requestedCwd = body.cwd || process.env.HOME || "/";
+    // No explicit cwd: start in the service home when it is an allowed root,
+    // else in the first allowed root. Defaulting blindly to $HOME rejected a
+    // fresh install's very first terminal ("Forbidden terminal root") whenever
+    // ALLOWED_FILE_ROOTS was set to a project directory instead.
+    const requestedCwd =
+      body.cwd ||
+      pickDefaultTerminalCwd({
+        home: process.env.HOME || "",
+        allowedRoots: await getAllowedRealRoots(),
+      });
     // Resolve the start dir first (side-effect-free) so BOTH capability checks
     // key on the resolved root's id, mirroring requireFileAccess. Before S1
     // (Alice/Bob e2e), terminal.create was checked on (terminal, "*") and
@@ -7948,44 +8131,49 @@ export function createWebApp() {
     return c.json({ files, truncated });
   });
 
-  // File download
+  // Downloads share a bounded per-actor/global budget with uploads.
   app.get("/api/files/download", async (c) => {
     const requestedPath = c.req.query("path");
-    if (!requestedPath) {
-      return c.json({ error: "Path required" }, 400);
-    }
+    if (!requestedPath) return c.json({ error: "Path required" }, 400);
     const execCtx = await resolveExecFsContext(c, "files");
-    if (!execCtx.ok) {
+    if (!execCtx.ok)
       return c.json(execCtx.body, { status: execCtx.status as any });
-    }
     const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
     if (!scoped.ok)
       return c.json(scoped.body, { status: scoped.status as any });
-    const fx = getFsExecutor(execCtx.ctx);
-
+    let release: (() => void) | undefined;
     try {
-      const st = await fx.statPath(scoped.root, scoped.relPath);
-      if (st.kind !== "file") {
-        return c.json({ error: "Not a file" }, 400);
+      release = transferBudget.acquire(getCurrentUser(c).ownerId);
+      if (execCtx.ctx.kind === "legacy") {
+        const response = await streamLegacyDownload(
+          scoped.root,
+          scoped.relPath,
+          c.req.raw.signal,
+          release,
+        );
+        release = undefined; // stream EOF/cancel owns the descriptor and budget
+        return response;
       }
-      // Download reuses the editor byte cap under isolation (B4 §2.2 / Codex #12);
-      // legacy is uncapped so pass through the observed size.
-      const cap =
-        execCtx.ctx.kind === "brokered" ? EDITOR_MAX_FILE_BYTES : st.size + 1;
-      const { content } = await fx.read(scoped.root, scoped.relPath, cap);
-      const filename = basename(scoped.relPath || scoped.root);
-
+      // The broker protocol remains capped at the existing editor limit.
+      const { content } = await getFsExecutor(execCtx.ctx).read(
+        scoped.root,
+        scoped.relPath,
+        EDITOR_MAX_FILE_BYTES,
+      );
       return new Response(new Uint8Array(content), {
-        headers: {
-          "Content-Type": "application/octet-stream",
-          "Content-Disposition": `attachment; filename="${filename}"`,
-          "Content-Length": String(content.length),
-        },
+        headers: downloadHeaders(
+          basename(scoped.relPath || scoped.root),
+          content.length,
+        ),
       });
-    } catch (err) {
-      if (err instanceof FsExecError)
-        return fsErrorResponse(c, err, "Cannot read file");
+    } catch (error) {
+      if (error instanceof TransferError)
+        return c.json({ error: error.message }, error.status);
+      if (error instanceof FsExecError)
+        return fsErrorResponse(c, error, "Cannot read file");
       return c.json({ error: "Cannot read file" }, 400);
+    } finally {
+      release?.();
     }
   });
 
@@ -8091,7 +8279,18 @@ export function createWebApp() {
         }
       }
 
-      await fx.write(scoped.root, scoped.relPath, Buffer.from(content, "utf8"));
+      if (body.createOnly === true)
+        await fx.create(
+          scoped.root,
+          scoped.relPath,
+          Buffer.from(content, "utf8"),
+        );
+      else
+        await fx.write(
+          scoped.root,
+          scoped.relPath,
+          Buffer.from(content, "utf8"),
+        );
       const saved = await fx.statPath(scoped.root, scoped.relPath);
 
       const state = await getFoundationState();
@@ -8106,6 +8305,8 @@ export function createWebApp() {
 
       return c.json({ ok: true, path: displayPath, mtimeMs: saved.mtimeMs });
     } catch (err) {
+      if (err instanceof FsExecError && err.code === "exists")
+        return c.json({ error: "File already exists" }, 409);
       if (err instanceof FsExecError)
         return fsErrorResponse(c, err, "Cannot write file");
       return c.json({ error: "Cannot write file", message: String(err) }, 500);
@@ -8255,14 +8456,24 @@ export function createWebApp() {
       const formData = await c.req.formData();
       const file = formData.get("file") as File | null;
 
-      if (!file) {
+      if (!(file instanceof File))
         return c.json({ error: "No file provided" }, 400);
-      }
+      const uploadCap =
+        execCtx.ctx.kind === "brokered"
+          ? EDITOR_MAX_FILE_BYTES
+          : UPLOAD_MAX_BYTES;
+      if (file.size > uploadCap)
+        return c.json(
+          { error: `File too large (max ${uploadCap / 1024 / 1024}MB)` },
+          413,
+        );
 
       const fileName = basename(file.name);
       const destRel = scoped.relPath
         ? `${scoped.relPath}/${fileName}`
         : fileName;
+      if (isReservedTrashPath(destRel))
+        return c.json({ error: "Trash path is reserved" }, 403);
       const buffer = await file.arrayBuffer();
       await fx.write(scoped.root, destRel, Buffer.from(buffer));
 
@@ -8315,7 +8526,7 @@ export function createWebApp() {
     }
   });
 
-  // Delete file or directory
+  // Delete means move to the actor-bound, same-root Trash; never a permanent fallback.
   app.delete("/api/files", async (c) => {
     const requestedPath = c.req.query("path");
     if (!requestedPath) {
@@ -8328,7 +8539,7 @@ export function createWebApp() {
     const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedPath);
     if (!scoped.ok)
       return c.json(scoped.body, { status: scoped.status as any });
-    const fx = getFsExecutor(execCtx.ctx);
+    const state = await getFoundationState();
 
     // Security: never delete a root itself. The reconstructed abs path guards the
     // legacy realpath'd roots; brokered additionally can never target the root
@@ -8340,21 +8551,107 @@ export function createWebApp() {
     if (
       scoped.relPath === "" ||
       absPath === "/" ||
-      protectedRoots.includes(absPath)
+      protectedRoots.includes(absPath) ||
+      containsManagedTrash(
+        absPath,
+        state.roots.map((root) => root.path),
+      )
     ) {
       return c.json({ error: "Cannot delete root or home directory" }, 403);
     }
 
     try {
-      const st = await fx.statPath(scoped.root, scoped.relPath);
-      await fx.remove(scoped.root, scoped.relPath, st.kind === "dir");
-      return c.json({ ok: true });
+      const binding: FileTrashBinding = {
+        actorId: resolveCanonicalOwnerId(state, getCurrentActor(c)).ownerId,
+        rootId: scoped.rootId,
+        root: scoped.root,
+        fsContext: execCtx.ctx,
+      };
+      // Cleanup is bounded and only follows an authenticated, explicit write.
+      await purgeExpiredTrashItems(state.db, binding, { limit: 10 });
+      const item = await trashPath(state.db, binding, scoped.relPath);
+      writeAuditEvent(state.db, {
+        actorUserId: binding.actorId,
+        action: "file.trash",
+        resourceType: "root",
+        resourceId: scoped.rootId,
+        decision: "allow",
+        data: { itemId: item.id },
+      });
+      return c.json({ ok: true, trash: item, root: scoped.root });
     } catch (err) {
+      if (err instanceof FileTrashError)
+        return c.json(
+          { error: err.message, reason: err.code },
+          err.code === "collision" ? 409 : 403,
+        );
       if (err instanceof FsExecError)
-        return fsErrorResponse(c, err, "Failed to delete");
+        return fsErrorResponse(c, err, "Could not move to Trash");
       return c.json({ error: "Failed to delete" }, 500);
     }
   });
+
+  const trashRequest = async (c: any, action: "list" | "restore" | "purge") => {
+    const body = action === "list" ? {} : await c.req.json().catch(() => ({}));
+    const requestedRoot = action === "list" ? c.req.query("path") : body.root;
+    if (typeof requestedRoot !== "string" || !requestedRoot)
+      return c.json({ error: "Root path required" }, 400);
+    if (action !== "list" && typeof body.id !== "string")
+      return c.json({ error: "Trash item id required" }, 400);
+    const execCtx = await resolveExecFsContext(c, "files");
+    if (!execCtx.ok) return c.json(execCtx.body, execCtx.status);
+    const scoped = await resolveScopedFsPath(c, execCtx.ctx, requestedRoot);
+    if (!scoped.ok) return c.json(scoped.body, scoped.status);
+    const state = await getFoundationState();
+    const binding: FileTrashBinding = {
+      actorId: resolveCanonicalOwnerId(state, getCurrentActor(c)).ownerId,
+      rootId: scoped.rootId,
+      root: scoped.root,
+      fsContext: execCtx.ctx,
+    };
+    try {
+      if (action === "list")
+        return c.json({
+          root: scoped.root,
+          items: await listTrashItems(state.db, binding),
+        });
+      const item =
+        action === "restore"
+          ? await restoreTrashItem(state.db, binding, body.id)
+          : await purgeTrashItem(state.db, binding, body.id);
+      writeAuditEvent(state.db, {
+        actorUserId: binding.actorId,
+        action: `file.trash.${action}`,
+        resourceType: "root",
+        resourceId: scoped.rootId,
+        decision: "allow",
+        data: { itemId: item.id },
+      });
+      return c.json({
+        ok: true,
+        item,
+        ...(action === "restore"
+          ? { path: join(scoped.root, item.originalRelPath) }
+          : {}),
+      });
+    } catch (error) {
+      if (error instanceof FileTrashError)
+        return c.json(
+          { error: error.message, reason: error.code },
+          error.code === "not_found"
+            ? 404
+            : error.code === "binding_changed"
+              ? 403
+              : 409,
+        );
+      if (error instanceof FsExecError)
+        return fsErrorResponse(c, error, "Trash operation failed");
+      throw error;
+    }
+  };
+  app.get("/api/files/trash", (c) => trashRequest(c, "list"));
+  app.post("/api/files/trash/restore", (c) => trashRequest(c, "restore"));
+  app.post("/api/files/trash/purge", (c) => trashRequest(c, "purge"));
 
   // Rename file or directory
   app.post("/api/files/rename", async (c) => {
@@ -8376,6 +8673,22 @@ export function createWebApp() {
     });
     if (!scopedTo.ok)
       return c.json(scopedTo.body, { status: scopedTo.status as any });
+    const renameState = await getFoundationState();
+    const sourcePath = scopedFrom.relPath
+      ? join(scopedFrom.root, scopedFrom.relPath)
+      : scopedFrom.root;
+    if (
+      scopedFrom.relPath === "" ||
+      containsManagedTrash(
+        sourcePath,
+        renameState.roots.map((root) => root.path),
+      )
+    ) {
+      return c.json(
+        { error: "Cannot rename a registered root or its parent" },
+        403,
+      );
+    }
     // BROKERED only: the helper resolves both endpoints beneath ONE root fd, so a
     // cross-root move is refused. LEGACY preserves the prior behavior (each
     // endpoint access-checked independently, fs.rename across allowed roots works
@@ -9700,9 +10013,10 @@ export function createWebApp() {
         const formData = await c.req.formData();
         const file = formData.get("image") as File | null;
 
-        if (!file) {
+        if (!(file instanceof File))
           return c.json({ error: "No image file provided" }, 400);
-        }
+        if (!ALLOWED_IMAGE_TYPES.includes(file.type))
+          return c.json({ error: "Invalid image type" }, 400);
 
         if (file.size > CLIPBOARD_IMAGE_MAX_SIZE) {
           return c.json({ error: "Image too large (max 10MB)" }, 400);
@@ -9808,7 +10122,31 @@ export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
   return { ok: true, terminal: await restore() };
 }
 
+// Keep the lease strongly reachable even when the entrypoint discards the Bun
+// server wrapper. Native server liveness is not a JavaScript GC ownership root.
+const activeStateOwners = new Set<{ release(): void }>();
 export async function startWebServer(host: string, port: number) {
+  const lease = acquireStateOwnership(DECKTERM_STATE_DIR);
+  const ownership = {
+    release() {
+      lease.release();
+      activeStateOwners.delete(ownership);
+    },
+  };
+  activeStateOwners.add(ownership);
+  try {
+    return await startOwnedWebServer(host, port, ownership);
+  } catch (error) {
+    ownership.release();
+    throw error;
+  }
+}
+
+async function startOwnedWebServer(
+  host: string,
+  port: number,
+  ownership: { release(): void },
+) {
   if (CF_ACCESS_REQUIRED && !CF_ACCESS_TEAM_NAME) {
     throw new Error(
       "CF_ACCESS_REQUIRED=1 but CF_ACCESS_TEAM_NAME is empty. Server-side JWT validation cannot run; refusing to start in a silently-unprotected state. Set CF_ACCESS_TEAM_NAME or unset CF_ACCESS_REQUIRED.",
@@ -9820,6 +10158,20 @@ export async function startWebServer(host: string, port: number) {
     );
   }
 
+  if (CF_ACCESS_TEAM_NAME) getAccessVerifier();
+  const boundary = configuredBrowserBoundary({
+    ...process.env,
+    HOST: host,
+    PORT: String(port),
+  });
+  if (
+    (CF_ACCESS_REQUIRED ||
+      !["", "local"].includes(process.env.DECKTERM_PUBLISH_MODE || "") ||
+      !isLoopbackHost(host)) &&
+    TRUSTED_ORIGINS.length === 0
+  ) {
+    throw new Error("Public and proxy modes require explicit TRUSTED_ORIGINS");
+  }
   // B2 (§4.4.1, B1 §1.2, invariant §7.15): `cloudflare-tunnel` publish mode
   // trusts an edge proxy for identity. On a NON-loopback bind that trust is
   // only sound if a real proxy fronts the port; refuse to start bound to a
@@ -9850,7 +10202,11 @@ export async function startWebServer(host: string, port: number) {
     process.env.CI === "true" ||
     process.env.NODE_ENV === "test" ||
     process.env.BUN_ENV === "test";
-  if (process.env.DECKTERM_OS_ISOLATION === "1" && !isCiOrTestEnv) {
+  if (
+    process.env.DECKTERM_OS_ISOLATION === "1" &&
+    !isCiOrTestEnv &&
+    process.env.DECKTERM_PREFLIGHT !== "1"
+  ) {
     const brokerOk = await brokerCheck(process.env);
     if (!brokerOk) {
       throw new Error(
@@ -9962,21 +10318,48 @@ export async function startWebServer(host: string, port: number) {
     });
   }
 
+  // Release validation migrates only its private snapshot. Do not construct the
+  // full app: task bridges, recovery, brokers and timers are operational effects.
+  if (process.env.DECKTERM_PREFLIGHT === "1") {
+    if (!isLoopbackHost(host)) throw new Error("Preflight must bind loopback");
+    const state = await getFoundationState();
+    const integrity = state.db.query("PRAGMA quick_check").get() as {
+      quick_check: string;
+    };
+    if (integrity.quick_check !== "ok")
+      throw new Error("Preflight database integrity failed");
+    const candidate = Bun.serve({
+      hostname: host,
+      port,
+      fetch(request) {
+        if (
+          request.method !== "GET" ||
+          new URL(request.url).pathname !== "/api/health"
+        )
+          return new Response("Preflight only", { status: 404 });
+        return Response.json({
+          status: "ok",
+          release: DECKTERM_RELEASE,
+          preflight: true,
+          terminals: 0,
+        });
+      },
+    });
+    const stop = candidate.stop.bind(candidate);
+    candidate.stop = async (force) => {
+      await stop(force);
+      ownership.release();
+    };
+    return candidate;
+  }
+
   // Fail fast if the port is already taken BEFORE touching recorded
   // sessions: a second instance pointed at the same state dir must not
   // reconcile (= write to) a live instance's rows (observed 2026-07-16: an
   // unpinned test-spawned child ended the dev instance's session row).
-  // Residual: a process bound to a DIFFERENT port but sharing the state dir
-  // still needs a real instance-ownership lock — backlogged.
+  // The state ownership lock also excludes instances using a different port.
   if (port !== 0) {
-    const { createServer } = await import("node:net");
-    await new Promise<void>((resolvePort, rejectPort) => {
-      const probe = createServer();
-      probe.once("error", rejectPort);
-      probe.listen(port, host, () => {
-        probe.close((err) => (err ? rejectPort(err) : resolvePort()));
-      });
-    });
+    await assertPortAvailable(port, host);
   }
 
   // Reconcile recorded sessions before starting the server: in tmux mode
@@ -10003,14 +10386,22 @@ export async function startWebServer(host: string, port: number) {
     }
   }
 
+  await ensureClipboardDir();
   const app = createWebApp();
 
   const server = Bun.serve<WsData>({
     port,
     hostname: host,
+    maxRequestBodySize: 26 * 1024 * 1024,
 
     async fetch(req, server) {
       const url = new URL(req.url);
+      if (
+        url.pathname.startsWith("/ws/") &&
+        !browserRequestAllowed(req, boundary, true)
+      ) {
+        return new Response("Untrusted WebSocket origin", { status: 403 });
+      }
 
       if (url.pathname.startsWith("/ws/terminals/")) {
         const id = url.pathname.split("/").pop();
@@ -10469,6 +10860,29 @@ export async function startWebServer(host: string, port: number) {
   });
 
   console.log(`🚀 DeckTerm running at http://${host}:${port}`);
+  const reaperWindowLabel = (ms: number) =>
+    isReaperEnabled(ms) ? `${Math.round(ms / 3_600_000)}h` : "never";
+  console.log(
+    `[reaper] policy idle=${reaperWindowLabel(TERMINAL_IDLE_TIMEOUT_MS)} detached=${reaperWindowLabel(DECKTERM_ORPHAN_TTL_MS_DEFAULT)} (a tab closed with the X still ends after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min)`,
+  );
+  // Warning-only host self-check: a unit without KillMode=process kills the
+  // tmux server on every restart — the one thing the tmux backend exists to
+  // prevent. Fire-and-forget; never blocks or fails startup.
+  void getServiceLifecycle()
+    .then((lifecycle) => {
+      const check = evaluateTmuxPersistence({
+        tmuxBackend: TMUX_BACKEND,
+        unit: lifecycle?.unit ?? null,
+        killMode: lifecycle?.killMode ?? null,
+      });
+      if (!check) return;
+      if (check.status === "warning") {
+        console.warn(`[lifecycle] ${check.message}`);
+      } else {
+        console.log(`[lifecycle] ${check.message}`);
+      }
+    })
+    .catch(() => {});
 
   const cleanupIdleTerminals = async () => {
     const now = Date.now();
@@ -10477,13 +10891,21 @@ export async function startWebServer(host: string, port: number) {
       const sockets = terminalSockets.get(id);
       const activeSocketsCount = sockets ? sockets.size : 0;
 
-      // Only clean up idle active/attached terminals. Detached terminals are reaped after 8 hours!
+      // Only attached terminals; detached ones belong to reapDetachedSessions.
       if (activeSocketsCount > 0) {
+        // Disabled unless the deployment configures a window. An attached
+        // terminal quiet at a prompt — an agent waiting for the operator to
+        // answer — is indistinguishable from an abandoned one, and ending it
+        // is the worse mistake. Resolved per owner because C3 makes the policy
+        // per user on this seam, so the check cannot move to the constant.
+        const { idleTimeoutMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(idleTimeoutMs)) continue;
+
         // Idle measured from the later of input/output: a terminal actively
         // streaming output (a running job on a tab left open) is not idle.
         const idleTime = idleMsSince(term, now);
 
-        if (idleTime > resolveSessionPolicy(term.ownerId).idleTimeoutMs) {
+        if (idleTime > idleTimeoutMs) {
           console.log(
             `[cleanup] Closing idle active terminal ${id} (idle: ${Math.round(idleTime / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
@@ -10531,6 +10953,13 @@ export async function startWebServer(host: string, port: number) {
 
       // Only reap detached sessions (0 active connections)
       if (activeSocketsCount === 0 && term.lastDetachedAt) {
+        // Disabled unless the deployment configures a window. A closed laptop
+        // is not a closed session: the ✕ is how a user says they are done, and
+        // reapScheduledTerminalClosures handles that intention. See
+        // session-reaper-policy.ts.
+        const { detachedTtlMs } = resolveSessionPolicy(term.ownerId);
+        if (!isReaperEnabled(detachedTtlMs)) continue;
+
         // Reap a detached session only once it has produced neither input NOR
         // live output for the detached TTL. Basing this on inactivity (not on
         // how long the browser has been gone) is what lets an unattended job
@@ -10538,7 +10967,7 @@ export async function startWebServer(host: string, port: number) {
         // PTY output keeps `lastOutputAt` fresh via the persistent attach.
         const inactiveMs = idleMsSince(term, now);
 
-        if (inactiveMs > resolveSessionPolicy(term.ownerId).detachedTtlMs) {
+        if (inactiveMs > detachedTtlMs) {
           console.log(
             `[reaper] Reaping expired detached terminal ${id} (inactive: ${Math.round(inactiveMs / 1000 / 60)}min, owner: ${term.ownerEmail})`,
           );
@@ -10610,9 +11039,12 @@ export async function startWebServer(host: string, port: number) {
     }
   };
 
-  setInterval(cleanupIdleTerminals, 5 * 60 * 1000);
-  setInterval(reapDetachedSessions, 15 * 60 * 1000);
-  setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS);
+  const lifecycleTimers = [
+    setInterval(cleanupClipboardImages, 15 * 60 * 1000),
+    setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
+    setInterval(reapDetachedSessions, 15 * 60 * 1000),
+    setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+  ];
 
   // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
   // durable `retention_runs` bookkeeping, so cadence survives restarts and a
@@ -10667,8 +11099,10 @@ export async function startWebServer(host: string, port: number) {
       console.error(`[retention] tick failed:`, err);
     }
   };
-  setInterval(retentionTick, 60 * 60 * 1000);
-  setTimeout(retentionTick, 60 * 1000);
+  lifecycleTimers.push(
+    setInterval(retentionTick, 60 * 60 * 1000),
+    setTimeout(retentionTick, 60 * 1000),
+  );
 
   // Deliberate service shutdown (deploy/restart). Tmux-backed sessions
   // survive the restart (state-dir-scoped socket + KillMode=process), so we
@@ -10706,10 +11140,28 @@ export async function startWebServer(host: string, port: number) {
         term.proc.kill();
       } catch {}
     }
+    ownership.release();
     process.exit(0);
   };
-  process.on("SIGINT", () => shutdownGracefully("SIGINT"));
-  process.on("SIGTERM", () => shutdownGracefully("SIGTERM"));
+  const onInt = () => shutdownGracefully("SIGINT");
+  const onTerm = () => shutdownGracefully("SIGTERM");
+  process.on("SIGINT", onInt);
+  process.on("SIGTERM", onTerm);
+  const stop = server.stop.bind(server);
+  server.stop = async (force) => {
+    await stop(force);
+    for (const timer of lifecycleTimers) clearTimeout(timer);
+    process.off("SIGINT", onInt);
+    process.off("SIGTERM", onTerm);
+    // A draining server retains ownership until process exit. Do not let a new
+    // writer enter while existing requests or sockets still access the state.
+    if (
+      server.pendingRequests === 0 &&
+      server.pendingWebSockets === 0 &&
+      terminals.size === 0
+    )
+      ownership.release();
+  };
 
   return server;
 }

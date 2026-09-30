@@ -2,9 +2,9 @@
 
 > Companion to `docs/plans/2026-07-02-b1-identity-isolation-storage-design.md` (B1). This
 > document states what DeckTerm's security architecture does and — just as important — what it
-> does **not** do. It is a prerequisite for the run-as-user work (B2/B4), not after-the-fact
-> documentation. Status: **draft — ships with B1; sections marked (planned) land with the
-> slice that implements them.**
+> does **not** do. It remains the design reference for run-as-user work (B2/B4). Sections
+> explicitly marked **(planned)** are not implemented; §5.1 and §8.2 record current repository
+> behavior without certifying any production host.
 
 ## 1. What DeckTerm is, security-wise
 
@@ -48,8 +48,8 @@ In scope (1.0 defends against):
 | Forged identity headers                                                                                                       | `cloudflare-access` mode verifies the JWT server-side (issuer/audience/signature); OIDC (C1) uses auth-code + PKCE + nonce with server-side sessions. Header-trusting `cloudflare-tunnel` mode is confined to trusted-proxy single-tenant deployments and **refuses to start on non-loopback binds** outside dev without an explicit dangerous override (§5; B2, planned). |
 | A user tampering with their own session recording                                                                             | Recordings are captured server-side from the PTY master into a service-owned store the recorded user cannot write to; the user-writable reconnect spool is never treated as evidence (C4, planned).                                                                                                                                                                        |
 | Tampering with the audit trail via DB write access                                                                            | Hash-chained audit rows anchored **outside** the database (B6/C2, planned).                                                                                                                                                                                                                                                                                                |
-| One user exhausting shared resources                                                                                          | Per-user rate limits, terminal caps, and per-session cgroup/ulimit properties fixed by the broker profile (B2/B7, planned).                                                                                                                                                                                                                                                |
-| CSRF / cross-origin WS hijack on cookie-auth deployments                                                                      | CSRF header on mutating endpoints + Origin checks on WS upgrades; `TRUSTED_ORIGINS` mandatory in prod (C1, planned).                                                                                                                                                                                                                                                       |
+| One user exhausting shared file-transfer resources                                                                            | Terminal caps and rates apply separately. Uploads and downloads share a bounded two-per-actor, eight-global transfer budget; oversized or slow uploads are rejected before multipart parsing (§5.1).                                                                                                                                                                       |
+| CSRF / cross-origin WS hijack                                                                                                 | Mutating `/api/` requests require `X-DeckTerm-Request: 1` and the configured browser-origin boundary; WebSocket upgrades validate the same origin policy before authentication (§5.1).                                                                                                                                                                                     |
 
 Out of scope in 1.0 (documented, not defended):
 
@@ -106,6 +106,35 @@ Out of scope in 1.0 (documented, not defended):
 | `cloudflare-tunnel`                                      | Forwarded email header, **unverified by the app** | **No — trusted-proxy single-tenant only** | Safe only when the app binds loopback and is reachable solely through the tunnel. Isolation mode treats these actors as unmapped (deny). |
 | legacy dev (`DECKTERM_RUNTIME_ENV=development`, CI/test) | None (`anonymous`)                                | No                                        | Dev/CI convenience; `DECKTERM_LEGACY_NO_BOOTSTRAP=1` bypass works only in these envs.                                                    |
 
+### 5.1 Current browser, WebSocket, and transfer boundary
+
+This section describes current repository behavior. It is not a certification of an
+installed production service or of its reverse proxy configuration.
+
+- `TRUSTED_ORIGINS` accepts only exact HTTP(S) origins, without a path. The server derives
+  the three standard loopback origins only for local loopback mode. A public or proxy bind,
+  and Cloudflare Access mode, refuse startup unless explicit trusted origins are configured.
+- `web/api-client.js` adds `X-DeckTerm-Request: 1` to unsafe same-origin `/api/` calls.
+  The server checks the origin before route handling and rejects cross-site or opaque-origin
+  mutations without that marker. The narrowly scoped originless compatibility path is only
+  for the explicit loopback legacy-development configuration.
+- CORS permits only a configured trusted origin when one exists, including the marker and
+  authorization headers. Security headers include a self-hosted-assets CSP: scripts are
+  `self`, while styles are `self` plus the UI's existing inline-style allowance; browser
+  dependencies are served from the repository's local assets, not a CDN. It also sends
+  `nosniff`, same-origin referrer policy, and frame denial headers.
+- WebSocket upgrades apply the trusted-origin rule before terminal authorization. An
+  originless upgrade needs either the explicit local compatibility condition or a Bearer
+  credential. A Bearer credential is not trusted by syntax alone: when supplied, it is
+  verified as a Cloudflare Access JWT using the configured team and audience; required
+  Access mode rejects a missing or invalid token.
+- File uploads are limited to 25 MiB plus 64 KiB multipart overhead; clipboard images to
+  10 MiB plus that overhead. The server counts actual request bytes before parsing a form,
+  including chunked requests, and cancels an upload after 30 seconds or client abort. The
+  shared transfer budget admits at most two transfers per actor and eight globally; downloads
+  hold their slot through EOF, cancellation, or error. Brokered file upload remains capped at
+  the 2 MiB editor-file limit.
+
 ## 6. Fail-closed rules
 
 Security-relevant configuration fails **closed**:
@@ -126,8 +155,8 @@ Security-relevant configuration fails **closed**:
   enablement (B3).
 - Multiuser flag enabled with no external audit-anchor sink configured and no explicit
   `DECKTERM_AUDIT_ANCHOR_LOCAL_ONLY=1` acknowledgment ⇒ refuse to start (B6/C2).
-- (C1) Production with cookie auth and no `TRUSTED_ORIGINS` ⇒ refuse to start rather than
-  default CORS to `*`.
+- Public/proxy or Cloudflare Access mode with no explicit `TRUSTED_ORIGINS` ⇒ refuse to start.
+  Local loopback mode derives only loopback browser origins; it is not a public CORS default.
 - Audit prune without a completed export of the pruned range ⇒ refuse (C2).
 
 ## 7. Auditability
@@ -186,3 +215,24 @@ isolation (or deny). Specific 1.0 scoping:
   world-readable) _before_ deleting the DeckTerm mapping, the home lookup fails and the grant may
   linger — mitigated by the resolver denying the now-unmapped/drifted actor. Suspension needs no
   revoke: the resolver denies a suspended mapping before any grant is consulted.
+
+### 8.2 Current reversible-file-delete boundary
+
+The current source implements a same-root Trash for `DELETE /api/files`; it does not turn
+filesystem deletion into a general recovery service.
+
+- A Trash row is bound immutably to the canonical actor, authorized root, execution kind, Unix
+  uid/gid/user, and source file identity. The item move, restore, and purge paths re-check that
+  binding and file identity. Restore refuses an existing destination; general file APIs reserve
+  `.deckterm-trash`, so it cannot be addressed as ordinary workspace content.
+- The directory is created and revalidated as mode `0700` and owned by the bound uid. This is
+  deliberate: if two mapped Unix users share one writable root, the first owner's private Trash
+  cannot be used by the second uid. The second operation fails closed with its source unchanged;
+  there is no permanent-delete fallback and no cross-user Trash visibility.
+- Expired items are purged only in a bounded batch following a later authenticated delete.
+  Explicit restore and purge actions retain the actor/root/mapping binding and audit the item id,
+  not a filesystem path.
+- Brokered Trash relies on newer contained-helper operations for identity, exact move, and exact
+  delete. Installing that helper is a separate privileged host operation required only for
+  brokered (`DECKTERM_OS_ISOLATION=1`) use; a normal application release does not install or
+  upgrade it. Do not infer brokered Trash availability from legacy-mode behavior.

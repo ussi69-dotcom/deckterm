@@ -347,7 +347,11 @@ class SurfaceWindow {
     );
     this.applyBounds();
 
-    const zone = computeSnapZone(this.pointerPct(e));
+    const candidate = computeSnapZone(this.pointerPct(e));
+    const behavior = this.manager?.getSnapBehavior?.() || "grid";
+    const zone = this.manager?.allowsSnapZone?.(behavior, candidate)
+      ? candidate
+      : null;
     if (zone !== this.dragState.activeZone) {
       this.dragState.activeZone = zone;
       this.manager?.showSnapPreview(zone);
@@ -360,7 +364,12 @@ class SurfaceWindow {
     const zone = this.dragState?.activeZone;
     this.dragState = null;
     this.manager?.showSnapPreview(null);
-    if (zone) this.applySnapZone(zone);
+    if (
+      zone &&
+      this.manager?.allowsSnapZone?.(this.manager.getSnapBehavior(), zone)
+    ) {
+      this.applySnapZone(zone);
+    }
     this.manager?.persistLayout();
   }
 
@@ -459,6 +468,10 @@ class SurfaceWindow {
   }
 }
 
+function normalizeSnapBehavior(value) {
+  return ["off", "edges", "grid"].includes(value) ? value : "grid";
+}
+
 class SurfaceWindowManager {
   constructor({ container, settingsStore = null, baseZIndex = 640 }) {
     this.container = container;
@@ -476,6 +489,18 @@ class SurfaceWindowManager {
       null,
     );
     this.savedLayout = deserializeWindowLayout(stored);
+  }
+
+  getSnapBehavior() {
+    const value = this.settingsStore?.get("windows.snapBehavior", "grid");
+    return normalizeSnapBehavior(value);
+  }
+
+  allowsSnapZone(behavior, zone) {
+    if (!zone || behavior === "off") return false;
+    return (
+      behavior === "grid" || ["left", "right", "top", "bottom"].includes(zone)
+    );
   }
 
   register({
@@ -575,6 +600,7 @@ class SurfaceWindowManager {
 }
 
 const SurfaceWindows = {
+  normalizeSnapBehavior,
   normalizeWindowBounds,
   computeSnapZone,
   boundsForSnapZone,

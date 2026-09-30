@@ -500,6 +500,7 @@ class ReconnectingWebSocket {
     this.heartbeatTimeout = null;
     this.heartbeatSocket = null;
     this.intentionallyClosed = false;
+    this.reconnectGeneration = 0;
     this.openedOnce = false;
     this.awaitingReconnectReady = false;
     this.connect();
@@ -612,6 +613,19 @@ class ReconnectingWebSocket {
 
   scheduleReconnect(socket = this.ws) {
     if (!this.isCurrentSocket(socket)) return;
+    const generation = this.reconnectGeneration;
+    const reconnectBehavior = this.callbacks.getReconnectBehavior?.() || "auto";
+    if (reconnectBehavior !== "auto") {
+      // Prompt and manual are non-blocking. The overlay provides one explicit
+      // reconnect action instead of native confirm loops during an outage.
+      this.awaitingReconnectReady = false;
+      this.callbacks.onStatusChange(
+        reconnectBehavior === "prompt"
+          ? "reconnect_prompt"
+          : "reconnect_manual",
+      );
+      return;
+    }
     if (this.retryCount >= this.maxRetries) {
       this.awaitingReconnectReady = false;
       this.callbacks.onStatusChange("failed");
@@ -634,7 +648,21 @@ class ReconnectingWebSocket {
     // instead of switching to the accurate dead/blocked overlay.
     if (this.retryCount >= 3) {
       this.classifyReconnect().then((outcome) => {
-        if (!this.isCurrentSocket(socket)) return;
+        if (
+          !this.isCurrentSocket(socket) ||
+          generation !== this.reconnectGeneration
+        )
+          return;
+        const currentBehavior =
+          this.callbacks.getReconnectBehavior?.() || "auto";
+        if (currentBehavior !== "auto") {
+          this.callbacks.onStatusChange(
+            currentBehavior === "prompt"
+              ? "reconnect_prompt"
+              : "reconnect_manual",
+          );
+          return;
+        }
         if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
@@ -655,7 +683,12 @@ class ReconnectingWebSocket {
         });
         if (!this.isCurrentSocket(socket)) return;
         this.reconnectTimer = setTimeout(() => {
-          if (this.isCurrentSocket(socket)) this.connect();
+          if (
+            this.isCurrentSocket(socket) &&
+            generation === this.reconnectGeneration &&
+            (this.callbacks.getReconnectBehavior?.() || "auto") === "auto"
+          )
+            this.connect();
         }, delay);
       });
       return;
@@ -668,7 +701,12 @@ class ReconnectingWebSocket {
     });
     if (!this.isCurrentSocket(socket)) return;
     this.reconnectTimer = setTimeout(() => {
-      if (this.isCurrentSocket(socket)) this.connect();
+      if (
+        this.isCurrentSocket(socket) &&
+        generation === this.reconnectGeneration &&
+        (this.callbacks.getReconnectBehavior?.() || "auto") === "auto"
+      )
+        this.connect();
     }, delay);
   }
 
@@ -739,6 +777,25 @@ class ReconnectingWebSocket {
     this.intentionallyClosed = false;
     this.awaitingReconnectReady = false;
     this.connect();
+  }
+
+  applyReconnectBehavior(behavior) {
+    this.reconnectGeneration += 1;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    if (this.intentionallyClosed) return;
+    const disconnected = !this.ws || this.ws.readyState === WebSocket.CLOSED;
+    if (behavior !== "auto") {
+      if (disconnected) {
+        this.callbacks.onStatusChange(
+          behavior === "prompt" ? "reconnect_prompt" : "reconnect_manual",
+        );
+      }
+      return;
+    }
+    // Re-enabling auto reconnect must resume a connection paused in prompt or
+    // manual mode. Connecting/open sockets continue undisturbed.
+    if (disconnected) this.retry();
   }
 
   markConnectionReady(resumed, socket = this.ws) {
@@ -2906,12 +2963,7 @@ class ClipboardManager {
     }
   }
 
-  async handleImagePaste(
-    blob,
-    terminalWs,
-    terminal = null,
-    inputState = null,
-  ) {
+  async handleImagePaste(blob, terminalWs, terminal = null, inputState = null) {
     this.showToast("Uploading image...", "pending");
 
     try {
@@ -2953,13 +3005,12 @@ class ClipboardManager {
     const cancelBtn = document.getElementById("paste-cancel");
     const closeBtn = modal.querySelector(".modal-close");
 
-    // Format size
+    // Format size — sub-KB keeps the spelled-out "bytes"; the KB/MB/GB ladder
+    // comes from the shared formatter (web/format-bytes.js).
     const sizeStr =
       sizeBytes < 1024
         ? `${sizeBytes} bytes`
-        : sizeBytes < 1024 * 1024
-          ? `${(sizeBytes / 1024).toFixed(1)} KB`
-          : `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`;
+        : window.FormatBytes.formatByteSize(sizeBytes);
 
     // SECURITY: Use textContent to prevent XSS from clipboard content
     sizeEl.textContent = sizeStr;
@@ -3178,7 +3229,9 @@ class GitManager {
       .querySelector("#git-diff-layout")
       .addEventListener("click", () => {
         const next = this.getDiffLayout() === "split" ? "inline" : "split";
-        window.terminalManager?.settingsStore?.set("git.diffLayout", next);
+        const runtime = window.terminalManager?.settingsRuntime;
+        if (runtime) runtime.apply("git.diffMode", next);
+        else window.terminalManager?.settingsStore?.set("git.diffMode", next);
         if (this.state.selectedPath) {
           this.showDiff(this.state.selectedPath);
         }
@@ -3939,6 +3992,7 @@ class GitManager {
   async stashAction(action, index) {
     if (
       action === "drop" &&
+      window.terminalManager?.confirmDestructive !== false &&
       !window.confirm("Drop this stash? This cannot be undone.")
     ) {
       return;
@@ -4019,7 +4073,12 @@ class GitManager {
     const question = untracked
       ? `Delete untracked file ${file.path}?`
       : `Discard changes to ${file.path}? This cannot be undone.`;
-    if (!window.confirm(question)) return;
+    if (
+      window.terminalManager?.confirmDestructive !== false &&
+      !window.confirm(question)
+    ) {
+      return;
+    }
     try {
       const cwd = this.state.cwd || this.currentCwd;
       const res = await fetch("/api/git/discard", {
@@ -4340,7 +4399,7 @@ class GitManager {
     // preference (settings KV, phase 1) decides.
     if (window.innerWidth < 768) return "inline";
     return (
-      window.terminalManager?.settingsStore?.get("git.diffLayout", "split") ||
+      window.terminalManager?.settingsStore?.get("git.diffMode", "split") ||
       "split"
     );
   }
@@ -4898,6 +4957,7 @@ class SettingsManager {
     this.searchInputEl.addEventListener("input", () => {
       this.query = this.searchInputEl.value || "";
       this.renderList();
+      this.loadServerConfigForCurrentView();
     });
     this.sidebarEl.addEventListener("click", (e) => {
       const btn = e.target.closest("[data-settings-category]");
@@ -4907,8 +4967,17 @@ class SettingsManager {
       if (this.searchInputEl) this.searchInputEl.value = "";
       this.renderSidebar();
       this.renderList();
+      this.loadServerConfigForCurrentView();
     });
     this.listEl.addEventListener("change", (e) => this.handleControlChange(e));
+    // A floating desktop surface is deliberately not modal, but its own Escape
+    // key closes Settings and gives focus back to the action that opened it.
+    root.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      window.terminalManager?.closeSettings?.();
+    });
 
     this.root = root;
     return root;
@@ -5001,7 +5070,36 @@ class SettingsManager {
       }
     }
 
-    this.listEl.appendChild(this.renderServerConfig());
+    if (this.shouldRenderServerConfig()) {
+      this.listEl.appendChild(this.renderServerConfig());
+    }
+  }
+
+  shouldRenderServerConfig() {
+    const query = this.query.trim().toLowerCase();
+    if (!query) return this.activeCategory === "Advanced";
+    return query
+      .split(/\s+/)
+      .some((term) =>
+        [
+          "server",
+          "config",
+          "configuration",
+          "diagnostics",
+          "environment",
+          "port",
+          "host",
+        ].includes(term),
+      );
+  }
+
+  loadServerConfigForCurrentView() {
+    if (!this.shouldRenderServerConfig() || this.envLoaded) return;
+    void this.loadServerConfig().then(() => this.renderList());
+  }
+
+  focusSearch() {
+    this.searchInputEl?.focus?.({ preventScroll: true });
   }
 
   renderControlRow(descriptor) {
@@ -5206,9 +5304,11 @@ class SettingsManager {
     await this.loadUsersAdminStatus();
     this.renderSidebar();
     this.renderList();
-    await this.loadServerConfig();
-    // Re-render the server-config section now that rows are loaded.
-    this.renderList();
+    if (this.shouldRenderServerConfig()) {
+      await this.loadServerConfig();
+      // Re-render the server-config section now that rows are loaded.
+      this.renderList();
+    }
   }
 }
 
@@ -5235,6 +5335,14 @@ class TerminalManager {
         ? settingsDefaults["terminal.fontSize"]
         : 14;
     this.wrapLines = Boolean(settingsDefaults["terminal.wrapLines"]);
+    this.scrollbackLimit =
+      window.SettingsBehavior?.clampScrollbackLimit?.(
+        settingsDefaults["terminal.scrollbackLimit"],
+      ) || 10000;
+    this.reconnectBehavior = "auto";
+    this.confirmDestructive = true;
+    this.autoFetchBlocked = false;
+    this.autoFetchController = null;
     this.draggingTabId = null;
     this.draggingWorkspaceId = null;
     this.workspaceLastActive = new Map(); // workspaceId -> terminalId
@@ -5525,6 +5633,8 @@ class TerminalManager {
     // right-surface bookkeeping) instead of only hiding the panel content.
     if (this.fileExplorer) {
       this.fileExplorer.onRequestClose = () => this.closeFileExplorer();
+      this.fileExplorer.getDefaultOpener = () =>
+        document.getElementById("mobile-files-btn");
     }
     if (this.fileExplorer && window.FileEditorModule) {
       this.fileEditor = new window.FileEditorModule.FileEditor();
@@ -6240,16 +6350,47 @@ class TerminalManager {
     grid.dataset.mode = mode;
     grid.dataset.empty = "false";
 
-    actionIds.forEach((actionId) => {
-      if (actionId === "font-size") return;
-      const button = this.createActionButton(actionId, "tools-sheet");
-      if (button) {
-        grid.appendChild(button);
+    const terminalActions = new Set([
+      "clipboard",
+      "paste",
+      "toggle-extra-keys",
+      "wrap-lines",
+      "dock-sessions",
+      "fullscreen",
+    ]);
+    const preferenceActions = new Set(["settings", "setup", "help"]);
+    const groups = [
+      {
+        label: "Work",
+        ids: actionIds.filter(
+          (id) =>
+            id !== "font-size" &&
+            !terminalActions.has(id) &&
+            !preferenceActions.has(id),
+        ),
+      },
+      {
+        label: "Terminal",
+        ids: actionIds.filter((id) => terminalActions.has(id)),
+        fontSize: !fontSizePinned,
+      },
+      {
+        label: "Preferences and help",
+        ids: actionIds.filter((id) => preferenceActions.has(id)),
+      },
+    ];
+    for (const group of groups) {
+      if (!group.ids.length && !group.fontSize) continue;
+      const heading = document.createElement("h3");
+      heading.className = "tools-sheet-group-title";
+      heading.textContent = group.label;
+      grid.appendChild(heading);
+      for (const actionId of group.ids) {
+        const button = this.createActionButton(actionId, "tools-sheet");
+        if (button) grid.appendChild(button);
       }
-    });
-
-    if (!fontSizePinned) {
-      grid.appendChild(this.createFontSizeStepper("tools-sheet"));
+      if (group.fontSize)
+        grid.appendChild(this.createFontSizeStepper("tools-sheet"));
     }
     this.syncFontSizeStepper();
     // The sheet is rebuilt at runtime, after the one-time page bootstrap icon
@@ -6982,21 +7123,37 @@ class TerminalManager {
     ) {
       return;
     }
-    const storage = typeof localStorage !== "undefined" ? localStorage : null;
-    if (!storage) return;
     const schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
     const flagKey =
       window.SettingsMigration.MIGRATED_FLAG_KEY || "settings.migratedV1";
+    const deprecated =
+      window.SettingsMigration.migrateDeprecatedStoreSettings?.(
+        this.settingsStore,
+        schema,
+      ) || { migrated: [], activationMarked: false };
+    const storage = typeof localStorage !== "undefined" ? localStorage : null;
+    if (!storage) {
+      if (deprecated.migrated.length || deprecated.activationMarked) {
+        await this.settingsStore.flush();
+      }
+      return;
+    }
     const result = window.SettingsMigration.migrateLegacySettings(
       storage,
       this.settingsStore,
       schema,
     );
-    if (result.alreadyMigrated) return;
+    if (
+      result.alreadyMigrated &&
+      !deprecated.migrated.length &&
+      !deprecated.activationMarked
+    )
+      return;
     try {
-      // Flush whatever the migration enqueued, THEN mark the flag and flush it.
-      await this.settingsStore.flush();
-      this.settingsStore.set(flagKey, true);
+      // Keep values and the marker in one merge PUT. settingsStore.flush()
+      // rejects and requeues on failure, so the marker cannot be accepted
+      // remotely without the values it certifies.
+      if (!result.alreadyMigrated) this.settingsStore.set(flagKey, true);
       await this.settingsStore.flush();
     } catch {
       // A failed flush leaves the flag unset; the next load+migration retries.
@@ -7025,6 +7182,14 @@ class TerminalManager {
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
         "terminal.renderer": (value) => this.applyRendererSetting(value),
+        "terminal.scrollbackLimit": (value) => this.applyScrollbackLimit(value),
+        "windows.snapBehavior": (value) => this.applySnapBehavior(value),
+        "git.diffMode": (value) => this.applyGitDiffMode(value),
+        "git.autoFetchInterval": (value) => this.applyAutoFetchInterval(value),
+        "workspace.reconnectBehavior": (value) =>
+          this.applyReconnectBehavior(value),
+        "workspace.confirmDestructive": (value) =>
+          this.applyConfirmDestructive(value),
         "notifications.soundMode": (value) =>
           this.applyCompletionSoundMode(value),
         "notifications.sound": (value) =>
@@ -7215,12 +7380,97 @@ class TerminalManager {
     }
   }
 
+  applyScrollbackLimit(value) {
+    const limit =
+      window.SettingsBehavior?.clampScrollbackLimit?.(value) || 10000;
+    this.scrollbackLimit = limit;
+    // xterm applies this live. A user explicitly lowering it may release old
+    // lines; first activation preserves the historic 10k default.
+    for (const [, entry] of this.terminals) {
+      if (entry.terminal?.options) entry.terminal.options.scrollback = limit;
+    }
+  }
+
+  applySnapBehavior(value) {
+    this.snapBehavior =
+      window.SettingsBehavior?.normalizeSnapBehavior?.(value) || "grid";
+  }
+
+  applyGitDiffMode(value) {
+    this.gitDiffMode = value === "inline" ? "inline" : "split";
+    if (window.gitManager?.state?.selectedPath) {
+      void window.gitManager.showDiff(window.gitManager.state.selectedPath);
+    }
+  }
+
+  isAutoFetchEligible() {
+    return Boolean(
+      !this.autoFetchBlocked &&
+      document.visibilityState === "visible" &&
+      navigator.onLine !== false &&
+      this.getCurrentDirectoryValue?.(),
+    );
+  }
+
+  async runAutoFetch() {
+    const cwd = this.getCurrentDirectoryValue?.();
+    if (!cwd || !this.isAutoFetchEligible()) return;
+    const response = await fetch("/api/git/fetch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cwd }),
+    });
+    // Access/isolation blocks must not create a periodic error loop.
+    if ([401, 403, 423].includes(response.status)) this.autoFetchBlocked = true;
+    if (!response.ok) throw new Error(`Git fetch failed: ${response.status}`);
+    if (
+      window.gitManager &&
+      !window.gitManager.panel?.classList.contains("hidden") &&
+      (window.gitManager.state.cwd || window.gitManager.currentCwd) === cwd
+    ) {
+      await window.gitManager.refresh();
+    }
+  }
+
+  applyAutoFetchInterval(value) {
+    this.autoFetchBlocked = false; // changing the control explicitly re-enables
+    this.autoFetchController ||=
+      window.SettingsBehavior?.createAutoFetchController?.({
+        fetchNow: () => this.runAutoFetch(),
+        isEligible: () => this.isAutoFetchEligible(),
+      });
+    this.autoFetchController?.configure(value);
+  }
+
+  applyReconnectBehavior(value) {
+    this.reconnectBehavior =
+      window.SettingsBehavior?.normalizeReconnectBehavior?.(value) || "auto";
+    for (const [, terminal] of this.terminals) {
+      terminal.ws?.applyReconnectBehavior?.(this.reconnectBehavior);
+    }
+  }
+
+  applyConfirmDestructive(value) {
+    // Keep the safe default effective until individual destructive flows adopt
+    // this preference. Merely opening Settings must never disable safeguards.
+    this.confirmDestructive = value !== false;
+  }
+
   async openSettings() {
+    // A viewport transition may still have a deferred focus restoration from
+    // the previous close. Opening Settings again makes that restoration stale.
+    this.settingsFocusRestoreGeneration =
+      (this.settingsFocusRestoreGeneration || 0) + 1;
+    this.settingsReturnFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
     this.closeToolsSheet();
     // IDE mode: open as an editor tab (singleton, pinned). SurfaceWindow is NOT
     // used — the tab IS the settings UI. (Codex fix 7: single UI per mode.)
     if (this.isIdeModeActive() && this.editorTabs) {
       this.editorTabs.openSettings();
+      this.settingsManager?.focusSearch?.();
       return;
     }
     if (!this.settingsManager) {
@@ -7239,7 +7489,7 @@ class TerminalManager {
         bounds: { x: 16, y: 8, width: 68, height: 82 },
         minWidthPx: 520,
         minHeightPx: 360,
-        onClose: () => this.surfaceWindowManager?.close("settings"),
+        onClose: () => this.closeSettings(),
       });
     } else {
       // Mobile (or a narrow desktop window where windowed surfaces are off):
@@ -7256,7 +7506,79 @@ class TerminalManager {
       this.openSettingsSheet();
     }
     await this.settingsManager.render();
+    requestAnimationFrame(() => this.settingsManager?.focusSearch?.());
     this.syncSurfaceButtonState();
+  }
+
+  async closeSettings({ repairViewportFocus = false } = {}) {
+    if (this.isIdeModeActive() && this.editorTabs)
+      await this.editorTabs.closeKey("settings:global");
+    this.surfaceWindowManager?.close("settings");
+    this.closeSettingsSheet();
+    this.syncSurfaceButtonState();
+    const returnFocus = this.settingsReturnFocus;
+    this.settingsReturnFocus = null;
+    if (returnFocus?.isConnected && returnFocus.getClientRects().length) {
+      returnFocus.focus({ preventScroll: true });
+    } else {
+      this.focusSettingsReturnTarget();
+    }
+    // A resize can make the terminal's own responsive focus work run after
+    // this synchronous close. Only the viewport reconciliation path needs a
+    // deferred repair: ordinary closes must leave a user's next focus choice
+    // alone.
+    if (repairViewportFocus) this.scheduleSettingsReturnFocus();
+  }
+
+  focusSettingsReturnTarget() {
+    const preferredId = this.isWindowedSurfaces()
+      ? "desktop-more-btn"
+      : "mobile-more-btn";
+    const preferred = document.getElementById(preferredId);
+    if (preferred?.getClientRects().length) {
+      preferred.focus({ preventScroll: true });
+      return;
+    }
+    const fallbackId =
+      preferredId === "desktop-more-btn"
+        ? "mobile-more-btn"
+        : "desktop-more-btn";
+    const fallback = document.getElementById(fallbackId);
+    if (fallback?.getClientRects().length) {
+      fallback.focus({ preventScroll: true });
+    }
+  }
+
+  scheduleSettingsReturnFocus() {
+    const generation = (this.settingsFocusRestoreGeneration || 0) + 1;
+    this.settingsFocusRestoreGeneration = generation;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        window.setTimeout(() => {
+          if (this.settingsFocusRestoreGeneration !== generation) return;
+          const sheet = document.getElementById("settings-sheet");
+          if (
+            this.surfaceWindowManager?.isOpen?.("settings") ||
+            (sheet && !sheet.classList.contains("hidden"))
+          ) {
+            return;
+          }
+          const active = document.activeElement;
+          const activeIsVisible =
+            active instanceof HTMLElement && active.getClientRects().length;
+          // The responsive terminal lifecycle can focus xterm's helper
+          // textarea after Settings closes. Repair that stale focus, but do
+          // not override a visible control selected by the user meanwhile.
+          if (
+            activeIsVisible &&
+            !active.classList.contains("xterm-helper-textarea")
+          ) {
+            return;
+          }
+          this.focusSettingsReturnTarget();
+        }, 0);
+      });
+    });
   }
 
   // Static mobile sheet host for Settings (index.html #settings-sheet) —
@@ -7267,14 +7589,42 @@ class TerminalManager {
     if (!sheet) return;
     sheet.classList.remove("hidden");
     sheet.setAttribute("aria-hidden", "false");
+    // The sheet shell, not its backdrop wrapper, is the one modal dialog.
+    // This avoids nested dialog semantics when the content is reparented.
+    const shell = sheet.querySelector(".settings-sheet-shell");
+    shell?.setAttribute("role", "dialog");
+    shell?.setAttribute("aria-modal", "true");
     if (!sheet.dataset.wired) {
       sheet.dataset.wired = "1";
       document
         .getElementById("settings-sheet-close")
-        ?.addEventListener("click", () => this.closeSettingsSheet());
+        ?.addEventListener("click", () => this.closeSettings());
       sheet
         .querySelector(".settings-sheet-backdrop")
-        ?.addEventListener("click", () => this.closeSettingsSheet());
+        ?.addEventListener("click", () => this.closeSettings());
+      sheet.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          this.closeSettings();
+          return;
+        }
+        if (event.key !== "Tab") return;
+        const focusable = [
+          ...sheet.querySelectorAll(
+            "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href]",
+          ),
+        ].filter((el) => !el.closest(".hidden"));
+        if (!focusable.length) return;
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
+      });
     }
   }
 
@@ -7501,8 +7851,80 @@ class TerminalManager {
     disclaimer.style.borderLeft = "2px solid var(--border-color, #30363d)";
     disclaimer.style.paddingLeft = "0.75rem";
 
-    section.append(header, rows, disclaimer);
+    section.append(header, rows);
+
+    // Backlog P0: a fresh install can render, authenticate and show READY yet
+    // cannot open a terminal until POST /api/bootstrap has run. Offer it here.
+    const bootstrapPlan =
+      typeof window.SetupBootstrap?.planBootstrapAction === "function"
+        ? window.SetupBootstrap.planBootstrapAction(foundation.bootstrap)
+        : null;
+    if (bootstrapPlan) {
+      const action = document.createElement("div");
+      action.className = "setup-bootstrap-action";
+      const hint = document.createElement("p");
+      hint.className = "setup-bootstrap-hint";
+      hint.textContent = bootstrapPlan.hint;
+      action.appendChild(hint);
+      const controls = document.createElement("div");
+      controls.className = "setup-bootstrap-controls";
+      if (bootstrapPlan.needsToken) {
+        const input = document.createElement("input");
+        input.type = "password";
+        input.id = "setup-bootstrap-token";
+        input.autocomplete = "off";
+        input.placeholder = "Bootstrap token";
+        input.setAttribute("aria-label", "Bootstrap token");
+        controls.appendChild(input);
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.id = "setup-finish-bootstrap";
+      button.className = "btn btn-primary";
+      button.textContent = bootstrapPlan.label;
+      button.addEventListener("click", () => this.finishSetupBootstrap());
+      controls.appendChild(button);
+      action.appendChild(controls);
+      section.appendChild(action);
+    }
+
+    section.appendChild(disclaimer);
     target.appendChild(section);
+  }
+
+  async finishSetupBootstrap() {
+    if (this.setupState.loading) return;
+    this.setupState.loading = true;
+    this.setSetupStatus("Finishing setup...");
+    try {
+      const token = document.getElementById("setup-bootstrap-token")?.value;
+      const body = window.SetupBootstrap?.buildBootstrapRequest
+        ? window.SetupBootstrap.buildBootstrapRequest(token)
+        : {};
+      const res = await fetch("/api/bootstrap", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        // The server's reason IS the diagnosis ("Bootstrap token expired",
+        // "Bootstrap token not found", "identity mismatch") — show it verbatim.
+        throw new Error(payload.error || payload.message || "Bootstrap failed");
+      }
+      this.setupState.loading = false;
+      this.setSetupStatus(
+        `Setup finished — ${payload.user?.email || "you"} is now the owner.`,
+      );
+      await this.runSetupDoctor();
+      return;
+    } catch (err) {
+      this.setSetupStatus(
+        err instanceof Error ? err.message : "Bootstrap failed",
+      );
+    } finally {
+      this.setupState.loading = false;
+    }
   }
 
   renderSetupOutputSection(text) {
@@ -10683,13 +11105,18 @@ class TerminalManager {
       // Growing past the desktop breakpoint: close the mobile Settings sheet
       // (its terminal-mode counterpart of a SurfaceWindow) so it isn't left
       // open/stuck underneath the now-available windowed surfaces.
-      this.closeSettingsSheet?.();
+      const sheet = document.getElementById("settings-sheet");
+      if (sheet && !sheet.classList.contains("hidden")) {
+        void this.closeSettings({ repairViewportFocus: true });
+      }
       return;
     }
     this.closeFileExplorer?.();
     this.closeGitPanel?.();
-    this.surfaceWindowManager?.close("tasks");
-    this.surfaceWindowManager?.close("settings");
+    this.closeTaskPanel?.();
+    if (this.surfaceWindowManager?.isOpen?.("settings")) {
+      void this.closeSettings({ repairViewportFocus: true });
+    }
     this.fileEditor?.close();
   }
 
@@ -11236,6 +11663,8 @@ class TerminalManager {
     const content = this.settingsManager.buildContent();
     hostEl.appendChild(content);
     await this.settingsManager.render();
+    if (hostEl.isConnected && hostEl.getClientRects().length)
+      this.settingsManager.focusSearch();
   }
 
   // Mount the full-width Task Board into the editor-area tab body: a second
@@ -12283,6 +12712,7 @@ class TerminalManager {
       onTerminalState: (message) => {
         this.applyTerminalRuntimeState(id, message);
       },
+      getReconnectBehavior: () => this.reconnectBehavior,
     });
 
     const inputState = this.createInputState();
@@ -12892,7 +13322,7 @@ class TerminalManager {
       fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: this.fontSize,
       lineHeight: TERMINAL_LINE_HEIGHT,
-      scrollback: 10000,
+      scrollback: this.scrollbackLimit || 10000,
       cursorBlink: true,
       allowProposedApi: true,
       scrollOnUserInput: true,
@@ -13242,6 +13672,18 @@ class TerminalManager {
           secondsLeft: Math.round((extra.delay || 0) / 1000),
         }),
         actions: "",
+      },
+      reconnect_prompt: {
+        icon: "🔄",
+        message: "Connection lost. Reconnect when you are ready.",
+        actions:
+          '<button class="btn btn-primary" data-overlay-action="retry">Reconnect</button>',
+      },
+      reconnect_manual: {
+        icon: "⏸️",
+        message: "Connection lost. Automatic reconnect is off.",
+        actions:
+          '<button class="btn btn-primary" data-overlay-action="retry">Reconnect</button>',
       },
       failed: {
         icon: "❌",
@@ -13749,6 +14191,7 @@ class TerminalManager {
           onLifecycle: (message) => this.handleReconnectLifecycle(id, message),
           onTerminalState: (message) =>
             this.applyTerminalRuntimeState(id, message),
+          getReconnectBehavior: () => this.reconnectBehavior,
         },
       );
 

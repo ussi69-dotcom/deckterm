@@ -16,31 +16,14 @@
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23238636'/><text x='50' y='68' font-size='50' text-anchor='middle' fill='white'>❯</text></svg>"
     />
     <!-- Nerd Font for terminal icons (Claude Code statusline, etc.) -->
-    <link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin />
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/@fontsource/jetbrains-mono@5.0.0/400.css"
-    />
-    <style>
-      /* Nerd Font symbols fallback - loaded from CDN */
-      @font-face {
-        font-family: "Symbols Nerd Font";
-        src: url("https://cdn.jsdelivr.net/gh/ryanoasis/nerd-fonts@master/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf")
-          format("truetype");
-        font-display: swap;
-      }
-    </style>
+    <link rel="stylesheet" href="/assets/jetbrains-mono-5.0.0-400.css" />
+    <link rel="stylesheet" href="/assets/nerd-fonts-v3.4.0.css" />
     <link rel="stylesheet" href="/vendor/xterm.css" />
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/css/diff2html.min.css"
-    />
+    <link rel="stylesheet" href="/assets/diff2html-3.4.56.min.css" />
     <link rel="stylesheet" href="/styles.css?v=20260719a" />
+    <link rel="stylesheet" href="/interaction.css?v=20260905a" />
     <!-- Lucide Icons for modern UI -->
-    <script
-      src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"
-      defer
-    ></script>
+    <script src="/assets/lucide-1.41.0.min.js" defer></script>
   </head>
   <body>
     <div id="app">
@@ -152,7 +135,7 @@
         <div class="tools-sheet-panel">
           <div class="tools-sheet-header">
             <div>
-              <div class="tools-sheet-kicker">Compact Navigation</div>
+              <div class="tools-sheet-kicker">Current workspace</div>
               <h2>Tools</h2>
             </div>
             <button
@@ -181,15 +164,6 @@
               <i data-lucide="folder"></i>
             </button>
           </div>
-
-          <button
-            id="tools-sheet-edit-layout"
-            class="tools-sheet-edit-layout"
-            type="button"
-          >
-            <i data-lucide="sliders-horizontal"></i>
-            <span>Edit layout</span>
-          </button>
 
           <div
             id="layout-editor"
@@ -266,6 +240,14 @@
             class="tools-sheet-grid"
             aria-label="More actions"
           ></div>
+          <button
+            id="tools-sheet-edit-layout"
+            class="tools-sheet-edit-layout"
+            type="button"
+          >
+            <i data-lucide="sliders-horizontal"></i>
+            <span>Edit layout</span>
+          </button>
         </div>
       </div>
 
@@ -508,11 +490,11 @@
           </div>
 
           <div class="file-toolbar file-explorer-toolbar">
-            <button id="file-explorer-upload-btn" class="btn">
+            <button id="file-explorer-upload-btn" class="btn btn-secondary">
               <i data-lucide="upload"></i>
               <span>Upload</span>
             </button>
-            <button id="file-explorer-mkdir-btn" class="btn">
+            <button id="file-explorer-mkdir-btn" class="btn btn-secondary">
               <i data-lucide="folder-plus"></i>
               <span>New Folder</span>
             </button>
@@ -566,12 +548,7 @@
 
       <div id="settings-sheet" class="settings-sheet hidden" aria-hidden="true">
         <div class="settings-sheet-backdrop"></div>
-        <section
-          class="settings-sheet-shell"
-          role="dialog"
-          aria-modal="false"
-          aria-labelledby="settings-sheet-title"
-        >
+        <section class="settings-sheet-shell">
           <div class="settings-sheet-header">
             <h3 id="settings-sheet-title">Settings</h3>
             <button
@@ -674,16 +651,19 @@
         class="command-palette hidden"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="command-palette-input"
+        aria-labelledby="command-palette-title"
       >
         <div class="command-palette-panel">
           <div class="command-palette-header">
             <div class="command-palette-title-row">
-              <span class="command-palette-kicker">Navigation Layer</span>
+              <span id="command-palette-title" class="command-palette-kicker"
+                >Command palette</span
+              >
               <span class="command-palette-shortcut">Ctrl+Shift+P</span>
             </div>
             <input
               id="command-palette-input"
+              aria-label="Search commands, files, and workspaces"
               type="text"
               autocomplete="off"
               spellcheck="false"
@@ -904,20 +884,16 @@
       </div>
     </div>
 
+    <script src="/api-client.js?v=20260905a"></script>
     <script src="/vendor/xterm.min.js"></script>
     <script src="/vendor/xterm-addon-fit.min.js"></script>
     <script src="/vendor/xterm-addon-web-links.min.js"></script>
     <script src="/vendor/xterm-addon-search.min.js"></script>
     <script src="/vendor/xterm-addon-webgl.min.js"></script>
     <script src="/vendor/xterm-addon-unicode11.min.js"></script>
-    <script>
-      if (location.search.includes("debug=1")) {
-        const script = document.createElement("script");
-        script.src = "/dev/diagnostics.js";
-        document.head.appendChild(script);
-      }
-    </script>
+    <script src="/debug-bootstrap.js?v=20260905a"></script>
     <script src="/html-escape.js?v=20260617a"></script>
+    <script src="/format-bytes.js?v=20260829a"></script>
     <script src="/access-denied.js?v=20260611a"></script>
     <script src="/git-error.js?v=20260611a"></script>
     <script src="/git-scm.js?v=20260705e"></script>
@@ -938,6 +914,7 @@
     <script src="/search-view.js?v=20260706a"></script>
     <script src="/terminal-colors.js?v=20260112g"></script>
     <script src="/bootstrap-routing.js?v=20260401b"></script>
+    <script src="/setup-bootstrap.js?v=20260826a"></script>
     <script src="/terminal-sizing.js?v=20260401a"></script>
     <script src="/action-registry.js?v=20260403a"></script>
     <script src="/palette-providers.js?v=20260705a"></script>
@@ -947,6 +924,7 @@
     <script src="/terminal-renderer.js?v=20260705a"></script>
     <script src="/settings-ui.js?v=20260705a"></script>
     <script src="/settings-runtime.js?v=20260616b"></script>
+    <script src="/settings-behavior.js?v=20260905a"></script>
     <script src="/settings-store.js?v=20260612a"></script>
     <script src="/settings-migration.js?v=20260616a"></script>
     <script src="/users-admin.js?v=20260703a"></script>
@@ -954,13 +932,13 @@
     <script src="/view-host.js?v=20260616a"></script>
     <script src="/file-tree-store.js?v=20260616a"></script>
     <script src="/ide-shell.js?v=20260618c"></script>
-    <script src="/file-explorer.js?v=20260620a"></script>
+    <script src="/file-explorer.js?v=20260829a"></script>
     <script src="/file-editor.js?v=20260705a"></script>
     <script src="/editor-tabs.js?v=20260705a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="/terminal-selection.js?v=20260819b"></script>
-    <script src="https://cdn.jsdelivr.net/npm/diff2html@3.4.48/bundles/js/diff2html.min.js"></script>
-    <script src="/app.js?v=20260819a"></script>
+    <script src="/assets/diff2html-3.4.56.min.js"></script>
+    <script src="/app.js?v=20260829a"></script>
   </body>
 </html>

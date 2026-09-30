@@ -1,0 +1,84 @@
+{
+  "date": "2026-09-06",
+  "scope": "development port 4174 and isolated fixtures; production unchanged",
+  "unit": {
+    "pass": 1252,
+    "fail": 0
+  },
+  "push": {
+    "pass": 13,
+    "fail": 0
+  },
+  "checks": {
+    "typecheck": "passed",
+    "build": "passed",
+    "assets": "passed",
+    "test_census": "passed",
+    "dependency_audit": {},
+    "frozen_lockfile_install": "passed"
+  },
+  "full_browser": {
+    "status": "accepted_after_targeted_test_repairs",
+    "unique_scenarios_passed": 183,
+    "initial_run": {
+      "pass": 181,
+      "fail": 2,
+      "retries": 0,
+      "duration_minutes": 8
+    },
+    "affected_suites_rerun": {
+      "pass": 16,
+      "fail": 0,
+      "retries": 0
+    },
+    "test_corrections": [
+      "IDE fixture disables push for a synthetic actor without a canonical registered user; strict error assertions retained",
+      "Clipboard assertion uses per-state private directory rather than retired global /tmp path"
+    ],
+    "application_changed_between_runs": false
+  },
+  "visual": {
+    "widths": [1440, 390],
+    "page_errors": 0,
+    "csp_violations": 0,
+    "external_http_requests": 0,
+    "review": "manual component screenshots; no automated image-diff or Gemini review"
+  },
+  "restore": {
+    "version": 1,
+    "restoredAt": "2026-09-06T00:54:49.697Z",
+    "backupId": "20260906T005429Z",
+    "databaseSha256": "13ffd9bb532b64903b07d71fc44151de848bc9becf0b4ead7c510221e0af04dc"
+  },
+  "restore_integrity": "ok",
+  "restore_tables": 15,
+  "backup_timer": {
+    "unit": "deckterm-backup-dev.timer",
+    "enabled": true,
+    "service_result": "success",
+    "exec_main_status": 0
+  },
+  "screenshots": {
+    "1440-files.png": "261d39cedaa198cd299499ca43b3ed797c11735197394db4236b7a4f8cbf678a",
+    "1440-settings.png": "f442c0ddf74e2a7668bd8600fa90a16a7511590766a832dce63927d375363e4b",
+    "1440-tools.png": "a7b6be2f5639588b8e33159dcec8d4c2e58cfc8b2cba59cd2945effb30e38c4f",
+    "1440-trash.png": "bc69626811595376c4bcece9ec2963279a671ea53c6ad7569a21f9dccbe61f4e",
+    "390-files.png": "8649fdba22b9729d9cde3c70655ff77841c10723695f699121b0f27a6fb135cf",
+    "390-settings.png": "f5818215d4e8e4928e7a9acdbd9e093370ad7fc6fcc9143d318b672aab4e42b0",
+    "390-tools.png": "fb05ea4c1a55ac063f95020d6bd3df3a26675edf0856249e47a0dfa36db68634",
+    "390-trash.png": "7d0f24de2034fd91885c1ae309cb6a3e96741c9ded649a8b88c8dfd7518b1a01"
+  },
+  "dev_health": {
+    "status": "ok",
+    "release": "dev",
+    "terminals": 0
+  },
+  "restore_drill_cleaned": true,
+  "production_observation": {
+    "kind": "read_only_service_and_symlink",
+    "release": "98f5175298adf7e6603ba90fca9d3d4aa170ab01",
+    "main_pid": 1126882,
+    "service_active_since": "2026-08-19T22:45:39Z",
+    "production_http_tests": false
+  }
+}

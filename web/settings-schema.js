@@ -90,7 +90,10 @@ const SETTINGS_SCHEMA = [
     label: "Scrollback limit",
     description: "Maximum number of scrollback lines retained per terminal.",
     type: "number",
-    default: 2000,
+    // DeckTerm historically created terminals with 10,000 lines. Retaining
+    // that default turns this formerly inert setting on without silently
+    // truncating existing users' history during startup.
+    default: 10000,
     min: 200,
     max: 50000,
     searchText: "scrollback history buffer lines limit memory",
@@ -103,7 +106,9 @@ const SETTINGS_SCHEMA = [
     label: "Window snapping",
     description: "How surface windows snap to edges and each other.",
     type: "select",
-    default: "edges",
+    // Existing windows used quadrant corners. Preserve that established
+    // behavior on activation; users can explicitly choose screen edges.
+    default: "grid",
     options: [
       { value: "off", label: "Off" },
       { value: "edges", label: "Screen edges" },
@@ -262,13 +267,13 @@ const SETTINGS_SCHEMA = [
   {
     key: "workspace.confirmDestructive",
     category: "Advanced",
-    label: "Confirm destructive actions",
+    label: "Confirm destructive Git actions",
     description:
-      "Ask for confirmation before discarding changes, killing sessions, or other destructive operations.",
+      "Ask before discarding a Git file change or dropping a Git stash.",
     type: "toggle",
     default: true,
     searchText:
-      "confirm destructive discard delete kill prompt warning dangerous",
+      "confirm destructive git discard stash drop prompt warning dangerous",
   },
 ];
 

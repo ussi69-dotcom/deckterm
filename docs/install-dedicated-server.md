@@ -101,6 +101,38 @@ systemctl --user enable --now deckterm.service
 loginctl enable-linger "$USER"
 ```
 
+## 4b. Unattended upgrades, needrestart and reboots
+
+Sessions live inside the tmux server, and the tmux server lives inside the
+service unit. Three host mechanisms can end them without anyone touching
+DeckTerm; check all three once after installing:
+
+```bash
+# 1. needrestart mode — 'a' (automatic) restarts services after library
+#    upgrades, which would restart deckterm.service and end every session.
+grep -r 'nrconf{restart}' /etc/needrestart/ || echo "default (list-only)"
+
+# 2. Automatic reboots after kernel updates end every session regardless of
+#    unit layout — nothing in DeckTerm can survive a reboot.
+grep -E 'Automatic-Reboot' /etc/apt/apt.conf.d/50unattended-upgrades
+last -x reboot | head -3
+
+# 3. The unit itself: without KillMode=process every restart kills tmux.
+systemctl --user show -p KillMode --value deckterm.service   # expect: process
+```
+
+Install the shipped needrestart override so automatic mode never restarts the
+unit (the deploy pipeline restarts it deliberately):
+
+```bash
+sudo install -m 0644 deploy/needrestart/deckterm.conf /etc/needrestart/conf.d/deckterm.conf
+```
+
+DeckTerm checks the first and third item itself: the Setup Doctor (More →
+Setup → Check) reports `KillMode`, needrestart mode and whether the service
+account's home is inside `ALLOWED_FILE_ROOTS`, and the service logs a
+`[lifecycle]` warning at startup when sessions would not survive a restart.
+
 ## 5. Publish through Cloudflare Tunnel
 
 Example config: `deploy/cloudflared/config.example.yml`.

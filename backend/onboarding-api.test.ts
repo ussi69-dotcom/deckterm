@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { afterEach, expect, test } from "bun:test";
 import {
   chmod,
@@ -22,6 +23,7 @@ const ISOLATED_ENV_KEYS = [
   "CF_ACCESS_AUD",
   "DECKTERM_RUNTIME_ENV",
   "DECKTERM_LEGACY_NO_BOOTSTRAP",
+  "DECKTERM_DOCTOR_LIFECYCLE",
   "PATH",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -60,6 +62,10 @@ function clearInheritedDoctorEnv() {
   delete process.env.CF_ACCESS_TEAM_NAME;
   delete process.env.CF_ACCESS_AUD;
   process.env.DECKTERM_RUNTIME_ENV = "development";
+  // Host lifecycle checks (KillMode, needrestart) depend on the cgroup the
+  // test runner happens to sit in; pin them off so profile validation stays
+  // deterministic. service-lifecycle-doctor.test.ts covers that integration.
+  process.env.DECKTERM_DOCTOR_LIFECYCLE = "0";
   process.env.DECKTERM_LEGACY_NO_BOOTSTRAP = "1";
 }
 

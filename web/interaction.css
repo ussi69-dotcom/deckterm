@@ -1,0 +1,263 @@
+/* Keyboard access for the existing file, editor, and command surfaces. */
+.file-item .file-open,
+.file-breadcrumb-button,
+.ide-editor-tab-activate {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.file-item .file-open {
+  padding: 3px 0;
+}
+
+.file-breadcrumb-button {
+  padding: 4px;
+  border-radius: 4px;
+  color: var(--accent-blue, #58a6ff);
+}
+
+.file-breadcrumb-button:hover {
+  text-decoration: underline;
+}
+
+.file-item:focus-within {
+  background: var(--bg-tertiary);
+}
+
+.file-open:focus-visible,
+.file-breadcrumb-button:focus-visible,
+.file-actions button:focus-visible,
+.ide-editor-tab-activate:focus-visible,
+.ide-editor-tab-close:focus-visible,
+.file-name-dialog :focus-visible {
+  outline: 2px solid var(--focus-ring, #58a6ff);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+.ide-editor-tab-activate {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 0;
+  overflow: hidden;
+}
+
+.ide-editor-tab:focus-within .ide-editor-tab-close {
+  opacity: 1;
+}
+
+.command-palette-item[role="option"] {
+  cursor: pointer;
+  text-align: left;
+}
+
+.file-name-dialog {
+  box-sizing: border-box;
+  width: min(440px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid var(--border-primary, #30363d);
+  border-radius: 12px;
+  background: var(--bg-secondary, #161b22);
+  color: var(--text-primary, #f0f6fc);
+  box-shadow: 0 20px 70px #0008;
+}
+
+.file-name-dialog::backdrop {
+  background: #0009;
+}
+
+.file-name-dialog form,
+.file-name-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.file-name-dialog h2 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.file-name-dialog p {
+  margin: 0;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.file-name-dialog-location {
+  color: var(--text-muted, #8b949e);
+}
+
+.file-name-dialog input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-primary, #30363d);
+  border-radius: 6px;
+  background: var(--bg-primary, #0d1117);
+  color: inherit;
+  font: inherit;
+}
+
+.file-name-dialog-error {
+  color: var(--accent-red, #ff7b72);
+}
+
+.file-name-dialog-error:empty {
+  display: none;
+}
+
+.file-name-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.file-name-dialog-actions button {
+  min-height: 40px;
+  padding: 8px 16px;
+  border: 1px solid var(--border-primary, #30363d);
+  border-radius: 6px;
+  background: var(--bg-tertiary, #21262d);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.file-name-dialog-actions .primary {
+  background: var(--accent-blue, #1f6feb);
+  color: #fff;
+}
+
+.file-operation-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-primary, #30363d);
+  background: var(--bg-secondary, #161b22);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.file-operation-notice[hidden] {
+  display: none;
+}
+
+.file-operation-notice [role="alert"] {
+  color: var(--accent-red, #ff7b72);
+}
+
+.file-trash-dialog {
+  width: min(620px, calc(100vw - 32px));
+}
+
+.file-trash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.file-trash-dialog > p {
+  margin-top: 12px;
+}
+
+.file-trash-list {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 0;
+}
+
+.file-trash-list li {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 16px 0;
+  border-top: 1px solid var(--border-primary, #30363d);
+  overflow-wrap: anywhere;
+}
+
+.file-trash-detail {
+  font-size: 12px;
+  color: var(--text-muted, #8b949e);
+}
+
+.file-trash-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.file-trash-dialog button,
+.file-operation-notice button {
+  min-height: 40px;
+}
+
+.file-trash-dialog button[aria-disabled="true"] {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.file-trash-actions .danger {
+  color: var(--accent-red, #ff7b72);
+}
+
+.file-operation-notice button:focus-visible,
+#file-explorer-trash-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, #58a6ff);
+  outline-offset: 2px;
+}
+
+@media (max-width: 768px) {
+  .file-trash-dialog {
+    padding: 16px;
+  }
+
+  .file-trash-dialog button,
+  .file-operation-notice button {
+    min-height: 44px;
+  }
+
+  .file-explorer-toolbar {
+    flex-wrap: wrap;
+  }
+}
+/* Keep frequent workspace actions above terminal utilities and preferences. */
+.tools-sheet-group-title {
+  grid-column: 1 / -1;
+  margin: 12px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+.tools-sheet-group-title:first-child {
+  margin-top: 0;
+}
+
+.tools-sheet-grid + .tools-sheet-edit-layout {
+  margin-top: 20px;
+}
+.file-explorer-toolbar {
+  flex-wrap: wrap;
+}
+.file-explorer-toolbar .btn {
+  white-space: nowrap;
+}
+@media (max-width: 767px) {
+  .tools-sheet-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

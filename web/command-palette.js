@@ -23,6 +23,22 @@ class CommandPaletteController {
     this.selectedIndex = 0;
     this.visibleResults = [];
     this.lastFocusedElement = null;
+    if (this.results) {
+      this.results.id ||= "command-palette-results";
+      this.results.setAttribute("role", "listbox");
+      this.results.setAttribute("aria-label", "Commands");
+    }
+    if (this.input) {
+      this.input.setAttribute("role", "combobox");
+      this.input.setAttribute(
+        "aria-label",
+        "Search commands, files, and workspaces",
+      );
+      this.input.setAttribute("aria-autocomplete", "list");
+      this.input.setAttribute("aria-expanded", "false");
+      if (this.results)
+        this.input.setAttribute("aria-controls", this.results.id);
+    }
 
     this.handleInput = this.handleInput.bind(this);
     this.handleKeydown = this.handleKeydown.bind(this);
@@ -39,6 +55,7 @@ class CommandPaletteController {
     this.context = context;
     this.selectedIndex = 0;
     this.root.classList.remove("hidden");
+    this.input.setAttribute("aria-expanded", "true");
     this.input.value = "";
     this.refreshResults();
     this.input.focus();
@@ -47,6 +64,8 @@ class CommandPaletteController {
   close({ restoreFocus = true } = {}) {
     if (!this.root) return;
     this.root.classList.add("hidden");
+    this.input?.setAttribute("aria-expanded", "false");
+    this.input?.removeAttribute("aria-activedescendant");
 
     if (
       restoreFocus &&
@@ -79,6 +98,8 @@ class CommandPaletteController {
 
   handleKeydown(event) {
     if (this.root?.classList.contains("hidden")) return;
+    if (event.isComposing) return;
+    event.stopPropagation?.();
 
     switch (event.key) {
       case "ArrowDown":
@@ -97,6 +118,12 @@ class CommandPaletteController {
         event.preventDefault();
         this.close();
         break;
+      case "Tab":
+        // The combobox is this modal's only tab stop. Its options are selected
+        // with arrows while DOM focus remains on the input.
+        event.preventDefault();
+        this.input.focus();
+        break;
     }
   }
 
@@ -113,13 +140,28 @@ class CommandPaletteController {
     const selected = this.visibleResults[this.selectedIndex];
     if (!selected || typeof selected.run !== "function") return;
     selected.run();
-    this.close({ restoreFocus: false });
+    // A command may focus another surface synchronously or after an await.
+    // Restore the opener only while focus is still stranded in this palette;
+    // an asynchronous command can then move it to its final target normally.
+    const focused =
+      typeof document !== "undefined" ? document.activeElement : null;
+    const focusStillInside =
+      focused === this.input || this.root?.contains?.(focused);
+    this.close({ restoreFocus: Boolean(focusStillInside) });
   }
 
   refreshResults() {
     if (!this.registry || !this.results) return;
     const query = this.input?.value || "";
-    this.visibleResults = this.registry.getResults(query, this.context);
+    // Keep keyboard order identical to the grouped visual order.
+    this.visibleResults = this.registry
+      .getResults(query, this.context)
+      .slice()
+      .sort(
+        (left, right) =>
+          getCommandPaletteGroupRank(left.group || "Other") -
+          getCommandPaletteGroupRank(right.group || "Other"),
+      );
     if (this.selectedIndex >= this.visibleResults.length) {
       this.selectedIndex = Math.max(0, this.visibleResults.length - 1);
     }
@@ -131,9 +173,11 @@ class CommandPaletteController {
     this.results.innerHTML = "";
 
     if (!Array.isArray(results) || results.length === 0) {
+      this.input?.removeAttribute("aria-activedescendant");
       const empty = document.createElement("div");
       empty.className = "command-palette-empty";
       empty.textContent = "No matching actions.";
+      empty.setAttribute("role", "status");
       this.results.appendChild(empty);
       return;
     }
@@ -154,20 +198,30 @@ class CommandPaletteController {
     for (const [group, entries] of orderedGroups) {
       const section = document.createElement("div");
       section.className = "command-palette-section";
+      section.setAttribute("role", "group");
+      section.setAttribute("aria-label", group);
 
       const label = document.createElement("div");
       label.className = "command-palette-section-label";
       label.textContent = group;
+      label.setAttribute("aria-hidden", "true");
       section.appendChild(label);
 
       for (const { result, index } of entries) {
-        const item = document.createElement("button");
-        item.type = "button";
+        const item = document.createElement("div");
+        item.id = `${this.results.id}-option-${index}`;
+        item.setAttribute("role", "option");
+        item.setAttribute(
+          "aria-selected",
+          index === this.selectedIndex ? "true" : "false",
+        );
+        item.tabIndex = -1;
         item.className = "command-palette-item";
         if (index === this.selectedIndex) {
           item.classList.add("selected");
         }
         item.dataset.actionId = result.id;
+        item.addEventListener("mousedown", (event) => event.preventDefault());
 
         const title = document.createElement("span");
         title.className = "command-palette-item-title";
@@ -195,6 +249,13 @@ class CommandPaletteController {
       }
 
       this.results.appendChild(section);
+    }
+    const selected = this.results.querySelector(
+      ".command-palette-item.selected",
+    );
+    if (selected) {
+      this.input?.setAttribute("aria-activedescendant", selected.id);
+      selected.scrollIntoView?.({ block: "nearest" });
     }
   }
 }

@@ -1,0 +1,56 @@
+[Unit]
+# Holds the tmux server that owns every terminal session, in its own control
+# group.
+#
+# Without this unit, tmux is started implicitly by the backend the first time a
+# terminal is created, which makes the server a child of deckterm.service. The
+# systemd default KillMode=control-group then kills the whole group on stop, so
+# *any* restart of the backend destroys every session — including restarts
+# nobody asked for. On Ubuntu, needrestart restarts services automatically after
+# a shared-library security upgrade; a libcurl update did exactly that on
+# 2026-08-26 and took three live sessions with it.
+#
+# With the server in this unit, restarting deckterm.service leaves sessions
+# untouched. Stopping *this* unit is what ends them, which is the intent.
+Description=DeckTerm tmux server (terminal sessions)
+Documentation=file:///home/deploy/apps/deckterm/prod/current/deploy/README.md
+After=network.target
+
+[Service]
+# tmux daemonises itself, so the started client exits and systemd adopts the
+# surviving server as the main process.
+Type=forking
+User=deploy
+Group=deploy
+WorkingDirectory=/home/deploy/apps/deckterm/prod/current
+
+# The same environment file the backend uses. The socket path is derived from
+# DECKTERM_STATE_DIR / HOME and TMUX_SESSION_NAMESPACE, so both sides must read
+# the same values or they end up on different sockets — see below.
+EnvironmentFile=/home/deploy/apps/deckterm/shared/prod.env
+
+# Do NOT replace this with a literal `tmux -S /path/... start-server`.
+#
+# The socket path is computed by getTmuxSocketPath() from the environment. A
+# hardcoded path here would drift the moment TMUX_SESSION_NAMESPACE or
+# DECKTERM_STATE_DIR changes: this unit would hold a server on one socket while
+# the backend started its own — back inside its own control group — on another.
+# Nothing would look broken until the next restart destroyed the sessions.
+#
+# backend/tmux-server-launch.ts derives the path with the very same function the
+# backend uses, creates the socket directory 0700, and starts the server with
+# `exit-empty off` in a single tmux invocation. That flag is load-bearing: tmux
+# defaults exit-empty to on, so a server started before any session exists would
+# otherwise exit immediately.
+ExecStart=/home/deploy/.bun/bin/bun run backend/tmux-server-launch.ts
+ExecStop=/home/deploy/.bun/bin/bun run backend/tmux-server-launch.ts --kill
+
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+
+# Deliberately the default KillMode=control-group: stopping this unit is the
+# operator saying "end the sessions", and the shells must go with it.
+
+[Install]
+WantedBy=multi-user.target

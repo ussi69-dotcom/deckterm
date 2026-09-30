@@ -180,29 +180,37 @@ Primary script: [scripts/deploy_release.sh](/home/deploy/deckterm_dev/scripts/de
 
 Current deployment flow:
 
-1. copy unpacked source into a versioned release directory
-2. symlink shared env file and write a `RELEASE_ID` marker into the release
-3. install dependencies inside the release
-4. refuse to deploy if `PROD_CANDIDATE_PORT` is already in use (stale candidate)
-5. start a candidate instance on `PROD_CANDIDATE_PORT`
-6. wait for candidate health, then confirm the candidate process is still alive
-7. repoint `current` symlink
-8. restart production systemd service
-9. verify live health on `PROD_PORT`
-10. verify `/api/health` reports the release id just promoted (proof prod is
-    actually serving this build, not a rolled-back/stale one)
-11. rollback to `previous` and exit non-zero on any failure
+1. run the driver and safety tools from the active reviewed release, with the unpacked
+   candidate supplied through `SOURCE_DIR`
+2. copy unpacked source into a versioned release directory
+3. symlink shared env file and write a `RELEASE_ID` marker into the release
+4. install dependencies inside the release
+5. refuse to deploy if `PROD_CANDIDATE_PORT` is already in use (stale candidate)
+6. create a serialized, integrity-checked production-state backup
+7. restore that backup into private candidate state, tmux, clipboard, and capture paths
+8. run a direct Bun process in validation-only preflight mode
+9. require exact candidate identity plus `preflight: true`, then stop it
+10. verify the backup again and prove the previous schema contract remains compatible
+11. remove the private candidate tree before changing `current`
+12. repoint `current` and restart the production systemd service
+13. require exact live release identity on `PROD_PORT`
+14. restore and re-verify `previous` on any post-promotion failure
 
 Important hardening already in place:
 
 - startup failures exit non-zero instead of leaving a fake alive process
 - SSH deploy key is written with trailing newline
 - deploy script uses an explicit Bun path for non-interactive SSH shells
-- candidates are killed as a whole process tree (`kill_tree`) so the real
-  server child does not leak onto the candidate port after each deploy
-- the candidate port is checked free before starting, and the candidate PID is
-  re-checked alive after the health probe, so "something healthy on the port"
-  can no longer be mistaken for "the new build is healthy"
+- the candidate is the directly tracked Bun child, terminated and waited on by every exit
+  path; its private `0700` tree and log are removed before promotion
+- the candidate port is checked free before startup; health must report the exact release
+  ID and validation-only marker, so another listener cannot satisfy the gate
+- old release code is never started as a schema probe; additive compatibility comes from
+  JSON contracts captured from the verified backup and private migrated database
+- the incoming release never supplies the backup, restore, health, or schema judgment code;
+  the active reviewed driver uses its own sibling tools
+- deploy and rollback share one host lifetime lock and refuse overlapping operations before
+  changing a release symlink or restarting the service
 - promotion is verified end to end via the `release` field of `/api/health`;
   a silent rollback can no longer be reported as a successful deploy
 - the remote deploy script runs under an explicit non-interactive `bash` so a
@@ -210,14 +218,19 @@ Important hardening already in place:
 
 ## Rollback
 
-Rollback script: [scripts/rollback_release.sh](/home/deploy/deckterm_dev/scripts/rollback_release.sh)
+Rollback script: [active release rollback script](/home/deploy/apps/deckterm/prod/current/scripts/rollback_release.sh)
+
+The script checks the target and current schema contracts before it changes a symlink. A
+missing or incompatible contract fails without opening live state. It then verifies the
+exact rollback release identity; a failed rollback restores and verifies the original
+release.
 
 Example:
 
 ```bash
 DEPLOY_ROOT=/home/deploy/apps/deckterm/prod \
 SYSTEMD_SERVICE=deckterm.service \
-bash scripts/rollback_release.sh
+bash /home/deploy/apps/deckterm/prod/current/scripts/rollback_release.sh
 ```
 
 ## Validation Commands

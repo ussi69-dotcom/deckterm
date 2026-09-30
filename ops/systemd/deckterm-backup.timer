@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the verified DeckTerm state backup every day
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+RandomizedDelaySec=30m
+Persistent=true
+AccuracySec=5m
+Unit=deckterm-backup.service
+
+[Install]
+WantedBy=timers.target

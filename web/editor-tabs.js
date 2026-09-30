@@ -562,6 +562,8 @@ class EditorTabsController {
       typeof options.onRevealLine === "function" ? options.onRevealLine : null;
 
     this.tabBarEl = null;
+    this.tabButtons = new Map();
+    this.focusedTabKey = null;
     this.bodyHostEl = null;
     // Per-tab mounted body element cache (so switching tabs doesn't re-fetch).
     this.bodies = new Map();
@@ -605,6 +607,8 @@ class EditorTabsController {
     const bar = this.doc.createElement("div");
     bar.className = "ide-editor-tabs";
     bar.setAttribute("role", "tablist");
+    bar.setAttribute("aria-label", "Open editors");
+    bar.setAttribute("aria-orientation", "horizontal");
     const host = this.doc.createElement("div");
     host.className = "ide-editor-bodies";
     this.areaEl.appendChild(bar);
@@ -678,10 +682,17 @@ class EditorTabsController {
     // Toggle the placeholder vs the tab UI.
     if (this.placeholderEl) this.placeholderEl.hidden = hasTabs;
     if (!hasTabs) {
+      const hadTabFocus = this.tabBarEl?.contains?.(this.doc.activeElement);
       // No tabs: tear down bodies + clear the bar, show the placeholder.
       if (this.tabBarEl) this.tabBarEl.replaceChildren();
+      this.tabButtons.clear();
+      this.focusedTabKey = null;
       this.clearBodies();
       if (this.areaEl) this.areaEl.classList.remove("has-tabs");
+      if (hadTabFocus && this.placeholderEl) {
+        this.placeholderEl.tabIndex = -1;
+        this.placeholderEl.focus?.();
+      }
       return;
     }
     this.ensureScaffold();
@@ -711,39 +722,67 @@ class EditorTabsController {
   renderTabBar() {
     if (!this.tabBarEl) return;
     const { tabs, activeKey } = this.model.state;
+    const focused = this.doc.activeElement;
+    const hadTabFocus = this.tabBarEl.contains?.(focused);
+    const focusedRow = hadTabFocus
+      ? focused?.closest?.(".ide-editor-tab")
+      : null;
+    const restoreClose = focused?.classList?.contains("ide-editor-tab-close");
+    const previousKey = focusedRow?.dataset.tabKey || this.focusedTabKey;
+    this.focusedTabKey =
+      hadTabFocus && tabs.some((tab) => tabKey(tab) === previousKey)
+        ? previousKey
+        : activeKey;
     this.tabBarEl.replaceChildren();
+    this.tabButtons.clear();
     for (const tab of tabs) {
       const key = tabKey(tab);
       const el = this.doc.createElement("div");
       el.className = "ide-editor-tab";
       el.dataset.tabKey = key;
-      el.setAttribute("role", "tab");
+      el.setAttribute("role", "presentation");
       if (key === activeKey) el.classList.add("active");
       if (tab.preview) el.classList.add("preview");
       if (tab.type === TAB_DIFF) el.classList.add("is-diff");
       if (tab.type === TAB_SETTINGS) el.classList.add("is-settings");
       if (tab.type === TAB_TASKS) el.classList.add("is-tasks");
-      el.setAttribute("aria-selected", key === activeKey ? "true" : "false");
+      const activate = this.doc.createElement("button");
+      activate.type = "button";
+      activate.className = "ide-editor-tab-activate";
+      activate.id = `editor-tab-${encodeURIComponent(key)}`;
+      activate.setAttribute("role", "tab");
+      activate.setAttribute(
+        "aria-selected",
+        key === activeKey ? "true" : "false",
+      );
+      activate.setAttribute(
+        "aria-controls",
+        `editor-panel-${encodeURIComponent(key)}`,
+      );
+      activate.tabIndex = key === this.focusedTabKey ? 0 : -1;
 
       if (tab.type === TAB_DIFF) {
         const ind = this.doc.createElement("span");
         ind.className = "ide-editor-tab-diff-indicator";
         ind.textContent = "±";
         ind.title = "Diff";
-        el.appendChild(ind);
+        ind.setAttribute("aria-hidden", "true");
+        activate.appendChild(ind);
       }
 
       const label = this.doc.createElement("span");
       label.className = "ide-editor-tab-label";
       label.textContent = this.labelForTab(tab);
       label.title = fullTitle(tab);
-      el.appendChild(label);
+      activate.appendChild(label);
+      el.appendChild(activate);
 
       const close = this.doc.createElement("button");
       close.type = "button";
       close.className = "ide-editor-tab-close";
       close.title = "Close";
-      close.setAttribute("aria-label", "Close tab");
+      close.setAttribute("aria-label", `Close ${this.labelForTab(tab)}`);
+      close.tabIndex = activate.tabIndex;
       close.textContent = "✕";
       close.addEventListener("click", (event) => {
         event.stopPropagation();
@@ -751,12 +790,52 @@ class EditorTabsController {
         this.requestCloseKey(key);
       });
       el.appendChild(close);
+      this.tabButtons.set(key, { activate, close });
+      activate.addEventListener("focus", () => this.setTabFocus(key));
+      el.addEventListener("keydown", (event) => {
+        if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)
+          return;
+        const index = tabs.findIndex((entry) => tabKey(entry) === key);
+        let next = null;
+        if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+        if (event.key === "ArrowLeft")
+          next = (index - 1 + tabs.length) % tabs.length;
+        if (event.key === "Home") next = 0;
+        if (event.key === "End") next = tabs.length - 1;
+        if (next !== null) {
+          event.preventDefault();
+          event.stopPropagation();
+          this.tabButtons.get(tabKey(tabs[next]))?.activate.focus();
+        } else if (event.key === "Delete") {
+          event.preventDefault();
+          event.stopPropagation();
+          this.requestCloseKey(key);
+        } else if (event.key === "Enter" || event.key === " ") {
+          // Native buttons generate click; keep shell shortcuts out of it.
+          event.stopPropagation();
+        }
+      });
 
       // Single click = activate (and promote the tab if it's the preview being
       // clicked twice). Double click = pin (VS Code).
       el.addEventListener("click", () => this.model.activate(key));
       el.addEventListener("dblclick", () => this.model.pin(key));
       this.tabBarEl.appendChild(el);
+    }
+    if (hadTabFocus) {
+      const controls = this.tabButtons.get(this.focusedTabKey);
+      (restoreClose && previousKey === this.focusedTabKey
+        ? controls?.close
+        : controls?.activate
+      )?.focus?.({ preventScroll: true });
+    }
+  }
+
+  setTabFocus(key) {
+    this.focusedTabKey = key;
+    for (const [entryKey, controls] of this.tabButtons) {
+      controls.activate.tabIndex = entryKey === key ? 0 : -1;
+      controls.close.tabIndex = entryKey === key ? 0 : -1;
     }
   }
 
@@ -785,6 +864,13 @@ class EditorTabsController {
       bodyEl = this.doc.createElement("div");
       bodyEl.className = "ide-editor-body";
       bodyEl.dataset.tabKey = activeKey;
+      bodyEl.id = `editor-panel-${encodeURIComponent(activeKey)}`;
+      bodyEl.setAttribute("role", "tabpanel");
+      bodyEl.setAttribute(
+        "aria-labelledby",
+        `editor-tab-${encodeURIComponent(activeKey)}`,
+      );
+      bodyEl.tabIndex = 0;
       this.bodyHostEl.appendChild(bodyEl);
       this.bodies.set(activeKey, bodyEl);
       try {

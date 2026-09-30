@@ -1,23 +1,30 @@
 import { afterEach, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runBackup } from "../scripts/backup-state";
+import {
+  acquireBackupLock,
+  runBackup,
+  verifyBackup,
+} from "../scripts/backup-state";
 
 const tempDirs: string[] = [];
 
-function createTempStateDir(): string {
-  const dir = mkdtempSync(
-    join(process.env.HOME || "/tmp", ".deckterm-backup-test-"),
-  );
+function fixture(prefix = "deckterm-backup-test-"): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  chmodSync(dir, 0o700);
   tempDirs.push(dir);
   return dir;
 }
@@ -40,225 +47,321 @@ function createStateDb(stateDir: string): Database {
   return db;
 }
 
-test("runBackup creates a readable backup with a valid manifest", async () => {
-  const stateDir = createTempStateDir();
-  const db = createStateDb(stateDir);
-  db.close();
+async function runBackupCli(
+  home: string,
+  args: string[],
+  stateDir?: string,
+  cwd = home,
+  envFile?: string,
+): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: home,
+  };
+  delete env.DECKTERM_STATE_DIR;
+  if (stateDir) env.DECKTERM_STATE_DIR = stateDir;
+  const command = [process.execPath];
+  if (envFile) command.push(`--env-file=${envFile}`);
+  command.push(join(import.meta.dir, "../scripts/backup-state.ts"), ...args);
+  const child = Bun.spawn(command, {
+    cwd,
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { exitCode, stdout, stderr };
+}
+
+test("standalone backup CLI still requires an explicit state directory", async () => {
+  const home = fixture();
+  const defaultState = join(home, ".deckterm");
+  mkdirSync(defaultState, { mode: 0o700 });
+  createStateDb(defaultState).close();
+
+  const result = await runBackupCli(home, []);
+
+  expect(result.exitCode).toBe(1);
+  expect(result.stderr).toContain("DECKTERM_STATE_DIR must be set");
+  expect(existsSync(join(defaultState, "backups"))).toBe(false);
+});
+
+test("deploy-only backup flag uses the server default while explicit state wins", async () => {
+  const home = fixture();
+  const defaultState = join(home, ".deckterm");
+  mkdirSync(defaultState, { mode: 0o700 });
+  createStateDb(defaultState).close();
+  const unrelatedCwd = fixture();
+  const unrelatedState = fixture();
+  createStateDb(unrelatedState).close();
+  writeFileSync(
+    join(unrelatedCwd, ".env"),
+    `DECKTERM_STATE_DIR=${unrelatedState}\n`,
+    { mode: 0o600 },
+  );
+  const legacyProductionEnv = join(home, "prod.env");
+  writeFileSync(legacyProductionEnv, "TMUX_BACKEND=1\n", { mode: 0o600 });
+
+  const fallback = await runBackupCli(
+    home,
+    ["--use-server-state-default"],
+    undefined,
+    unrelatedCwd,
+    legacyProductionEnv,
+  );
+  expect(fallback.exitCode).toBe(0);
+  expect(fallback.stdout.trim()).toStartWith(join(defaultState, "backups"));
+  expect(existsSync(join(unrelatedState, "backups"))).toBe(false);
+
+  const explicitState = fixture();
+  createStateDb(explicitState).close();
+  const explicit = await runBackupCli(
+    home,
+    ["--use-server-state-default"],
+    explicitState,
+  );
+  expect(explicit.exitCode).toBe(0);
+  expect(explicit.stdout.trim()).toStartWith(join(explicitState, "backups"));
+});
+
+test("runBackup publishes a private, integrity-checked version-2 set", async () => {
+  const stateDir = fixture();
+  createStateDb(stateDir).close();
 
   const result = await runBackup({
     stateDir,
     now: new Date("2026-07-04T03:15:00Z"),
   });
+  const verified = verifyBackup(result.manifestPath);
 
-  expect(existsSync(result.backupPath)).toBe(true);
-  expect(existsSync(result.manifestPath)).toBe(true);
   expect(result.backupPath).toContain("20260704T031500Z");
-
-  const backupDb = new Database(result.backupPath, { readonly: true });
-  const widgets = backupDb
-    .query("SELECT name FROM widgets ORDER BY id")
-    .all() as { name: string }[];
-  expect(widgets.map((w) => w.name)).toEqual(["alpha", "beta", "gamma"]);
-  const counters = backupDb
-    .query("SELECT value FROM counters ORDER BY id")
-    .all() as {
-    value: number;
-  }[];
-  expect(counters.map((c) => c.value)).toEqual([1, 2]);
-  backupDb.close();
-
-  const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8")) as {
-    createdAt: string;
-    sourceDb: string;
-    sourceBytes: number;
-    backupBytes: number;
-    sha256: string;
-    anchorCopied: boolean;
-  };
-  expect(manifest.sourceDb).toBe(join(stateDir, "deckterm.db"));
-  expect(manifest.anchorCopied).toBe(false);
-  expect(manifest.sourceBytes).toBeGreaterThan(0);
-  expect(manifest.backupBytes).toBeGreaterThan(0);
-
-  const recomputedSha = createHash("sha256")
-    .update(readFileSync(result.backupPath))
-    .digest("hex");
-  expect(manifest.sha256).toBe(recomputedSha);
-
-  const backupMode = statSync(result.backupPath).mode & 0o777;
-  const manifestMode = statSync(result.manifestPath).mode & 0o777;
-  expect(backupMode).toBe(0o600);
-  expect(manifestMode).toBe(0o600);
-
-  const backupsDirMode = statSync(join(stateDir, "backups")).mode & 0o777;
-  expect(backupsDirMode).toBe(0o700);
-});
-
-test("runBackup copies audit-anchor.log when present", async () => {
-  const stateDir = createTempStateDir();
-  const db = createStateDb(stateDir);
-  db.close();
-  writeFileSync(
-    join(stateDir, "audit-anchor.log"),
-    "anchor-line-1\nanchor-line-2\n",
-  );
-
-  const result = await runBackup({
-    stateDir,
-    now: new Date("2026-07-04T03:15:00Z"),
-  });
-
-  const manifest = JSON.parse(readFileSync(result.manifestPath, "utf8")) as {
-    anchorCopied: boolean;
-  };
-  expect(manifest.anchorCopied).toBe(true);
-
-  const anchorCopyPath = join(
-    stateDir,
-    "backups",
-    "deckterm-20260704T031500Z.audit-anchor.log",
-  );
-  expect(existsSync(anchorCopyPath)).toBe(true);
-  expect(readFileSync(anchorCopyPath, "utf8")).toBe(
-    "anchor-line-1\nanchor-line-2\n",
-  );
-  const anchorMode = statSync(anchorCopyPath).mode & 0o777;
-  expect(anchorMode).toBe(0o600);
-});
-
-test("runBackup prunes to keep only the newest N sets and never touches unrelated files", async () => {
-  const stateDir = createTempStateDir();
-  const db = createStateDb(stateDir);
-  db.close();
-
-  const backupsDir = join(stateDir, "backups");
-  // Plant decoy files before any backup runs; the dir doesn't exist yet so create it first.
-  const { mkdirSync } = await import("node:fs");
-  mkdirSync(backupsDir, { recursive: true });
-  writeFileSync(join(backupsDir, "keep-me.txt"), "do not delete me");
-  // Codex pre-final #1: lookalikes that share the prefix/suffix but are not
-  // an exact backup-set filename must never be pruned.
-  writeFileSync(
-    join(backupsDir, "deckterm-20200101T000000Z.manual.db"),
-    "operator's manual copy",
-  );
-  writeFileSync(
-    join(backupsDir, "deckterm-notes.manifest.json"),
-    "not a backup manifest",
-  );
-
-  const keep = 7;
-  const runTimestamps = Array.from(
-    { length: 9 },
-    (_, i) => new Date(Date.UTC(2026, 6, 4, 0, i, 0)), // distinct minutes, no sleeping
-  );
-
-  const results = [];
-  for (const now of runTimestamps) {
-    results.push(await runBackup({ stateDir, keep, now }));
-  }
-
-  // Decoy files must survive every prune pass — including exact-shape
-  // lookalikes older than every kept set.
-  expect(existsSync(join(backupsDir, "keep-me.txt"))).toBe(true);
-  expect(
-    existsSync(join(backupsDir, "deckterm-20200101T000000Z.manual.db")),
-  ).toBe(true);
-  expect(existsSync(join(backupsDir, "deckterm-notes.manifest.json"))).toBe(
-    true,
-  );
-
-  // Only the newest 7 of the 9 backup sets should remain.
-  const remaining = results.slice(2); // oldest 2 pruned
-  const prunedExpected = results.slice(0, 2);
-
-  for (const r of remaining) {
-    expect(existsSync(r.backupPath)).toBe(true);
-    expect(existsSync(r.manifestPath)).toBe(true);
-  }
-  for (const r of prunedExpected) {
-    expect(existsSync(r.backupPath)).toBe(false);
-    expect(existsSync(r.manifestPath)).toBe(false);
-  }
-
-  // The final run's pruned list should report exactly the two oldest sets removed overall
-  // across the whole sequence (each run only prunes what's currently over the keep count).
-  const allPruned = results.flatMap((r) => r.pruned);
-  expect(allPruned.length).toBe(2 /* db */ * 1 + 2 /* manifest */); // 2 sets * 2 files each
-  for (const r of prunedExpected) {
-    expect(allPruned).toContain(r.backupPath);
-    expect(allPruned).toContain(r.manifestPath);
-  }
-});
-
-test("runBackup works against a live DB with uncommitted WAL content", async () => {
-  const stateDir = createTempStateDir();
-  const db = createStateDb(stateDir);
-
-  // Write more rows without checkpointing — this content lives only in the WAL file.
-  db.exec("INSERT INTO widgets (name) VALUES ('delta'), ('epsilon')");
-
-  const result = await runBackup({
-    stateDir,
-    now: new Date("2026-07-04T03:15:00Z"),
+  expect(verified.databasePath).toBe(result.backupPath);
+  expect(verified.manifest).toMatchObject({
+    version: 2,
+    backupId: "20260704T031500Z",
+    source: { fileName: "deckterm.db" },
+    database: {
+      fileName: "deckterm-20260704T031500Z.db",
+      integrityCheck: "ok",
+    },
+    auditAnchor: null,
   });
 
   const backupDb = new Database(result.backupPath, { readonly: true });
-  const widgets = backupDb
-    .query("SELECT name FROM widgets ORDER BY id")
-    .all() as { name: string }[];
-  expect(widgets.map((w) => w.name)).toEqual([
-    "alpha",
-    "beta",
-    "gamma",
-    "delta",
-    "epsilon",
+  expect(backupDb.query("SELECT name FROM widgets ORDER BY id").all()).toEqual([
+    { name: "alpha" },
+    { name: "beta" },
+    { name: "gamma" },
   ]);
   backupDb.close();
 
-  db.close();
+  expect(statSync(join(stateDir, "backups")).mode & 0o777).toBe(0o700);
+  expect(statSync(result.backupPath).mode & 0o777).toBe(0o600);
+  expect(statSync(result.manifestPath).mode & 0o777).toBe(0o600);
+  expect(
+    readdirSync(join(stateDir, "backups")).filter((name) =>
+      name.endsWith(".partial"),
+    ),
+  ).toEqual([]);
 });
 
-test("runBackup throws a clear error when the source DB is missing", async () => {
-  const stateDir = createTempStateDir();
+test("runBackup authenticates the copied audit anchor", async () => {
+  const stateDir = fixture();
+  createStateDb(stateDir).close();
+  writeFileSync(
+    join(stateDir, "audit-anchor.log"),
+    "anchor-one\nanchor-two\n",
+    {
+      mode: 0o600,
+    },
+  );
 
-  await expect(runBackup({ stateDir, now: new Date() })).rejects.toThrow(
+  const result = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:15:00Z"),
+  });
+  const verified = verifyBackup(result.manifestPath);
+
+  expect(verified.auditAnchorPath).toBe(result.anchorPath);
+  expect(verified.manifest.auditAnchor?.bytes).toBe(22);
+  expect(readFileSync(result.anchorPath!, "utf8")).toBe(
+    "anchor-one\nanchor-two\n",
+  );
+  expect(statSync(result.anchorPath!).mode & 0o777).toBe(0o600);
+});
+
+test("retention prunes only complete verified sets after a successful backup", async () => {
+  const stateDir = fixture();
+  createStateDb(stateDir).close();
+  const backupsDir = join(stateDir, "backups");
+  mkdirSync(backupsDir, { mode: 0o700 });
+  writeFileSync(join(backupsDir, "keep-me.txt"), "operator data", {
+    mode: 0o600,
+  });
+  writeFileSync(
+    join(backupsDir, "deckterm-20200101T000000Z.db"),
+    "orphan without a manifest",
+    { mode: 0o600 },
+  );
+  writeFileSync(
+    join(backupsDir, "deckterm-20200102T000000Z.manifest.json"),
+    "{broken",
+    { mode: 0o600 },
+  );
+
+  const first = await runBackup({
+    stateDir,
+    keep: 2,
+    now: new Date("2026-07-04T00:00:00Z"),
+  });
+  const second = await runBackup({
+    stateDir,
+    keep: 2,
+    now: new Date("2026-07-04T00:01:00Z"),
+  });
+  const third = await runBackup({
+    stateDir,
+    keep: 2,
+    now: new Date("2026-07-04T00:02:00Z"),
+  });
+
+  expect(existsSync(first.manifestPath)).toBe(false);
+  expect(existsSync(first.backupPath)).toBe(false);
+  expect(existsSync(second.manifestPath)).toBe(true);
+  expect(existsSync(third.manifestPath)).toBe(true);
+  expect(third.pruned).toEqual([first.manifestPath, first.backupPath]);
+  expect(existsSync(join(backupsDir, "keep-me.txt"))).toBe(true);
+  expect(existsSync(join(backupsDir, "deckterm-20200101T000000Z.db"))).toBe(
+    true,
+  );
+  expect(
+    existsSync(join(backupsDir, "deckterm-20200102T000000Z.manifest.json")),
+  ).toBe(true);
+});
+
+test("runBackup includes committed WAL rows without stopping the writer", async () => {
+  const stateDir = fixture();
+  const live = createStateDb(stateDir);
+  live.exec("INSERT INTO widgets (name) VALUES ('delta'), ('epsilon')");
+
+  const result = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:15:00Z"),
+  });
+  const backup = new Database(result.backupPath, { readonly: true });
+  expect(backup.query("SELECT name FROM widgets ORDER BY id").all()).toEqual([
+    { name: "alpha" },
+    { name: "beta" },
+    { name: "gamma" },
+    { name: "delta" },
+    { name: "epsilon" },
+  ]);
+  backup.close();
+  live.close();
+});
+
+test("a separate lifetime lock serializes backup jobs and releases cleanly", async () => {
+  const stateDir = fixture();
+  createStateDb(stateDir).close();
+  const backupsDir = join(stateDir, "backups");
+  mkdirSync(backupsDir, { mode: 0o700 });
+  const lock = acquireBackupLock(backupsDir);
+  try {
+    await expect(
+      runBackup({ stateDir, now: new Date("2026-07-04T03:15:00Z") }),
+    ).rejects.toThrow(/Another DeckTerm backup/);
+    expect(
+      readdirSync(backupsDir).some((name) => name.endsWith(".manifest.json")),
+    ).toBe(false);
+  } finally {
+    lock.release();
+  }
+  const result = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:15:00Z"),
+  });
+  expect(verifyBackup(result.manifestPath).manifest.backupId).toBe(
+    "20260704T031500Z",
+  );
+});
+
+test("verification detects database and anchor tampering", async () => {
+  const stateDir = fixture();
+  createStateDb(stateDir).close();
+  writeFileSync(join(stateDir, "audit-anchor.log"), "anchor\n", {
+    mode: 0o600,
+  });
+
+  const databaseSet = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:15:00Z"),
+  });
+  writeFileSync(databaseSet.backupPath, "not sqlite", { mode: 0o600 });
+  expect(() => verifyBackup(databaseSet.manifestPath)).toThrow(
+    /size mismatch|SHA-256/,
+  );
+
+  const anchorSet = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:16:00Z"),
+  });
+  writeFileSync(anchorSet.anchorPath!, "changed\n", { mode: 0o600 });
+  expect(() => verifyBackup(anchorSet.manifestPath)).toThrow(
+    /audit anchor.*mismatch/i,
+  );
+});
+
+test("failed and colliding backups publish no false complete set", async () => {
+  const stateDir = fixture();
+  writeFileSync(join(stateDir, "deckterm.db"), "invalid sqlite", {
+    mode: 0o600,
+  });
+  await expect(
+    runBackup({ stateDir, now: new Date("2026-07-04T03:15:00Z") }),
+  ).rejects.toThrow();
+  const entries = readdirSync(join(stateDir, "backups"));
+  expect(entries.some((name) => name.endsWith(".manifest.json"))).toBe(false);
+  expect(entries.some((name) => name.endsWith(".partial"))).toBe(false);
+
+  rmSync(join(stateDir, "deckterm.db"), { force: true });
+  createStateDb(stateDir).close();
+  const first = await runBackup({
+    stateDir,
+    now: new Date("2026-07-04T03:15:00Z"),
+  });
+  await expect(
+    runBackup({ stateDir, now: new Date("2026-07-04T03:15:00Z") }),
+  ).rejects.toThrow(/already exists/);
+  expect(() => verifyBackup(first.manifestPath)).not.toThrow();
+});
+
+test("backup rejects missing and symlinked state entries", async () => {
+  const missing = fixture();
+  await expect(runBackup({ stateDir: missing })).rejects.toThrow(
     /deckterm\.db/,
   );
-});
 
-test("runBackup refuses symlinked DB, backups dir, and anchor log", async () => {
-  const { mkdirSync, symlinkSync } = await import("node:fs");
-
-  // Symlinked backups dir → refuse.
-  const stateA = createTempStateDir();
+  const stateA = fixture();
   createStateDb(stateA).close();
-  const elsewhereA = createTempStateDir();
-  symlinkSync(elsewhereA, join(stateA, "backups"));
-  await expect(
-    runBackup({ stateDir: stateA, now: new Date() }),
-  ).rejects.toThrow(/symlink/);
+  symlinkSync(fixture(), join(stateA, "backups"));
+  await expect(runBackup({ stateDir: stateA })).rejects.toThrow(
+    /real directory/,
+  );
 
-  // Symlinked source DB → refuse.
-  const stateB = createTempStateDir();
-  const realDbHome = createTempStateDir();
+  const stateB = fixture();
+  const realDbHome = fixture();
   createStateDb(realDbHome).close();
   symlinkSync(join(realDbHome, "deckterm.db"), join(stateB, "deckterm.db"));
-  await expect(
-    runBackup({ stateDir: stateB, now: new Date() }),
-  ).rejects.toThrow(/symlink/);
+  await expect(runBackup({ stateDir: stateB })).rejects.toThrow(/regular file/);
 
-  // Symlinked audit-anchor.log → refuse (DB itself is fine).
-  const stateC = createTempStateDir();
+  const stateC = fixture();
   createStateDb(stateC).close();
-  const anchorHome = createTempStateDir();
-  writeFileSync(join(anchorHome, "real-anchor.log"), "anchor");
-  symlinkSync(
-    join(anchorHome, "real-anchor.log"),
-    join(stateC, "audit-anchor.log"),
-  );
-  mkdirSync(join(stateC, "backups"), { recursive: true });
-  await expect(
-    runBackup({ stateDir: stateC, now: new Date() }),
-  ).rejects.toThrow(/symlink/);
+  const anchorHome = fixture();
+  writeFileSync(join(anchorHome, "anchor"), "anchor", { mode: 0o600 });
+  symlinkSync(join(anchorHome, "anchor"), join(stateC, "audit-anchor.log"));
+  await expect(runBackup({ stateDir: stateC })).rejects.toThrow(/regular file/);
 });

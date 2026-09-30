@@ -373,6 +373,7 @@ function fakeDocument() {
       children: [],
       hidden: false,
       attrs: {},
+      listeners: {},
       _connected: true,
       classList: {
         _set: new Set(),
@@ -384,7 +385,7 @@ function fakeDocument() {
         },
         toggle() {},
         contains(c) {
-          return this._set.has(c);
+          return this._set.has(c) || el.className.split(" ").includes(c);
         },
       },
       setAttribute(k, v) {
@@ -396,6 +397,9 @@ function fakeDocument() {
         return c;
       },
       replaceChildren() {
+        if (this.contains(doc.activeElement))
+          doc.activeElement = doc.body || null;
+        for (const child of this.children) child._connected = false;
         this.children = [];
       },
       remove() {
@@ -404,7 +408,28 @@ function fakeDocument() {
           this.parent.children = this.parent.children.filter((x) => x !== this);
         }
       },
-      addEventListener() {},
+      addEventListener(type, handler) {
+        (this.listeners[type] ||= []).push(handler);
+      },
+      contains(child) {
+        return (
+          child === this ||
+          this.children.some((entry) => entry.contains?.(child))
+        );
+      },
+      closest(selector) {
+        if (
+          selector.startsWith(".") &&
+          this.classList.contains(selector.slice(1))
+        )
+          return this;
+        return this.parent?.closest?.(selector) || null;
+      },
+      focus() {
+        doc.activeElement = this;
+        for (const handler of this.listeners.focus || [])
+          handler({ target: this });
+      },
       querySelector() {
         return null;
       },
@@ -414,8 +439,74 @@ function fakeDocument() {
     };
     return el;
   };
-  return { createElement: (tag) => make(tag) };
+  const doc = { activeElement: null, createElement: (tag) => make(tag) };
+  return doc;
 }
+
+test("editor tabs move focus with arrows, preserve active content until activation, and close safely", () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  const areaEl = doc.createElement("div");
+  const controller = new EditorTabsController({ document: doc, areaEl });
+  controller.openFile("/first.txt", { preview: false });
+  controller.openFile("/second.txt", { preview: false });
+  const keys = [...controller.tabButtons.keys()];
+  const activeKey = controller.model.state.activeKey;
+  const first = controller.tabButtons.get(keys[0]).activate;
+  first.focus();
+  for (const handler of first.parent.listeners.keydown)
+    handler({ key: "ArrowRight", preventDefault() {}, stopPropagation() {} });
+  expect(doc.activeElement).toBe(controller.tabButtons.get(keys[1]).activate);
+  expect(controller.model.state.activeKey).toBe(activeKey);
+  expect(
+    [...controller.tabButtons.values()].map((entry) => entry.activate.tabIndex),
+  ).toEqual([-1, 0]);
+  for (const handler of doc.activeElement.parent.listeners.keydown)
+    handler({ key: "Home", preventDefault() {}, stopPropagation() {} });
+  expect(doc.activeElement).toBe(first);
+  expect(controller.model.state.activeKey).toBe(activeKey);
+  // Native Enter/Space dispatches click on the activation button; the row
+  // delegates that click to the model and restores focus after the render.
+  for (const handler of first.parent.listeners.click) handler();
+  expect(controller.model.state.activeKey).toBe(keys[0]);
+  expect(doc.activeElement).toBe(controller.tabButtons.get(keys[0]).activate);
+  const current = doc.activeElement;
+  for (const handler of current.parent.listeners.keydown)
+    handler({ key: "Delete", preventDefault() {}, stopPropagation() {} });
+  expect(controller.model.state.tabs).toHaveLength(1);
+  expect(doc.activeElement).toBe(controller.tabButtons.get(keys[1]).activate);
+});
+
+test("editor keyboard Delete uses the unsaved-change confirmation and tab panels are linked", async () => {
+  const { EditorTabsController } = require("./editor-tabs");
+  const doc = fakeDocument();
+  let confirmations = 0;
+  const controller = new EditorTabsController({
+    document: doc,
+    areaEl: doc.createElement("div"),
+    isDirtyImpl: () => true,
+    confirmImpl: () => {
+      confirmations += 1;
+      return false;
+    },
+    mountFileBody: async () => {},
+  });
+  controller.openFile("/unsaved.txt", { preview: false });
+  await Promise.resolve();
+  const key = controller.model.state.activeKey;
+  const activate = controller.tabButtons.get(key).activate;
+  activate.focus();
+  for (const handler of activate.parent.listeners.keydown)
+    handler({ key: "Delete", preventDefault() {}, stopPropagation() {} });
+  expect(confirmations).toBe(1);
+  expect(controller.model.state.tabs).toHaveLength(1);
+  expect(activate.attrs["role"]).toBe("tab");
+  expect(activate.attrs["aria-selected"]).toBe("true");
+  const body = controller.bodies.get(key);
+  expect(body.id).toBe(activate.attrs["aria-controls"]);
+  expect(body.attrs["aria-labelledby"]).toBe(activate.id);
+  expect(body.attrs["role"]).toBe("tabpanel");
+});
 
 test("controller prunes + tears down a preview body replaced in place", async () => {
   const { EditorTabsController } = require("./editor-tabs");

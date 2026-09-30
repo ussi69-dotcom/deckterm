@@ -24,7 +24,7 @@ test.describe("Settings window (VS Code style)", () => {
     await waitForTerminal(page);
   });
 
-  test("opens, switches category, filters via search, and renders server config", async ({
+  test("opens, focuses search, switches category, filters, and scopes server config to Advanced", async ({
     page,
   }) => {
     await openSettings(page);
@@ -32,6 +32,7 @@ test.describe("Settings window (VS Code style)", () => {
     const win = page.locator('[data-window-id="settings"]');
     const sidebar = win.locator(".settings-sidebar");
     const list = win.locator(".settings-list");
+    await expect(win.locator(".settings-search-input")).toBeFocused();
 
     // Sidebar shows categories.
     await expect(sidebar.getByRole("tab", { name: "Terminal" })).toBeVisible();
@@ -50,8 +51,128 @@ test.describe("Settings window (VS Code style)", () => {
     // Clear search restores the active category view.
     await search.fill("");
 
-    // Server Config section renders an allowlisted key.
+    // Server diagnostics are a deliberate Advanced surface, not routine
+    // appearance settings noise.
+    await expect(list.locator(".settings-server-config")).toHaveCount(0);
+    await sidebar.getByRole("tab", { name: "Advanced" }).click();
     await expect(list.locator(".settings-server-config")).toContainText("PORT");
+  });
+
+  test("Escape closes Settings and returns focus to its trigger", async ({
+    page,
+  }) => {
+    await openToolsSheet(page);
+    const trigger = page
+      .locator("#tools-sheet")
+      .getByRole("button", { name: "Settings" });
+    await trigger.click();
+    const win = page.locator('[data-window-id="settings"]');
+    await expect(win).not.toHaveClass(/hidden/);
+    await win.locator(".settings-search-input").press("Escape");
+    await expect(win).toHaveClass(/hidden/);
+    await expect(page.locator("#desktop-more-btn")).toBeFocused();
+  });
+
+  test("mobile close button uses the full Settings close path", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await openToolsSheet(page);
+    await page
+      .locator("#tools-sheet")
+      .getByRole("button", { name: "Settings" })
+      .click();
+    const sheet = page.locator("#settings-sheet");
+    await expect(sheet).not.toHaveClass(/hidden/);
+    await sheet.getByRole("button", { name: /close settings/i }).click();
+    await expect(sheet).toHaveClass(/hidden/);
+    await expect(page.locator("#mobile-more-btn")).toBeFocused();
+  });
+
+  test("IDE Settings opened from Tools focuses its search field", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await page.evaluate(() =>
+      (window as any).terminalManager.ideShell.setMode("ide"),
+    );
+    await expect(page.locator("body")).toHaveClass(/ide-mode/);
+    await openToolsSheet(page);
+    await page
+      .locator("#tools-sheet")
+      .getByRole("button", { name: "Settings" })
+      .click();
+    const search = page.locator(".settings-search-input:visible");
+    await expect(search).toBeFocused();
+    await search.press("Escape");
+    await expect(page.locator(".settings-search-input:visible")).toHaveCount(0);
+    await expect(page.locator("#desktop-more-btn")).toBeFocused();
+  });
+
+  test("focused Settings closes without leaving hidden focus across viewport changes", async ({
+    page,
+  }) => {
+    await openSettings(page);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await expect(page.locator('[data-window-id="settings"]')).toHaveClass(
+      /hidden/,
+    );
+    await expect(page.locator("#mobile-more-btn")).toBeFocused();
+    await openToolsSheet(page);
+    await page
+      .locator("#tools-sheet")
+      .getByRole("button", { name: "Settings" })
+      .click();
+    await expect(
+      page.locator("#settings-sheet .settings-search-input"),
+    ).toBeFocused();
+    await page.setViewportSize({ width: 1400, height: 900 });
+    await expect(page.locator("#settings-sheet")).toHaveClass(/hidden/);
+    await expect(page.locator("#desktop-more-btn")).toBeFocused();
+  });
+
+  test("viewport reconciliation leaves a newly chosen visible control alone", async ({
+    page,
+  }) => {
+    await openSettings(page);
+    await page.evaluate(async () => {
+      const manager = (window as any).terminalManager;
+      const queuedFrames: FrameRequestCallback[] = [];
+      const queuedTimers: Array<() => void> = [];
+      const originalFrame = window.requestAnimationFrame;
+      const originalTimeout = window.setTimeout;
+      const originalIsWindowedSurfaces = manager.isWindowedSurfaces;
+      const settingsWindow = document.querySelector(
+        '[data-window-id="settings"]',
+      );
+      const search = settingsWindow?.querySelector(
+        ".settings-search-input",
+      ) as HTMLElement | null;
+      window.requestAnimationFrame = ((callback: FrameRequestCallback) => {
+        queuedFrames.push(callback);
+        return 1;
+      }) as typeof window.requestAnimationFrame;
+      window.setTimeout = ((callback: TimerHandler) => {
+        if (typeof callback === "function") queuedTimers.push(callback);
+        return 1;
+      }) as typeof window.setTimeout;
+      try {
+        // Reproduce the responsive path: the old focused Settings field has
+        // just become hidden while the mobile breakpoint is active.
+        search?.focus();
+        settingsWindow?.classList.add("hidden");
+        manager.isWindowedSurfaces = () => false;
+        manager.reconcileSurfaceWindowsForViewport();
+        document.getElementById("desktop-files-btn")?.focus();
+        while (queuedFrames.length) queuedFrames.shift()?.(performance.now());
+        while (queuedTimers.length) queuedTimers.shift()?.();
+      } finally {
+        window.requestAnimationFrame = originalFrame;
+        window.setTimeout = originalTimeout;
+        manager.isWindowedSurfaces = originalIsWindowedSurfaces;
+      }
+    });
+    await expect(page.locator("#desktop-files-btn")).toBeFocused();
   });
 
   test("toggling a setting persists across close + reopen", async ({

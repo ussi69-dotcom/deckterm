@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "generatedBy": "scripts/build-assets.ts",
+  "dependencies": {
+    "@fontsource/jetbrains-mono": {
+      "version": "5.0.0",
+      "license": "SIL OFL 1.1"
+    },
+    "diff2html": {
+      "version": "3.4.56",
+      "license": "MIT"
+    },
+    "lucide": {
+      "version": "1.41.0",
+      "license": "ISC and MIT for listed Feather-derived icons"
+    }
+  },
+  "nerdFonts": {
+    "repository": "https://github.com/ryanoasis/nerd-fonts",
+    "tag": "v3.4.0",
+    "commit": "fa7b859994228a9c8759f99c55a8d31ee92a1b5e",
+    "license": "MIT"
+  },
+  "files": [
+    {
+      "path": "diff2html-3.4.56.min.css",
+      "bytes": 17331,
+      "sha256": "d3ecc0e9b2b1e5c8466c19de29bed052fd0863475d25829ecc858446efded372",
+      "source": {
+        "path": "node_modules/diff2html/bundles/css/diff2html.min.css",
+        "sha256": "d3ecc0e9b2b1e5c8466c19de29bed052fd0863475d25829ecc858446efded372"
+      }
+    },
+    {
+      "path": "diff2html-3.4.56.min.js",
+      "bytes": 77747,
+      "sha256": "a2110a09cee157bd5466da77be02107ac81a0baa2bc1f3fe81aac8183314598e",
+      "source": {
+        "path": "node_modules/diff2html/bundles/js/diff2html.min.js",
+        "sha256": "a2110a09cee157bd5466da77be02107ac81a0baa2bc1f3fe81aac8183314598e"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-400.css",
+      "bytes": 2924,
+      "sha256": "d191be3878810dfc9f36e2cbc3f26ad714cb39aad7ae8a186234bfca38f6b065",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/400.css",
+        "sha256": "44e652d776c4aa6467c4fd4c4250ea7b36e734fcb7fffda01e961bba8c136f4e"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-cyrillic-400-normal.woff",
+      "bytes": 6940,
+      "sha256": "f391cdadb532c38fb8d927649fc271151594816c4699d6eb9466425270ab277c",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff",
+        "sha256": "f391cdadb532c38fb8d927649fc271151594816c4699d6eb9466425270ab277c"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-cyrillic-400-normal.woff2",
+      "bytes": 5288,
+      "sha256": "9f48e746ee6dde077f5426448d98d30a719d8962d2866f7da36371ca33f254b4",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-400-normal.woff2",
+        "sha256": "9f48e746ee6dde077f5426448d98d30a719d8962d2866f7da36371ca33f254b4"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-cyrillic-ext-400-normal.woff",
+      "bytes": 1724,
+      "sha256": "accd59194e6355b5af911cc2819322d9c8ad184d6c9d501489fde9af142b1f69",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-ext-400-normal.woff",
+        "sha256": "accd59194e6355b5af911cc2819322d9c8ad184d6c9d501489fde9af142b1f69"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-cyrillic-ext-400-normal.woff2",
+      "bytes": 1132,
+      "sha256": "ecefdeb16963c874dfd9b9c0409cd1c67ed7369e57510eec628b44a31e3c0b17",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-cyrillic-ext-400-normal.woff2",
+        "sha256": "ecefdeb16963c874dfd9b9c0409cd1c67ed7369e57510eec628b44a31e3c0b17"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-greek-400-normal.woff",
+      "bytes": 5640,
+      "sha256": "f95fabcf8292b7f904425ba93bba009cbe994aabe7d5f712e157b8c8dae7741f",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff",
+        "sha256": "f95fabcf8292b7f904425ba93bba009cbe994aabe7d5f712e157b8c8dae7741f"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-greek-400-normal.woff2",
+      "bytes": 4216,
+      "sha256": "4e44607d885ced12200164d263a0dfeb303e4154097e331b3b07f205b3acd032",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-greek-400-normal.woff2",
+        "sha256": "4e44607d885ced12200164d263a0dfeb303e4154097e331b3b07f205b3acd032"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-latin-400-normal.woff",
+      "bytes": 27272,
+      "sha256": "54664ceda50fccd3546f8e7115190a8d45ff0515ecc42cf28db53088e956744b",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff",
+        "sha256": "54664ceda50fccd3546f8e7115190a8d45ff0515ecc42cf28db53088e956744b"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-latin-400-normal.woff2",
+      "bytes": 20740,
+      "sha256": "7b53d2b16b4a98a46e88cc425ca753f2c93c61ead8f2954f877e81b6f668e6ec",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-400-normal.woff2",
+        "sha256": "7b53d2b16b4a98a46e88cc425ca753f2c93c61ead8f2954f877e81b6f668e6ec"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-latin-ext-400-normal.woff",
+      "bytes": 9152,
+      "sha256": "135ef8777bc98c43babaf230762b18bc958dac9c9f9e82d84c176e8e7704657d",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff",
+        "sha256": "135ef8777bc98c43babaf230762b18bc958dac9c9f9e82d84c176e8e7704657d"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-latin-ext-400-normal.woff2",
+      "bytes": 6596,
+      "sha256": "e5fba36c069344cab850704b9abb845b000aa24bd8bea85efd0b9f2a25fb042c",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-latin-ext-400-normal.woff2",
+        "sha256": "e5fba36c069344cab850704b9abb845b000aa24bd8bea85efd0b9f2a25fb042c"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-vietnamese-400-normal.woff",
+      "bytes": 4848,
+      "sha256": "73ce272a517fc0120137891846390e37f4a92a402d20d169aebf464984531811",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-400-normal.woff",
+        "sha256": "73ce272a517fc0120137891846390e37f4a92a402d20d169aebf464984531811"
+      }
+    },
+    {
+      "path": "jetbrains-mono-5.0.0-files/jetbrains-mono-vietnamese-400-normal.woff2",
+      "bytes": 3504,
+      "sha256": "8dd6ab705e97124f05cc1733ef911adb8316c228a663f9a42286bcb4b2b93e5d",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/files/jetbrains-mono-vietnamese-400-normal.woff2",
+        "sha256": "8dd6ab705e97124f05cc1733ef911adb8316c228a663f9a42286bcb4b2b93e5d"
+      }
+    },
+    {
+      "path": "licenses/diff2html-MIT.txt",
+      "bytes": 1091,
+      "sha256": "6de794566a8feb4233594420299cec2dbfba51ae57201763541a5e7d627cb245",
+      "source": {
+        "path": "node_modules/diff2html/LICENSE.md",
+        "sha256": "6de794566a8feb4233594420299cec2dbfba51ae57201763541a5e7d627cb245"
+      }
+    },
+    {
+      "path": "licenses/jetbrains-mono-OFL-1.1.txt",
+      "bytes": 4397,
+      "sha256": "bb1c26eb6fe1839e3759548777c8a35b9495ce4878a4b833b1b63d43ff313a4b",
+      "source": {
+        "path": "node_modules/@fontsource/jetbrains-mono/LICENSE",
+        "sha256": "bb1c26eb6fe1839e3759548777c8a35b9495ce4878a4b833b1b63d43ff313a4b"
+      }
+    },
+    {
+      "path": "licenses/lucide-ISC.txt",
+      "bytes": 3208,
+      "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57",
+      "source": {
+        "path": "node_modules/lucide/LICENSE",
+        "sha256": "b495047bd93a9b06913511076f504daba17d5bbeb3e0650f3bb53a4220329c57"
+      }
+    },
+    {
+      "path": "licenses/nerd-fonts-v3.4.0-LICENSE",
+      "bytes": 1082,
+      "sha256": "84a7a98c82140fb12c37fe42b93805baa16024cb3e5acc599b7ffe612c55d847",
+      "source": {
+        "path": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/NerdFontsSymbolsOnly/LICENSE",
+        "sha256": "84a7a98c82140fb12c37fe42b93805baa16024cb3e5acc599b7ffe612c55d847"
+      }
+    },
+    {
+      "path": "lucide-1.41.0.min.js",
+      "bytes": 429425,
+      "sha256": "2b978be5c2e0341e48022e1650eb5b6c0425d2755f140b094f7439ec539a8c1f",
+      "source": {
+        "path": "node_modules/lucide/dist/umd/lucide.min.js",
+        "sha256": "fc3ec2766fddfbe26905acbd3a46e2bad7a8f8ac7ef5f30e3707b5abb750cf9a",
+        "transform": "Remove development-only sourceMappingURL trailer"
+      }
+    },
+    {
+      "path": "nerd-fonts-v3.4.0.css",
+      "bytes": 190,
+      "sha256": "fadbabcf27b43a2140e91c3a89cc5a56e37b8a9a76622eceab6b368d1322dcc2",
+      "source": {
+        "path": "generated from Nerd Fonts v3.4.0 (fa7b859994228a9c8759f99c55a8d31ee92a1b5e)",
+        "sha256": "fadbabcf27b43a2140e91c3a89cc5a56e37b8a9a76622eceab6b368d1322dcc2"
+      }
+    },
+    {
+      "path": "SymbolsNerdFontMono-Regular-v3.4.0.ttf",
+      "bytes": 2507556,
+      "sha256": "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60",
+      "source": {
+        "path": "https://raw.githubusercontent.com/ryanoasis/nerd-fonts/v3.4.0/patched-fonts/NerdFontsSymbolsOnly/SymbolsNerdFontMono-Regular.ttf",
+        "sha256": "f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60"
+      }
+    }
+  ]
+}

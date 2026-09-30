@@ -417,6 +417,10 @@ test("server exits when DECKTERM_PUBLISH_MODE=cloudflare-tunnel binds a non-loop
       CF_ACCESS_AUD: "",
       DECKTERM_PUBLISH_MODE: "cloudflare-tunnel",
       DECKTERM_STATE_DIR: await isolatedStateDir(),
+      // Public and proxy modes refuse to start without TRUSTED_ORIGINS, and that
+      // check runs first. Set it so this test reaches the bind guard it targets
+      // (it passed locally only because .env supplied a value).
+      TRUSTED_ORIGINS: "https://deckterm.example.test",
       // Clear every dev/CI marker so the (production-only) guard actually runs,
       // and ensure the trust-proxy override is absent.
       CI: undefined,

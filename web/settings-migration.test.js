@@ -1,6 +1,7 @@
 const { test, expect } = require("bun:test");
 const {
   migrateLegacySettings,
+  migrateDeprecatedStoreSettings,
   LEGACY_KEY_MAP,
 } = require("./settings-migration.js");
 
@@ -26,6 +27,12 @@ const SCHEMA = [
     ],
   },
   { key: "files.defaultCwd", type: "text", default: "" },
+  {
+    key: "git.diffMode",
+    type: "select",
+    default: "split",
+    options: ["split", "inline"],
+  },
 ];
 
 // In-memory storage emulating localStorage (string values only).
@@ -182,4 +189,48 @@ test("LEGACY_KEY_MAP exposes the six documented mappings", () => {
     "deckterm-task-view": "tasks.view",
     "opencode-web-dir": "files.defaultCwd",
   });
+});
+
+test("moves the old git.diffLayout choice to canonical git.diffMode", () => {
+  const store = fakeStore({ "git.diffLayout": "inline" });
+  const result = migrateDeprecatedStoreSettings(store, SCHEMA);
+  expect(result.migrated).toEqual(["git.diffMode"]);
+  expect(store.get("git.diffMode")).toBe("inline");
+  expect(store.get("git.diffLayout")).toBeNull();
+});
+
+test("requires an explicit auto-fetch re-enable after the formerly inert value", () => {
+  const store = fakeStore({
+    "git.autoFetchInterval": 60,
+    "workspace.confirmDestructive": false,
+    "terminal.scrollbackLimit": 2000,
+  });
+  const result = migrateDeprecatedStoreSettings(store, SCHEMA);
+  expect(result.migrated).toContain("git.autoFetchInterval");
+  expect(result.migrated).toContain("workspace.confirmDestructive");
+  expect(result.migrated).toContain("terminal.scrollbackLimit");
+  expect(store.get("git.autoFetchInterval")).toBe(0);
+  expect(store.get("workspace.confirmDestructive")).toBe(true);
+  expect(store.get("terminal.scrollbackLimit")).toBe(10000);
+  expect(store.get("settings.effectiveControlsV1")).toBe(true);
+  expect(result.activationMarked).toBe(true);
+});
+
+test("effective-control safety migration is one-time and retains safe historic values", () => {
+  const store = fakeStore({
+    "git.autoFetchInterval": 0,
+    "workspace.confirmDestructive": true,
+    "terminal.scrollbackLimit": 15000,
+  });
+  const first = migrateDeprecatedStoreSettings(store, SCHEMA);
+  expect(first.migrated).toEqual([]);
+  expect(first.activationMarked).toBe(true);
+  // A later deliberate lower scrollback/disabled confirmation must be kept.
+  store.set("terminal.scrollbackLimit", 2000);
+  store.set("workspace.confirmDestructive", false);
+  const second = migrateDeprecatedStoreSettings(store, SCHEMA);
+  expect(second.migrated).toEqual([]);
+  expect(second.activationMarked).toBe(false);
+  expect(store.get("terminal.scrollbackLimit")).toBe(2000);
+  expect(store.get("workspace.confirmDestructive")).toBe(false);
 });

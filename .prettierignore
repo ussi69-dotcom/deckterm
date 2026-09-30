@@ -2,6 +2,7 @@
 # (minified). Prettier must never reformat these: it expands the minified
 # bundle to ~30k lines, bloating the served file and corrupting the vendor.
 web/vendor/
+web/assets/
 
 # Dependencies & build output
 node_modules/

@@ -129,7 +129,7 @@ test.describe("Command palette navigation layer", () => {
     await page.locator("#command-palette-input").fill(workspaceALabel);
 
     const recentWorkspaceEntry = page
-      .getByRole("button", { name: /Recent Workspace/i })
+      .getByRole("option", { name: /Recent Workspace/i })
       .first();
     await expect(recentWorkspaceEntry).toBeVisible();
 
@@ -156,7 +156,7 @@ test.describe("Command palette navigation layer", () => {
     await page.locator("#command-palette-input").fill(workspace.root);
 
     const goToDirectory = page
-      .getByRole("button", { name: "Go to Directory..." })
+      .getByRole("option", { name: "Go to Directory..." })
       .first();
     await expect(goToDirectory).toBeVisible();
 
@@ -186,7 +186,7 @@ test.describe("Command palette navigation layer", () => {
       .fill("Reveal Current CWD in Files");
 
     const revealFiles = page
-      .getByRole("button", { name: "Reveal Current CWD in Files" })
+      .getByRole("option", { name: "Reveal Current CWD in Files" })
       .first();
     await expect(revealFiles).toBeVisible();
 
@@ -223,14 +223,14 @@ test.describe("Command palette navigation layer", () => {
     await page.locator("#command-palette-input").fill("Checkout Git Branch");
 
     const checkoutEntry = page
-      .getByRole("button", { name: "Checkout Git Branch" })
+      .getByRole("option", { name: "Checkout Git Branch" })
       .first();
     await expect(checkoutEntry).toBeVisible();
 
     await checkoutEntry.click();
 
     const branchEntry = page
-      .getByRole("button", { name: targetBranch })
+      .getByRole("option", { name: targetBranch })
       .first();
     await expect(branchEntry).toBeVisible();
 

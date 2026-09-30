@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -18,6 +19,7 @@ const ISOLATED_ENV_KEYS = [
   "DECKTERM_LEGACY_NO_BOOTSTRAP",
   "DECKTERM_BOOTSTRAP_ADMIN_EMAIL",
   "PORT",
+  "TRUSTED_ORIGINS",
   "SHELL",
 ] as const;
 const previousEnv: Record<string, string | undefined> = {};
@@ -33,7 +35,9 @@ async function createTempDir(prefix: string) {
 
 async function openWebSocket(url: URL): Promise<WebSocket> {
   const wsUrl = url.toString().replace(/^http/, "ws");
-  const socket = new WebSocket(wsUrl);
+  const socket = new WebSocket(wsUrl, {
+    headers: { Origin: "http://localhost:4174" },
+  } as never); // Bun supports request headers; older DOM types omit this extension.
   openSockets.push(socket);
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -93,6 +97,7 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   delete process.env.CF_ACCESS_AUD;
   process.env.DECKTERM_RUNTIME_ENV = "development";
   process.env.PORT = "4174";
+  process.env.TRUSTED_ORIGINS = "http://localhost:4174";
   delete process.env.DECKTERM_BOOTSTRAP_ADMIN_EMAIL;
   // Pin non-tunnel mode so this test deterministically exercises the
   // bootstrap-required gate. In cloudflare-tunnel mode that gate is bypassed by
@@ -118,7 +123,12 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
       actor: { id: "anonymous", email: "anonymous", source: "legacy_dev" },
       cloudflareAccessRequired: false,
     },
-    bootstrap: { bootstrapped: false, mode: "token" },
+    bootstrap: {
+      bootstrapped: false,
+      mode: "token",
+      // Path only — the Setup panel's "Finish setup" hint points here.
+      tokenPath: expect.stringMatching(/\/bootstrap-token$/),
+    },
     roots: [
       {
         name: projectRoot.split("/").pop(),
@@ -144,6 +154,7 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
     new URL("/ws/terminals/fake-terminal", server.url),
     {
       headers: {
+        Origin: "http://localhost:4174",
         connection: "Upgrade",
         upgrade: "websocket",
       },
@@ -226,6 +237,7 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
     new URL(`/ws/terminals/${created.id}`, server.url),
     {
       headers: {
+        Origin: "http://localhost:4174",
         connection: "Upgrade",
         upgrade: "websocket",
       },
