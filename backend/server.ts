@@ -25,6 +25,7 @@ import {
   chmodSync,
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { assertPortAvailable } from "./port-probe";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   classifyAgentOutputPhase,
@@ -10017,14 +10018,7 @@ export async function startWebServer(host: string, port: number) {
   // Residual: a process bound to a DIFFERENT port but sharing the state dir
   // still needs a real instance-ownership lock — backlogged.
   if (port !== 0) {
-    const { createServer } = await import("node:net");
-    await new Promise<void>((resolvePort, rejectPort) => {
-      const probe = createServer();
-      probe.once("error", rejectPort);
-      probe.listen(port, host, () => {
-        probe.close((err) => (err ? rejectPort(err) : resolvePort()));
-      });
-    });
+    await assertPortAvailable(port, host);
   }
 
   // Reconcile recorded sessions before starting the server: in tmux mode

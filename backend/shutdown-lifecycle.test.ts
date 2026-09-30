@@ -124,7 +124,10 @@ function spawnServer(opts: {
 async function waitForHealth(port: number): Promise<void> {
   for (let attempt = 0; attempt < 100; attempt++) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      // Bounded: one hung request must not eat the whole test budget.
+      const res = await fetch(`http://127.0.0.1:${port}/api/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
       if (res.ok) return;
     } catch {
       // Not listening yet.

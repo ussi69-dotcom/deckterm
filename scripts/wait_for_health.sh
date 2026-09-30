@@ -12,7 +12,9 @@ interval_seconds=${3:-1}
 
 elapsed=0
 while (( elapsed < timeout_seconds )); do
-  if curl -fsS "$url" >/dev/null; then
+  # --max-time: a request accepted but never answered must fail and retry,
+  # not stall the whole wait (and with it CI or Deploy Main).
+  if curl -fsS --max-time 5 "$url" >/dev/null; then
     exit 0
   fi
 
