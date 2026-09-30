@@ -40,6 +40,19 @@ function createFakeElement(tagName, ownerDocument) {
     textContent: "",
     type: "",
     parentNode: null,
+    attributes: {},
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+    },
+    getAttribute(name) {
+      return this.attributes[name] ?? null;
+    },
+    removeAttribute(name) {
+      delete this.attributes[name];
+    },
+    scrollIntoView() {
+      this.wasScrolledIntoView = true;
+    },
     appendChild(child) {
       child.parentNode = this;
       this.children.push(child);
@@ -60,7 +73,11 @@ function createFakeElement(tagName, ownerDocument) {
     querySelectorAll(selector) {
       const results = [];
       const matcher = selector.startsWith(".")
-        ? (node) => node.classList.contains(selector.slice(1))
+        ? (node) =>
+            selector
+              .slice(1)
+              .split(".")
+              .every((name) => node.classList.contains(name))
         : () => false;
 
       const walk = (node) => {
@@ -241,4 +258,151 @@ test("empty query renders default results", () => {
   ).map((node) => node.textContent?.trim());
 
   expect(resultItems).toEqual(["Open Git", "Open File Manager"]);
+});
+
+test("combobox exposes the selected option and clears it on empty results and close", () => {
+  const dom = createPaletteDom();
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: createRegistry(),
+  });
+  controller.open();
+  expect(dom.input.getAttribute("role")).toBe("combobox");
+  expect(dom.input.getAttribute("aria-controls")).toBe(dom.results.id);
+  expect(dom.input.getAttribute("aria-expanded")).toBe("true");
+  controller.moveSelection(1);
+  const options = dom.results.querySelectorAll(".command-palette-item");
+  expect(options.map((option) => option.getAttribute("aria-selected"))).toEqual(
+    ["false", "true"],
+  );
+  expect(options[1].getAttribute("role")).toBe("option");
+  expect(options[1].tabIndex).toBe(-1);
+  expect(dom.input.getAttribute("aria-activedescendant")).toBe(options[1].id);
+  expect(options[1].wasScrolledIntoView).toBe(true);
+  expect(dom.document.activeElement).toBe(dom.input);
+  controller.setQuery("does not exist");
+  expect(dom.input.getAttribute("aria-activedescendant")).toBeNull();
+  controller.close();
+  expect(dom.input.getAttribute("aria-expanded")).toBe("false");
+});
+
+test("arrow navigation follows visual group order and Tab stays inside the modal", () => {
+  const dom = createPaletteDom();
+  const runLog = [];
+  const registry = {
+    getResults: () => [
+      {
+        id: "workspace",
+        title: "Workspace",
+        group: "Workspaces",
+        run: () => runLog.push("workspace"),
+      },
+      {
+        id: "file",
+        title: "File",
+        group: "Files",
+        run: () => runLog.push("file"),
+      },
+    ],
+  };
+  const controller = new CommandPaletteController({ ...dom, registry });
+  controller.open();
+  expect(
+    dom.results
+      .querySelectorAll(".command-palette-item-title")
+      .map((node) => node.textContent),
+  ).toEqual(["File", "Workspace"]);
+  expect(controller.visibleResults.map((result) => result.id)).toEqual([
+    "file",
+    "workspace",
+  ]);
+  let prevented = false;
+  let stopped = false;
+  controller.handleKeydown({
+    key: "Tab",
+    preventDefault() {
+      prevented = true;
+    },
+    stopPropagation() {
+      stopped = true;
+    },
+  });
+  expect(prevented && stopped).toBe(true);
+  expect(dom.document.activeElement).toBe(dom.input);
+  controller.handleKeydown({
+    key: "Enter",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  expect(runLog).toEqual(["file"]);
+});
+
+test("IME Enter does not execute a command", () => {
+  const dom = createPaletteDom();
+  const runLog = [];
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: createRegistry(runLog),
+  });
+  controller.open();
+  controller.handleKeydown({
+    key: "Enter",
+    isComposing: true,
+    preventDefault() {},
+  });
+  expect(runLog).toEqual([]);
+  expect(dom.root.classList.contains("hidden")).toBe(false);
+});
+
+test("commands that leave focus in the palette return focus to their opener", () => {
+  const dom = createPaletteDom();
+  const opener = dom.document.createElement("button");
+  dom.document.body.appendChild(opener);
+  opener.focus();
+  const runLog = [];
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: createRegistry(runLog),
+  });
+  controller.open();
+  controller.runSelected();
+  expect(runLog).toEqual(["open-git"]);
+  expect(dom.document.activeElement).toBe(opener);
+  expect(dom.root.classList.contains("hidden")).toBe(true);
+});
+
+test("command focus destinations win both synchronously and after an await", async () => {
+  const dom = createPaletteDom();
+  const opener = dom.document.createElement("button");
+  const destination = dom.document.createElement("input");
+  dom.document.body.appendChild(opener);
+  dom.document.body.appendChild(destination);
+  let asynchronous = false;
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: {
+      getResults: () => [
+        {
+          id: "focus",
+          title: "Focus editor",
+          run: () => {
+            if (asynchronous)
+              return Promise.resolve().then(() => destination.focus());
+            destination.focus();
+          },
+        },
+      ],
+    },
+  });
+  opener.focus();
+  controller.open();
+  controller.runSelected();
+  expect(dom.document.activeElement).toBe(destination);
+  asynchronous = true;
+  opener.focus();
+  controller.open();
+  controller.runSelected();
+  expect(dom.document.activeElement).toBe(opener);
+  await Promise.resolve();
+  expect(dom.document.activeElement).toBe(destination);
 });

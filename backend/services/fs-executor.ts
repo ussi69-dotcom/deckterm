@@ -33,6 +33,8 @@ export type FsErrorCode =
   | "permission"
   | "io_error"
   | "bad_request"
+  | "identity_changed"
+  | "unsupported"
   | "isolation_busy"
   | "broker_unavailable";
 
@@ -60,6 +62,20 @@ export type StatResult = {
   mode: number;
 };
 
+/** Stable lstat-style identity used to bind a destructive move/delete to the
+ * exact entry the caller inspected. Integer fields that may exceed JS's safe
+ * range stay decimal strings across JSON and SQLite. */
+export type FsIdentity = {
+  kind: DirEntry["kind"];
+  dev: string;
+  ino: string;
+  uid: number;
+  gid: number;
+  size: string;
+  mtimeNs: string;
+  mode: number;
+};
+
 export type ReadResult = {
   content: Buffer;
   size: number;
@@ -78,9 +94,129 @@ export interface FsExecutor {
     content: Buffer,
     expectedMode?: number,
   ): Promise<void>;
-  mkdir(root: string, relPath: string): Promise<void>;
+  /** Create a complete regular file without ever replacing an existing entry. */
+  create(root: string, relPath: string, content: Buffer): Promise<void>;
+  /** Inspect one entry without following a final symlink. */
+  identity(root: string, relPath: string): Promise<FsIdentity>;
+  mkdir(root: string, relPath: string, mode?: number): Promise<void>;
   remove(root: string, relPath: string, recursive: boolean): Promise<void>;
+  /** Delete only if the current entry still has `expected` identity. */
+  removeExact(
+    root: string,
+    relPath: string,
+    expected: FsIdentity,
+    recursive: boolean,
+    quarantineRelPath: string,
+  ): Promise<void>;
   rename(root: string, relFrom: string, relTo: string): Promise<void>;
+  /** Atomic same-root RENAME_NOREPLACE pinned to the inspected source. */
+  atomicMove(
+    root: string,
+    relFrom: string,
+    relTo: string,
+    expected: FsIdentity,
+  ): Promise<void>;
+}
+
+type HelperResponse = Record<string, unknown>;
+
+function parseHelperResponse(stdout: string): HelperResponse {
+  let parsed: HelperResponse;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new FsExecError("io_error", "helper returned non-JSON");
+  }
+  if (parsed.ok !== true) {
+    throw new FsExecError(
+      (parsed.code as FsErrorCode) || "io_error",
+      String(parsed.message ?? "fs helper error"),
+    );
+  }
+  return parsed;
+}
+
+function identityFromResponse(r: HelperResponse): FsIdentity {
+  const kind = r.kind;
+  const dev = r.dev;
+  const ino = r.ino;
+  const size = r.size;
+  const mtimeNs = r.mtimeNs;
+  const uid = Number(r.uid);
+  const gid = Number(r.gid);
+  const mode = Number(r.mode);
+  const decimal = /^(0|[1-9][0-9]*)$/;
+  if (
+    (kind !== "file" && kind !== "dir") ||
+    typeof dev !== "string" ||
+    !decimal.test(dev) ||
+    typeof ino !== "string" ||
+    !decimal.test(ino) ||
+    typeof size !== "string" ||
+    !decimal.test(size) ||
+    typeof mtimeNs !== "string" ||
+    !decimal.test(mtimeNs) ||
+    !Number.isSafeInteger(uid) ||
+    uid < 0 ||
+    !Number.isSafeInteger(gid) ||
+    gid < 0 ||
+    !Number.isInteger(mode) ||
+    mode < 0 ||
+    mode > 0o7777
+  ) {
+    throw new FsExecError("io_error", "helper returned an invalid identity");
+  }
+  return { kind, dev, ino, uid, gid, size, mtimeNs, mode };
+}
+
+const LOCAL_FS_HELPER = join(
+  import.meta.dir,
+  "..",
+  "..",
+  "scripts",
+  "broker",
+  "deckterm-fs-helper",
+);
+
+/** Run the fd-contained helper directly as the service uid. This is used only
+ * for operations whose legacy node:fs equivalent cannot provide an atomic
+ * no-replace/CAS contract. It does not cross an OS privilege boundary. */
+async function callLocalHelper(
+  req: Record<string, unknown>,
+): Promise<HelperResponse> {
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(["python3", LOCAL_FS_HELPER], {
+      stdin: Buffer.from(JSON.stringify(req), "utf8"),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (err) {
+    throw new FsExecError("io_error", `cannot start fs helper: ${String(err)}`);
+  }
+  const timeout = setTimeout(() => {
+    try {
+      proc.kill();
+    } catch {
+      // already exited
+    }
+  }, 30_000);
+  try {
+    const [stdout, stderr, code] = await Promise.all([
+      new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+      new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+      proc.exited,
+    ]);
+    if (code !== 0) {
+      throw new FsExecError(
+        "io_error",
+        `fs helper failed (${code}): ${stderr.slice(0, 200)}`,
+      );
+    }
+    return parseHelperResponse(stdout);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +412,21 @@ class LegacyFsExecutor implements FsExecutor {
       throw err;
     }
   }
-  async mkdir(root: string, relPath: string): Promise<void> {
-    await fsMkdir(this.abs(root, relPath));
+  async create(root: string, relPath: string, content: Buffer): Promise<void> {
+    await callLocalHelper({
+      op: "create",
+      root,
+      path: relPath,
+      contentB64: content.toString("base64"),
+    });
+  }
+  async identity(root: string, relPath: string): Promise<FsIdentity> {
+    return identityFromResponse(
+      await callLocalHelper({ op: "identity", root, path: relPath }),
+    );
+  }
+  async mkdir(root: string, relPath: string, mode = 0o755): Promise<void> {
+    await fsMkdir(this.abs(root, relPath), { mode });
   }
   async remove(
     root: string,
@@ -286,8 +435,38 @@ class LegacyFsExecutor implements FsExecutor {
   ): Promise<void> {
     await rm(this.abs(root, relPath), { recursive, force: false });
   }
+  async removeExact(
+    root: string,
+    relPath: string,
+    expected: FsIdentity,
+    recursive: boolean,
+    quarantineRelPath: string,
+  ): Promise<void> {
+    await callLocalHelper({
+      op: "deleteExact",
+      root,
+      path: relPath,
+      expected,
+      recursive,
+      quarantinePath: quarantineRelPath,
+    });
+  }
   async rename(root: string, relFrom: string, relTo: string): Promise<void> {
     await fsRename(this.abs(root, relFrom), this.abs(root, relTo));
+  }
+  async atomicMove(
+    root: string,
+    relFrom: string,
+    relTo: string,
+    expected: FsIdentity,
+  ): Promise<void> {
+    await callLocalHelper({
+      op: "atomicMove",
+      root,
+      path: relFrom,
+      toPath: relTo,
+      expected,
+    });
   }
 }
 
@@ -343,19 +522,7 @@ class BrokeredFsExecutor implements FsExecutor {
           `broker exec failed (${res.code}): ${res.stderr.slice(0, 200)}`,
         );
       }
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = JSON.parse(res.stdout);
-      } catch {
-        throw new FsExecError("io_error", "helper returned non-JSON");
-      }
-      if (parsed.ok !== true) {
-        throw new FsExecError(
-          (parsed.code as FsErrorCode) || "io_error",
-          String(parsed.message ?? "fs helper error"),
-        );
-      }
-      return parsed;
+      return parseHelperResponse(res.stdout);
     } finally {
       releaseBrokerSlot(this.id.uid);
     }
@@ -406,8 +573,21 @@ class BrokeredFsExecutor implements FsExecutor {
       expectedMode: expectedMode ?? null,
     });
   }
-  async mkdir(root: string, relPath: string): Promise<void> {
-    await this.call(root, { op: "mkdir", root, path: relPath });
+  async create(root: string, relPath: string, content: Buffer): Promise<void> {
+    await this.call(root, {
+      op: "create",
+      root,
+      path: relPath,
+      contentB64: content.toString("base64"),
+    });
+  }
+  async identity(root: string, relPath: string): Promise<FsIdentity> {
+    return identityFromResponse(
+      await this.call(root, { op: "identity", root, path: relPath }),
+    );
+  }
+  async mkdir(root: string, relPath: string, mode = 0o755): Promise<void> {
+    await this.call(root, { op: "mkdir", root, path: relPath, mode });
   }
   async remove(
     root: string,
@@ -416,12 +596,42 @@ class BrokeredFsExecutor implements FsExecutor {
   ): Promise<void> {
     await this.call(root, { op: "delete", root, path: relPath, recursive });
   }
+  async removeExact(
+    root: string,
+    relPath: string,
+    expected: FsIdentity,
+    recursive: boolean,
+    quarantineRelPath: string,
+  ): Promise<void> {
+    await this.call(root, {
+      op: "deleteExact",
+      root,
+      path: relPath,
+      expected,
+      recursive,
+      quarantinePath: quarantineRelPath,
+    });
+  }
   async rename(root: string, relFrom: string, relTo: string): Promise<void> {
     await this.call(root, {
       op: "rename",
       root,
       path: relFrom,
       toPath: relTo,
+    });
+  }
+  async atomicMove(
+    root: string,
+    relFrom: string,
+    relTo: string,
+    expected: FsIdentity,
+  ): Promise<void> {
+    await this.call(root, {
+      op: "atomicMove",
+      root,
+      path: relFrom,
+      toPath: relTo,
+      expected,
     });
   }
 }

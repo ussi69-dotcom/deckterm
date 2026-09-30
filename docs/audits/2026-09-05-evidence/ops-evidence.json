@@ -1,0 +1,103 @@
+{
+  "observedAtUtc": "2026-09-05T23:25:59.473401+00:00",
+  "repoHead": "f88524470d54b795de1413bd150e05d22284f14a",
+  "unit": {
+    "exit": 0,
+    "pass": 1129,
+    "fail": 0,
+    "skip": 0
+  },
+  "push": {
+    "exit": 0,
+    "pass": 13,
+    "fail": 0,
+    "skip": 0
+  },
+  "unregisteredBootstrapRouting": {
+    "exit": 0,
+    "pass": 7,
+    "fail": 0,
+    "skip": 0
+  },
+  "typecheck": {
+    "command": "tsc --noEmit",
+    "version": "7.0.2",
+    "exit": 0,
+    "source": "existing global binary; root package does not pin TypeScript"
+  },
+  "build": {
+    "command": "bun build backend/index.ts --target=bun --outdir=/tmp/deckterm-audit-20260905/build",
+    "exit": 0
+  },
+  "dependencies": {
+    "bun": "1.3.5",
+    "honoInstalledDevAndProd": "4.11.3",
+    "playwrightInstalled": "1.57.0",
+    "bunAuditExit": 1,
+    "advisoryRecords": 36,
+    "severityCounts": {
+      "high": 4,
+      "moderate": 29,
+      "low": 3
+    },
+    "interpretation": "All advisory records are in Hono; individual application exploitability requires reachability assessment."
+  },
+  "services": {
+    "dev": {
+      "unitScope": "user",
+      "active": "active/running",
+      "pid": 2709854,
+      "startedUtc": "2026-08-26T14:33:28Z",
+      "bind": "127.0.0.1:4174",
+      "stateDir": "/home/deploy/.deckterm-dev",
+      "killMode": "process",
+      "nRestarts": 0,
+      "publishMode": "local",
+      "legacyBypass": true,
+      "osIsolationEnabled": false,
+      "trustedOriginsConfiguredInEnvironmentFile": true,
+      "initialProcessEnvironmentLimit": "Bun loads .env after process startup; absence from initial /proc environ does not establish runtime absence"
+    },
+    "prod": {
+      "unitScope": "user",
+      "active": "active/running",
+      "serviceMainPid": 1126882,
+      "listenerPid": 1126885,
+      "startedUtc": "2026-08-19T22:45:39Z",
+      "bind": "127.0.0.1:4173",
+      "stateDir": "/home/deploy/.deckterm",
+      "killMode": "process",
+      "nRestarts": 0,
+      "publishMode": "cloudflare-access",
+      "cfAccessRequired": true,
+      "releaseDir": "/home/deploy/apps/deckterm/prod/releases/98f5175298adf7e6603ba90fca9d3d4aa170ab01",
+      "osIsolationEnabled": false,
+      "trustedOriginsConfiguredInEnvironmentFile": true,
+      "trustedOriginsConfiguredInInitialProcessEnvironment": true
+    }
+  },
+  "backupEvidence": {
+    "lastProdDbManifestUtc": "2026-08-19T21:03:57Z",
+    "lastDevDbManifestUtc": "2026-07-04T01:00:21Z",
+    "decktermBackupTimerFound": false,
+    "userCrontabDecktermOrBackupJobFound": false,
+    "matchingReadableCronOrSystemdConfigFound": false,
+    "limitation": "No off-host or host-wide backup inventory was verified; absence of local schedule is not proof that no other backup exists."
+  },
+  "safety": {
+    "noServiceRestart": true,
+    "noProductionHttpTests": true,
+    "noApplicationSourceEdits": true,
+    "noIdentityOrExistingSessionMutation": true,
+    "unitHarnessesUseTemporaryStateAndPrivateSockets": true
+  },
+  "smokeBrowser": {
+    "command": "bun run test:e2e:smoke",
+    "exit": 0,
+    "pass": 32,
+    "fail": 0,
+    "durationAsReported": "1.1m",
+    "target": "http://localhost:4174",
+    "evidence": "Final Playwright output: 32 passed (1.1m)"
+  }
+}

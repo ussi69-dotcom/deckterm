@@ -1,3 +1,4 @@
+import { ApiRequest as Request } from "./test-support/api-request";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";

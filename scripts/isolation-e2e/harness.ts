@@ -22,6 +22,8 @@ import {
 import { MockEdge, type Persona } from "./mock-edge.ts";
 
 const REPO_ROOT = join(import.meta.dir, "..", "..");
+// Test-only: sends the product's Cloudflare certs fetch to the mock edge.
+const JWKS_REDIRECT_PRELOAD = join(REPO_ROOT, "scripts", "isolation-e2e", "jwks-redirect-preload.ts");
 const AUD = "e2e-fixed-aud";
 
 export const PERSONAS = {
@@ -195,11 +197,15 @@ export class Harness {
       // Bind loopback: a test SUT is never public, and tunnel mode refuses a
       // non-loopback bind (the default HOST is 0.0.0.0 on a clean env).
       HOST: "127.0.0.1",
+      // Public and proxy modes refuse to start without explicit origins.
+      TRUSTED_ORIGINS: `http://127.0.0.1:${port}`,
       DECKTERM_STATE_DIR: this.stateDir,
       ALLOWED_FILE_ROOTS: "/home/dtalice:/home/dtbob",
       DECKTERM_OS_ISOLATION: "1",
       TMUX_BACKEND: "1",
       NODE_EXTRA_CA_CERTS: this.certPath,
+      DECKTERM_E2E_JWKS_FROM: this.edge.certsUrl,
+      DECKTERM_E2E_JWKS_TO: this.edge.localCertsUrl,
       DECKTERM_MIN_UID: "1000",
       DECKTERM_OS_USERS_GROUP: "deckterm-users",
     };
@@ -218,7 +224,7 @@ export class Harness {
     const env = baseEnv({ ...common, ...modeEnv });
     const child = spawn(
       "bun",
-      ["run", join(REPO_ROOT, "backend", "index.ts")],
+      ["run", "--preload", JWKS_REDIRECT_PRELOAD, join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
@@ -280,6 +286,8 @@ export class Harness {
     const port = await findFreePort();
     const env = baseEnv({
       PORT: String(port),
+      // Set so a boot failure comes from the gate under test, not this guard.
+      TRUSTED_ORIGINS: `http://127.0.0.1:${port}`,
       DECKTERM_STATE_DIR:
         stateDir ?? mkdtempSync(join(this.tmpRoot, "negstate-")),
       ALLOWED_FILE_ROOTS: "/home/dtalice:/home/dtbob",
@@ -291,7 +299,7 @@ export class Harness {
     });
     const child = spawn(
       "bun",
-      ["run", join(REPO_ROOT, "backend", "index.ts")],
+      ["run", "--preload", JWKS_REDIRECT_PRELOAD, join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
@@ -345,6 +353,9 @@ export class Harness {
     init: RequestInit & { rawJwt?: string } = {},
   ): Promise<Response> {
     const headers = new Headers(init.headers);
+    // Same marker the real web client sends (web/api-client.js); without it
+    // the browser boundary rejects every mutating /api request with 403.
+    headers.set("X-DeckTerm-Request", "1");
     if (init.rawJwt) headers.set("cf-access-jwt-assertion", init.rawJwt);
     else if (persona)
       headers.set("cf-access-jwt-assertion", await this.mint(persona));
@@ -358,6 +369,7 @@ export class Harness {
     init: RequestInit = {},
   ): Promise<Response> {
     const headers = new Headers(init.headers);
+    headers.set("X-DeckTerm-Request", "1");
     if (email) headers.set("cf-access-authenticated-user-email", email);
     return fetch(`${this.baseUrl}${path}`, { ...init, headers });
   }
@@ -374,7 +386,9 @@ export class Harness {
   ): Promise<{ opened: boolean; closeCode?: number }> {
     const jwt = opts.rawJwt ?? (persona ? await this.mint(persona) : "");
     const url = `${this.baseUrl.replace(/^http/, "ws")}/ws/terminals/${terminalId}`;
-    const headers: Record<string, string> = {};
+    // A browser upgrade always carries its page origin; the boundary rejects
+    // originless cookie/JWT upgrades before authorization is even checked.
+    const headers: Record<string, string> = { origin: this.baseUrl };
     if (jwt) headers["cf-access-jwt-assertion"] = jwt;
     return await new Promise((resolve) => {
       let settled = false;
@@ -441,7 +455,7 @@ export class Harness {
 
     return await new Promise((resolve, reject) => {
       const ws = new WebSocket(url, {
-        headers: { "cf-access-jwt-assertion": jwt },
+        headers: { origin: this.baseUrl, "cf-access-jwt-assertion": jwt },
       } as never);
       let opened = false;
       ws.addEventListener("open", () => {

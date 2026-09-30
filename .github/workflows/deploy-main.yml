@@ -158,13 +158,19 @@ jobs:
           rm -rf "${remote_source}"
           mkdir -p "${remote_source}"
           tar -xzf "${remote_archive}" -C "${remote_source}"
-          cd "${remote_source}"
+          # The active reviewed driver owns live state. An old installation
+          # needs the documented one-time reviewed bootstrap before this job.
+          if [ ! -f "${DEPLOY_ROOT}/prod/current/scripts/release-state.ts" ]; then
+            echo "Reviewed release-driver bootstrap required; production was not changed." >&2
+            exit 1
+          fi
+          SOURCE_DIR="${remote_source}" \
           DEPLOY_ROOT="${DEPLOY_ROOT}/prod" \
           TARGET_PORT="${PROD_PORT}" \
           CANDIDATE_PORT="${PROD_CANDIDATE_PORT}" \
           SYSTEMD_SERVICE="${PROD_SERVICE}" \
           SHARED_ENV="${DEPLOY_ROOT}/shared/prod.env" \
-          bash ./scripts/deploy_release.sh "${RELEASE_ID}"
+          bash "${DEPLOY_ROOT}/prod/current/scripts/deploy_release.sh" "${RELEASE_ID}"
           rm -f "${remote_archive}"
           EOF
 

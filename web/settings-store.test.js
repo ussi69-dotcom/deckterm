@@ -108,3 +108,101 @@ test("API failure falls back to the local storage cache", async () => {
     "dock.height": 55,
   });
 });
+
+test("explicit flush rejects an HTTP failure and retains entries for retry", async () => {
+  let fail = true;
+  const requests = [];
+  const store = createSettingsStore({
+    fetchImpl: async (_url, options = {}) => {
+      if (options.method !== "PUT")
+        return new Response(JSON.stringify({ settings: {} }));
+      requests.push(JSON.parse(options.body).settings);
+      return new Response("no", { status: fail ? 503 : 200 });
+    },
+    storage: createFakeStorage(),
+    scheduler: createFakeScheduler(),
+  });
+  store.set("terminal.scrollbackLimit", 10000);
+  await expect(store.flush()).rejects.toThrow("HTTP 503");
+  fail = false;
+  await store.flush();
+  expect(requests).toEqual([
+    { "terminal.scrollbackLimit": 10000 },
+    { "terminal.scrollbackLimit": 10000 },
+  ]);
+});
+
+test("overlapping explicit flushes serialize and retain the newer value after an old failure", async () => {
+  let release;
+  let attempt = 0;
+  const sent = [];
+  const store = createSettingsStore({
+    fetchImpl: async (_url, options = {}) => {
+      if (options.method !== "PUT")
+        return new Response(JSON.stringify({ settings: {} }));
+      sent.push(JSON.parse(options.body).settings);
+      if (attempt++ === 0) {
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        return new Response("no", { status: 500 });
+      }
+      return new Response("ok", { status: 200 });
+    },
+    storage: createFakeStorage(),
+    scheduler: createFakeScheduler(),
+  });
+  store.set("git.autoFetchInterval", 30);
+  const firstFlush = store.flush();
+  store.set("git.autoFetchInterval", 0);
+  const secondFlush = store.flush();
+  // The second PUT cannot start until the old request has completed.
+  expect(sent).toEqual([{ "git.autoFetchInterval": 30 }]);
+  release();
+  await expect(firstFlush).rejects.toThrow("HTTP 500");
+  await secondFlush;
+  // The retry has the later explicit zero, which wins over the failed 30.
+  expect(sent).toEqual([
+    { "git.autoFetchInterval": 30 },
+    { "git.autoFetchInterval": 0 },
+  ]);
+});
+
+test("an automatic scheduled flush serializes behind an explicit flush", async () => {
+  const jobs = [];
+  let release;
+  let attempt = 0;
+  const sent = [];
+  const scheduler = {
+    schedule(fn) {
+      jobs.push(fn);
+      return jobs.length - 1;
+    },
+    cancel() {},
+  };
+  const store = createSettingsStore({
+    fetchImpl: async (_url, options = {}) => {
+      sent.push(JSON.parse(options.body).settings);
+      if (attempt++ === 0) {
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+      }
+      return new Response("ok", { status: 200 });
+    },
+    storage: createFakeStorage(),
+    scheduler,
+  });
+  store.set("git.autoFetchInterval", 30);
+  jobs.shift()();
+  await Promise.resolve();
+  store.set("git.autoFetchInterval", 0);
+  const explicit = store.flush();
+  expect(sent).toEqual([{ "git.autoFetchInterval": 30 }]);
+  release();
+  await explicit;
+  expect(sent).toEqual([
+    { "git.autoFetchInterval": 30 },
+    { "git.autoFetchInterval": 0 },
+  ]);
+});

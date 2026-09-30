@@ -7,33 +7,31 @@ import { expect, test } from "./fixtures";
 test("IDE mode toggles losslessly with no PTY recreation", async ({ page }) => {
   const consoleErrors: string[] = [];
   const httpErrors: string[] = [];
-  // Pre-existing startup noise unrelated to the IDE shell: the headless smoke
-  // env can't create a terminal (foundation auth "Forbidden terminal root"),
-  // and the matching 403. Filter these so the assertion stays meaningful.
-  const PREEXISTING = [
-    "Forbidden terminal root",
-    "Failed to create terminal",
-    "Failed to load resource: the server responded with a status of 403",
-  ];
-  const isPreexisting = (text: string) =>
-    PREEXISTING.some((p) => text.includes(p));
   page.on("console", (msg) => {
-    if (msg.type() === "error" && !isPreexisting(msg.text()))
-      consoleErrors.push(msg.text());
+    if (msg.type() === "error") consoleErrors.push(msg.text());
   });
   page.on("pageerror", (err) => {
-    if (!isPreexisting(String(err))) consoleErrors.push(String(err));
+    consoleErrors.push(String(err));
   });
   page.on("response", (response) => {
     if (response.status() < 400) return;
-    const url = new URL(response.url());
-    const isExpectedForbiddenTerminal =
-      response.status() === 403 &&
-      response.request().method() === "POST" &&
-      url.pathname === "/api/terminals";
-    if (!isExpectedForbiddenTerminal)
-      httpErrors.push(`${response.status()} ${response.url()}`);
+    httpErrors.push(`${response.status()} ${response.url()}`);
   });
+
+  // The guarded E2E actor has no canonical users row, so the real push API
+  // correctly refuses it with known_user_required. This IDE-only smoke uses
+  // the supported unconfigured-push state; canonical-user push API behavior
+  // and subscription ownership are exercised in backend/push-api.test.ts.
+  // Only the optional capability read is virtualized; mutations stay real.
+  await page.route(
+    (url) => url.pathname === "/api/notifications/push",
+    async (route) => {
+      if (route.request().method() !== "GET") return route.fallback();
+      await route.fulfill({
+        json: { configured: false, publicKey: null },
+      });
+    },
+  );
 
   // Desktop viewport BEFORE navigation so the app boots in desktop mode (IDE
   // is desktop-only — gating it after load would suppress the toggle).

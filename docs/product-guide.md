@@ -58,8 +58,12 @@ The current product is shaped by four influences:
 - Create folders
 - Create a folder in the active cwd directly from the command palette
 - Rename files
-- Delete files and directories
-- Download files
+- Move files and directories to Trash, then use Undo or restore them from the Trash list after reloading the browser
+- Restore without overwriting a replacement file; conflicts keep both versions available
+- Trash belongs to the original user and granted root. Items become eligible for cleanup after 30 days; a later delete processes a bounded batch. Permanent deletion remains explicit in Trash
+- New File refuses to overwrite an existing filename
+- Navigate file rows, breadcrumbs, editor tabs and command results with the keyboard
+- Download files as bounded streams; uploads are limited to 25 MiB (2 MiB in brokered mode)
 
 ### 5. Clipboard workflow
 
@@ -106,6 +110,12 @@ The state model is driven by shell integration markers plus agent output heurist
 - Desktop and Android browser support through standards-based Web Push
 - iPhone/iPad support when DeckTerm is installed as a Home Screen web app and permission is granted from that installed app
 - The bell in the toolbar remains the quick sound toggle; push enrollment lives in **Settings → Notifications** because browser permission must follow a direct user action
+
+### 9. Settings and everyday navigation
+
+Tools groups workspace actions, terminal utilities, and preferences; Edit layout remains available below those actions. Mobile uses a compact two-column arrangement. Settings focuses its search field on open, closes with Escape, and preserves a visible focus target across responsive layout changes. Server diagnostics live under Advanced.
+
+Scrollback, window snapping, Git diff layout, auto-fetch, reconnect policy and destructive confirmation now control their advertised behavior. Formerly inert stored auto-fetch/confirmation choices require a safe reactivation, and historical scrollback is preserved during migration. Auto-fetch stays off until explicitly selected. Local pinned icons, fonts and diff assets load without runtime CDN requests.
 
 ## User Interface Inventory
 
@@ -158,6 +168,9 @@ Core endpoints currently present:
 - `POST /api/files/upload`
 - `POST /api/files/mkdir`
 - `DELETE /api/files`
+- `GET /api/files/trash`
+- `POST /api/files/trash/restore`
+- `POST /api/files/trash/purge`
 - `POST /api/files/rename`
 
 ### Git APIs

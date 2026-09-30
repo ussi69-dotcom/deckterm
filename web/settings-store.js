@@ -26,7 +26,14 @@ function createSettingsStore({
   let cache = {};
   let pending = {};
   let flushHandle = null;
+  let flushInFlight = null;
   let loaded = false;
+
+  // A failed request must not discard its snapshot: values written while it
+  // was in flight already live in `pending`, and therefore win on merge.
+  function requeue(entries) {
+    pending = { ...entries, ...pending };
+  }
 
   function readStorageCache() {
     if (!storage) return null;
@@ -85,24 +92,44 @@ function createSettingsStore({
       : fallback;
   }
 
-  async function flush() {
-    if (flushHandle !== null) {
-      cancel(flushHandle);
-      flushHandle = null;
-    }
+  async function performFlush() {
     const entries = pending;
     pending = {};
-    if (Object.keys(entries).length === 0 || !fetchImpl) return;
+    if (Object.keys(entries).length === 0) return;
+    if (!fetchImpl) {
+      requeue(entries);
+      throw new Error("Settings sync is unavailable");
+    }
     try {
-      await fetchImpl("/api/settings", {
+      const response = await fetchImpl("/api/settings", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ settings: entries }),
       });
-    } catch {
-      // The localStorage mirror already holds the values; next successful
-      // load() + set() cycle will reconcile with the server.
+      if (!response?.ok) {
+        throw new Error(`Settings sync failed: HTTP ${response?.status || 0}`);
+      }
+    } catch (error) {
+      requeue(entries);
+      throw error;
     }
+  }
+
+  function flush() {
+    if (flushHandle !== null) {
+      cancel(flushHandle);
+      flushHandle = null;
+    }
+    // Server merges are not revisioned. Serialize every PUT so an earlier
+    // request cannot complete after a newer write and restore stale values.
+    if (flushInFlight) {
+      return flushInFlight.catch(() => {}).then(() => flush());
+    }
+    const attempt = performFlush();
+    flushInFlight = attempt;
+    return attempt.finally(() => {
+      if (flushInFlight === attempt) flushInFlight = null;
+    });
   }
 
   function set(key, value) {
@@ -118,7 +145,9 @@ function createSettingsStore({
     if (flushHandle === null) {
       flushHandle = schedule(() => {
         flushHandle = null;
-        return flush();
+        // A background persistence failure remains queued for the next write
+        // or explicit flush; never create an unhandled async rejection.
+        void flush().catch(() => {});
       }, debounceMs);
     }
   }

@@ -9,14 +9,16 @@
 # Protocol (design §2.2): exactly ONE JSON request object on stdin, then EOF; one
 # JSON response on stdout. No argv beyond the fixed profile exec. Stdlib only.
 #
-#   request:  { "op": "list|stat|read|write|mkdir|delete|rename",
+#   request:  { "op": "list|stat|read|write|create|mkdir|delete|rename|
+#                     identity|atomicMove|deleteExact",
 #               "root": "/home/alice",            # absolute, non-symlink dir, != "/"
 #               "path": "projects/x/file.ts",     # relative; "" = the root itself
 #               "toPath": "…",                    # rename only, same root
 #               "contentB64": "…",                # write only
 #               "expectedMode": 420,              # write: mode for a fresh create
 #               "maxBytes": 2097152,              # read cap
-#               "recursive": false }              # delete only
+#               "recursive": false,               # delete only
+#               "expected": { ...identity... } }  # exact move/delete only
 #   response: { "ok": true, ... } | { "ok": false, "code": "...", "message": "..." }
 #
 # Containment (design §2.3, Codex #1/#2):
@@ -333,6 +335,22 @@ def _resolve_parent(rootfd, segs):
     return pfd, leaf
 
 
+def _fsync_dir(dirfd):
+    """Best-effort directory durability using a real readable directory fd.
+    Mutation parents are held as O_PATH for least privilege; fsync(O_PATH) is
+    always EBADF, so reopen the already-contained directory for this step."""
+    syncfd = -1
+    try:
+        syncfd = os.open(".", os.O_RDONLY | os.O_DIRECTORY, dir_fd=dirfd)
+        os.fsync(syncfd)
+    except OSError:
+        # Some writable/searchable directories are intentionally not readable.
+        pass
+    finally:
+        if syncfd >= 0:
+            os.close(syncfd)
+
+
 def _os_to_helper(exc):
     if exc.errno == errno.ENOENT:
         return HelperError("not_found", os.strerror(exc.errno))
@@ -358,6 +376,104 @@ def _dirent_kind(mode):
     if stat.S_ISLNK(mode):
         return "symlink"
     return "other"
+
+
+def _identity_dict(st):
+    """JSON-safe lstat identity. dev/ino/mtimeNs are decimal strings because
+    JavaScript cannot exactly represent all 64-bit integer values."""
+    return {
+        "kind": _dirent_kind(st.st_mode),
+        "dev": str(st.st_dev),
+        "ino": str(st.st_ino),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+        "size": str(st.st_size),
+        "mtimeNs": str(st.st_mtime_ns),
+        "mode": stat.S_IMODE(st.st_mode),
+    }
+
+
+def _parse_expected_identity(req):
+    expected = req.get("expected")
+    if not isinstance(expected, dict):
+        raise HelperError("bad_request", "expected identity required")
+    kind = expected.get("kind")
+    if kind not in ("file", "dir"):
+        raise HelperError("bad_request", "expected kind must be file or dir")
+    parsed = {"kind": kind}
+    for key in ("dev", "ino", "size", "mtimeNs"):
+        value = expected.get(key)
+        if not isinstance(value, str) or not value.isdigit():
+            raise HelperError("bad_request", "expected %s must be a decimal string" % key)
+        parsed[key] = str(int(value))
+    for key in ("uid", "gid"):
+        value = expected.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise HelperError("bad_request", "expected %s must be a non-negative int" % key)
+        parsed[key] = value
+    mode = expected.get("mode")
+    if isinstance(mode, bool) or not isinstance(mode, int) or not 0 <= mode <= 0o7777:
+        raise HelperError("bad_request", "expected mode must be an integer from 0 to 07777")
+    parsed["mode"] = mode
+    return parsed
+
+
+def _identity_matches(st, expected):
+    return (
+        _dirent_kind(st.st_mode) == expected["kind"]
+        and str(st.st_dev) == expected["dev"]
+        and str(st.st_ino) == expected["ino"]
+        and st.st_uid == expected["uid"]
+        and st.st_gid == expected["gid"]
+        and str(st.st_size) == expected["size"]
+        and str(st.st_mtime_ns) == expected["mtimeNs"]
+        and stat.S_IMODE(st.st_mode) == expected["mode"]
+    )
+
+
+def _identity_core_matches(st, expected):
+    """Stable identity for resuming a partially emptied directory quarantine."""
+    return (
+        _dirent_kind(st.st_mode) == expected["kind"]
+        and str(st.st_dev) == expected["dev"]
+        and str(st.st_ino) == expected["ino"]
+        and st.st_uid == expected["uid"]
+        and st.st_gid == expected["gid"]
+        and stat.S_IMODE(st.st_mode) == expected["mode"]
+        and (
+            expected["kind"] == "dir"
+            or (
+                str(st.st_size) == expected["size"]
+                and str(st.st_mtime_ns) == expected["mtimeNs"]
+            )
+        )
+    )
+
+
+def _open_entry_identity(pfd, leaf):
+    """Open the final entry itself (never its symlink target) and return fd+stat."""
+    try:
+        fd = os.open(leaf, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
+    except OSError as exc:
+        raise _os_to_helper(exc)
+    st = os.fstat(fd)
+    if stat.S_ISLNK(st.st_mode):
+        os.close(fd)
+        raise _escape("final component is a symlink")
+    if not (stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode)):
+        os.close(fd)
+        raise HelperError("not_regular", "entry must be a regular file or directory")
+    return fd, st
+
+
+def _require_identity(st, expected):
+    if not _identity_matches(st, expected):
+        raise HelperError("identity_changed", "entry identity changed")
+
+
+def _require_core_identity(st, expected):
+    if not _identity_core_matches(st, expected):
+        raise HelperError("identity_changed", "entry identity changed")
 
 
 def op_list(rootfd, req):
@@ -404,6 +520,20 @@ def op_stat(rootfd, req):
         os.close(fd)
 
 
+def op_identity(rootfd, req):
+    """Return an lstat-style identity for a file/directory, rejecting symlinks."""
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    try:
+        fd, st = _open_entry_identity(pfd, leaf)
+        try:
+            return {"ok": True, **_identity_dict(st)}
+        finally:
+            os.close(fd)
+    finally:
+        os.close(pfd)
+
+
 def op_read(rootfd, req):
     segs = _validate_rel(req.get("path"), allow_empty=False)
     max_bytes = req.get("maxBytes")
@@ -441,15 +571,50 @@ def op_read(rootfd, req):
         os.close(pathfd)
 
 
-def op_write(rootfd, req):
-    segs = _validate_rel(req.get("path"), allow_empty=False)
+def _decode_content(req):
     b64 = req.get("contentB64")
     if not isinstance(b64, str):
         raise HelperError("bad_request", "contentB64 required")
     try:
-        content = base64.b64decode(b64, validate=True)
+        return base64.b64decode(b64, validate=True)
     except Exception:
         raise HelperError("bad_request", "contentB64 not valid base64")
+
+
+def _write_temp(pfd, content, mode, prefix=".deckterm-tmp-"):
+    tmp_name = prefix + base64.b32encode(os.urandom(8)).decode("ascii").rstrip(
+        "="
+    ).lower()
+    try:
+        tfd = os.open(
+            tmp_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            mode,
+            dir_fd=pfd,
+        )
+    except OSError as exc:
+        raise _os_to_helper(exc)
+    complete = False
+    try:
+        off = 0
+        while off < len(content):
+            off += os.write(tfd, content[off:])
+        os.fchmod(tfd, mode)
+        os.fsync(tfd)
+        complete = True
+    finally:
+        os.close(tfd)
+        if not complete:
+            try:
+                os.unlink(tmp_name, dir_fd=pfd)
+            except OSError:
+                pass
+    return tmp_name
+
+
+def op_write(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    content = _decode_content(req)
 
     uid = os.getuid()
     pfd, leaf = _resolve_parent(rootfd, segs)
@@ -488,32 +653,12 @@ def op_write(rootfd, req):
             finally:
                 os.close(pf)
 
-        tmp_name = ".deckterm-tmp-%s" % base64.b32encode(os.urandom(8)).decode(
-            "ascii"
-        ).rstrip("=").lower()
+        tmp_name = _write_temp(pfd, content, target_mode)
         committed = False
-        tfd = os.open(
-            tmp_name,
-            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
-            target_mode,
-            dir_fd=pfd,
-        )
         try:
-            try:
-                off = 0
-                while off < len(content):
-                    off += os.write(tfd, content[off:])
-                os.fchmod(tfd, target_mode)  # chmod BEFORE fsync (Codex #6)
-                os.fsync(tfd)
-            finally:
-                os.close(tfd)
-
             committed = _commit_write(pfd, tmp_name, leaf, replacing, expect_ino, expect_dev, uid)
             # Durability: fsync the containing directory after the rename (Codex #6).
-            try:
-                os.fsync(pfd)
-            except OSError:
-                pass
+            _fsync_dir(pfd)
         finally:
             if not committed:
                 try:
@@ -522,6 +667,39 @@ def op_write(rootfd, req):
                     pass
         return {"ok": True, "size": len(content), "mode": target_mode}
     finally:
+        os.close(pfd)
+
+
+def op_create(rootfd, req):
+    """Atomic exclusive create. This is a distinct protocol op so an older
+    deployed helper cannot silently treat a create-only flag as ordinary write."""
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    content = _decode_content(req)
+    mode = req.get("mode")
+    if isinstance(mode, bool) or not isinstance(mode, int):
+        mode = 0o644
+    mode &= 0o777
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    tmp_name = None
+    try:
+        tmp_name = _write_temp(pfd, content, mode, ".deckterm-create-")
+        try:
+            _renameat2(pfd, tmp_name, pfd, leaf, RENAME_NOREPLACE)
+        except OSError as exc:
+            if exc.errno == errno.ENOSYS:
+                raise HelperError(
+                    "unsupported", "atomic no-replace create requires renameat2"
+                )
+            raise _os_to_helper(exc)
+        tmp_name = None
+        _fsync_dir(pfd)
+        return {"ok": True, "size": len(content), "mode": mode}
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name, dir_fd=pfd)
+            except OSError:
+                pass
         os.close(pfd)
 
 
@@ -580,10 +758,14 @@ def _commit_write(pfd, tmp_name, leaf, replacing, expect_ino, expect_dev, uid):
 
 def op_mkdir(rootfd, req):
     segs = _validate_rel(req.get("path"), allow_empty=False)
+    mode = req.get("mode")
+    if isinstance(mode, bool) or not isinstance(mode, int):
+        mode = 0o755
+    mode &= 0o777
     pfd, leaf = _resolve_parent(rootfd, segs)
     try:
         try:
-            os.mkdir(leaf, 0o755, dir_fd=pfd)
+            os.mkdir(leaf, mode, dir_fd=pfd)
         except OSError as exc:
             raise _os_to_helper(exc)
         return {"ok": True}
@@ -653,6 +835,135 @@ def op_delete(rootfd, req):
         os.close(pfd)
 
 
+def _atomic_move_checked(fpfd, fleaf, tpfd, tleaf, expected):
+    """RENAME_NOREPLACE one entry, verifying the exact source both before and
+    after the move. There is deliberately no stat+rename fallback."""
+    if fpfd == tpfd and fleaf == tleaf:
+        raise HelperError("bad_request", "source and destination must differ")
+    source_fd, source_st = _open_entry_identity(fpfd, fleaf)
+    moved = False
+    try:
+        _require_identity(source_st, expected)
+        try:
+            _renameat2(fpfd, fleaf, tpfd, tleaf, RENAME_NOREPLACE)
+            moved = True
+        except OSError as exc:
+            if exc.errno == errno.ENOSYS:
+                raise HelperError(
+                    "unsupported", "atomic no-replace move requires renameat2"
+                )
+            if exc.errno == errno.EEXIST:
+                raise HelperError("exists", "destination exists")
+            raise _os_to_helper(exc)
+
+        dest_fd, dest_st = _open_entry_identity(tpfd, tleaf)
+        try:
+            _require_identity(dest_st, expected)
+            # The still-open source fd must name the same inode now visible at dest.
+            if (
+                source_st.st_dev != dest_st.st_dev
+                or source_st.st_ino != dest_st.st_ino
+            ):
+                raise HelperError("identity_changed", "moved entry identity changed")
+        finally:
+            os.close(dest_fd)
+        _fsync_dir(fpfd)
+        if tpfd != fpfd:
+            _fsync_dir(tpfd)
+        return _identity_dict(dest_st)
+    except Exception:
+        if moved:
+            try:
+                _renameat2(tpfd, tleaf, fpfd, fleaf, RENAME_NOREPLACE)
+            except OSError:
+                # If a same-uid process occupied the source concurrently, leave the
+                # item at the destination for the metadata reconciler to classify.
+                pass
+        raise
+    finally:
+        os.close(source_fd)
+
+
+def op_atomic_move(rootfd, req):
+    from_segs = _validate_rel(req.get("path"), allow_empty=False)
+    to_segs = _validate_rel(req.get("toPath"), allow_empty=False)
+    if from_segs == to_segs:
+        raise HelperError("bad_request", "source and destination must differ")
+    expected = _parse_expected_identity(req)
+    fpfd, fleaf = _resolve_parent(rootfd, from_segs)
+    try:
+        tpfd, tleaf = _resolve_parent(rootfd, to_segs)
+        try:
+            identity = _atomic_move_checked(fpfd, fleaf, tpfd, tleaf, expected)
+            return {"ok": True, "identity": identity}
+        finally:
+            os.close(tpfd)
+    finally:
+        os.close(fpfd)
+
+
+def op_delete_exact(rootfd, req):
+    segs = _validate_rel(req.get("path"), allow_empty=False)
+    quarantine_segs = _validate_rel(req.get("quarantinePath"), allow_empty=False)
+    if segs == quarantine_segs:
+        raise HelperError("bad_request", "delete path and quarantine must differ")
+    expected = _parse_expected_identity(req)
+    recursive = bool(req.get("recursive"))
+    pfd, leaf = _resolve_parent(rootfd, segs)
+    try:
+        qfd, qleaf = _resolve_parent(rootfd, quarantine_segs)
+        try:
+            # A prior helper may have crashed after the atomic move or midway
+            # through recursive deletion. The caller persists this exact path,
+            # so resume from it instead of inventing an untracked temp name.
+            try:
+                quarantine_fd, quarantine_st = _open_entry_identity(qfd, qleaf)
+            except HelperError as exc:
+                if exc.code != "not_found":
+                    raise
+                quarantine_fd = -1
+                quarantine_st = None
+
+            if quarantine_st is None:
+                _atomic_move_checked(pfd, leaf, qfd, qleaf, expected)
+                quarantine_fd, quarantine_st = _open_entry_identity(qfd, qleaf)
+
+            try:
+                _require_core_identity(quarantine_st, expected)
+                if stat.S_ISDIR(quarantine_st.st_mode):
+                    if recursive:
+                        child = os.open(
+                            qleaf,
+                            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=qfd,
+                        )
+                        try:
+                            child_st = os.fstat(child)
+                            if (
+                                child_st.st_dev != quarantine_st.st_dev
+                                or child_st.st_ino != quarantine_st.st_ino
+                            ):
+                                raise HelperError(
+                                    "identity_changed",
+                                    "delete target changed under us",
+                                )
+                            _recursive_delete(child, child_st.st_dev)
+                        finally:
+                            os.close(child)
+                    os.rmdir(qleaf, dir_fd=qfd)
+                else:
+                    os.unlink(qleaf, dir_fd=qfd)
+            finally:
+                if quarantine_fd >= 0:
+                    os.close(quarantine_fd)
+            _fsync_dir(qfd)
+            return {"ok": True}
+        finally:
+            os.close(qfd)
+    finally:
+        os.close(pfd)
+
+
 def op_rename(rootfd, req):
     from_segs = _validate_rel(req.get("path"), allow_empty=False)
     to_segs = _validate_rel(req.get("toPath"), allow_empty=False)
@@ -688,11 +999,15 @@ def op_rename(rootfd, req):
 OPS = {
     "list": op_list,
     "stat": op_stat,
+    "identity": op_identity,
     "read": op_read,
     "write": op_write,
+    "create": op_create,
     "mkdir": op_mkdir,
     "delete": op_delete,
+    "deleteExact": op_delete_exact,
     "rename": op_rename,
+    "atomicMove": op_atomic_move,
 }
 
 

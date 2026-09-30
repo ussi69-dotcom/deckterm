@@ -1,0 +1,13 @@
+[Unit]
+Description=Create and verify a DeckTerm production state backup
+Documentation=file:///home/deploy/apps/deckterm/prod/current/docs/upgrade-and-backup-runbook.md
+ConditionPathIsDirectory=/home/deploy/.deckterm
+ConditionPathExists=/home/deploy/.deckterm/deckterm.db
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=DECKTERM_STATE_DIR=/home/deploy/.deckterm
+Environment=DECKTERM_BACKUP_KEEP=7
+ExecStart=/home/deploy/apps/deckterm/prod/current/scripts/backup-state.sh
+NoNewPrivileges=true

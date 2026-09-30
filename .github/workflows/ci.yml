@@ -38,7 +38,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y tmux
 
       - name: Type check
-        run: bun x tsc --noEmit
+        run: bun run typecheck
+
+      - name: Test census
+        run: bun run test:census
+
+      - name: Build
+        run: bun run build
+
+      - name: Verify self-hosted browser assets
+        run: bun run assets:check
 
       - name: Run push notification tests
         run: bun run test:push
