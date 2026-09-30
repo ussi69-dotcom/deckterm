@@ -222,7 +222,7 @@ export class Harness {
     const env = baseEnv({ ...common, ...modeEnv });
     const child = spawn(
       "bun",
-      ["--preload", JWKS_REDIRECT_PRELOAD, "run", join(REPO_ROOT, "backend", "index.ts")],
+      ["run", "--preload", JWKS_REDIRECT_PRELOAD, join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
@@ -295,7 +295,7 @@ export class Harness {
     });
     const child = spawn(
       "bun",
-      ["--preload", JWKS_REDIRECT_PRELOAD, "run", join(REPO_ROOT, "backend", "index.ts")],
+      ["run", "--preload", JWKS_REDIRECT_PRELOAD, join(REPO_ROOT, "backend", "index.ts")],
       {
         cwd: REPO_ROOT,
         env,
