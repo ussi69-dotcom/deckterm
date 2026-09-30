@@ -285,12 +285,25 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   /**
    * Deletes this namespace's `<session prefix>_*.log` pipe logs whose tmux
-   * session is not in `liveSessionNames`. Sessions that ended while the
-   * service was down (or before logs were deleted on kill) leave these behind.
-   * Returns the number of files removed.
+   * session no longer exists. Sessions that ended while the service was down
+   * (or before logs were deleted on kill) leave these behind. Does nothing
+   * unless the tmux server answers: an unreachable server lists no sessions,
+   * which must not be read as "every log is an orphan". Returns the count.
    */
-  async pruneOrphanPipeLogs(liveSessionNames: string[]): Promise<number> {
-    const live = new Set(liveSessionNames.map((name) => `${name}.log`));
+  async pruneOrphanPipeLogs(): Promise<number> {
+    const listProc = await this.spawnTmux(
+      ["list-sessions", "-F", "#{session_name}"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const output = await new Response((listProc as any).stdout).text();
+    if ((await listProc.exited) !== 0) return 0;
+    const live = new Set(
+      output
+        .trim()
+        .split("\n")
+        .filter(Boolean)
+        .map((name) => `${name}.log`),
+    );
     let entries: string[];
     try {
       entries = await readdir(this.pipeDir);

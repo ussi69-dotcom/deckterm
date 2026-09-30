@@ -1046,7 +1046,7 @@ async function recoverTmuxSessions(): Promise<number> {
   try {
     const sessions =
       await tmuxTerminalBackend!.listSessions(TMUX_SESSION_PREFIX);
-    const prunedLogs = await tmuxTerminalBackend!.pruneOrphanPipeLogs(sessions);
+    const prunedLogs = await tmuxTerminalBackend!.pruneOrphanPipeLogs();
     if (prunedLogs > 0) {
       console.log(`[tmux] Removed ${prunedLogs} orphaned pipe log(s)`);
     }

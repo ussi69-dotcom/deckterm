@@ -117,12 +117,26 @@ test.skipIf(!TMUX_AVAILABLE)(
     writeFileSync(orphan, "old transcript");
     writeFileSync(unrelated, "keep");
 
-    const removed = await backend.pruneOrphanPipeLogs([live.sessionName]);
+    const removed = await backend.pruneOrphanPipeLogs();
 
     expect(removed).toBe(1);
     expect(existsSync(orphan)).toBe(false);
     expect(existsSync(live.pipePath!)).toBe(true);
     expect(existsSync(unrelated)).toBe(true);
+  },
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "pruneOrphanPipeLogs deletes nothing when the tmux server does not answer",
+  async () => {
+    const { socketPath, pipeDir } = freshDirs();
+    mkdirSync(pipeDir, { recursive: true });
+    const log = join(pipeDir, "deckterm_hyg_alive.log");
+    writeFileSync(log, "transcript of a session we cannot see");
+    const backend = makeBackend(socketPath, pipeDir);
+
+    expect(await backend.pruneOrphanPipeLogs()).toBe(0);
+    expect(existsSync(log)).toBe(true);
   },
 );
 
