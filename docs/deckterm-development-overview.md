@@ -1,6 +1,26 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-08-10–11 viz sekce 0x** · **Delta 2026-07-05 viz sekce 0y**
+
+## 0x. Delta 2026-08-10–11 — Scrollback tmux history z UI (scrollHistory · replay fix · alternate-screen guard)
+
+Implementace scrollování tmux historian z prohlížeče — čtyři commity (`0f522b9`, `4b55466`, `0aeddd0`, `2d192e3`).
+
+**Feat: `scrollHistory()` v `TerminalBackend` (`0f522b9`):** Přidáno `scrollHistory(direction, lines)` do rozhraní `TerminalBackend`. Tmux backend vstupuje do copy-mode (`-e`) a odesílá ohraničené `scroll-up`/`scroll-down`; brokered backend totéž přes broker; raw backend vrací `false`. Allowlist brokeru rozšířen o `copy-mode` a `send-keys` s přísným tvarem (`-X -N <1..100> -t <name>`, akce omezena na `scroll-up|scroll-down`). Frontend napojuje afford scroll v `web/extra-keys-scroll.js`. Nové testy: `backend/broker-tmux-schema.test.ts`, `backend/services/brokered-tmux-backend.test.ts`, `backend/services/tmux-scrollback.test.ts`, `web/extra-keys-scroll.test.js` (všechny v `test:unit`).
+
+**Fix: replay 10 000 řádků při reconnectu (`4b55466`):** `capture-pane` používal `-S -2000`, ale sezení mají `history-limit 10000` a frontend drží 10 000 řádků. Opraveno v `TmuxTerminalBackend` i `BrokeredTmuxBackend` — sjednoceno s `ensureHistoryLimit()`.
+
+**Fix: alternate-screen guard — buffer type (`0aeddd0`):** Přidána `shouldRouteScrollToTmux(backendMode, bufferType)` v `extra-keys-scroll`; alternate buffer propustí event do aplikace, normal buffer zachová tmux scroll. Opravuje Claude Code/Codex/vim pane, kde copy-mode otvíralo prázdné `[0/0]`.
+
+**Fix: scroll-routing podle mouse ownership (`2d192e3`):** `buffer.active.type` se ukázal chybný (tmux attach klient dává outer terminal na alternate buffer vždy). Skutečný diskriminátor: `modes.mouseTrackingMode` — SGR mouse tracking indikuje, že aplikace vlastní scroll; `"none"` → routováno do tmux history. Server-side: `scrollHistory` odmítá copy-mode pro `#{alternate_on}=1` panes.
+
+**Nové soubory klíčových modulů:**
+- `backend/services/tmux-scrollback.test.ts` — testy scrollHistory + alternate-screen guard
+- `backend/broker-tmux-schema.test.ts` — testy allowlist schématu brokeru
+- `web/extra-keys-scroll.js` — pure helpers `shouldRouteScrollToTmux`, scroll affordance
+- `web/extra-keys-scroll.test.js` — unit testy scroll logiky
+
+---
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -486,11 +506,13 @@ Nejbližší logické pokračování po C2: dotáhnout multisession backlog (sek
 - `backend/services/foundation-state.ts` — DB, migrace, granty, sessions, audit.
 - `backend/services/foundation-authorization.ts` — autorizační rozhodnutí, route registry.
 - `backend/services/foundation-actors.ts` — Cloudflare Access → aktér.
-- `backend/services/{raw,tmux}-terminal-backend.ts` — `TerminalBackend` impl.
+- `backend/services/{raw,tmux}-terminal-backend.ts` — `TerminalBackend` impl (včetně `scrollHistory()`).
+- `backend/services/brokered-tmux-backend.ts` — brokered varianta (per-user unix isolation + scroll).
 - `backend/task-runner.ts` — supervizovaný task runner.
 - `backend/onboarding-doctor.ts` — setup wizard / autoconfig asistent.
 - `backend/telemetry.ts` — agent badge klasifikace.
 - `web/app.js` — ~12k řádků frontendu (TileManager, TerminalManager, ReconnectingWebSocket, SessionRegistry).
+- `web/extra-keys-scroll.js` — pure helpers `shouldRouteScrollToTmux`, scroll affordance (od Delta 0x).
 
 **Dokumenty:**
 
