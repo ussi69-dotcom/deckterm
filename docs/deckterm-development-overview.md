@@ -1,6 +1,58 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-07-06 viz sekce 0x** · předchozí: 0y (Traycer patterns), 0z (VS Code workspace)
+
+## 0x. Delta 2026-07-06 — Track B enterprise multiuser + Track D IDE/UX HOTOVÉ (HEAD: `7fe43f6`)
+
+### Track A — Stabilizace (KOMPLETNÍ, 2026-07-02)
+
+`tsc --noEmit` přidán jako hard CI gate (8 pre-existing chyb opraveno, `1f48582`); git-panel
+cwd bug opraven — refreshuje živě (`0b7c88d`); search overlay, IDE resize + 24-row floor,
+mobile overflow, explorer řádky (A2-A5, `c58c95f`); zastaralé nároky v docs opraveny (`6e62a7b`).
+Enterprise 1.0 program plan Codex-validován rev 2 (`26029eb`); B5 onboarding gate (`c48d85e`).
+
+### Track B — Enterprise multiuser + OS-level izolace (KOMPLETNÍ, 2026-07-03)
+
+**B1** design (identity/izolace/storage, E1 security model, `ff6dc21`).
+
+**B3 — Multiuser identity + role + revokace (5 slices):** identity migrace (`5bb4ad8`),
+authorization precedence — disabled-wins + check-time role bundles (`b2bf304`), admin
+users/grants API + revokace kill primitive (`e62a6a5`), multiuser enablement gate —
+fail-closed startup (`2072de0`), admin-only Users settings kategorie (`9bfb5c2`). Codex
+integrated-review: 8 nálezů opraveno (`2889e7f`).
+
+**B2 — Root-owned launch broker:** OS mapping state + eligibility core (migrace 6, `bdba581`),
+root-owned spawn/exec/kill/check (`c3cee5e`), broker client + execution-context resolver
+(`1821671`), broker hardening + brokered backends + server wiring (`d0b8441`). Každý uživatelský
+proces poběží pod jejich unixovým UID — OS-level izolace.
+
+**B4 — Brokered filesystem + git (6 slices + Alice/Bob adversarial e2e):** fd-based fs helper
+(`47315b4`), broker git/search profiles s fd-cwd kontraktem (`4e7e780`), fs-executor seam +
+path policy + concurrency cap (`f3490f5`), files routes run as mapped user (`94fb6bc`), git
+routes run as mapped user + síťový git zakázán (`79efedd`), per-user root provisioning +
+task/network deny (`a7acab8`). Codex integrated-review: 9 nálezů (`f9cf810`). Alice/Bob
+adversarial e2e spec (`fb7e09c`).
+
+**B6+B7 — Retence + rate limity:** retire output events z DB hot path (`d28f743`), retention
+modul (migrace 8) + backup/maintenance skripty (`5c8d222`), per-user terminal-create rate limity
+(`abe6d0d`). Codex pre-final: 4 nálezy (`82bb6f6`). Fast-follow: bound state-event growth
+(`cf2cd84`). 18 vizuálních/ergonomických oprav IDE+mobil+git (`52ca61b`).
+
+### Track D — IDE/UX credibility (KOMPLETNÍ, 2026-07-06)
+
+Plán `docs/plans/2026-07-05-track-d-ide-ux.md` (`4b82940`). 6 slices:
+
+- **D1** Ctrl+P quick-open fuzzy file finder + palette command breadth (`551c9e7`)
+- **D2** WebGL renderer (auto/default) + unicode11 wide-char metrics; fallback na canvas (`9c372d3`)
+- **D3** Merge-conflict handling — Merge Changes group + marker-based resolve (`06f9c9d`)
+- **D4** Brokered workspace search + literal replace-in-files — search i replace běží pod UID uživatele (`fbf2796`)
+- **D5** Editor language breadth, autosave, in-editor search (`86029f0`)
+- **D6** Settings/UI polish — toggle switches, focus-visible rings, contrast pass (`a6d001a`)
+
+Codex pre-finalizace: conflict-diff reopen + regex/replace guard (`8a1a889`). Track D delivery
+record + docs close-out (`7fe43f6`, 2026-07-06).
+
+---
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -455,7 +507,7 @@ Po "push to main" vždy ověř, že workflow **Deploy Main** prošel, než prohl
 ### Testy
 
 - `bun run test:unit` — kanonický correctness gate. Nový `*.test.ts/js` **musí** být přidán do `test:unit` v `package.json`, jinak ho CI přeskočí.
-- `tsc --noEmit` na čistém HEAD **padá** (pre-existing errors) — neslouží jako gate, testy ano.
+- `tsc --noEmit` **zelené a hard CI gate** (od 2026-07-02, Track A6a) — držet zelené; testy zůstávají primárním correctness gatem.
 - E2E: `bun run test:e2e:smoke` / `test:e2e` / `test:all`.
 
 ---
