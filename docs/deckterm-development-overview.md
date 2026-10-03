@@ -1,6 +1,12 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y** · **Delta 2026-07-29 viz sekce 0z**
+
+## 0z. Delta 2026-07-29 — Fix: tmux history-limit sjednocen s frontend scrollbackem (`9b46192`)
+
+tmux defaultoval na 2000 řádků history-limitu, zatímco xterm.js na frontendu udržuje 10 000 řádků scrollbacku (`scrollback: 10000` v `web/app.js`). Dlouhodobě běžící agentní sezení (Codex, Claude) přesáhnou 2000 řádků rychle — tmux tiše eviktoval starý výstup (včetně dokončených odpovědí agenta) ještě před tím, než nastoupil fix `--no-alt-screen` (`a8aa5ea`, 2026-07-24). `set-option -g history-limit 10000` je nyní nastaven globálně při vytvoření sezení v obou tmux backendech (`TmuxTerminalBackend.ensureHistoryLimit()` i `BrokeredTmuxBackend.ensureHistoryLimit()`). Nastavení je idempotentní — bezpečné pro opakované volání při každém vytvoření sezení.
+
+---
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 
@@ -455,7 +461,7 @@ Po "push to main" vždy ověř, že workflow **Deploy Main** prošel, než prohl
 ### Testy
 
 - `bun run test:unit` — kanonický correctness gate. Nový `*.test.ts/js` **musí** být přidán do `test:unit` v `package.json`, jinak ho CI přeskočí.
-- `tsc --noEmit` na čistém HEAD **padá** (pre-existing errors) — neslouží jako gate, testy ano.
+- `bun x tsc --noEmit` je **zelený a hard CI gate** (od 2026-07-02, Track A6a) — udržuj ho zeleným; testy zůstávají primárním correctness gatem.
 - E2E: `bun run test:e2e:smoke` / `test:e2e` / `test:all`.
 
 ---
