@@ -2,6 +2,14 @@
 
 DeckTerm is a browser-based terminal workspace for long-running remote development sessions.
 
+[![Tests on dev](https://img.shields.io/github/actions/workflow/status/ussi69-dotcom/deckterm/ci.yml?branch=dev&event=push&label=tests%20%28dev%29)](https://github.com/ussi69-dotcom/deckterm/actions/workflows/ci.yml?query=branch%3Adev+event%3Apush)
+[![Latest production deployment](https://img.shields.io/github/deployments/ussi69-dotcom/deckterm/production?label=production%20deployment)](https://github.com/ussi69-dotcom/deckterm/actions/workflows/deploy-main.yml)
+
+Tests show the latest CI run triggered by a push to `dev`. Deployment shows the latest
+recorded attempt for the `production` environment; open the badges for commit, date,
+and logs. These cached statuses describe recorded checks; live service health is
+verified separately through `/api/health`.
+
 It combines persistent tmux-backed shells, workspace tabs, split tiles, mobile-first controls, file and git tooling, and agent-aware status signals into one interface. The product direction is inspired by Ghostty's calm terminal UX, Termux-style mobile ergonomics, VS Code-style workspace affordances, and the practical needs of Codex and Claude-driven server workflows.
 
 ## What It Does
