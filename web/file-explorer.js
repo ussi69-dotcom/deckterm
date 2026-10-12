@@ -44,8 +44,9 @@ function fileIconName(item) {
 
 // Swap the <i data-lucide> placeholders inside `root` for SVGs. Scoped to
 // `root` so a re-render never re-scans the whole document; decorative, so a
-// missing library or icon name is ignored.
-function renderLucideIcons(root) {
+// missing library or icon name is ignored. Uniquely named: web modules are
+// classic scripts sharing one global scope.
+function renderExplorerIcons(root) {
   if (!root || typeof window === "undefined" || !window.lucide?.createIcons) {
     return;
   }
@@ -518,7 +519,7 @@ class FileExplorerController {
       this.trashButtonEl.appendChild(createIconElement("trash-2"));
       this.trashButtonEl.addEventListener("click", () => void this.openTrash());
       toolbar.appendChild(this.trashButtonEl);
-      renderLucideIcons(toolbar);
+      renderExplorerIcons(toolbar);
       this.fileNoticeEl = document.createElement("div");
       this.fileNoticeEl.className = "file-operation-notice";
       this.fileNoticeEl.hidden = true;
@@ -960,7 +961,7 @@ class FileExplorerController {
         snapshot.items.forEach((item) => {
           this.listEl.appendChild(this.createItemElement(item, snapshot));
         });
-        renderLucideIcons(this.listEl);
+        renderExplorerIcons(this.listEl);
       }
       const pending = this.pendingListFocus;
       if (pending && pending.workspaceId !== snapshot.workspaceId) {

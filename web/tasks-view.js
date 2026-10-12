@@ -99,14 +99,17 @@ function getTaskBoardHelpers() {
   };
 }
 
-// Swap freshly inserted <i data-lucide> placeholders for SVGs (no-op under bun).
-function renderLucideIcons() {
-  if (typeof window !== "undefined" && window.lucide?.createIcons) {
-    try {
-      window.lucide.createIcons();
-    } catch {
-      // cosmetic
-    }
+// Swap freshly inserted <i data-lucide> placeholders under `root` for SVGs
+// (no-op under bun). Uniquely named: every web module is a classic script, so
+// a shared top-level name would resolve to whichever script loaded last.
+function renderTasksViewIcons(root) {
+  if (!root || typeof window === "undefined" || !window.lucide?.createIcons) {
+    return;
+  }
+  try {
+    window.lucide.createIcons({ root });
+  } catch {
+    // cosmetic
   }
 }
 
@@ -316,7 +319,7 @@ class TasksViewController {
         : "ide-tasks-view";
     root.innerHTML = this.skeletonHtml();
     container.appendChild(root);
-    renderLucideIcons();
+    renderTasksViewIcons(root);
     this.root = root;
     this._renderSig = null;
     this.bindEvents();
@@ -460,7 +463,7 @@ class TasksViewController {
       if (viewBtn.dataset.label !== content.label) {
         viewBtn.dataset.label = content.label;
         viewBtn.innerHTML = `<i data-lucide="${this.esc(content.icon)}"></i><span>${this.esc(content.label)}</span>`;
-        renderLucideIcons();
+        renderTasksViewIcons(viewBtn);
       }
     }
 
@@ -477,7 +480,7 @@ class TasksViewController {
     if (tasks.length === 0) {
       list.classList.remove("board");
       list.innerHTML = this.emptyStateHtml();
-      renderLucideIcons();
+      renderTasksViewIcons(list);
       return;
     }
     if (viewMode === "board") {
@@ -677,6 +680,7 @@ const TasksViewModule = {
   formatTaskMessageRow,
   taskMessagesSignature,
   TasksViewController,
+  renderTasksViewIcons,
 };
 
 if (typeof window !== "undefined") {
@@ -696,4 +700,5 @@ if (typeof exports !== "undefined") {
   exports.formatTaskMessageRow = formatTaskMessageRow;
   exports.taskMessagesSignature = taskMessagesSignature;
   exports.TasksViewController = TasksViewController;
+  exports.renderTasksViewIcons = renderTasksViewIcons;
 }
