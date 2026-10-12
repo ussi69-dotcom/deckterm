@@ -57,11 +57,58 @@ function renderExplorerIcons(root) {
   }
 }
 
+// SVG templates per icon name, built once with lucide and cloned per use. A
+// listing puts up to five icons on each of thousands of rows; createIcons
+// would rebuild every SVG node by node after a DOM scan. Only successes are
+// cached: lucide loads with `defer`, so an early render may find it missing.
+const explorerIconTemplates = new Map();
+// Placeholders created while lucide was unavailable, still to be hydrated.
+let explorerIconPlaceholders = 0;
+
+function lucideIconKey(name) {
+  return String(name).replace(/(?:^|[-_\s]+)(\w)/g, (_, char) =>
+    char.toUpperCase(),
+  );
+}
+
+function explorerIconTemplate(name) {
+  const cached = explorerIconTemplates.get(name);
+  if (cached) return cached;
+  const lucide = typeof window !== "undefined" ? window.lucide : null;
+  const iconNode = lucide?.icons?.[lucideIconKey(name)];
+  if (!iconNode || typeof lucide.createElement !== "function") return null;
+  try {
+    // Same attributes createIcons gives a replaced <i data-lucide>.
+    const template = lucide.createElement(iconNode, {
+      "data-lucide": name,
+      "aria-hidden": "true",
+      class: `lucide lucide-${name}`,
+    });
+    if (!template?.cloneNode) return null;
+    explorerIconTemplates.set(name, template);
+    return template;
+  } catch {
+    return null;
+  }
+}
+
 function createIconElement(name) {
+  const template = explorerIconTemplate(name);
+  if (template) return template.cloneNode(true);
+  explorerIconPlaceholders += 1;
   const icon = document.createElement("i");
   icon.setAttribute("data-lucide", name);
   icon.setAttribute("aria-hidden", "true");
   return icon;
+}
+
+// Hydrate placeholders under `root` only when some were created since the
+// last pass, so a fully cloned listing never pays for a DOM scan.
+function renderPendingExplorerIcons(root) {
+  if (explorerIconPlaceholders === 0 || !root) return;
+  if (typeof window === "undefined" || !window.lucide?.createIcons) return;
+  explorerIconPlaceholders = 0;
+  renderExplorerIcons(root);
 }
 
 function normalizeExplorerPath(value) {
@@ -519,7 +566,7 @@ class FileExplorerController {
       this.trashButtonEl.appendChild(createIconElement("trash-2"));
       this.trashButtonEl.addEventListener("click", () => void this.openTrash());
       toolbar.appendChild(this.trashButtonEl);
-      renderExplorerIcons(toolbar);
+      renderPendingExplorerIcons(toolbar);
       this.fileNoticeEl = document.createElement("div");
       this.fileNoticeEl.className = "file-operation-notice";
       this.fileNoticeEl.hidden = true;
@@ -961,7 +1008,7 @@ class FileExplorerController {
         snapshot.items.forEach((item) => {
           this.listEl.appendChild(this.createItemElement(item, snapshot));
         });
-        renderExplorerIcons(this.listEl);
+        renderPendingExplorerIcons(this.listEl);
       }
       const pending = this.pendingListFocus;
       if (pending && pending.workspaceId !== snapshot.workspaceId) {
