@@ -3137,37 +3137,60 @@ class GitManager {
     this.panel = document.createElement("div");
     this.panel.id = "git-panel";
     this.panel.className = "side-panel hidden";
-    // Static HTML template - no user input, safe for innerHTML
+    const syncButtons = gitSyncActions(null)
+      .map(
+        (a) =>
+          `<button type="button" id="git-${a.op}-btn" class="git-header-btn git-sync-btn git-header-inline" data-git-op="${a.op}" title="${a.title}" aria-label="${a.label}"><i data-lucide="${a.icon}">${a.glyph}</i></button>`,
+      )
+      .join("");
+    const overflowItems = gitSyncActions(null)
+      .map(
+        (a) =>
+          `<button type="button" class="git-overflow-item" role="menuitem" data-git-op="${a.op}" title="${a.title}"><i data-lucide="${a.icon}">${a.glyph}</i><span class="git-overflow-label">${a.label}</span></button>`,
+      )
+      .join("");
+    // Static HTML template - no user input, safe for innerHTML. The header
+    // sits above both columns so its Close control is always pinned at the
+    // top right; Pull/Push/Fetch/Stash show inline when the panel is wide and
+    // move into the overflow menu when it is narrow (container query in
+    // styles.css). Icons are lucide placeholders whose text is the fallback.
     this.panel.innerHTML = `
+      <div class="panel-header git-panel-header">
+        <h3>Git</h3>
+        <span id="git-branch" class="git-branch clickable" role="button" tabindex="0" title="Click to switch branch"></span>
+        <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
+        <div class="git-header-actions">
+          ${syncButtons}
+          <button type="button" class="panel-refresh git-header-btn" title="Refresh (r)" aria-label="Refresh"><i data-lucide="refresh-cw">&#x21bb;</i></button>
+          <div class="git-overflow">
+            <button type="button" class="git-header-btn git-overflow-btn" title="More actions" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" aria-controls="git-overflow-menu"><i data-lucide="ellipsis">&#x22ef;</i></button>
+            <div id="git-overflow-menu" class="git-overflow-menu hidden" role="menu" aria-label="Git actions">${overflowItems}</div>
+          </div>
+        </div>
+        <button type="button" class="panel-close git-header-btn" title="Close (Esc)" aria-label="Close panel"><i data-lucide="x">&times;</i></button>
+      </div>
       <div class="git-panel-layout">
         <div class="git-left-panel">
-          <div class="panel-header">
-            <h3>Git</h3>
-            <span id="git-branch" class="git-branch clickable" title="Click to switch branch"></span>
-            <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
-            <button id="git-pull-btn" class="panel-refresh git-sync-btn" title="Pull">↓</button>
-            <button id="git-push-btn" class="panel-refresh git-sync-btn" title="Push">↑</button>
-            <button id="git-fetch-btn" class="panel-refresh git-sync-btn" title="Fetch">⇣</button>
-            <button id="git-stash-btn" class="panel-refresh git-sync-btn" title="Stash changes">≡</button>
-            <button class="panel-refresh" title="Refresh (r)">&#x21bb;</button>
-            <button class="panel-close" title="Close (Esc)">&times;</button>
-          </div>
           <div id="git-files" class="git-files"></div>
           <div id="git-stashes" class="git-stashes"></div>
           <div id="git-branches" class="git-branches hidden"></div>
         </div>
         <div class="git-right-panel">
           <div class="git-diff-header">
-            <span id="git-diff-title">Diff</span>
-            <div class="git-right-views">
-              <button class="git-right-view active" data-view="diff" title="Diff of the selected file">Diff</button>
-              <button class="git-right-view" data-view="timeline" title="Commit history of the selected file">Timeline</button>
-            </div>
-            <div class="git-diff-modes">
-              <button class="git-diff-mode active" data-mode="working">Working Tree</button>
-              <button class="git-diff-mode" data-mode="staged">Staged</button>
-              <button class="git-diff-mode" data-mode="commit">Commit</button>
-              <button id="git-diff-layout" class="git-diff-mode git-diff-layout" title="Toggle split / inline diff">⫿⫿</button>
+            <span id="git-diff-title" class="git-diff-title">Diff</span>
+            <div class="git-diff-controls">
+              <div class="git-right-views git-segmented" role="group" aria-label="Right pane">
+                <button type="button" class="git-right-view active" data-view="diff" aria-pressed="true" title="Diff of the selected file">Diff</button>
+                <button type="button" class="git-right-view" data-view="timeline" aria-pressed="false" title="Commit history of the selected file">Timeline</button>
+              </div>
+              <div class="git-diff-modes">
+                <div class="git-segmented" role="group" aria-label="Compare">
+                  <button type="button" class="git-diff-mode active" data-mode="working" aria-pressed="true">Working Tree</button>
+                  <button type="button" class="git-diff-mode" data-mode="staged" aria-pressed="false">Staged</button>
+                  <button type="button" class="git-diff-mode" data-mode="commit" aria-pressed="false">Commit</button>
+                </div>
+                <button type="button" id="git-diff-layout" class="git-header-btn git-diff-layout" title="Toggle split / inline diff" aria-label="Toggle split / inline diff"><i data-lucide="columns-2">&#x2aff;</i></button>
+              </div>
             </div>
           </div>
           <div id="git-timeline" class="git-timeline hidden"></div>
@@ -3206,21 +3229,40 @@ class GitManager {
     this.panel
       .querySelector("#git-commit-btn")
       .addEventListener("click", () => this.commit());
+    const branchEl = this.panel.querySelector("#git-branch");
+    branchEl.addEventListener("click", () => this.toggleBranches());
+    branchEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.toggleBranches();
+    });
+    // Pull/Push/Fetch/Stash: the inline header buttons and the overflow menu
+    // items share one data-git-op dispatcher.
+    this.panel.querySelectorAll("[data-git-op]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.closeOverflowMenu();
+        this.runHeaderAction(btn.dataset.gitOp);
+      });
+    });
     this.panel
-      .querySelector("#git-branch")
-      .addEventListener("click", () => this.toggleBranches());
-    this.panel
-      .querySelector("#git-pull-btn")
-      .addEventListener("click", () => this.syncAction("pull"));
-    this.panel
-      .querySelector("#git-push-btn")
-      .addEventListener("click", () => this.syncAction("push"));
-    this.panel
-      .querySelector("#git-fetch-btn")
-      .addEventListener("click", () => this.syncAction("fetch"));
-    this.panel
-      .querySelector("#git-stash-btn")
-      .addEventListener("click", () => this.stashPush());
+      .querySelector(".git-overflow-btn")
+      .addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.toggleOverflowMenu();
+      });
+    document.addEventListener("pointerdown", (e) => {
+      if (!this.isOverflowMenuOpen()) return;
+      if (e.target.closest?.(".git-overflow")) return;
+      this.closeOverflowMenu();
+    });
+    // Not-a-repository empty state: "Choose folder" opens the working
+    // directory picker (delegated — the state is re-rendered on refresh).
+    this.panel.querySelector("#git-files").addEventListener("click", (e) => {
+      if (e.target.closest?.('[data-git-action="choose-folder"]')) {
+        this.chooseWorkingDirectory();
+      }
+    });
     this.panel.querySelector("#git-amend").addEventListener("change", (e) => {
       const messageEl = this.panel.querySelector("#git-message");
       if (e.target.checked && !messageEl.value.trim()) {
@@ -3246,6 +3288,57 @@ class GitManager {
     this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
       btn.addEventListener("click", () => this.setRightView(btn.dataset.view));
     });
+    // The panel is built after the page-level lucide pass; hydrate its icon
+    // placeholders now (their text content stays as the fallback otherwise).
+    window.lucide?.createIcons?.();
+  }
+
+  runHeaderAction(op) {
+    if (op === "stash") return this.stashPush();
+    if (op === "pull" || op === "push" || op === "fetch") {
+      return this.syncAction(op);
+    }
+    return undefined;
+  }
+
+  isOverflowMenuOpen() {
+    const menu = this.panel?.querySelector("#git-overflow-menu");
+    return Boolean(menu && !menu.classList.contains("hidden"));
+  }
+
+  toggleOverflowMenu(force) {
+    const menu = this.panel?.querySelector("#git-overflow-menu");
+    const btn = this.panel?.querySelector(".git-overflow-btn");
+    if (!menu || !btn) return;
+    const open =
+      force === undefined ? menu.classList.contains("hidden") : force;
+    menu.classList.toggle("hidden", !open);
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) menu.querySelector(".git-overflow-item:not(:disabled)")?.focus();
+  }
+
+  closeOverflowMenu() {
+    if (this.isOverflowMenuOpen()) this.toggleOverflowMenu(false);
+  }
+
+  // Opens the working-directory picker from the not-a-repository state. The
+  // picker commits the chosen folder through commitWorkingDirectory(), which
+  // refreshes this panel against the new cwd.
+  chooseWorkingDirectory() {
+    const tm = window.terminalManager;
+    if (tm?.openDirPicker) {
+      void tm.openDirPicker();
+      return;
+    }
+    document.getElementById("directory")?.focus();
+  }
+
+  // True when the panel renders as one column (phones / narrow windows): the
+  // files, diff and history then share a single scroll container.
+  isSingleColumnLayout() {
+    const layout = this.panel?.querySelector(".git-panel-layout");
+    if (!layout || typeof getComputedStyle !== "function") return false;
+    return getComputedStyle(layout).display === "block";
   }
 
   // Switches the right pane between the Diff editor and the per-file Timeline.
@@ -3266,7 +3359,9 @@ class GitManager {
   updateRightViewUI() {
     const view = this.state.rightView || "diff";
     this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.view === view);
+      const active = btn.dataset.view === view;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
     });
     const isTimeline = view === "timeline";
     const timelineEl = this.panel.querySelector("#git-timeline");
@@ -3293,6 +3388,39 @@ class GitManager {
           e.target.blur();
           return;
         }
+        return;
+      }
+
+      // Overflow menu: Escape closes it (not the panel), arrows move focus.
+      if (this.isOverflowMenuOpen()) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          this.closeOverflowMenu();
+          this.panel.querySelector(".git-overflow-btn")?.focus();
+          return;
+        }
+        if (e.target.closest?.("#git-overflow-menu")) {
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const items = [
+              ...this.panel.querySelectorAll(
+                ".git-overflow-item:not(:disabled)",
+              ),
+            ];
+            const at = items.indexOf(document.activeElement);
+            const step = e.key === "ArrowDown" ? 1 : -1;
+            items[(at + step + items.length) % items.length]?.focus();
+          }
+          return;
+        }
+      }
+
+      // Enter/Space on a focused button keep their native activation; the
+      // panel shortcuts below would otherwise swallow them.
+      if (
+        (e.key === "Enter" || e.key === " ") &&
+        e.target.closest?.("button, [role='button'], a[href]")
+      ) {
         return;
       }
 
@@ -3339,52 +3467,66 @@ class GitManager {
     });
   }
 
-  navigateFiles(delta) {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    if (fileElements.length === 0) return;
+  // Selection is keyed by path: the tree renders folders before files and
+  // sorts each level, so a row's position never matches getAllFiles() order.
+  // data-index is only the row's position in the rendered list.
+  fileRows() {
+    return [...this.panel.querySelectorAll(".git-file")];
+  }
 
-    this.state.selectedIndex = Math.max(
-      0,
-      Math.min(fileElements.length - 1, this.state.selectedIndex + delta),
+  findFile(path) {
+    if (!path) return null;
+    return this.getAllFiles().find((f) => f.path === path) || null;
+  }
+
+  navigateFiles(delta) {
+    const rows = this.fileRows();
+    if (rows.length === 0) return;
+    let at = rows.findIndex(
+      (el) => el.dataset.path === this.state.selectedPath,
     );
+    if (at === -1) at = Math.min(this.state.selectedIndex, rows.length - 1);
+    const next = Math.max(0, Math.min(rows.length - 1, at + delta));
+    this.state.selectedIndex = next;
+    this.state.selectedPath = rows[next].dataset.path;
     this.highlightSelectedFile();
+    // Keyboard users who focused a row keep focus on the selection.
+    if (document.activeElement?.classList?.contains("git-file")) {
+      rows[next].focus();
+    }
   }
 
   highlightSelectedFile() {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    fileElements.forEach((el) => {
-      const elIndex = Number(el.dataset.index || -1);
-      const isSelected =
-        elIndex === this.state.selectedIndex ||
-        el.dataset.path === this.state.selectedPath;
-      el.classList.toggle("selected", isSelected);
-    });
-
-    // Scroll into view
-    const selected = this.panel.querySelector(".git-file.selected");
-    if (selected) {
-      this.state.selectedPath =
-        selected.dataset.path || this.state.selectedPath;
-      this.state.selectedIndex = Number(
-        selected.dataset.index || this.state.selectedIndex,
+    const rows = this.fileRows();
+    let selectedAt = rows.findIndex(
+      (el) => el.dataset.path === this.state.selectedPath,
+    );
+    if (selectedAt === -1 && rows.length > 0) {
+      selectedAt = Math.min(
+        Math.max(0, this.state.selectedIndex),
+        rows.length - 1,
       );
+    }
+    rows.forEach((el, i) => el.classList.toggle("selected", i === selectedAt));
+
+    const selected = rows[selectedAt];
+    if (selected) {
+      this.state.selectedPath = selected.dataset.path;
+      this.state.selectedIndex = selectedAt;
       selected.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
   }
 
   stageSelectedFile() {
-    const files = this.getAllFiles();
-    const file = files[this.state.selectedIndex];
+    const file = this.findFile(this.state.selectedPath);
     if (file) {
       this.toggleStage(file.path, file.staged);
     }
   }
 
   showSelectedDiff() {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    const selectedFile = fileElements[this.state.selectedIndex];
-    if (selectedFile) {
-      const path = selectedFile.dataset.path;
+    const path = this.state.selectedPath;
+    if (path && this.fileRows().some((el) => el.dataset.path === path)) {
       this.showDiff(path);
     }
   }
@@ -3426,7 +3568,9 @@ class GitManager {
 
   updateDiffModeUI() {
     this.panel.querySelectorAll(".git-diff-mode").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.mode === this.state.diffMode);
+      const active = btn.dataset.mode === this.state.diffMode;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
     });
   }
 
@@ -3528,6 +3672,7 @@ class GitManager {
   }
 
   hide() {
+    this.closeOverflowMenu();
     this.panel.classList.add("hidden");
     // In windowed mode the panel lives inside a SurfaceWindow that must
     // close with it (the in-panel × and Esc call hide() directly).
@@ -3619,13 +3764,12 @@ class GitManager {
       if (stale()) return;
 
       if (statusData.error) {
-        this.state.error = statusData.error;
-        this.panel.querySelector("#git-branch").textContent = "not a repo";
-        this.panel.querySelector("#git-files").innerHTML =
-          `<p class="error">${this.escapeHtml(statusData.error)}</p>`;
+        this.renderStatusFailure(statusData, cwd);
         return;
       }
       this.state.error = null;
+      this.state.notRepository = false;
+      this.panel.classList.remove("git-no-repo");
 
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
@@ -3643,6 +3787,10 @@ class GitManager {
       this.panel.querySelector("#git-branch").textContent = statusData.branch;
       this.renderSyncState();
       this.renderFiles();
+      // The status store emitted onChange BEFORE this method updated state,
+      // so the IDE Source Control view may have rendered the previous cwd's
+      // result; re-render it from the settled state (deduped by signature).
+      tm?.scmView?.render?.();
 
       if (prevSelectedPath) {
         const allFiles = this.getAllFiles();
@@ -3650,7 +3798,6 @@ class GitManager {
           (f) => f.path === prevSelectedPath,
         );
         if (nextIndex !== -1) {
-          this.state.selectedIndex = nextIndex;
           this.state.selectedPath = prevSelectedPath;
           this.highlightSelectedFile();
           this.state.diffMode = prevDiffMode;
@@ -3694,6 +3841,41 @@ class GitManager {
     } finally {
       if (!stale()) this.state.loading = false;
     }
+  }
+
+  // The status probe failed. A folder outside any repository is a normal
+  // state (calm empty state + "Choose folder"); anything else is a real error.
+  // Either way the previous repository's files, history, stashes and branch
+  // must not linger, and the branch slot stays empty instead of "not …".
+  renderStatusFailure(statusData, cwd) {
+    const notRepository = isNotRepositoryStatus(statusData);
+    this.state.error = statusData.error;
+    this.state.notRepository = notRepository;
+    this.state.files = { merge: [], staged: [], changes: [], untracked: [] };
+    this.state.commits = [];
+    this.state.stashes = [];
+    this.state.sync = { upstream: null, ahead: 0, behind: 0 };
+    this.state.branches.current = "";
+    this.state.selectedPath = null;
+    this.state.selectedIndex = 0;
+    this.closeOverflowMenu();
+    this.panel.classList.toggle("git-no-repo", notRepository);
+    this.panel.querySelector("#git-branch").textContent = "";
+    this.panel.querySelector("#git-branches")?.classList.add("hidden");
+    this.renderSyncState();
+    this.renderStashes();
+    this.renderHistory();
+    const diffTitle = this.panel.querySelector("#git-diff-title");
+    if (diffTitle) diffTitle.textContent = "Diff";
+    const diffEl = this.panel.querySelector("#git-diff");
+    if (diffEl) diffEl.innerHTML = "";
+    this._mergeView?.destroy?.();
+    this._mergeView = null;
+    this.panel.querySelector("#git-files").innerHTML = notRepository
+      ? notRepositoryStateHtml(cwd, (t) => this.escapeHtml(t))
+      : `<p class="error">${this.escapeHtml(formatGitError(statusData, statusData.error))}</p>`;
+    window.lucide?.createIcons?.();
+    window.terminalManager?.scmView?.render?.();
   }
 
   renderStatus(files) {
@@ -3766,6 +3948,7 @@ class GitManager {
         key: "merge",
         label: "Merge Conflicts",
         icon: "!",
+        hideWhenEmpty: true,
         files: this.state.files.merge || [],
         groupAction: null,
         groupActionGlyph: "",
@@ -3800,34 +3983,45 @@ class GitManager {
       },
     ];
 
+    // Groups with files render first (in their usual order); empty groups
+    // follow as one compact header line each. Row data-index is the row's
+    // position in render order; file lookups go by path (see findFile()).
     let html = "";
-    let globalIndex = 0;
-
-    sections.forEach((section) => {
+    let rowIndex = 0;
+    orderFileSections(sections).forEach((section) => {
       const files = section.files;
-      // The merge section is conflict-only visibility: hidden entirely when
-      // there is no conflict (unlike the three permanent groups).
-      if (section.key === "merge" && files.length === 0) return;
+      const countLabel = `${files.length} ${files.length === 1 ? "file" : "files"}`;
+      if (section.empty) {
+        html += `
+        <div class="git-file-group git-file-group-${section.key} is-empty">
+          <div class="git-file-group-header">
+            <span class="git-file-group-label">${section.label}</span>
+            <span class="git-file-group-count" aria-label="${countLabel}">0</span>
+          </div>
+        </div>
+      `;
+        return;
+      }
       const { html: treeHtml, nextIndex } = this.renderSectionTree(
         files,
         section,
-        globalIndex,
+        rowIndex,
       );
-      globalIndex = nextIndex;
+      rowIndex = nextIndex;
 
       html += `
         <div class="git-file-group git-file-group-${section.key}">
           <div class="git-file-group-header">
-            <span class="git-file-group-icon ${section.key}">${section.icon}</span>
+            <span class="git-file-group-icon ${section.key}" aria-hidden="true">${section.icon}</span>
             <span class="git-file-group-label">${section.label}</span>
-            <span class="git-file-group-count">(${files.length})</span>
+            <span class="git-file-group-count" aria-label="${countLabel}">${files.length}</span>
             ${
-              files.length > 0 && section.groupAction
-                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+              section.groupAction
+                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
                 : ""
             }
           </div>
-          <div class="git-file-group-items">
+          <div class="git-file-group-items" role="list" aria-label="${section.label}">
             ${treeHtml}
           </div>
         </div>
@@ -3840,17 +4034,16 @@ class GitManager {
 
     container.innerHTML = html;
 
-    if (!this.state.selectedPath) {
-      const firstFile = this.getAllFiles()[0];
-      if (firstFile) {
-        this.state.selectedPath = firstFile.path;
-        this.state.selectedIndex = 0;
-      }
+    // Keep the selection when its file is still listed; otherwise fall back
+    // to the first rendered row (highlightSelectedFile picks it by index).
+    if (!this.findFile(this.state.selectedPath)) {
+      this.state.selectedPath = null;
+      this.state.selectedIndex = 0;
     }
     this.highlightSelectedFile();
 
     container.querySelectorAll(".git-tree-folder").forEach((el) => {
-      el.addEventListener("click", () => {
+      const toggleFolder = () => {
         const key = el.dataset.folderKey;
         if (!key) return;
         if (this.state.collapsedFolders.has(key)) {
@@ -3859,14 +4052,25 @@ class GitManager {
           this.state.collapsedFolders.add(key);
         }
         this.renderFiles();
+        container
+          .querySelector(
+            `.git-tree-folder[data-folder-key="${CSS.escape(key)}"]`,
+          )
+          ?.focus();
+      };
+      el.addEventListener("click", toggleFolder);
+      el.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleFolder();
       });
     });
 
     // Add event listeners
     container.querySelectorAll(".git-file").forEach((el) => {
       el.addEventListener("click", (e) => {
-        const files = this.getAllFiles();
-        const file = files[parseInt(el.dataset.index, 10)];
+        const file = this.findFile(el.dataset.path);
 
         if (e.target.classList.contains("git-file-stage")) {
           this.toggleStage(el.dataset.path, file?.staged);
@@ -3889,14 +4093,21 @@ class GitManager {
           return;
         }
 
+        this.activateFileRow(el);
+      });
+      // Keyboard: Enter opens the row like a click; focusing a row selects
+      // it so Space (stage) and j/k continue from there.
+      el.addEventListener("keydown", (e) => {
+        if (e.target !== el || e.key !== "Enter") return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.activateFileRow(el);
+      });
+      el.addEventListener("focus", () => {
+        if (el.dataset.path === this.state.selectedPath) return;
         this.state.selectedIndex = parseInt(el.dataset.index, 10);
         this.state.selectedPath = el.dataset.path;
         this.highlightSelectedFile();
-        if (this.state.rightView === "timeline") {
-          this.showTimeline(el.dataset.path);
-        } else {
-          this.showDiff(el.dataset.path);
-        }
       });
     });
 
@@ -3915,25 +4126,55 @@ class GitManager {
     });
   }
 
+  // Select a file row and open it in the right pane (diff or timeline). On a
+  // one-column layout the diff sits below the file list, so bring it into
+  // view — otherwise a tap on a phone seems to do nothing.
+  activateFileRow(el) {
+    this.state.selectedIndex = parseInt(el.dataset.index, 10);
+    this.state.selectedPath = el.dataset.path;
+    this.highlightSelectedFile();
+    if (this.state.rightView === "timeline") {
+      this.showTimeline(el.dataset.path);
+    } else {
+      this.showDiff(el.dataset.path);
+    }
+    if (this.isSingleColumnLayout()) {
+      this.panel
+        .querySelector(".git-diff-header")
+        ?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  }
+
   renderSyncState() {
     const el = this.panel.querySelector("#git-sync-label");
     if (!el) return;
     const sync = this.state.sync || { ahead: 0, behind: 0, upstream: null };
     el.textContent = syncLabel(sync.ahead, sync.behind);
     // Pull only makes sense with an upstream; Push without one publishes the
-    // branch (-u origin <branch>), VS Code-style.
-    this.panel.querySelector("#git-pull-btn").disabled = !sync.upstream;
-    this.panel
-      .querySelector("#git-push-btn")
-      .setAttribute(
-        "title",
-        sync.upstream ? "Push" : "Publish branch (push -u origin)",
-      );
+    // branch (-u origin <branch>), VS Code-style. The inline buttons and the
+    // overflow menu items carry the same data-git-op.
+    for (const action of gitSyncActions(sync)) {
+      this.panel
+        .querySelectorAll(`[data-git-op="${action.op}"]`)
+        .forEach((btn) => {
+          btn.disabled = action.disabled;
+          btn.setAttribute("title", action.title);
+          if (btn.classList.contains("git-overflow-item")) {
+            const label = btn.querySelector(".git-overflow-label");
+            if (label) label.textContent = action.label;
+          } else {
+            btn.setAttribute("aria-label", action.label);
+          }
+        });
+    }
   }
 
   async syncAction(op) {
     const btn = this.panel.querySelector(`#git-${op}-btn`);
     if (btn?.disabled) return;
+    const menuItem = this.panel.querySelector(
+      `.git-overflow-item[data-git-op="${op}"]`,
+    );
     const cwd = this.state.cwd || this.currentCwd;
     const body = { cwd };
     if (op === "push" && !this.state.sync?.upstream) {
@@ -3942,6 +4183,7 @@ class GitManager {
       body.branch = this.state.branches.current;
     }
     if (btn) btn.disabled = true;
+    if (menuItem) menuItem.disabled = true;
     try {
       const res = await fetch(`/api/git/${op}`, {
         method: "POST",
@@ -3966,6 +4208,7 @@ class GitManager {
       this.showCommitStatus(`${op} failed: network error`, "error");
     } finally {
       if (btn) btn.disabled = false;
+      if (menuItem) menuItem.disabled = false;
       this.renderSyncState();
     }
   }
@@ -4201,32 +4444,10 @@ class GitManager {
     return { html: rendered.html, nextIndex: rendered.nextIndex };
   }
 
+  // Compact folders (single-child chains render as one "a/b" node) keep deep
+  // paths from eating the row width; see buildFileTree in git-scm.js.
   buildFileTree(files) {
-    const root = { folders: new Map(), files: [] };
-
-    files.forEach((file) => {
-      const parts = file.path.split("/");
-      let node = root;
-      let prefix = "";
-
-      for (let i = 0; i < parts.length - 1; i++) {
-        const folder = parts[i];
-        prefix = prefix ? `${prefix}/${folder}` : folder;
-        if (!node.folders.has(folder)) {
-          node.folders.set(folder, {
-            name: folder,
-            fullPath: prefix,
-            folders: new Map(),
-            files: [],
-          });
-        }
-        node = node.folders.get(folder);
-      }
-
-      node.files.push(file);
-    });
-
-    return root;
+    return buildFileTree(files, { compact: true });
   }
 
   renderTreeNode(node, sectionKey, depth, startIndex) {
@@ -4240,9 +4461,9 @@ class GitManager {
       const folderKey = `${sectionKey}:${folder.fullPath}`;
       const collapsed = this.state.collapsedFolders.has(folderKey);
       html += `
-        <div class="git-tree-folder" data-node-type="folder" data-folder-key="${this.escapeHtml(folderKey)}" style="--tree-depth:${depth}">
-          <span class="git-tree-chevron">${collapsed ? "\u25b8" : "\u25be"}</span>
-          <span class="git-tree-folder-name">${this.escapeHtml(folder.name)}</span>
+        <div class="git-tree-folder" data-node-type="folder" data-folder-key="${this.escapeHtml(folderKey)}" role="button" tabindex="0" aria-expanded="${collapsed ? "false" : "true"}" style="--tree-depth:${depth}">
+          <span class="git-tree-chevron" aria-hidden="true">${collapsed ? "\u25b8" : "\u25be"}</span>
+          <span class="git-tree-folder-name" title="${this.escapeHtml(folder.fullPath)}">${this.escapeHtml(folder.name)}</span>
         </div>
       `;
       if (!collapsed) {
@@ -4261,17 +4482,19 @@ class GitManager {
       a.path.localeCompare(b.path),
     );
     files.forEach((file) => {
-      const isSelected =
-        this.state.selectedPath === file.path ||
-        index === this.state.selectedIndex;
-      const fileName = file.path.split("/").pop() || file.path;
+      const isSelected = this.state.selectedPath === file.path;
+      const { name: fileName, dir } = splitRepoPath(file.path);
       const letter = statusLetter(file);
       const colorClass = statusClass(letter);
       const discardTitle =
         letter === "U" ? "Delete untracked file" : "Discard changes";
+      const pathAttr = this.escapeHtml(file.path);
       html += `
-        <div class="git-file ${isSelected ? "selected" : ""}" data-path="${this.escapeHtml(file.path)}" data-index="${index}" style="--tree-depth:${depth}">
-          <span class="git-file-path ${colorClass}" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
+        <div class="git-file ${isSelected ? "selected" : ""}" role="listitem" tabindex="0" aria-label="${this.escapeHtml(fileName)}, ${statusWord(letter)}${dir ? `, in ${this.escapeHtml(dir)}` : ""}" data-path="${pathAttr}" data-index="${index}" style="--tree-depth:${depth}">
+          <span class="git-file-label" title="${pathAttr}">
+            <span class="git-file-path ${colorClass}">${this.escapeHtml(fileName || file.path)}</span>
+            ${dir ? `<span class="git-file-dir">${this.escapeHtml(dir)}</span>` : ""}
+          </span>
           <div class="git-file-actions">
             <button class="git-file-open" title="Open file">⤢</button>
             <button class="git-file-discard" title="${discardTitle}">⟲</button>

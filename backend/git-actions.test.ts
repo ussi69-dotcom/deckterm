@@ -227,6 +227,70 @@ test("status treats an allowed non-repository directory as a normal probe result
   });
 });
 
+test("status detects a non-repository even when git speaks another language", async () => {
+  // Simulate a host whose git has translations installed (none are on the CI
+  // image): a `git` shim earlier on PATH rewrites git's English stderr into
+  // German unless the caller pinned LC_ALL=C. Detection must not depend on
+  // the service locale.
+  const { mkdir, chmod } = await import("node:fs/promises");
+  const realGit = Bun.which("git");
+  if (!realGit) throw new Error("git not found on PATH");
+  const shimDir = await mkdtemp(join(allowedRoot, "localized-git-"));
+  const shim = join(shimDir, "git");
+  await writeFile(
+    shim,
+    [
+      "#!/bin/sh",
+      `if [ "$LC_ALL" = "C" ]; then exec "${realGit}" "$@"; fi`,
+      'err="$(mktemp)"',
+      `"${realGit}" "$@" 2>"$err"`,
+      "code=$?",
+      "sed 's/not a git repository/Kein Git-Repository/' \"$err\" >&2",
+      'rm -f "$err"',
+      'exit "$code"',
+      "",
+    ].join("\n"),
+  );
+  await chmod(shim, 0o755);
+  const nonRepo = join(allowedRoot, "not-a-repository-localized");
+  await mkdir(nonRepo, { recursive: true });
+
+  const savedPath = process.env.PATH;
+  const savedLang = process.env.LANG;
+  const savedLcAll = process.env.LC_ALL;
+  process.env.PATH = `${shimDir}:${savedPath}`;
+  process.env.LANG = "de_DE.UTF-8";
+  delete process.env.LC_ALL;
+  try {
+    const res = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(nonRepo)}`,
+      ),
+    );
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      error: "Not a git repository",
+      isRepository: false,
+    });
+
+    // A real repository still reports its branch through the same shim.
+    const ok = await app.fetch(
+      new Request(
+        `http://deckterm.test/api/git/status?cwd=${encodeURIComponent(repo)}`,
+      ),
+    );
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as any).branch).toBe("main");
+  } finally {
+    process.env.PATH = savedPath;
+    if (savedLang === undefined) delete process.env.LANG;
+    else process.env.LANG = savedLang;
+    if (savedLcAll === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = savedLcAll;
+    await rm(shimDir, { recursive: true, force: true });
+  }
+});
+
 test("status failure classification preserves operational errors", () => {
   expect(
     classifyGitStatusFailure(

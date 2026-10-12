@@ -2769,6 +2769,12 @@ export function computeLiteralEdits(
   return { edits, matchCount, truncated, newContent: outLines.join("\n") };
 }
 
+// Environment overlay for git calls whose stderr DeckTerm parses: pins the
+// message catalogue to untranslated English (see the /api/git/status route).
+export const GIT_PROBE_ENV: Readonly<Record<string, string>> = Object.freeze({
+  LC_ALL: "C",
+});
+
 export function classifyGitStatusFailure(exitCode: number, stderr: string) {
   const message = stderr.trim() || "git status failed";
   if (/not a git repository/i.test(message)) {
@@ -8808,6 +8814,7 @@ export function createWebApp() {
     git: GitCwd,
     args: string[],
     timeoutMs = 10000,
+    extraEnv: Record<string, string> = {},
   ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
     if (git.ctx.kind === "brokered") {
       // Brokered git shares the per-uid/global broker concurrency cap so it can't
@@ -8858,7 +8865,7 @@ export function createWebApp() {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extraEnv },
     });
     const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
     const [output, stderr, code] = await Promise.all([
@@ -9145,12 +9152,17 @@ export function createWebApp() {
     }
 
     try {
-      const statusRes = await runGit(g.git, [
-        "status",
-        "--porcelain",
-        "-uall",
-        "-b",
-      ]);
+      // LC_ALL=C keeps git's stderr in English so the non-repository probe in
+      // classifyGitStatusFailure() works under any service locale (a
+      // translated "not a git repository" would otherwise surface as a 502).
+      // Porcelain output itself is never localized. Brokered git runs with
+      // the broker's own fixed environment (LANG defaults to C.UTF-8).
+      const statusRes = await runGit(
+        g.git,
+        ["status", "--porcelain", "-uall", "-b"],
+        undefined,
+        GIT_PROBE_ENV,
+      );
       const output = statusRes.output;
       const stderr = statusRes.stderr;
       const exitCode = statusRes.code;

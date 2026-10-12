@@ -57,7 +57,19 @@ function getScm() {
     typeof statusClass === "function" &&
     typeof groupStatusFiles === "function"
   ) {
-    return { statusLetter, statusClass, groupStatusFiles };
+    return {
+      statusLetter,
+      statusClass,
+      groupStatusFiles,
+      ...(typeof splitRepoPath === "function" ? { splitRepoPath } : {}),
+      ...(typeof statusWord === "function" ? { statusWord } : {}),
+      ...(typeof isNotRepositoryStatus === "function"
+        ? { isNotRepositoryStatus }
+        : {}),
+      ...(typeof notRepositoryStateHtml === "function"
+        ? { notRepositoryStateHtml }
+        : {}),
+    };
   }
   if (typeof require !== "undefined") {
     try {
@@ -105,6 +117,18 @@ function getGitHistoryView() {
     }
   }
   return null;
+}
+
+// Replace freshly inserted <i data-lucide> placeholders with SVG icons (their
+// text content is the fallback when lucide is unavailable, e.g. under bun).
+function hydrateIcons() {
+  if (typeof window !== "undefined" && window.lucide?.createIcons) {
+    try {
+      window.lucide.createIcons();
+    } catch {
+      // icons are decorative; the text fallback stays
+    }
+  }
 }
 
 // ── Pure helpers (DOM-free, unit-tested) ─────────────────────────────────────
@@ -247,6 +271,7 @@ class GitScmViewController {
     container.appendChild(root);
     this.root = root;
     this.bindEvents();
+    hydrateIcons();
 
     // Subscribe to the shared status store so an EXTERNAL mutation refreshes us.
     // render() dedupes by a content signature, so a self-induced onChange from
@@ -341,11 +366,11 @@ class GitScmViewController {
         <span class="ide-scm-branch" title="Current branch"></span>
         <span class="ide-scm-sync" title="Commits behind↓ / ahead↑"></span>
         <span class="ide-scm-actions-spacer"></span>
-        <button type="button" class="ide-scm-action" data-action="refresh" title="Refresh">&#x21bb;</button>
-        <button type="button" class="ide-scm-action" data-action="pull" title="Pull">&#x2193;</button>
-        <button type="button" class="ide-scm-action" data-action="push" title="Push">&#x2191;</button>
-        <button type="button" class="ide-scm-action" data-action="fetch" title="Fetch">&#x21e3;</button>
-        <button type="button" class="ide-scm-action" data-action="stash" title="Stash changes">&#x2261;</button>
+        <button type="button" class="ide-scm-action" data-action="refresh" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw">&#x21bb;</i></button>
+        <button type="button" class="ide-scm-action" data-action="pull" title="Pull" aria-label="Pull"><i data-lucide="arrow-down-to-line">&#x2193;</i></button>
+        <button type="button" class="ide-scm-action" data-action="push" title="Push" aria-label="Push"><i data-lucide="arrow-up-from-line">&#x2191;</i></button>
+        <button type="button" class="ide-scm-action" data-action="fetch" title="Fetch" aria-label="Fetch"><i data-lucide="cloud-download">&#x21e3;</i></button>
+        <button type="button" class="ide-scm-action" data-action="stash" title="Stash changes" aria-label="Stash changes"><i data-lucide="archive">&#x2261;</i></button>
       </div>
       <div class="ide-scm-tree"></div>
       <div class="ide-scm-sections">
@@ -451,6 +476,7 @@ class GitScmViewController {
         ahead: sync.ahead || 0,
         behind: sync.behind || 0,
         error: gm.state?.error || "",
+        cwd: gm.state?.cwd || gm.currentCwd || "",
         staged: fileSig(groups.staged),
         changes: fileSig(groups.changes),
         untracked: fileSig(groups.untracked),
@@ -476,10 +502,23 @@ class GitScmViewController {
 
     const tree = this.q(".ide-scm-tree");
     if (!tree) return;
-    // A status-fetch error (most commonly "Not a git repository") must show a
-    // distinct banner — NOT the silent "No changes" empty state the classic
-    // Git window would never show in this situation. Mirrors the classic
-    // window's `.error` red banner (reuses that existing shared class).
+    // A folder outside any repository is a normal state: a calm explanation
+    // plus "Choose folder" (shared markup with the classic Git panel), and
+    // the commit box + remote actions hide. Any other status failure keeps
+    // the red `.error` banner — never the silent "No changes" empty state.
+    const notRepository =
+      Boolean(errorMessage) &&
+      (scm.isNotRepositoryStatus
+        ? scm.isNotRepositoryStatus({ error: errorMessage })
+        : /not a git repository/i.test(errorMessage));
+    this.root?.classList?.toggle("ide-scm-no-repo", notRepository);
+    if (notRepository && scm.notRepositoryStateHtml) {
+      tree.innerHTML = scm.notRepositoryStateHtml(this.cwd(), (t) =>
+        this.esc(t),
+      );
+      hydrateIcons();
+      return;
+    }
     if (errorMessage) {
       tree.innerHTML = `<p class="error">${this.esc(errorMessage)}</p>`;
       return;
@@ -518,16 +557,17 @@ class GitScmViewController {
         .map((file) => {
           const letter = scm.statusLetter(file);
           const colorClass = scm.statusClass(letter);
-          const fileName =
-            (file.path || "").split("/").pop() || file.path || "";
+          const { name: fileName, dir } = this.splitPath(scm, file.path);
           const staged = section.key === "staged";
           const stageGlyph = staged ? "−" : "+";
           const stageTitle = staged ? "Unstage" : "Stage";
           const discardTitle =
             letter === "U" ? "Delete untracked file" : "Discard changes";
+          const word = scm.statusWord ? scm.statusWord(letter) : letter;
+          const label = `${fileName}, ${word}${dir ? `, in ${dir}` : ""}`;
           return `
-            <div class="ide-scm-file" data-path="${this.esc(file.path)}" data-section="${section.key}">
-              <span class="ide-scm-file-name ${colorClass}" title="${this.esc(file.path)}">${this.esc(fileName)}</span>
+            <div class="ide-scm-file" role="listitem" tabindex="0" aria-label="${this.esc(label)}" data-path="${this.esc(file.path)}" data-section="${section.key}">
+              <span class="ide-scm-file-label" title="${this.esc(file.path)}"><span class="ide-scm-file-name ${colorClass}">${this.esc(fileName)}</span>${dir ? `<span class="ide-scm-file-dir">${this.esc(dir)}</span>` : ""}</span>
               <span class="ide-scm-file-actions">
                 <button type="button" class="ide-scm-file-action" data-file-action="open" title="Open file">⤢</button>
                 <button type="button" class="ide-scm-file-action" data-file-action="discard" title="${discardTitle}">⟲</button>
@@ -544,10 +584,21 @@ class GitScmViewController {
             <span class="ide-scm-group-count">${section.files.length}</span>
             <button type="button" class="ide-scm-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${groupTitle}">${groupGlyph}</button>
           </div>
-          <div class="ide-scm-group-items">${rows}</div>
+          <div class="ide-scm-group-items" role="list" aria-label="${section.label}">${rows}</div>
         </div>`;
     }
     tree.innerHTML = html;
+  }
+
+  // { name, dir } for a repo-relative path (git-scm.js splitRepoPath, with an
+  // inline fallback when the helper is not loaded).
+  splitPath(scm, path) {
+    if (scm.splitRepoPath) return scm.splitRepoPath(path);
+    const raw = String(path || "");
+    const cut = raw.lastIndexOf("/");
+    return cut === -1
+      ? { name: raw, dir: "" }
+      : { name: raw.slice(cut + 1), dir: raw.slice(0, cut) };
   }
 
   // The "Merge Changes" group: no bulk group action (unlike the other
@@ -563,7 +614,7 @@ class GitScmViewController {
           <span class="ide-scm-group-label">${section.label}</span>
           <span class="ide-scm-group-count">${section.files.length}</span>
         </div>
-        <div class="ide-scm-group-items">${rows}</div>
+        <div class="ide-scm-group-items" role="list" aria-label="${section.label}">${rows}</div>
       </div>`;
   }
 
@@ -576,7 +627,7 @@ class GitScmViewController {
   renderMergeFileHtml(file, scm) {
     const letter = scm.statusLetter(file); // always "C" for a conflicted file
     const colorClass = scm.statusClass(letter);
-    const fileName = (file.path || "").split("/").pop() || file.path || "";
+    const { name: fileName, dir } = this.splitPath(scm, file.path);
     const xy = file.status || "";
     const checkable = xy === "UU" || xy === "AA";
     const eligible = checkable && this.getConflictEligibility(file);
@@ -588,8 +639,8 @@ class GitScmViewController {
       : `
               <span class="ide-scm-merge-hint" title="Binary conflicts and files over the editor size limit resolve in the terminal">resolve in terminal</span>`;
     return `
-            <div class="ide-scm-file ide-scm-merge-file" data-path="${this.esc(file.path)}" data-section="merge">
-              <span class="ide-scm-file-name ${colorClass}" title="${this.esc(file.path)}">${this.esc(fileName)}</span>
+            <div class="ide-scm-file ide-scm-merge-file" role="listitem" tabindex="0" aria-label="${this.esc(`${fileName}, conflict${dir ? `, in ${dir}` : ""}`)}" data-path="${this.esc(file.path)}" data-section="merge">
+              <span class="ide-scm-file-label" title="${this.esc(file.path)}"><span class="ide-scm-file-name ${colorClass}">${this.esc(fileName)}</span>${dir ? `<span class="ide-scm-file-dir">${this.esc(dir)}</span>` : ""}</span>
               <span class="ide-scm-file-actions">${actionsHtml}</span>
               <span class="ide-scm-file-status ${colorClass}" title="${this.esc(letter)}">${this.esc(letter)}</span>
             </div>`;
@@ -837,6 +888,7 @@ class GitScmViewController {
     const tree = this.q(".ide-scm-tree");
     if (tree) {
       tree.addEventListener("click", (e) => this.onTreeClick(e));
+      tree.addEventListener("keydown", (e) => this.onTreeKeydown(e));
     }
 
     // Sections collapse + branch/stash actions (delegated on the whole root).
@@ -864,7 +916,34 @@ class GitScmViewController {
     }
   }
 
+  // Enter on a focused file row opens its diff, like a click. Enter on one of
+  // the row's own buttons keeps the button's behaviour.
+  onTreeKeydown(e) {
+    if (e.key !== "Enter") return;
+    const row = e.target?.closest?.(".ide-scm-file");
+    if (!row || e.target !== row) return;
+    e.preventDefault();
+    this.openDiff(row.dataset.path, scmDiffModeForSection(row.dataset.section));
+  }
+
+  // "Choose folder" in the not-a-repository state opens the working
+  // directory picker; committing a folder there refreshes git state.
+  chooseWorkingDirectory() {
+    const tm = this.terminalManager;
+    if (tm?.openDirPicker) {
+      void tm.openDirPicker();
+      return;
+    }
+    if (typeof document !== "undefined") {
+      document.getElementById("directory")?.focus();
+    }
+  }
+
   onTreeClick(e) {
+    if (e.target?.closest?.('[data-git-action="choose-folder"]')) {
+      this.chooseWorkingDirectory();
+      return;
+    }
     const gm = this.gitManager;
     if (!gm) return;
     // Group-level stage-all / unstage-all.

@@ -38,6 +38,26 @@ function statusClass(letter) {
   }
 }
 
+// Spoken form of a status letter (row aria-labels).
+function statusWord(letter) {
+  switch (letter) {
+    case "M":
+      return "modified";
+    case "A":
+      return "added";
+    case "D":
+      return "deleted";
+    case "U":
+      return "untracked";
+    case "R":
+      return "renamed";
+    case "C":
+      return "conflict";
+    default:
+      return "changed";
+  }
+}
+
 // Splits status files into the four Source Control groups. `merge` (conflicted
 // files) is checked FIRST — a conflict takes priority over every other
 // classification, mirroring statusLetter()'s precedence (Track D slice D3).
@@ -106,6 +126,165 @@ function diffSources(mode, file, commit) {
   };
 }
 
+// Splits a repo-relative path into the file name and its directory, for rows
+// that show "name  dim/dir". An untracked directory entry ("docs/drafts/")
+// keeps its trailing slash on the name so it still reads as a folder.
+function splitRepoPath(path) {
+  const raw = typeof path === "string" ? path : "";
+  if (!raw) return { name: "", dir: "" };
+  const trailing = raw.endsWith("/");
+  const trimmed = trailing ? raw.slice(0, -1) : raw;
+  const cut = trimmed.lastIndexOf("/");
+  const name =
+    (cut === -1 ? trimmed : trimmed.slice(cut + 1)) + (trailing ? "/" : "");
+  const dir = cut === -1 ? "" : trimmed.slice(0, cut);
+  return { name, dir };
+}
+
+// Display order for the file groups: groups that hold files come first (in
+// their original order), empty groups follow as compact one-line headers.
+// A section flagged `hideWhenEmpty` (Merge Conflicts) disappears when empty.
+// Returns shallow copies with `empty` set; the input is not mutated.
+function orderFileSections(sections) {
+  const list = Array.isArray(sections) ? sections : [];
+  const full = [];
+  const empty = [];
+  for (const section of list) {
+    const files = Array.isArray(section?.files) ? section.files : [];
+    if (files.length > 0) {
+      full.push({ ...section, files, empty: false });
+    } else if (!section?.hideWhenEmpty) {
+      empty.push({ ...section, files, empty: true });
+    }
+  }
+  return [...full, ...empty];
+}
+
+// True when a /api/git/status payload is the server's "this folder is not a
+// git repository" probe result (HTTP 200, isRepository:false) rather than an
+// operational failure. Older servers sent only the error string.
+function isNotRepositoryStatus(data) {
+  if (!data || typeof data !== "object") return false;
+  if (data.isRepository === false) return true;
+  return (
+    typeof data.error === "string" && /not a git repository/i.test(data.error)
+  );
+}
+
+// The remote/stash actions shown in the Git panel header (inline when there
+// is room, otherwise in the overflow menu). `icon` is a lucide name; `glyph`
+// is the text fallback rendered inside the <i> until lucide replaces it.
+function gitSyncActions(sync) {
+  const upstream = sync?.upstream || null;
+  return [
+    {
+      op: "pull",
+      label: "Pull",
+      title: upstream ? "Pull" : "Pull (no upstream branch)",
+      icon: "arrow-down-to-line",
+      glyph: "\u2193",
+      disabled: !upstream,
+    },
+    {
+      op: "push",
+      label: upstream ? "Push" : "Publish branch",
+      title: upstream ? "Push" : "Publish branch (push -u origin)",
+      icon: "arrow-up-from-line",
+      glyph: "\u2191",
+      disabled: false,
+    },
+    {
+      op: "fetch",
+      label: "Fetch",
+      title: "Fetch",
+      icon: "cloud-download",
+      glyph: "\u21e3",
+      disabled: false,
+    },
+    {
+      op: "stash",
+      label: "Stash changes",
+      title: "Stash changes",
+      icon: "archive",
+      glyph: "\u2261",
+      disabled: false,
+    },
+  ];
+}
+
+// Markup for the "current folder is not a git repository" state shared by the
+// Git panel and the IDE Source Control view: an explanation plus a button
+// (data-git-action="choose-folder") that the host wires to the working
+// directory picker. `escape` is the host's HTML escaper; the path is
+// user-controlled.
+function notRepositoryStateHtml(cwd, escape) {
+  const esc = typeof escape === "function" ? escape : (t) => String(t);
+  const pathLine = cwd
+    ? `<code class="git-empty-path" title="${esc(cwd)}">${esc(cwd)}</code>`
+    : "";
+  return `
+    <div class="git-empty-state" role="status">
+      <i data-lucide="folder-git-2" class="git-empty-icon" aria-hidden="true"></i>
+      <p class="git-empty-title">Not a Git repository</p>
+      <p class="git-empty-text">The current working folder is not inside a Git repository.</p>
+      ${pathLine}
+      <p class="git-empty-text">Switch to a project folder to see its changes.</p>
+      <button type="button" class="btn btn-secondary git-empty-action" data-git-action="choose-folder">
+        <i data-lucide="folder-open" aria-hidden="true"></i><span>Choose folder</span>
+      </button>
+    </div>`;
+}
+
+// Builds the folder tree for a group's files: { folders: Map, files: [] },
+// each folder { name, fullPath, folders, files }. With `compact`, a folder
+// that holds no files and exactly one sub-folder merges with it into one node
+// named "a/b" (VS Code "compact folders"), which keeps deep paths from eating
+// the row width on phones. fullPath always names the deepest folder.
+function buildFileTree(files, options = {}) {
+  const root = { folders: new Map(), files: [] };
+  for (const file of Array.isArray(files) ? files : []) {
+    const parts = String(file?.path || "").split("/");
+    let node = root;
+    let prefix = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      const folder = parts[i];
+      if (!folder) continue;
+      prefix = prefix ? `${prefix}/${folder}` : folder;
+      if (!node.folders.has(folder)) {
+        node.folders.set(folder, {
+          name: folder,
+          fullPath: prefix,
+          folders: new Map(),
+          files: [],
+        });
+      }
+      node = node.folders.get(folder);
+    }
+    node.files.push(file);
+  }
+  if (options.compact) compactFolders(root);
+  return root;
+}
+
+function compactFolders(node) {
+  const next = new Map();
+  for (const folder of node.folders.values()) {
+    let merged = folder;
+    while (merged.files.length === 0 && merged.folders.size === 1) {
+      const child = merged.folders.values().next().value;
+      merged = {
+        name: `${merged.name}/${child.name}`,
+        fullPath: child.fullPath,
+        folders: child.folders,
+        files: child.files,
+      };
+    }
+    compactFolders(merged);
+    next.set(merged.name, merged);
+  }
+  node.folders = next;
+}
+
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     statusLetter,
@@ -113,6 +292,13 @@ if (typeof module !== "undefined" && module.exports) {
     groupStatusFiles,
     syncLabel,
     diffSources,
+    splitRepoPath,
+    orderFileSections,
+    isNotRepositoryStatus,
+    gitSyncActions,
+    buildFileTree,
+    notRepositoryStateHtml,
+    statusWord,
   };
 }
 
@@ -122,4 +308,11 @@ if (typeof exports !== "undefined") {
   exports.groupStatusFiles = groupStatusFiles;
   exports.syncLabel = syncLabel;
   exports.diffSources = diffSources;
+  exports.splitRepoPath = splitRepoPath;
+  exports.orderFileSections = orderFileSections;
+  exports.isNotRepositoryStatus = isNotRepositoryStatus;
+  exports.gitSyncActions = gitSyncActions;
+  exports.buildFileTree = buildFileTree;
+  exports.notRepositoryStateHtml = notRepositoryStateHtml;
+  exports.statusWord = statusWord;
 }
