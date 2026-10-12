@@ -543,6 +543,11 @@ class ReconnectingWebSocket {
       if (!isReconnectTransport && this.isCurrentSocket(socket)) {
         this.markConnectionReady(false, socket);
       }
+      // Deliver input queued while connecting right after open. On a
+      // reconnect this lands during the server's replay window, exactly
+      // like input typed there always has, and never waits on a `ready`
+      // that might not come.
+      this.flushQueuedInput(socket);
     };
     socket.onmessage = (e) => {
       if (!this.isCurrentSocket(socket)) return;
@@ -791,8 +796,6 @@ class ReconnectingWebSocket {
     const dropped = queue.push(data);
     if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
     this.scheduleQueuedInputExpiry();
-    // A queued chunk behind an already-open socket (e.g. typed during a
-    // reconnect replay) still flushes once the server says ready.
     return true;
   }
 
@@ -883,9 +886,6 @@ class ReconnectingWebSocket {
       "connected",
       resumed ? { resumed: true } : {},
     );
-    // Flush after the status handshake (reconnects: after the replay and the
-    // resize the client sent on replay-complete).
-    this.flushQueuedInput(socket);
   }
 
   startHeartbeat(socket = this.ws) {
