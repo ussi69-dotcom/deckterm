@@ -6991,9 +6991,10 @@ class TerminalManager {
             ? `<span class="session-chip session-chip-attention" data-kind="${esc(attentionKind)}">${esc(ATTENTION_KIND_LABELS[attentionKind] || "Attention")}</span>`
             : "";
           const activityAt = signals?.sessionActivityAt?.(s) || 0;
-          const activity = activityAt
-            ? signals.formatActivityAge(now - activityAt)
-            : "";
+          const activity =
+            activityAt && signals?.formatActivityAge
+              ? signals.formatActivityAge(now - activityAt)
+              : "";
           const meta = [
             esc(status),
             esc(mode),
@@ -10917,7 +10918,9 @@ class TerminalManager {
 
   applyTerminalAttention(terminal, next) {
     const signals = window.TaskSignals;
-    if (!signals || !terminal) return;
+    // A stale cached task-signals.js (older than this app.js) lacks the
+    // attention helpers: skip attention rather than break telemetry refresh.
+    if (typeof signals?.newAttentionSince !== "function" || !terminal) return;
     const baseline = terminal.attentionSeqBaseline;
     const fresh = signals.newAttentionSince(baseline, next);
     terminal.attentionSeqBaseline = signals.attentionSeq(next);
@@ -11039,7 +11042,7 @@ class TerminalManager {
     const activeVisibleId = this.getActiveVisibleTerminalId();
     if (activeVisibleId) this.markAttentionSeen(activeVisibleId);
     const signals = window.TaskSignals;
-    if (!signals) return;
+    if (typeof signals?.countUnseenAttention !== "function") return;
     const sessions = new Map();
     for (const session of this._sessionCatalog || []) {
       if (session?.id && session.active !== false) {
