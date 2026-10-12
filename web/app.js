@@ -477,6 +477,15 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-paste",
     desktopTone: "secondary",
   }),
+  compose: Object.freeze({
+    label: "Compose",
+    icon: "message-square-text",
+    action: "compose",
+    mobileId: "mobile-compose-btn",
+    toolsId: "tools-sheet-compose",
+    desktopTone: "secondary",
+    description: "Write a message in a text box and send it to the terminal",
+  }),
   copy: Object.freeze({
     label: "Copy",
     icon: "copy",
@@ -792,6 +801,14 @@ class ReconnectingWebSocket {
       return true;
     }
     return false;
+  }
+
+  // True when input would go straight out: socket open, nothing queued.
+  isReadyForInput() {
+    return (
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(this.inputQueue && this.inputQueue.length > 0)
+    );
   }
 
   // Send terminal input, queueing it while the transport is not ready. Input
@@ -7050,6 +7067,7 @@ class TerminalManager {
     else if (action === "clipboard") this.clipboardManager.togglePanel();
     else if (action === "copy") this.copySelection();
     else if (action === "paste") await this.pasteClipboard();
+    else if (action === "compose") this.openComposeSheet();
     else if (action === "font-decrease") this.changeFontSize(-1);
     else if (action === "font-increase") this.changeFontSize(1);
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
@@ -10051,6 +10069,14 @@ class TerminalManager {
         keywords: ["files", "explorer", "browse"],
         priority: 40,
         run: () => this.openFileExplorer(),
+      },
+      {
+        id: "compose-message",
+        title: "Compose message…",
+        group: "Actions",
+        keywords: ["compose", "write", "message", "prompt", "send", "dictate"],
+        priority: 35,
+        run: () => this.openComposeSheet(),
       },
       {
         id: "open-clipboard",
@@ -15731,6 +15757,7 @@ class TerminalManager {
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.composeSubmit?.cancel();
     t.resizeObserver = null;
     t.resizeTimer = null;
     t.fitFrame = 0;
@@ -16106,6 +16133,100 @@ class TerminalManager {
     const selection = active.terminal.getSelection();
     if (selection)
       navigator.clipboard.writeText(selection).catch(console.error);
+  }
+
+  // --- Compose sheet (web/compose-sheet.js) ---------------------------------
+  // A real text box for writing a message to the active terminal (phones
+  // first; desktop through the palette). It targets the terminal that was
+  // active when it opened.
+  openComposeSheet() {
+    const helpers = window.ComposeSheet;
+    const targetId = this.activeId;
+    const target = this.terminals.get(targetId);
+    if (!helpers?.ComposeSheet || !target) {
+      if (!target) {
+        this.notify({
+          key: "compose",
+          kind: "warning",
+          title: "No terminal to write to",
+          body: "Open a terminal first.",
+        });
+      }
+      return;
+    }
+    this.closeToolsSheet?.();
+    if (!this.composeSheet) {
+      let storage = null;
+      try {
+        storage = window.localStorage;
+      } catch {
+        storage = null;
+      }
+      this.composeSheet = new helpers.ComposeSheet({
+        document,
+        storage,
+        onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
+        onClose: ({ restoreFocus }) => {
+          // On touch, refocusing xterm would pop the keyboard back up.
+          if (restoreFocus && !this.isTouchLayout() && this.activeId) {
+            this.focusTerminal(this.activeId);
+          }
+        },
+      });
+    }
+    this.composeTargetId = targetId;
+    this.composeSheet.open({
+      targetLabel: this.formatCwdLabel(target.cwd || "") || "terminal",
+    });
+  }
+
+  // Paste through xterm (bracketed-paste markers when the program asked for
+  // them) into the queued input path, then — for Send — a separate deferred
+  // Enter once that input has settled (see scheduleDeferredSubmit).
+  sendComposedText(id, plan) {
+    const helpers = window.ComposeSheet;
+    const t = this.terminals.get(id);
+    if (!plan || !t || t.disposed || !t.ws || !helpers) {
+      this.notify({
+        key: "compose",
+        kind: "error",
+        title: "Message not sent",
+        body: "That terminal is no longer open.",
+      });
+      return false;
+    }
+    const readyAtStart = Boolean(t.ws.isReadyForInput?.());
+    this.clipboardManager.executePaste(
+      plan.text,
+      t.ws,
+      t.terminal,
+      t.inputState,
+    );
+    if (!plan.submit) return true;
+    t.composeSubmit?.cancel();
+    t.composeSubmit = helpers.scheduleDeferredSubmit({
+      readyAtStart,
+      delayMs: plan.submitDelayMs,
+      isReady: () =>
+        this.terminals.get(id) === t &&
+        !t.disposed &&
+        Boolean(t.ws?.isReadyForInput?.()),
+      send: () => {
+        t.composeSubmit = null;
+        t.ws.sendInput("\r");
+      },
+      onGiveUp: () => {
+        t.composeSubmit = null;
+        if (this.terminals.get(id) !== t || t.disposed) return;
+        this.notify({
+          key: `compose-submit:${id}`,
+          kind: "warning",
+          title: "Message inserted but not submitted",
+          body: "The terminal was not connected. Press Enter once it is.",
+        });
+      },
+    });
+    return true;
   }
 
   async pasteClipboard() {
