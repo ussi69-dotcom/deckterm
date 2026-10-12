@@ -10052,6 +10052,11 @@ class TerminalManager {
         this.closeCommandPalette();
       }
     });
+    // Touch screens have no Esc key: a visible Cancel (coarse pointers only,
+    // styles.css) is their way out besides tapping the backdrop.
+    document
+      .getElementById("command-palette-cancel")
+      ?.addEventListener("click", () => this.closeCommandPalette());
 
     this.registerCommandPaletteActions();
   }
