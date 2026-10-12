@@ -10,6 +10,7 @@ const {
   dockStateFromSettings,
   isDesktopSurfaceWidth,
   computeBottomChromeInset,
+  planDockPlaceholder,
   DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
@@ -178,4 +179,29 @@ test("computeBottomChromeInset measures the bottom bars a floating surface must 
   expect(computeBottomChromeInset(800, [{ top: 900, height: 40 }])).toBe(0);
   // Junk viewport → 0.
   expect(computeBottomChromeInset(NaN, [{ top: 10, height: 5 }])).toBe(0);
+});
+
+test("planDockPlaceholder fills the area above the docked terminals with surface actions", () => {
+  const plan = planDockPlaceholder();
+  expect(plan.title).toBeTruthy();
+  expect(plan.hint).toBeTruthy();
+  expect(plan.actions.map((action) => action.id)).toEqual([
+    "files",
+    "git",
+    "tasks",
+    "palette",
+    "undock",
+  ]);
+  for (const action of plan.actions) {
+    expect(action.label).toBeTruthy();
+    expect(action.icon).toBeTruthy();
+  }
+  // Keyboard hints are optional and come from the caller's registry.
+  const hinted = planDockPlaceholder({
+    keysFor: (id) => (id === "palette" ? "Ctrl+Shift+P" : ""),
+  });
+  expect(hinted.actions.find((a) => a.id === "palette").keys).toBe(
+    "Ctrl+Shift+P",
+  );
+  expect(hinted.actions.find((a) => a.id === "files").keys).toBe("");
 });

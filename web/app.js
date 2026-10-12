@@ -12760,9 +12760,83 @@ class TerminalManager {
         heightPct: this.dockState.heightPct,
       });
     }
+    this.syncDockPlaceholder(enabled);
     // xterm instances must refit to the resized terminal area.
     window.dispatchEvent(new Event("resize"));
     this.syncSurfaceButtonState();
+  }
+
+  // The main area above the docked terminals: the surfaces that open there
+  // and the way back (surface-windows.js planDockPlaceholder). Open windows
+  // cover it; styles.css hides it outside the dock and in IDE mode.
+  syncDockPlaceholder(enabled) {
+    let root = document.getElementById("dock-placeholder");
+    if (!enabled) {
+      if (root) root.hidden = true;
+      return;
+    }
+    if (!root) {
+      const plan = window.SurfaceWindows?.planDockPlaceholder?.({
+        keysFor: (id) => {
+          if (id !== "palette") return "";
+          const KS = window.KeyboardShortcuts;
+          const row = KS?.KEYBOARD_SHORTCUTS?.find(
+            (shortcut) => shortcut.id === "command-palette",
+          );
+          return row?.keys?.[0] ? KS.formatCombo(row.keys[0]) : "";
+        },
+      });
+      const area = document.getElementById("workspace-area");
+      if (!plan || !area) return;
+      root = document.createElement("div");
+      root.id = "dock-placeholder";
+      root.className = "dock-placeholder";
+      const title = document.createElement("p");
+      title.className = "dock-placeholder-title";
+      title.textContent = plan.title;
+      const hint = document.createElement("p");
+      hint.className = "dock-placeholder-hint";
+      hint.textContent = plan.hint;
+      const actions = document.createElement("div");
+      actions.className = "dock-placeholder-actions";
+      const run = {
+        files: () => this.openFileExplorer(),
+        git: () => this.openGitPanel(),
+        tasks: () => this.openTaskPanel(),
+        palette: () => this.openCommandPalette(),
+        undock: () => this.toggleSessionsDock(),
+      };
+      for (const action of plan.actions) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dock-placeholder-action";
+        btn.dataset.dockAction = action.id;
+        const icon = document.createElement("i");
+        icon.dataset.lucide = action.icon;
+        icon.setAttribute("aria-hidden", "true");
+        const label = document.createElement("span");
+        label.textContent = action.label;
+        btn.append(icon, label);
+        if (action.keys) {
+          const kbd = document.createElement("kbd");
+          kbd.textContent = action.keys;
+          btn.appendChild(kbd);
+        }
+        btn.addEventListener("click", () => void run[action.id]?.());
+        actions.appendChild(btn);
+      }
+      root.append(title, hint, actions);
+      area.insertBefore(
+        root,
+        document.getElementById("surface-windows-layer") || null,
+      );
+      try {
+        window.lucide?.createIcons?.({ root });
+      } catch {
+        // decorative
+      }
+    }
+    root.hidden = false;
   }
 
   toggleSessionsDock() {

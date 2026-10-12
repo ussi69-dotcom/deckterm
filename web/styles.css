@@ -7975,6 +7975,92 @@ body.sessions-docked .dock-sash.dragging {
   background: var(--accent-blue);
 }
 
+/* The main area above the docked terminals (app.js syncDockPlaceholder):
+   what opens there and the way back, instead of an empty black block.
+   Surface windows (z-index 640) cover it. */
+.dock-placeholder {
+  display: none;
+}
+
+body.sessions-docked:not(.ide-mode) .dock-placeholder:not([hidden]) {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--dock-height, 35%);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  overflow: auto;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.dock-placeholder-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dock-placeholder-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.dock-placeholder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: 640px;
+}
+
+.dock-placeholder-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.dock-placeholder-action:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-tertiary);
+}
+
+.dock-placeholder-action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.dock-placeholder-action svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.dock-placeholder-action kbd {
+  padding: 0 5px;
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+}
+
 /* =============================================================================
    IDE SHELL (Phase 5, slice 2) — VS Code layout: activity bar + sidebar +
    editor-area placeholder, with terminals docked to the bottom panel.

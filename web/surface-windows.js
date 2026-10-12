@@ -173,6 +173,27 @@ function dockStateFromSettings(value) {
   };
 }
 
+// What the main area shows while the terminals are docked to the bottom and
+// no window covers it (it used to be ~545 px of empty black): the surfaces
+// that open there, plus the way back. keysFor(id) may supply a key hint.
+function planDockPlaceholder({ keysFor = () => "" } = {}) {
+  const actions = [
+    { id: "files", label: "Files", icon: "folder-open" },
+    { id: "git", label: "Git", icon: "git-branch" },
+    { id: "tasks", label: "Tasks", icon: "list-todo" },
+    { id: "palette", label: "Command palette", icon: "search" },
+    { id: "undock", label: "Undock terminals", icon: "panel-bottom-close" },
+  ];
+  return {
+    title: "Terminals are docked below",
+    hint: "Files, Git, Tasks and the editor open here as windows.",
+    actions: actions.map((action) => ({
+      ...action,
+      keys: String((typeof keysFor === "function" && keysFor(action.id)) || ""),
+    })),
+  };
+}
+
 // ---------------------------------------------------------------------------
 // DOM classes (browser only)
 // ---------------------------------------------------------------------------
@@ -627,6 +648,7 @@ const SurfaceWindows = {
   dockStateFromSettings,
   isDesktopSurfaceWidth,
   computeBottomChromeInset,
+  planDockPlaceholder,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,
