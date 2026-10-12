@@ -10263,6 +10263,15 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   content: "Reconnecting…";
 }
 
+/* Touch layouts size the pane controls to 44px, so detach + close reach
+   8 + 44 + 4 + 44 = 100px from the edge; keep the chip clear of them. */
+@media (pointer: coarse) {
+  .tile[data-connection-status="connecting"]::after,
+  .tile[data-connection-status="reconnecting"]::after {
+    right: 108px;
+  }
+}
+
 @keyframes tile-connecting-chip-in {
   to {
     opacity: 1;

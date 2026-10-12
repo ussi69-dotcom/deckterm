@@ -61,7 +61,39 @@ function resolve(selector, prop, mediaMatches = () => false) {
   return value;
 }
 
+const px = (value) => {
+  const match = /^(-?\d+(?:\.\d+)?)px$/.exec(String(value || ""));
+  if (!match) throw new Error(`expected a px length, got ${value}`);
+  return Number(match[1]);
+};
+
 test("git file-group headers stay sticky (no later rule resets position)", () => {
   expect(resolve(".git-file-group-header", "position")).toBe("sticky");
   expect(resolve(".git-file-group-header", "top")).toBe("0");
+});
+
+test("connecting chip clears the touch pane controls", () => {
+  const coarse = (media) => media.includes("(pointer: coarse)");
+  const chip = '.tile[data-connection-status="reconnecting"]::after';
+  const chipRight = px(resolve(chip, "right", coarse));
+
+  // Multi-pane touch layout shows detach + close side by side.
+  const containerRight = px(resolve(".tile-close-container", "right", coarse));
+  const gap = px(resolve(".tile-close-container", "gap", coarse));
+  const closeWidth = px(resolve(".tile-close-btn", "width", coarse));
+  const detachWidth = px(resolve(".tile-detach-btn", "width", coarse));
+  const controlsReach = containerRight + detachWidth + gap + closeWidth;
+
+  expect(closeWidth).toBe(44);
+  expect(chipRight).toBeGreaterThan(controlsReach);
+});
+
+test("connecting chip clears the desktop pane controls", () => {
+  const chip = '.tile[data-connection-status="connecting"]::after';
+  const fine = (media) => media.includes("(pointer: fine)");
+  const chipRight = px(resolve(chip, "right", fine));
+  // Desktop stacks the 20px controls vertically in the right gutter.
+  const containerRight = px(resolve(".tile-close-container", "right", fine));
+  const closeWidth = px(resolve(".tile-close-btn", "width", fine));
+  expect(chipRight).toBeGreaterThan(containerRight + closeWidth);
 });
