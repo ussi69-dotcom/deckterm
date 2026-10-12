@@ -3,6 +3,7 @@ import {
   classifyAgentOutputPhase,
   inferRecoveredTmuxRuntimeState,
   inferTmuxRuntimeState,
+  nextAgentMarkerActive,
   inferPolledTmuxAgentState,
   parseShellIntegrationChunk,
   resolveAgentOutputState,
@@ -375,6 +376,7 @@ test("inferTmuxRuntimeState recovers last exit code from tmux capture markers af
     lastExitCode: 0,
     agentName: null,
     agentState: null,
+    agentMissedSamples: 0,
   });
 });
 
@@ -397,6 +399,7 @@ test("inferTmuxRuntimeState keeps explicit agent markers active even when tmux r
     lastExitCode: null,
     agentName: "codex",
     agentState: "thinking",
+    agentMissedSamples: 0,
   });
 });
 
@@ -420,12 +423,14 @@ test("inferTmuxRuntimeState promotes explicit agent output to responding after u
     lastExitCode: null,
     agentName: "codex",
     agentState: "responding",
+    agentMissedSamples: 0,
   });
 });
 
 test("inferTmuxRuntimeState preserves explicit agent state across markerless tmux polls", () => {
   const state = inferTmuxRuntimeState({
     paneCurrentCommand: "bash",
+    agentMarkerActive: true,
     capture: "OpenAI Codex\n",
     previousCapture: "OpenAI Codex\n",
     previousState: {
@@ -442,7 +447,163 @@ test("inferTmuxRuntimeState preserves explicit agent state across markerless tmu
     lastExitCode: null,
     agentName: "codex",
     agentState: "thinking",
+    agentMissedSamples: 0,
   });
+});
+
+// A1: an agent found only through the process tree (no open agent;start
+// marker) is dropped once the agent process is gone. The tree is sampled, so
+// one empty sample is not enough: two consecutive conclusive samples are.
+const CLAUDE_GONE_SAMPLE = {
+  paneCurrentCommand: "bash",
+  processTree: ["-bash"],
+  capture: "> \n",
+  previousCapture: "> \n",
+  hasUserPrompted: true,
+};
+
+test("inferTmuxRuntimeState keeps a process-detected agent through one empty process sample", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    previousState: {
+      running: false,
+      lastExitCode: 130,
+      agentName: "claude",
+      agentState: "responding",
+      agentMissedSamples: 0,
+    },
+  });
+
+  expect(state.agentName).toBe("claude");
+  expect(state.agentMissedSamples).toBe(1);
+});
+
+test("inferTmuxRuntimeState clears a process-detected agent after two consecutive empty samples", () => {
+  const first = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    previousState: {
+      running: false,
+      lastExitCode: 130,
+      agentName: "claude",
+      agentState: "responding",
+    },
+  });
+  const second = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    previousState: first,
+  });
+
+  expect(second).toEqual({
+    running: false,
+    lastExitCode: 130,
+    agentName: null,
+    agentState: null,
+    agentMissedSamples: 0,
+  });
+});
+
+test("inferTmuxRuntimeState resets the miss count when the agent process shows up again", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    processTree: ["-bash", "claude"],
+    previousState: {
+      running: false,
+      lastExitCode: null,
+      agentName: "claude",
+      agentState: "thinking",
+      agentMissedSamples: 1,
+    },
+  });
+
+  expect(state.agentName).toBe("claude");
+  expect(state.agentMissedSamples).toBe(0);
+});
+
+test("inferTmuxRuntimeState keeps an agent whose agent;start marker is still open", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    agentMarkerActive: true,
+    previousState: {
+      running: true,
+      lastExitCode: null,
+      agentName: "codex",
+      agentState: "thinking",
+      agentMissedSamples: 1,
+    },
+  });
+
+  expect(state.agentName).toBe("codex");
+  expect(state.agentState).toBe("thinking");
+  expect(state.agentMissedSamples).toBe(0);
+});
+
+test("inferTmuxRuntimeState does not count a sample where tmux gave no pane command", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    paneCurrentCommand: "",
+    processTree: [],
+    previousState: {
+      running: false,
+      lastExitCode: null,
+      agentName: "claude",
+      agentState: "thinking",
+      agentMissedSamples: 1,
+    },
+  });
+
+  expect(state.agentName).toBe("claude");
+  expect(state.agentMissedSamples).toBe(1);
+});
+
+test("inferTmuxRuntimeState does not count a sample whose process tree read failed", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    processTree: null,
+    previousState: {
+      running: false,
+      lastExitCode: null,
+      agentName: "claude",
+      agentState: "thinking",
+      agentMissedSamples: 1,
+    },
+  });
+
+  expect(state.agentName).toBe("claude");
+  expect(state.agentMissedSamples).toBe(1);
+});
+
+test("inferTmuxRuntimeState clears the agent at once on an explicit agent;done marker", () => {
+  const state = inferTmuxRuntimeState({
+    ...CLAUDE_GONE_SAMPLE,
+    capture: `${AGENT_START("claude")}working\n${AGENT_DONE("claude", 0)}> `,
+    previousState: {
+      running: false,
+      lastExitCode: null,
+      agentName: "claude",
+      agentState: "responding",
+      agentMissedSamples: 0,
+    },
+  });
+
+  expect(state.agentName).toBeNull();
+  expect(state.agentState).toBeNull();
+});
+
+test("nextAgentMarkerActive opens on agent;start and closes on agent;done or a returned prompt", () => {
+  const start = parseShellIntegrationChunk(AGENT_START("claude")).events;
+  const done = parseShellIntegrationChunk(AGENT_DONE("claude", 0)).events;
+  const prompt = parseShellIntegrationChunk(DONE(130)).events;
+  const output = parseShellIntegrationChunk("plain output").events;
+
+  expect(nextAgentMarkerActive(false, start)).toBe(true);
+  expect(nextAgentMarkerActive(true, output)).toBe(true);
+  expect(nextAgentMarkerActive(true, done)).toBe(false);
+  // The wrapper never printed agent;done (it was interrupted) but the shell
+  // prompt came back, so the wrapped agent is no longer in the foreground.
+  expect(nextAgentMarkerActive(true, prompt)).toBe(false);
+  expect(
+    nextAgentMarkerActive(false, [...start, ...done, ...start]),
+  ).toBe(true);
 });
 
 // ---------------------------------------------------------------------------

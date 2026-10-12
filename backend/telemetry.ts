@@ -35,7 +35,19 @@ export type TmuxRuntimeState = {
   lastExitCode: number | null;
   agentName: AgentName | null;
   agentState: AgentState | null;
+  /**
+   * Consecutive conclusive tmux samples in which a process-detected agent was
+   * missing from both the process tree and pane_current_command.
+   */
+  agentMissedSamples?: number;
 };
+
+/**
+ * A process-detected agent is dropped after this many consecutive samples
+ * without it. The process tree is sampled, so one empty sample (a race with a
+ * respawn, a short-lived exec) must not clear the badge.
+ */
+export const AGENT_MISSING_SAMPLES_TO_CLEAR = 2;
 
 export type TerminalTelemetry = {
   busy: boolean;
@@ -279,6 +291,28 @@ export function inferPolledTmuxAgentState({
   return classifiedState || "thinking";
 }
 
+/**
+ * Whether an explicit `agent;<name>;start` marker is still open after these
+ * shell-integration events. `agent;done` closes it, and so does a returned
+ * shell prompt (`running;done`): the prompt only comes back once the wrapped
+ * agent has left the foreground, even if the wrapper never printed its done
+ * marker (interrupted function).
+ */
+export function nextAgentMarkerActive(
+  current: boolean,
+  events: ShellIntegrationEvent[],
+): boolean {
+  let active = current;
+  for (const event of events) {
+    if (event.type === "agent-start") {
+      active = true;
+    } else if (event.type === "agent-done" || event.type === "running-done") {
+      active = false;
+    }
+  }
+  return active;
+}
+
 export function inferTmuxRuntimeState({
   paneCurrentCommand,
   processTree = [],
@@ -291,13 +325,17 @@ export function inferTmuxRuntimeState({
     agentState: null,
   },
   hasUserPrompted = false,
+  agentMarkerActive = false,
 }: {
   paneCurrentCommand?: string | null;
-  processTree?: string[];
+  /** Agent process args under the pane; null when the read failed. */
+  processTree?: string[] | null;
   previousCapture?: string | null;
   capture?: string | null;
   previousState?: TmuxRuntimeState;
   hasUserPrompted?: boolean;
+  /** An explicit agent;start marker is open (see nextAgentMarkerActive). */
+  agentMarkerActive?: boolean;
 }): TmuxRuntimeState {
   const safeCapture = capture || "";
   const parsedCapture = parseShellIntegrationChunk(safeCapture);
@@ -309,9 +347,32 @@ export function inferTmuxRuntimeState({
   );
   const recoveredState = inferRecoveredTmuxRuntimeState({
     paneCurrentCommand,
-    processTree,
+    processTree: processTree || [],
     capture: safeCapture,
   });
+
+  // A previous agent that nothing confirms any more (no process, no pane
+  // command, no open marker) is kept only until the miss count reaches
+  // AGENT_MISSING_SAMPLES_TO_CLEAR. A sample is inconclusive when tmux gave
+  // no pane command or the process tree read failed; it neither counts nor
+  // resets.
+  const sampleConclusive =
+    String(paneCurrentCommand || "").trim().length > 0 && processTree !== null;
+  const previousMisses = previousState.agentMissedSamples || 0;
+  let agentMissedSamples = 0;
+  let carriedAgentName = previousState.agentName;
+  if (
+    !hasAgentMarkers &&
+    !recoveredState.agentName &&
+    previousState.agentName &&
+    !agentMarkerActive
+  ) {
+    agentMissedSamples = sampleConclusive ? previousMisses + 1 : previousMisses;
+    if (agentMissedSamples >= AGENT_MISSING_SAMPLES_TO_CLEAR) {
+      carriedAgentName = null;
+      agentMissedSamples = 0;
+    }
+  }
 
   const running = hasRunningMarkers
     ? parsedCapture.state.running
@@ -319,8 +380,7 @@ export function inferTmuxRuntimeState({
   const lastExitCode = hasRunningMarkers
     ? parsedCapture.state.lastExitCode
     : previousState.lastExitCode;
-  const recoveredAgentName =
-    recoveredState.agentName || previousState.agentName;
+  const recoveredAgentName = recoveredState.agentName || carriedAgentName;
   const agentName = hasAgentMarkers
     ? parsedCapture.state.agentName
     : recoveredAgentName;
@@ -337,6 +397,7 @@ export function inferTmuxRuntimeState({
       lastExitCode,
       agentName: null,
       agentState: null,
+      agentMissedSamples: 0,
     };
   }
 
@@ -361,6 +422,7 @@ export function inferTmuxRuntimeState({
     lastExitCode,
     agentName,
     agentState,
+    agentMissedSamples,
   };
 }
 
