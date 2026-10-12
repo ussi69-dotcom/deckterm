@@ -14,13 +14,16 @@
 //   task-message delivery uses on the server (POINTER_SUBMIT_DELAY_MS).
 // - Insert without Enter: the paste only, for editing before submitting.
 //
-// Both go through the terminal's queued input path, so a message sent while
-// the socket reconnects is held and flushed in order, and the Enter waits
-// until that flush has settled.
+// Both need a connected terminal: while it reconnects the message stays in
+// the sheet (never parked in the small, short-lived reconnect queue, where it
+// could be dropped after the sheet was cleared), and the Enter follows only a
+// paste that actually went out.
 //
-// The last 20 sent messages are kept in localStorage; tapping one puts it
-// back into the text box. Pure parts are exported for Bun unit tests; app.js
-// owns the glue (window.ComposeSheet).
+// The last 20 sent messages are kept for this browser tab only
+// (sessionStorage — sends can include passwords or tokens typed on a phone);
+// tapping one puts it back into the text box, and "Clear" forgets them. An
+// older persistent localStorage copy is deleted on first use. Pure parts are
+// exported for Bun unit tests; app.js owns the glue (window.ComposeSheet).
 
 const COMPOSE_HISTORY_STORAGE_KEY = "deckterm.compose.history.v1";
 const COMPOSE_HISTORY_MAX = 20;
@@ -112,6 +115,29 @@ function saveComposeHistory(storage, history) {
   }
 }
 
+function removeStorageKey(storage) {
+  try {
+    if (typeof storage?.removeItem !== "function") return false;
+    storage.removeItem(COMPOSE_HISTORY_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Forget every saved message ("Clear" in the sheet). */
+function clearComposeHistory(storage) {
+  return removeStorageKey(storage);
+}
+
+/**
+ * Delete the history an earlier version kept in persistent localStorage
+ * (deliberately not carried over: it may hold secrets).
+ */
+function purgeLegacyComposeHistory(legacyStorage) {
+  return removeStorageKey(legacyStorage);
+}
+
 /** One-line preview of a history entry. */
 function composeHistoryPreview(text, maxChars = 90) {
   const flat = String(text || "").replace(/\s+/g, " ").trim();
@@ -138,18 +164,22 @@ function scheduleDeferredSubmit({
   delayMs = COMPOSE_SUBMIT_DELAY_MS,
   maxWaitMs = COMPOSE_SUBMIT_MAX_WAIT_MS,
   onGiveUp = null,
+  now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (handle) => clearTimeout(handle),
 }) {
   let previousReady = Boolean(readyAtStart);
-  let waited = 0;
+  let ticked = 0;
+  const startedAt = now();
   let handle = null;
   let finished = false;
 
   const tick = () => {
     handle = null;
     if (finished) return;
-    waited += delayMs;
+    ticked += delayMs;
+    // Background tabs throttle timers, so count real elapsed time too.
+    const waited = Math.max(ticked, now() - startedAt);
     let ready = false;
     try {
       ready = Boolean(isReady());
@@ -180,12 +210,41 @@ function scheduleDeferredSubmit({
   };
 }
 
+/**
+ * Hand a Send / Insert plan to the terminal without ever losing the text.
+ * Only input that goes straight out is accepted (socket open, nothing
+ * queued): the reconnect queue is small (8 KB) and short-lived (15 s), so a
+ * message parked there could be dropped after the sheet already cleared it,
+ * and its deferred Enter would then submit an empty line. When not accepted,
+ * nothing is pasted or submitted and the caller keeps the text in the sheet.
+ * The deferred Enter is scheduled only after an accepted paste.
+ *
+ * `paste(text)` may return false when the transport refused it.
+ * Returns { accepted: true } or { accepted: false, reason }.
+ */
+function deliverComposePlan({ plan, isReady, paste, scheduleSubmit = null }) {
+  if (!plan || typeof plan.text !== "string" || !plan.text) {
+    return { accepted: false, reason: "empty" };
+  }
+  let ready = false;
+  try {
+    ready = Boolean(isReady?.());
+  } catch {
+    ready = false;
+  }
+  if (!ready) return { accepted: false, reason: "not-connected" };
+  if (paste(plan.text) === false) return { accepted: false, reason: "refused" };
+  if (plan.submit) scheduleSubmit?.();
+  return { accepted: true };
+}
+
 // --- DOM (browser only) -------------------------------------------------------
 
 class ComposeSheet {
   constructor({
     document: doc,
     storage = null,
+    legacyStorage = null,
     onSend,
     onClose = null,
     mount = null,
@@ -196,6 +255,9 @@ class ComposeSheet {
     this.onClose = onClose;
     this.mount = mount;
     this.root = null;
+    if (legacyStorage && legacyStorage !== storage) {
+      purgeLegacyComposeHistory(legacyStorage);
+    }
     this.history = loadComposeHistory(storage);
   }
 
@@ -273,9 +335,22 @@ class ComposeSheet {
     const historySection = doc.createElement("section");
     historySection.className = "compose-sheet-history";
     historySection.setAttribute("aria-labelledby", "compose-sheet-history-title");
+    const historyHeader = doc.createElement("div");
+    historyHeader.className = "compose-sheet-history-header";
     const historyTitle = doc.createElement("h3");
     historyTitle.id = "compose-sheet-history-title";
     historyTitle.textContent = "Recent";
+    const clearHistory = doc.createElement("button");
+    clearHistory.type = "button";
+    clearHistory.className = "compose-sheet-history-clear";
+    clearHistory.textContent = "Clear";
+    clearHistory.title = "Forget recent messages";
+    clearHistory.setAttribute("aria-label", "Clear recent messages");
+    clearHistory.addEventListener("click", () => {
+      this.clearHistory();
+      input.focus();
+    });
+    historyHeader.append(historyTitle, clearHistory);
     const list = doc.createElement("ul");
     list.className = "compose-sheet-history-list";
     list.addEventListener("click", (event) => {
@@ -289,7 +364,7 @@ class ComposeSheet {
       const end = input.value.length;
       input.setSelectionRange?.(end, end);
     });
-    historySection.append(historyTitle, list);
+    historySection.append(historyHeader, list);
 
     panel.append(header, input, actions, historySection);
     root.append(backdrop, panel);
@@ -375,6 +450,12 @@ class ComposeSheet {
     );
   }
 
+  clearHistory() {
+    this.history = [];
+    clearComposeHistory(this.storage);
+    if (this.els) this.renderHistory();
+  }
+
   async submit({ submit }) {
     const plan = planComposeSend(this.els?.input?.value, { submit });
     if (!plan) return false;
@@ -407,7 +488,10 @@ const ComposeSheetApi = {
   addToComposeHistory,
   loadComposeHistory,
   saveComposeHistory,
+  clearComposeHistory,
   composeHistoryPreview,
+  purgeLegacyComposeHistory,
+  deliverComposePlan,
   scheduleDeferredSubmit,
   ComposeSheet,
 };

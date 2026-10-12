@@ -119,6 +119,9 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// /api/terminals telemetry poll cadence (see startTelemetryRefreshLoop).
+const TELEMETRY_VISIBLE_POLL_MS = 5000;
+const TELEMETRY_HIDDEN_POLL_MS = 30000;
 // Quick-open (Ctrl+P) file-tree cache TTL — the git branch cache never
 // expires (branch switches invalidate it explicitly), but the tree fetch
 // walks the live filesystem, so it is re-fetched after this window.
@@ -2640,7 +2643,9 @@ class ExtraKeysManager {
     const visible = helpers.shouldShowQuickReplies({
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
+      agentState: active?.agentState ?? null,
       attention: active?.attention ?? null,
+      attentionBaselineSeq: active?.quickReplyAttentionBaseline ?? null,
     });
     root.dataset.state = helpers.getQuickReplyState({
       agentState: active?.agentState ?? null,
@@ -7139,6 +7144,35 @@ class TerminalManager {
     this.scheduleDesktopToolbarDensitySync();
   }
 
+  // Whether the Files explorer and the Git panel / IDE SCM view are on screen
+  // right now. Windowed surfaces can be open simultaneously; the exclusive
+  // right-surface notion only applies to the mobile sheets.
+  getFilesGitVisibility(surface = this.getRightSurface()) {
+    const windowed = this.isWindowedSurfaces();
+    let filesOpen = windowed
+      ? Boolean(this.fileExplorer?.isOpen)
+      : surface === "files";
+    let gitOpen = windowed
+      ? Boolean(
+          window.gitManager &&
+          !window.gitManager.panel?.classList.contains("hidden"),
+        )
+      : surface === "git";
+    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
+    // permanently "open" there, so its isOpen flag would keep Files lit).
+    if (this.isIdeModeActive() && this.ideShell) {
+      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
+      const view = this.ideShell.activeView?.();
+      filesOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
+      gitOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
+    }
+    return { filesOpen, gitOpen };
+  }
+
   syncSurfaceButtonState() {
     const surface = this.getRightSurface();
     const moreOpen = Boolean(
@@ -7154,31 +7188,8 @@ class TerminalManager {
     );
     const paletteOpen = this.isCommandPaletteOpen();
 
-    // Windowed surfaces can be open simultaneously; the exclusive
-    // right-surface notion only applies to the mobile sheets.
-    const windowed = this.isWindowedSurfaces();
-    let filesOpen = windowed
-      ? Boolean(this.fileExplorer?.isOpen)
-      : surface === "files";
-    let gitOpen = windowed
-      ? Boolean(
-          window.gitManager &&
-          !window.gitManager.panel?.classList.contains("hidden"),
-        )
-      : surface === "git";
-    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
-    // permanently "open" there, so its isOpen flag would keep Files lit).
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility(surface);
     const ideMode = this.isIdeModeActive();
-    if (ideMode && this.ideShell) {
-      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
-      const view = this.ideShell.activeView?.();
-      filesOpen =
-        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
-        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
-      gitOpen =
-        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
-        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
-    }
 
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
@@ -7299,7 +7310,10 @@ class TerminalManager {
     return cwd.replace(/\/+$/, "");
   }
 
-  setDirectoryValue(value, { force = false, userDraft = false } = {}) {
+  setDirectoryValue(
+    value,
+    { force = false, userDraft = false, persist = true } = {},
+  ) {
     const next = String(value || "");
     if (userDraft) {
       this.markDirectoryDraftEdited();
@@ -7324,7 +7338,9 @@ class TerminalManager {
     // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
     // recurse). The value is only a navigation default; the backend file gates
     // remain the authorization boundary (Codex #4 — do not trust it).
-    this.settingsStore?.set("files.defaultCwd", next);
+    // persist:false — a live cwd the shell merely `cd`-ed into is shown but
+    // never saved: only values the user commits become the default.
+    if (persist) this.settingsStore?.set("files.defaultCwd", next);
   }
 
   setupToolsSheet() {
@@ -11296,12 +11312,18 @@ class TerminalManager {
     if (this.telemetryRefreshInterval) {
       clearInterval(this.telemetryRefreshInterval);
     }
-    // Hidden tabs skip the 5 s poll (each one costs tmux queries on the
-    // server) and catch up immediately when they become visible again; live
-    // state changes still arrive over the terminal WebSockets meanwhile.
+    // Visible tabs poll every 5 s. Hidden tabs slow down to every 30 s (each
+    // poll costs tmux queries on the server) but never stop: agent attention
+    // (needs-input / done) only arrives through this poll, and the local
+    // notification fallback for users without web push depends on it. A tab
+    // catches up immediately when it becomes visible again.
     this.telemetryRefreshInterval = setInterval(() => {
-      if (!document.hidden) this.queueTelemetryRefresh(0);
-    }, 5000);
+      if (document.hidden) {
+        const sinceLast = Date.now() - (this.telemetryLastStartedAt || 0);
+        if (sinceLast < TELEMETRY_HIDDEN_POLL_MS) return;
+      }
+      this.queueTelemetryRefresh(0);
+    }, TELEMETRY_VISIBLE_POLL_MS);
     if (!this.telemetryVisibilityHandler) {
       this.telemetryVisibilityHandler = () => {
         if (!document.hidden) this.queueTelemetryRefresh(0);
@@ -11328,9 +11350,12 @@ class TerminalManager {
         // Lets a cwd learned while this poll is in flight (OSC 7) win over
         // the older server snapshot.
         const requestStartedAt = Date.now();
+        this.telemetryLastStartedAt = requestStartedAt;
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
+        // Live cwd adoption checks the allowed roots (cached after once).
+        await this.ensureAllowedRoots();
         this._sessionCatalog = Array.isArray(serverTerminals)
           ? serverTerminals
           : [];
@@ -11695,6 +11720,19 @@ class TerminalManager {
     const completedAgentTurn =
       nextAgentTurnCompletedAt > 0 &&
       nextAgentTurnCompletedAt !== previousAgentTurnCompletedAt;
+
+    // A new agent session: attention seen so far belongs to an earlier run
+    // and must not drive its quick-reply chips.
+    const quickReplies = window.QuickReplies;
+    if (typeof quickReplies?.quickReplyAttentionBaseline === "function") {
+      terminal.quickReplyAttentionBaseline =
+        quickReplies.quickReplyAttentionBaseline({
+          previousAgentName: terminal.agentName || null,
+          nextAgentName,
+          attention: terminal.attention || null,
+          currentBaseline: terminal.quickReplyAttentionBaseline ?? null,
+        });
+    }
 
     terminal.running = nextRunning;
     terminal.busy = nextRunning;
@@ -12071,63 +12109,135 @@ class TerminalManager {
     return terminal.parser.registerOscHandler(7, (data) => {
       const cwd = this.parseOsc7Cwd(data);
       if (!cwd) return false;
-      this.applyLiveCwd(id, cwd);
+      // Under tmux the server's pane cwd is authoritative; a stray OSC 7 in
+      // the output (forgeable by anything printed) is swallowed.
+      const backendMode = this.terminals.get(id)?.backendMode || null;
+      if (window.LiveCwd?.acceptsOsc7Cwd?.(backendMode) === false) return true;
+      this.applyLiveCwd(id, cwd, { source: "osc7" });
       if (DEBUG) dbg("osc7 cwd", { id, cwd });
       return true;
     });
   }
 
   // One path for every live cwd change (OSC 7 from the shell, or the server's
-  // tmux pane cwd from the telemetry poll): tab/workspace label, session
-  // registry and — for the active terminal — the working-directory field and
-  // the Files/Git surfaces that follow it. The field keeps a draft the user
-  // is editing (setDirectoryValue's draft lock).
-  applyLiveCwd(id, cwd) {
+  // tmux pane cwd from the telemetry poll): the terminal's cwd, tab/workspace
+  // label and session registry always follow. Only the server source may move
+  // the active terminal's working-directory field and the Files/Git surfaces
+  // (planLiveCwdAdoption): OSC 7 is forgeable by printed output. The field
+  // keeps a draft the user is editing (setDirectoryValue's draft lock).
+  applyLiveCwd(id, cwd, { source = "server" } = {}) {
     const t = this.terminals.get(id);
     if (!t || t.disposed || typeof cwd !== "string" || !cwd) return false;
     const previousCwd = t.cwd;
     t.cwdUpdatedAt = Date.now();
     if (previousCwd === cwd) return false;
     t.cwd = cwd;
-    if (t.workspaceId && this.activeId === id) {
-      this.setDirectoryValue(cwd);
+    const active = Boolean(t.workspaceId) && this.activeId === id;
+    if (active) {
       this.updateWorkspaceLabel(t.workspaceId, cwd);
       this.rememberWorkspaceById(t.workspaceId, cwd);
-      this.followLiveCwdInSurfaces(t.workspaceId, previousCwd, cwd);
     }
+    t.cwdIsLive = true;
+    const plan = this.planLiveCwdSurfaces({
+      source,
+      active,
+      cwd,
+      workspaceId: t.workspaceId,
+      previousCwd,
+    });
+    if (plan.field) this.setDirectoryValue(cwd, { persist: false });
+    this.followLiveCwdInSurfaces(t.workspaceId, cwd, plan);
     this.updateTabGroups();
     this.sessionRegistry.update(id, { cwd });
     return true;
   }
 
-  // Move the Files explorer (and with it the Git panel, which resolves its
-  // cwd from the explorer first) to the new cwd — but only while it still
-  // shows the terminal's previous cwd. A user who navigated the explorer
-  // elsewhere keeps their place.
-  followLiveCwdInSurfaces(workspaceId, previousCwd, cwd) {
-    const explorer = this.fileExplorer;
-    const explorerPath =
-      explorer && explorer.currentWorkspaceId === workspaceId
-        ? explorer.currentPath
-        : null;
-    if (
-      !window.LiveCwd?.shouldSurfaceFollowCwd?.({
-        surfacePath: explorerPath,
-        previousCwd,
-      })
-    ) {
-      return;
+  // Allowed roots (realpaths) from /api/foundation/status, cached so a live
+  // cwd outside them never lands in the working-directory field. null until
+  // known; a failed fetch is retried after a minute, a good list is
+  // refreshed every 5 minutes.
+  async ensureAllowedRoots() {
+    const now = Date.now();
+    const age = now - (this.allowedRootsFetchedAt || 0);
+    if (this.allowedRoots ? age < 5 * 60_000 : age < 60_000) {
+      return this.allowedRoots;
     }
-    if (explorerPath) {
+    if (this.allowedRootsPromise) return this.allowedRootsPromise;
+    this.allowedRootsFetchedAt = now;
+    this.allowedRootsPromise = (async () => {
+      try {
+        const res = await fetch("/api/foundation/status");
+        if (!res.ok) return this.allowedRoots;
+        const status = await res.json();
+        const roots = (Array.isArray(status?.roots) ? status.roots : [])
+          .filter((root) => root && root.status !== "missing")
+          .map((root) => root.path)
+          .filter((path) => typeof path === "string" && path);
+        if (roots.length) this.allowedRoots = roots;
+      } catch (err) {
+        if (DEBUG) dbg("allowed roots fetch failed", err);
+      } finally {
+        this.allowedRootsPromise = null;
+      }
+      return this.allowedRoots;
+    })();
+    return this.allowedRootsPromise;
+  }
+
+  // true / false, or null while the roots list is unknown.
+  isCwdInAllowedRoots(cwd) {
+    return (
+      window.LiveCwd?.isCwdWithinRoots?.(cwd, this.allowedRoots || null) ??
+      null
+    );
+  }
+
+  planLiveCwdSurfaces({ source, active, cwd, workspaceId, previousCwd }) {
+    const explorer = this.fileExplorer;
+    const explorerOnWorkspace = Boolean(
+      explorer && workspaceId && explorer.currentWorkspaceId === workspaceId,
+    );
+    const explorerPath = explorerOnWorkspace ? explorer.currentPath : null;
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility();
+    return (
+      window.LiveCwd?.planLiveCwdAdoption?.({
+        source,
+        active,
+        inRoots: this.isCwdInAllowedRoots(cwd),
+        explorerOnWorkspace: explorerOnWorkspace && Boolean(explorerPath),
+        explorerFollows: window.LiveCwd.shouldSurfaceFollowCwd({
+          surfacePath: explorerPath,
+          previousCwd,
+        }),
+        filesVisible: filesOpen,
+        gitVisible: gitOpen,
+      }) || { field: false, explorer: "none", git: false }
+    );
+  }
+
+  // Move the Files explorer (and with it the Git panel, which resolves its
+  // cwd from the explorer first) to the new cwd — only while it still shows
+  // the terminal's previous cwd (a user who navigated it elsewhere keeps
+  // their place), and only reload/refresh what is on screen. A hidden
+  // explorer just records the new path and drops its stale listing, so
+  // opening Files (or Git, via getGitCwd) loads the current cwd.
+  followLiveCwdInSurfaces(workspaceId, cwd, plan) {
+    const explorer = this.fileExplorer;
+    if (explorer && plan.explorer === "load") {
       // loadDir records the new path synchronously, so the git refresh
       // below already resolves the new cwd through getGitCwd().
       Promise.resolve(explorer.loadDir(cwd, workspaceId)).catch((err) => {
         if (DEBUG) dbg("live cwd explorer follow failed", err);
       });
+    } else if (explorer && plan.explorer === "retarget") {
+      explorer.setWorkspacePath(workspaceId, cwd);
+      explorer.setWorkspaceItems(workspaceId, []);
     }
-    Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
-      if (DEBUG) dbg("live cwd git refresh failed", err);
-    });
+    if (plan.git) {
+      Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
+        if (DEBUG) dbg("live cwd git refresh failed", err);
+      });
+    }
   }
 
   updateWrapButton() {
@@ -12608,7 +12718,12 @@ class TerminalManager {
       beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
-      onViewChange: () => this.syncSurfaceButtonState(),
+      onViewChange: () => {
+        // A live cwd change while the Explorer view was hidden only
+        // retargeted it; load the listing once it is shown again.
+        this.ensureIdeExplorerLoaded();
+        this.syncSurfaceButtonState();
+      },
       // Refit terminals + re-render the explorer after the container resizes.
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));
@@ -15450,27 +15565,61 @@ class TerminalManager {
     }
     await this.waitForFontMetrics();
 
-    const cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
+    let cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
     const { cols, rows } = this.estimateInitialTerminalSize(split);
 
     try {
-      const res = await fetch("/api/terminals", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, cols, rows }),
-      });
+      const postTerminal = (requestCwd) =>
+        fetch("/api/terminals", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: requestCwd, cols, rows }),
+        });
+      let res = await postTerminal(cwd);
 
       if (!res.ok) {
         // Surface the backend's real reason (e.g. SQLITE_BUSY-driven 500,
         // max-terminals limit, bad cwd) instead of a generic, doubled message.
         let reason = `HTTP ${res.status}`;
+        let denialReason = null;
         try {
           const body = await res.json();
           reason = body.message || body.error || reason;
+          denialReason = body.reason || null;
         } catch (_) {
           /* non-JSON body — keep the status code */
         }
-        throw new Error(reason);
+        // An implicit cwd (the field / saved default) outside the allowed
+        // roots: start in the server's default root instead of failing.
+        if (
+          window.LiveCwd?.shouldRetryCreateWithoutCwd?.({
+            status: res.status,
+            reason: denialReason,
+            cwd,
+            explicitCwd: Boolean(cwdOverride),
+          })
+        ) {
+          const rejectedCwd = cwd;
+          cwd = undefined;
+          res = await postTerminal(undefined);
+          if (res.ok) {
+            this.notify({
+              key: "terminal-default-root",
+              kind: "info",
+              title: "Opened in the default folder",
+              body: `${rejectedCwd} is outside the allowed folders.`,
+            });
+          } else {
+            reason = `HTTP ${res.status}`;
+            try {
+              const body = await res.json();
+              reason = body.message || body.error || reason;
+            } catch (_) {
+              /* non-JSON body — keep the status code */
+            }
+          }
+        }
+        if (!res.ok) throw new Error(reason);
       }
 
       const terminalInfo = await res.json();
@@ -16104,7 +16253,12 @@ class TerminalManager {
     }
     this.tileManager.setActive(id);
     if (t?.workspaceId && t.cwd) {
-      this.setDirectoryValue(t.cwd, { force: true });
+      // A live cwd (the shell's `cd`) is shown but not saved as the default,
+      // and one known to be outside the allowed roots stays out of the field
+      // (New terminal would only get a 403 there).
+      if (this.isCwdInAllowedRoots(t.cwd) !== false) {
+        this.setDirectoryValue(t.cwd, { force: true, persist: !t.cwdIsLive });
+      }
       this.updateWorkspaceLabel(t.workspaceId, t.cwd);
       this.rememberWorkspaceById(t.workspaceId, t.cwd);
     }
@@ -16604,15 +16758,24 @@ class TerminalManager {
     }
     this.closeToolsSheet?.();
     if (!this.composeSheet) {
+      // Recent messages live for this tab only (they can hold secrets);
+      // the old persistent localStorage copy is deleted.
       let storage = null;
+      let legacyStorage = null;
       try {
-        storage = window.localStorage;
+        storage = window.sessionStorage;
       } catch {
         storage = null;
+      }
+      try {
+        legacyStorage = window.localStorage;
+      } catch {
+        legacyStorage = null;
       }
       this.composeSheet = new helpers.ComposeSheet({
         document,
         storage,
+        legacyStorage,
         onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
         onClose: ({ restoreFocus }) => {
           // On touch, refocusing xterm would pop the keyboard back up.
@@ -16629,8 +16792,9 @@ class TerminalManager {
   }
 
   // Paste through xterm (bracketed-paste markers when the program asked for
-  // them) into the queued input path, then — for Send — a separate deferred
-  // Enter once that input has settled (see scheduleDeferredSubmit).
+  // them), then — for Send — a separate deferred Enter once that input has
+  // settled (see scheduleDeferredSubmit). Only a connected terminal accepts
+  // the text (deliverComposePlan); otherwise it stays in the sheet.
   sendComposedText(id, plan) {
     const helpers = window.ComposeSheet;
     const t = this.terminals.get(id);
@@ -16643,17 +16807,37 @@ class TerminalManager {
       });
       return false;
     }
-    const readyAtStart = Boolean(t.ws.isReadyForInput?.());
-    this.clipboardManager.executePaste(
-      plan.text,
-      t.ws,
-      t.terminal,
-      t.inputState,
-    );
-    if (!plan.submit) return true;
+    const result = helpers.deliverComposePlan({
+      plan,
+      isReady: () => t.ws.isReadyForInput?.(),
+      paste: (text) =>
+        this.clipboardManager.executePaste(
+          text,
+          t.ws,
+          t.terminal,
+          t.inputState,
+        ),
+      scheduleSubmit: () => this.scheduleComposeSubmit(id, t, plan),
+    });
+    if (!result.accepted) {
+      this.notify({
+        key: `compose-kept:${id}`,
+        kind: "warning",
+        title: "Not connected — message kept",
+        body: "Your message is still in the compose box. Send it again once the terminal reconnects.",
+      });
+      return false;
+    }
+    return true;
+  }
+
+  scheduleComposeSubmit(id, t, plan) {
+    const helpers = window.ComposeSheet;
     t.composeSubmit?.cancel();
     t.composeSubmit = helpers.scheduleDeferredSubmit({
-      readyAtStart,
+      // The paste went straight out (deliverComposePlan only accepts ready
+      // input).
+      readyAtStart: true,
       delayMs: plan.submitDelayMs,
       isReady: () =>
         this.terminals.get(id) === t &&
@@ -16674,7 +16858,6 @@ class TerminalManager {
         });
       },
     });
-    return true;
   }
 
   async pasteClipboard() {

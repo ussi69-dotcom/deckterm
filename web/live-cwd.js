@@ -52,9 +52,93 @@ function shouldSurfaceFollowCwd({ surfacePath, previousCwd } = {}) {
   return surface === normalizeLiveCwd(previousCwd);
 }
 
+// Whether a cwd lies inside one of the allowed roots (realpaths from
+// /api/foundation/status). Returns null when the client has no roots list and
+// cannot tell. tmux reports the pane cwd as a realpath, so a lexical check is
+// enough here; the server stays the authority (it re-checks with realpath).
+function isCwdWithinRoots(cwd, roots) {
+  const list = Array.isArray(roots)
+    ? roots.map((root) => normalizeLiveCwd(root)).filter(Boolean)
+    : [];
+  if (list.length === 0) return null;
+  const path = normalizeLiveCwd(cwd);
+  if (!path || !path.startsWith("/")) return false;
+  return list.some(
+    (root) => root === "/" || path === root || path.startsWith(`${root}/`),
+  );
+}
+
+// Backstop for a stale implicit working directory (e.g. a saved
+// files.defaultCwd outside the roots): New terminal retries once without a
+// cwd so the server picks its default root. An explicit cwd is the caller's
+// choice, so its error is shown instead.
+function shouldRetryCreateWithoutCwd({
+  status,
+  reason,
+  cwd,
+  explicitCwd = false,
+} = {}) {
+  return (
+    status === 403 &&
+    reason === "forbidden_root" &&
+    !explicitCwd &&
+    typeof cwd === "string" &&
+    cwd.trim().length > 0
+  );
+}
+
+// OSC 7 is printed output: anything that reaches the terminal (`cat` of a
+// file, a remote program) can forge it. Under tmux the server's pane cwd is
+// authoritative anyway (tmux does not forward OSC 7), so OSC 7 is ignored
+// there; elsewhere it may only move the terminal's own cwd and label.
+function acceptsOsc7Cwd(backendMode) {
+  return backendMode !== "tmux";
+}
+
+// What one live cwd change may touch beyond the terminal's own cwd, label and
+// session registry entry:
+//   field    — the toolbar working-directory field (never persisted)
+//   explorer — "load" (Files is visible: navigate it), "retarget" (Files is
+//              hidden: only record the new path so opening it loads there),
+//              or "none"
+//   git      — refresh the Git panel / IDE SCM view (only while visible)
+// The cwd must be inside the allowed roots (inRoots === true); the field
+// value is never saved as files.defaultCwd by the caller.
+// Entering a directory must not run git there by itself: repo-local config
+// (fsmonitor, filter drivers, hooks) would execute for a plain `cd`.
+function planLiveCwdAdoption({
+  source = "server",
+  active = false,
+  inRoots = null,
+  explorerOnWorkspace = false,
+  explorerFollows = true,
+  filesVisible = false,
+  gitVisible = false,
+} = {}) {
+  const nothing = { field: false, explorer: "none", git: false };
+  if (source !== "server" || !active) return nothing;
+  // Outside the allowed roots (or unknown): New terminal and Files would
+  // only get a 403 there, so keep the field and surfaces where they are.
+  if (inRoots !== true) return nothing;
+  if (!explorerFollows) return { field: true, explorer: "none", git: false };
+  return {
+    field: true,
+    explorer: explorerOnWorkspace
+      ? filesVisible
+        ? "load"
+        : "retarget"
+      : "none",
+    git: Boolean(gitVisible),
+  };
+}
+
 const LiveCwd = {
+  acceptsOsc7Cwd,
+  isCwdWithinRoots,
   normalizeLiveCwd,
+  planLiveCwdAdoption,
   resolveServerLiveCwd,
+  shouldRetryCreateWithoutCwd,
   shouldSurfaceFollowCwd,
 };
 
