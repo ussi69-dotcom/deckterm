@@ -808,6 +808,7 @@ function processShellIntegrationChunk(
     agentState: term.agentState || null,
   });
   applyParsedShellIntegrationState(term, parsed, options);
+  processTerminalNotifications(term, chunk, options.source || "live");
   if (
     term.attention.progress &&
     parsed.events.some(
@@ -817,7 +818,6 @@ function processShellIntegrationChunk(
     // A finished command/agent cannot still be reporting progress.
     term.attention = { ...term.attention, progress: null };
   }
-  processTerminalNotifications(term, chunk, options.source || "live");
 }
 
 // Notification escapes are read from exactly one raw source per terminal:
