@@ -128,6 +128,12 @@ test("onboarding doctor API runs the configured doctor script and parses deploym
     }),
   );
   expect(payload.recommendations.join("\n")).toContain("HOST=127.0.0.1");
+  expect(payload.recommendations.join("\n")).toContain(
+    '"preferredNotifChannel": "iterm2"',
+  );
+  expect(payload.recommendations.join("\n")).toContain(
+    'notification_method = "osc9"',
+  );
   expect(payload.stdout).toContain("DeckTerm doctor");
 });
 
