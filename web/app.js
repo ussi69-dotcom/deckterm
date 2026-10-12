@@ -7139,6 +7139,35 @@ class TerminalManager {
     this.scheduleDesktopToolbarDensitySync();
   }
 
+  // Whether the Files explorer and the Git panel / IDE SCM view are on screen
+  // right now. Windowed surfaces can be open simultaneously; the exclusive
+  // right-surface notion only applies to the mobile sheets.
+  getFilesGitVisibility(surface = this.getRightSurface()) {
+    const windowed = this.isWindowedSurfaces();
+    let filesOpen = windowed
+      ? Boolean(this.fileExplorer?.isOpen)
+      : surface === "files";
+    let gitOpen = windowed
+      ? Boolean(
+          window.gitManager &&
+          !window.gitManager.panel?.classList.contains("hidden"),
+        )
+      : surface === "git";
+    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
+    // permanently "open" there, so its isOpen flag would keep Files lit).
+    if (this.isIdeModeActive() && this.ideShell) {
+      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
+      const view = this.ideShell.activeView?.();
+      filesOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
+      gitOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
+    }
+    return { filesOpen, gitOpen };
+  }
+
   syncSurfaceButtonState() {
     const surface = this.getRightSurface();
     const moreOpen = Boolean(
@@ -7154,31 +7183,8 @@ class TerminalManager {
     );
     const paletteOpen = this.isCommandPaletteOpen();
 
-    // Windowed surfaces can be open simultaneously; the exclusive
-    // right-surface notion only applies to the mobile sheets.
-    const windowed = this.isWindowedSurfaces();
-    let filesOpen = windowed
-      ? Boolean(this.fileExplorer?.isOpen)
-      : surface === "files";
-    let gitOpen = windowed
-      ? Boolean(
-          window.gitManager &&
-          !window.gitManager.panel?.classList.contains("hidden"),
-        )
-      : surface === "git";
-    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
-    // permanently "open" there, so its isOpen flag would keep Files lit).
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility(surface);
     const ideMode = this.isIdeModeActive();
-    if (ideMode && this.ideShell) {
-      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
-      const view = this.ideShell.activeView?.();
-      filesOpen =
-        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
-        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
-      gitOpen =
-        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
-        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
-    }
 
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
@@ -12071,63 +12077,92 @@ class TerminalManager {
     return terminal.parser.registerOscHandler(7, (data) => {
       const cwd = this.parseOsc7Cwd(data);
       if (!cwd) return false;
-      this.applyLiveCwd(id, cwd);
+      // Under tmux the server's pane cwd is authoritative; a stray OSC 7 in
+      // the output (forgeable by anything printed) is swallowed.
+      const backendMode = this.terminals.get(id)?.backendMode || null;
+      if (window.LiveCwd?.acceptsOsc7Cwd?.(backendMode) === false) return true;
+      this.applyLiveCwd(id, cwd, { source: "osc7" });
       if (DEBUG) dbg("osc7 cwd", { id, cwd });
       return true;
     });
   }
 
   // One path for every live cwd change (OSC 7 from the shell, or the server's
-  // tmux pane cwd from the telemetry poll): tab/workspace label, session
-  // registry and — for the active terminal — the working-directory field and
-  // the Files/Git surfaces that follow it. The field keeps a draft the user
-  // is editing (setDirectoryValue's draft lock).
-  applyLiveCwd(id, cwd) {
+  // tmux pane cwd from the telemetry poll): the terminal's cwd, tab/workspace
+  // label and session registry always follow. Only the server source may move
+  // the active terminal's working-directory field and the Files/Git surfaces
+  // (planLiveCwdAdoption): OSC 7 is forgeable by printed output. The field
+  // keeps a draft the user is editing (setDirectoryValue's draft lock).
+  applyLiveCwd(id, cwd, { source = "server" } = {}) {
     const t = this.terminals.get(id);
     if (!t || t.disposed || typeof cwd !== "string" || !cwd) return false;
     const previousCwd = t.cwd;
     t.cwdUpdatedAt = Date.now();
     if (previousCwd === cwd) return false;
     t.cwd = cwd;
-    if (t.workspaceId && this.activeId === id) {
-      this.setDirectoryValue(cwd);
+    const active = Boolean(t.workspaceId) && this.activeId === id;
+    if (active) {
       this.updateWorkspaceLabel(t.workspaceId, cwd);
       this.rememberWorkspaceById(t.workspaceId, cwd);
-      this.followLiveCwdInSurfaces(t.workspaceId, previousCwd, cwd);
     }
+    const plan = this.planLiveCwdSurfaces({
+      source,
+      active,
+      workspaceId: t.workspaceId,
+      previousCwd,
+    });
+    if (plan.field) this.setDirectoryValue(cwd);
+    this.followLiveCwdInSurfaces(t.workspaceId, cwd, plan);
     this.updateTabGroups();
     this.sessionRegistry.update(id, { cwd });
     return true;
   }
 
-  // Move the Files explorer (and with it the Git panel, which resolves its
-  // cwd from the explorer first) to the new cwd — but only while it still
-  // shows the terminal's previous cwd. A user who navigated the explorer
-  // elsewhere keeps their place.
-  followLiveCwdInSurfaces(workspaceId, previousCwd, cwd) {
+  planLiveCwdSurfaces({ source, active, workspaceId, previousCwd }) {
     const explorer = this.fileExplorer;
-    const explorerPath =
-      explorer && explorer.currentWorkspaceId === workspaceId
-        ? explorer.currentPath
-        : null;
-    if (
-      !window.LiveCwd?.shouldSurfaceFollowCwd?.({
-        surfacePath: explorerPath,
-        previousCwd,
-      })
-    ) {
-      return;
-    }
-    if (explorerPath) {
+    const explorerOnWorkspace = Boolean(
+      explorer && workspaceId && explorer.currentWorkspaceId === workspaceId,
+    );
+    const explorerPath = explorerOnWorkspace ? explorer.currentPath : null;
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility();
+    return (
+      window.LiveCwd?.planLiveCwdAdoption?.({
+        source,
+        active,
+        explorerOnWorkspace: explorerOnWorkspace && Boolean(explorerPath),
+        explorerFollows: window.LiveCwd.shouldSurfaceFollowCwd({
+          surfacePath: explorerPath,
+          previousCwd,
+        }),
+        filesVisible: filesOpen,
+        gitVisible: gitOpen,
+      }) || { field: false, explorer: "none", git: false }
+    );
+  }
+
+  // Move the Files explorer (and with it the Git panel, which resolves its
+  // cwd from the explorer first) to the new cwd — only while it still shows
+  // the terminal's previous cwd (a user who navigated it elsewhere keeps
+  // their place), and only reload/refresh what is on screen. A hidden
+  // explorer just records the new path and drops its stale listing, so
+  // opening Files (or Git, via getGitCwd) loads the current cwd.
+  followLiveCwdInSurfaces(workspaceId, cwd, plan) {
+    const explorer = this.fileExplorer;
+    if (explorer && plan.explorer === "load") {
       // loadDir records the new path synchronously, so the git refresh
       // below already resolves the new cwd through getGitCwd().
       Promise.resolve(explorer.loadDir(cwd, workspaceId)).catch((err) => {
         if (DEBUG) dbg("live cwd explorer follow failed", err);
       });
+    } else if (explorer && plan.explorer === "retarget") {
+      explorer.setWorkspacePath(workspaceId, cwd);
+      explorer.setWorkspaceItems(workspaceId, []);
     }
-    Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
-      if (DEBUG) dbg("live cwd git refresh failed", err);
-    });
+    if (plan.git) {
+      Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
+        if (DEBUG) dbg("live cwd git refresh failed", err);
+      });
+    }
   }
 
   updateWrapButton() {
@@ -12608,7 +12643,12 @@ class TerminalManager {
       beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
-      onViewChange: () => this.syncSurfaceButtonState(),
+      onViewChange: () => {
+        // A live cwd change while the Explorer view was hidden only
+        // retargeted it; load the listing once it is shown again.
+        this.ensureIdeExplorerLoaded();
+        this.syncSurfaceButtonState();
+      },
       // Refit terminals + re-render the explorer after the container resizes.
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));
