@@ -246,6 +246,7 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
+import { hardenGitInvocation } from "./git-readonly";
 import {
   forbiddenRootDetail,
   rejectedPathMayBeMissing,
@@ -9338,7 +9339,8 @@ export function createWebApp() {
   }
 
   // Shared runner for git child processes. Legacy: direct spawn with
-  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast. Brokered: the broker
+  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast, read-only calls
+  // hardened by hardenGitInvocation. Brokered: the broker
   // `git` profile (argv rebuilt from the fixed schema; cwd resolved fd-safely
   // beneath the granted root as the mapped user). `args` is the argv AFTER `git`.
   async function runGit(
@@ -9392,11 +9394,21 @@ export function createWebApp() {
       }
     }
     const cwd = git.reldir ? join(git.root, git.reldir) : git.root;
-    const proc = Bun.spawn(["git", ...args], {
+    // Read-only calls (status/diff/log/…) run in whatever directory a
+    // terminal enters: repo-local fsmonitor, hooks and diff drivers must not
+    // execute there. Writes keep the user's hooks. The broker git profile
+    // applies its own fixed hardening.
+    const hardened = hardenGitInvocation(args);
+    const proc = Bun.spawn(["git", ...hardened.argv], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extraEnv },
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        ...hardened.env,
+        ...extraEnv,
+      },
     });
     const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
     const [output, stderr, code] = await Promise.all([
