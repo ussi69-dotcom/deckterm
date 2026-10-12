@@ -104,11 +104,14 @@ const TERMINAL_FONT_FAMILY =
 const TERMINAL_LINE_HEIGHT = 1.2;
 // Scrollback-search match highlighting (GitHub-dark yellows; the overview
 // ruler colors are required fields of the SearchAddon decorations API).
-const TERMINAL_SEARCH_DECORATIONS = {
-  matchBackground: "#5a4a00",
-  matchOverviewRuler: "#d29922",
-  activeMatchBackground: "#9e6a03",
-  activeMatchColorOverviewRuler: "#f0c674",
+// Colours live in web/search-overlay.js; this fallback only covers a stale
+// cached copy of that file.
+const TERMINAL_SEARCH_DECORATIONS = window.SearchOverlay
+  ?.SEARCH_DECORATIONS || {
+  matchBackground: "#3d3214",
+  matchOverviewRuler: "#9e6a03",
+  activeMatchBackground: "#b35c00",
+  activeMatchColorOverviewRuler: "#ffd33d",
 };
 const TERMINAL_PADDING_X = 16;
 const TERMINAL_PADDING_Y = 16;
@@ -13293,7 +13296,10 @@ class TerminalManager {
         e.preventDefault();
         return;
       }
-      if (e.ctrlKey && e.key === "f") {
+      // Ctrl+Shift+F is the documented scrollback search everywhere (inside a
+      // terminal it is caught by the xterm key handler first). Plain Ctrl+F
+      // only reaches here outside a terminal; it keeps working as before.
+      if (e.ctrlKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         this.openTerminalSearch();
       }
@@ -14273,6 +14279,9 @@ class TerminalManager {
         (event.key === "F" || event.key === "f")
       ) {
         event.preventDefault();
+        // The event still bubbles to the document shortcut handler, which
+        // also maps Ctrl+Shift+F: mark it handled so search opens once.
+        this.handledPaneShortcutEvents.add(event);
         this.openTerminalSearch();
         return false;
       }
@@ -14398,12 +14407,15 @@ class TerminalManager {
     if (this.searchBar) return this.searchBar;
     const bar = document.createElement("div");
     bar.className = "terminal-search-bar hidden";
+    bar.dataset.placement = "bottom";
+    bar.setAttribute("role", "search");
     bar.innerHTML = `
-      <input type="text" class="search-input" placeholder="Search scrollback" spellcheck="false" autocomplete="off" />
+      <i class="search-bar-icon" data-lucide="search" aria-hidden="true"></i>
+      <input type="text" class="search-input" placeholder="Search scrollback" aria-label="Search terminal scrollback" spellcheck="false" autocomplete="off" />
       <span class="search-count" aria-live="polite"></span>
-      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)">↑</button>
-      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)">↓</button>
-      <button type="button" class="search-btn" data-search-act="close" title="Close (Esc)">✕</button>
+      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)" aria-label="Previous match"><i data-lucide="chevron-up"></i></button>
+      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)" aria-label="Next match"><i data-lucide="chevron-down"></i></button>
+      <button type="button" class="search-btn search-btn-close" data-search-act="close" title="Close (Esc)" aria-label="Close search"><i data-lucide="x"></i></button>
     `;
     const input = bar.querySelector(".search-input");
     input.addEventListener("input", () => {
@@ -14420,13 +14432,64 @@ class TerminalManager {
       }
     });
     bar.addEventListener("click", (e) => {
-      const act = e.target?.dataset?.searchAct;
+      // Buttons hold lucide SVGs: resolve the button, not the clicked icon.
+      const act = e.target?.closest?.("[data-search-act]")?.dataset?.searchAct;
       if (act === "prev") this.searchController?.prev();
       else if (act === "next") this.searchController?.next();
       else if (act === "close") this.closeTerminalSearch({ refocus: true });
     });
     this.searchBar = bar;
     return bar;
+  }
+
+  // Keep the floating bar off the active match: it sits at the tile's bottom
+  // edge and dodges to the top only when the active match is under it (pure
+  // rule: SearchOverlay.searchBarPlacement).
+  syncSearchBarPlacement(terminal, { reset = false } = {}) {
+    const bar = this.searchBar;
+    if (!bar) return;
+    if (reset) bar.dataset.placement = "bottom";
+    const placementFn = window.SearchOverlay?.searchBarPlacement;
+    if (!placementFn || !terminal) return;
+    const rows = terminal.rows || 0;
+    const screen = terminal.element?.querySelector(".xterm-screen");
+    const cellHeight =
+      rows && screen ? screen.getBoundingClientRect().height / rows : 0;
+    const barHeight = bar.getBoundingClientRect().height || 40;
+    // The bar's height plus its 8px inset from the tile edge.
+    const coveredRows = cellHeight
+      ? Math.ceil((barHeight + 8) / cellHeight)
+      : 2;
+    const selection = terminal.getSelectionPosition?.();
+    const viewportY = terminal.buffer?.active?.viewportY ?? 0;
+    const activeRow = selection ? selection.start.y - viewportY : null;
+    // Columns the bar overlaps (it is right-aligned over the screen).
+    let barCols = null;
+    let activeCols = null;
+    if (screen && terminal.cols && selection) {
+      const screenRect = screen.getBoundingClientRect();
+      const barRect = bar.getBoundingClientRect();
+      const cellWidth = screenRect.width / terminal.cols;
+      if (cellWidth > 0 && barRect.width > 0) {
+        barCols = [
+          Math.floor((barRect.left - screenRect.left) / cellWidth),
+          Math.ceil((barRect.right - screenRect.left) / cellWidth),
+        ];
+        // A single-line match; a wrapped one spans to the row end.
+        activeCols =
+          selection.end.y === selection.start.y
+            ? [selection.start.x, selection.end.x]
+            : [selection.start.x, terminal.cols];
+      }
+    }
+    bar.dataset.placement = placementFn({
+      activeRow,
+      rows,
+      coveredRows,
+      current: bar.dataset.placement,
+      activeCols,
+      barCols,
+    });
   }
 
   openTerminalSearch() {
@@ -14437,6 +14500,8 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     const host = active.element?.parentElement || active.element;
     if (bar.parentElement !== host) host.appendChild(bar);
+    // lucide only swaps <i data-lucide> placeholders that are in the document.
+    if (bar.querySelector("i[data-lucide]")) initLucideIcons();
 
     this.searchResultsDisposable?.dispose?.();
     this.searchController = window.SearchOverlay.createSearchController({
@@ -14455,11 +14520,13 @@ class TerminalManager {
       },
       onState: (state) => this.renderSearchState(state),
     });
-    this.searchResultsDisposable = addon.onDidChangeResults?.((r) =>
+    this.searchResultsDisposable = addon.onDidChangeResults?.((r) => {
       this.searchController?.handleResults(
         r || { resultIndex: -1, resultCount: 0 },
-      ),
-    );
+      );
+      this.syncSearchBarPlacement(active.terminal);
+    });
+    this.syncSearchBarPlacement(active.terminal, { reset: true });
 
     // Prefill: short single-line selection wins, then the last search.
     const selection = active.terminal.getSelection?.()?.trim() || "";
@@ -14490,13 +14557,16 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     bar.classList.toggle("hidden", !state.open);
     const count = bar.querySelector(".search-count");
-    if (!state.query || state.resultCount === null) {
-      count.textContent = "";
-    } else if (state.resultCount === 0) {
-      count.textContent = "0/0";
-    } else {
-      count.textContent = `${state.resultIndex + 1}/${state.resultCount}`;
-    }
+    const format = window.SearchOverlay?.formatSearchCount;
+    count.textContent = format
+      ? format(state)
+      : !state.query || state.resultCount === null
+        ? ""
+        : `${state.resultIndex + 1}/${state.resultCount}`;
+    bar.classList.toggle(
+      "no-results",
+      Boolean(state.query) && state.resultCount === 0,
+    );
   }
 
   createDimensionOverlay(container) {
