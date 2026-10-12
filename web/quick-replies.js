@@ -52,19 +52,39 @@ function getQuickReplySequence(replyOrKey, keySequences) {
   return key.length === 1 ? key : null;
 }
 
+// How long an agent's "needs your input" notification keeps the chips up.
+const QUICK_REPLY_ATTENTION_WINDOW_MS = 5 * 60 * 1000;
+
+/**
+ * True when the session's latest agent notification (OSC 9/777/99, reported
+ * as `attention` by /api/terminals) is a recent "needs your input".
+ */
+function isRecentInputRequest(attention, now = Date.now()) {
+  if (attention?.kind !== "needs-input") return false;
+  const at = Number(attention.at);
+  if (!Number.isFinite(at)) return false;
+  return now - at <= QUICK_REPLY_ATTENTION_WINDOW_MS;
+}
+
 /**
  * The chip row shows on touch layouts while the active terminal has an agent
- * session. The server's agentState only separates "streaming output" from
- * "quiet" (quiet covers both working and waiting for an answer), so there is
- * no exact waiting-for-input signal; keeping the row for the whole session
- * also avoids re-fitting the terminal on every output burst.
+ * session. When the agent sends notifications (the server's `attention`
+ * signal), the row narrows to the moments it asked for input recently;
+ * without that signal agentState cannot tell "working" from "waiting", so
+ * the row stays for the whole session (which also avoids re-fitting the
+ * terminal on every output burst).
  */
 function shouldShowQuickReplies({
   touchLayout = false,
   agentName = null,
+  attention = null,
+  now = Date.now(),
 } = {}) {
   if (!touchLayout) return false;
-  return typeof agentName === "string" && agentName.trim().length > 0;
+  if (!(typeof agentName === "string" && agentName.trim().length > 0)) {
+    return false;
+  }
+  return attention?.kind ? isRecentInputRequest(attention, now) : true;
 }
 
 /**
@@ -79,7 +99,9 @@ function getQuickReplyState({ agentState = null } = {}) {
 
 const QuickReplies = {
   QUICK_REPLIES,
+  QUICK_REPLY_ATTENTION_WINDOW_MS,
   getQuickReplySequence,
+  isRecentInputRequest,
   shouldShowQuickReplies,
   getQuickReplyState,
 };

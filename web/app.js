@@ -2618,6 +2618,7 @@ class ExtraKeysManager {
     const visible = helpers.shouldShowQuickReplies({
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
+      attention: active?.attention ?? null,
     });
     root.dataset.state = helpers.getQuickReplyState({
       agentState: active?.agentState ?? null,
