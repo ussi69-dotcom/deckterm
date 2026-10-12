@@ -11814,17 +11814,39 @@ class TerminalManager {
       helpModal.addEventListener("click", (e) => {
         if (e.target === helpModal) this.closeHelp();
       });
+      helpModal.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeHelp({ refocus: true });
+      });
     }
+  }
+
+  // Rows come from web/keyboard-shortcuts.js (one list, no hand-kept table).
+  renderHelpShortcuts() {
+    const shortcuts = window.KeyboardShortcuts;
+    const container = document.getElementById("help-shortcuts");
+    if (!shortcuts || !container || container.childElementCount) return;
+    shortcuts.renderHelpShortcuts(container, document);
+    const footnote = document.getElementById("help-footnote");
+    if (footnote) footnote.textContent = shortcuts.SHORTCUT_FOOTNOTE || "";
   }
 
   openHelp() {
     this.closeToolsSheet();
-    document.getElementById("help-modal")?.classList.remove("hidden");
+    this.renderHelpShortcuts();
+    const modal = document.getElementById("help-modal");
+    modal?.classList.remove("hidden");
+    document.getElementById("help-close")?.focus({ preventScroll: true });
     this.syncSurfaceButtonState();
   }
 
-  closeHelp() {
-    document.getElementById("help-modal")?.classList.add("hidden");
+  closeHelp({ refocus = false } = {}) {
+    const modal = document.getElementById("help-modal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    modal.classList.add("hidden");
+    if (refocus) this.getActiveTerminal()?.terminal?.focus();
   }
 
   getActiveWorkspaceContext() {
@@ -13322,10 +13344,20 @@ class TerminalManager {
         e.preventDefault();
         this.changeFontSize(-1);
       }
-      // `?` is a literal character in task/commit/search inputs — only treat it
-      // as the help shortcut when focus is not inside an editable field. F1 is a
-      // function key (never typed as text) so it opens help anywhere.
-      if (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target))) {
+      // Help: Ctrl+Shift+? works everywhere (it never produces terminal
+      // input). F1 and a bare `?` only count outside the terminal — TUIs such
+      // as htop use F1 — and `?` not inside an editable field.
+      const helpShortcut = window.KeyboardShortcuts?.isHelpShortcut;
+      const inTerminal = Boolean(e.target?.closest?.(".xterm"));
+      if (
+        helpShortcut
+          ? helpShortcut(e, {
+              inTerminal,
+              editable: isEditableTarget(e.target),
+            })
+          : !inTerminal &&
+            (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target)))
+      ) {
         e.preventDefault();
         this.openHelp();
       }

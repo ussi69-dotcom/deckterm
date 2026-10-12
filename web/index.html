@@ -760,135 +760,25 @@
       </div>
     </div>
 
-    <!-- Help Modal -->
+    <!-- Help Modal: rows are generated from web/keyboard-shortcuts.js -->
     <div id="help-modal" class="modal hidden">
-      <div class="modal-content modal-large">
+      <div
+        class="modal-content modal-large help-modal-content"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="help-modal-title"
+      >
         <div class="modal-header">
-          <h3>Help - Keyboard Shortcuts</h3>
-          <button class="modal-close" id="help-close">&times;</button>
+          <h3 id="help-modal-title">Keyboard shortcuts</h3>
+          <button class="modal-close" id="help-close" aria-label="Close">
+            &times;
+          </button>
         </div>
         <div class="help-content">
-          <div class="help-grid">
-            <div class="help-column">
-              <h4>Workspaces & Tabs</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>N</kbd></td>
-                  <td>New workspace tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>W</kbd></td>
-                  <td>Close current pane</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Tab</kbd></td>
-                  <td>Next tab</td>
-                </tr>
-                <tr>
-                  <td>
-                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>←</kbd>/<kbd
-                      >→</kbd
-                    >
-                  </td>
-                  <td>Previous/next tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>1-9</kbd></td>
-                  <td>Switch to tab number</td>
-                </tr>
-                <tr>
-                  <td>Drag tab → tab</td>
-                  <td>Merge workspaces</td>
-                </tr>
-              </table>
-
-              <h4>Terminals</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td>
-                  <td>Split workspace (add terminal)</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
-                  <td>Move current pane to a new tab</td>
-                </tr>
-                <tr>
-                  <td>
-                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd>/<kbd
-                      >↓</kbd
-                    >
-                  </td>
-                  <td>Previous/next pane in this tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td>
-                  <td>Undo layout change</td>
-                </tr>
-                <tr>
-                  <td>Drag tile edge</td>
-                  <td>Resize terminals</td>
-                </tr>
-              </table>
-            </div>
-
-            <div class="help-column">
-              <h4>Visual Groups</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>G</kbd></td>
-                  <td>Color-group with previous</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
-                  <td>Ungroup when pane is already alone</td>
-                </tr>
-              </table>
-
-              <h4>General</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd></td>
-                  <td>Open actions palette</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>F</kbd></td>
-                  <td>Search</td>
-                </tr>
-                <tr>
-                  <td><kbd>F11</kbd></td>
-                  <td>Toggle fullscreen</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>+</kbd>/<kbd>-</kbd></td>
-                  <td>Font size</td>
-                </tr>
-                <tr>
-                  <td><kbd>F1</kbd> or <kbd>?</kbd></td>
-                  <td>Show this help</td>
-                </tr>
-              </table>
-
-              <h4>Surfaces</h4>
-              <table class="help-table">
-                <tr>
-                  <td>Desktop</td>
-                  <td>
-                    Use the top-bar actions to open Files, Git, Palette, and
-                    More
-                  </td>
-                </tr>
-                <tr>
-                  <td>Mobile</td>
-                  <td>
-                    Use the bottom action bar for Files, Git, Paste, and More
-                  </td>
-                </tr>
-              </table>
-            </div>
-          </div>
-
+          <div id="help-shortcuts" class="help-shortcuts"></div>
+          <p id="help-footnote" class="help-footnote"></p>
           <div class="help-legend">
-            <h4>Tab Colors</h4>
+            <h4>Tab colors</h4>
             <p>
               <span class="legend-dot" style="background: #58a6ff"></span>
               <strong>Single color dot</strong> = 1 terminal
@@ -931,6 +821,7 @@
     <script src="/input-queue.js?v=20261012a"></script>
     <script src="/live-cwd.js?v=20261012a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
+    <script src="/keyboard-shortcuts.js?v=20261012a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
     <script src="/notification-sounds.js?v=20260719a"></script>
     <script src="/push-notifications.js?v=20260719a"></script>
