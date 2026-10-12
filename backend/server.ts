@@ -246,6 +246,7 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
+import { forbiddenRootDetail } from "./forbidden-root";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -2120,6 +2121,21 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   );
 }
 
+// Whether a path refused by resolveAllowedPath exists at all, so the denial
+// can say "outside the allowed roots" instead of "outside the allowed roots or
+// does not exist". Legacy (service-account) view only — never consulted under
+// OS isolation, where the service account must not traverse a user's tree.
+async function rejectedPathExists(inputPath: string): Promise<boolean> {
+  if (!inputPath) return false;
+  try {
+    const fs = await import("fs/promises");
+    await fs.stat(resolve(inputPath));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function resolveAllowedPath(
   inputPath: string,
   opts: { allowMissing?: boolean } = {},
@@ -3622,7 +3638,7 @@ async function requireFileAccess(
       body: {
         error: "Forbidden path (no matching registered root)",
         reason: "no_matching_root",
-        path: resolvedPath,
+        ...forbiddenRootDetail({ path: resolvedPath, subject: "path" }),
       },
     };
   }
@@ -3739,10 +3755,20 @@ async function resolveScopedFsPath(
   if (ctx.kind === "legacy") {
     const abs = await resolveAllowedPath(clientPath, opts);
     if (!abs) {
+      // resolveAllowedPath also returns null for a path that does not exist
+      // (realpath ENOENT), so the message must not claim it is out of bounds.
       return {
         ok: false,
         status: 403,
-        body: { error: "Forbidden path", reason: "no_matching_root" },
+        body: {
+          error: "Forbidden path",
+          reason: "no_matching_root",
+          ...forbiddenRootDetail({
+            path: clientPath,
+            subject: "path",
+            mayBeMissing: !(await rejectedPathExists(clientPath)),
+          }),
+        },
       };
     }
     const access = await requireFileAccess(c, abs);
@@ -3770,7 +3796,15 @@ async function resolveScopedFsPath(
     return {
       ok: false,
       status: 403,
-      body: { error: "Forbidden path", reason: "no_matching_root" },
+      body: {
+        error: "Forbidden path",
+        reason: "no_matching_root",
+        ...forbiddenRootDetail({
+          path: clientPath,
+          subject: "path",
+          scope: "granted",
+        }),
+      },
     };
   }
   const actor = getCurrentActor(c);
@@ -3798,6 +3832,11 @@ async function resolveScopedFsPath(
     body: lastDeny?.body ?? {
       error: "Forbidden path",
       reason: "no_matching_root",
+      ...forbiddenRootDetail({
+        path: clientPath,
+        subject: "path",
+        scope: "granted",
+      }),
     },
   };
 }
@@ -6999,7 +7038,18 @@ export function createWebApp() {
           reason: "forbidden_root",
           data: { projectRoot: requestedRoot },
         });
-        return c.json({ error: "Forbidden project root" }, 403);
+        return c.json(
+          {
+            error: "Forbidden project root",
+            reason: "forbidden_root",
+            ...forbiddenRootDetail({
+              path: requestedRoot,
+              subject: "project",
+              mayBeMissing: !(await rejectedPathExists(requestedRoot)),
+            }),
+          },
+          403,
+        );
       }
       const access = await requireFileAccess(c, resolvedRoot);
       if (!access.ok) {
@@ -7463,7 +7513,20 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden terminal root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden terminal root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: isOsIsolationEnabled(process.env)
+              ? (body.cwd ?? null)
+              : requestedCwd,
+            subject: "terminal",
+            scope: isOsIsolationEnabled(process.env) ? "granted" : "allowed",
+          }),
+        },
+        403,
+      );
     }
 
     // Lexical (no realpath) root match, same helper requireFileAccess uses.
@@ -7484,6 +7547,7 @@ export function createWebApp() {
         {
           error: "Forbidden path (no matching registered root)",
           reason: "no_matching_root",
+          ...forbiddenRootDetail({ path: resolvedCwd, subject: "terminal" }),
         },
         403,
       );
@@ -8338,7 +8402,19 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root", requestId }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+          }),
+          requestId,
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
@@ -8428,7 +8504,18 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+          }),
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);

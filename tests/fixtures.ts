@@ -454,7 +454,7 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
     });
   }
 
-  // Wait for terminal to be actually connected (cursor visible or content rendered)
+  // Wait for terminal to be actually connected (socket open or content rendered)
   await page.waitForFunction(
     () => {
       const tm = (window as any).terminalManager;
@@ -463,13 +463,16 @@ export async function waitForTerminal(page: Page, timeout = 30000) {
         return true;
       }
 
-      // Check if any terminal has a cursor (sign of active connection)
-      const cursor = document.querySelector(".xterm-cursor-layer canvas");
-      if (cursor) return true;
-
-      // Check for rows rendered
-      const rows = document.querySelectorAll(".xterm-rows");
-      return rows.length > 0;
+      // Fallback: the active terminal already holds output. Read the xterm
+      // buffer (the same source as readActiveTerminalText), never the
+      // `.xterm-rows` / cursor-layer DOM: the WebGL renderer (default since
+      // Track D2) paints to a canvas and leaves those empty or absent.
+      const buf = active?.terminal?.buffer?.active;
+      if (!buf) return false;
+      for (let i = 0; i < buf.length; i++) {
+        if (buf.getLine(i)?.translateToString(true).trim()) return true;
+      }
+      return false;
     },
     { timeout },
   );

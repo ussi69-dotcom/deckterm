@@ -239,6 +239,14 @@ test.describe("Terminal Basics", () => {
       expect(rendererBox.width).toBeGreaterThan(50);
       expect(rendererBox.height).toBeGreaterThan(50);
     }
+
+    // And it holds the shell's output. Read the xterm buffer rather than the
+    // DOM: under WebGL `.xterm-rows` is empty, so a DOM read would see "".
+    await expect
+      .poll(async () => (await readActiveTerminalText(page)).trim(), {
+        timeout: 10000,
+      })
+      .not.toBe("");
   });
 });
 

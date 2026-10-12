@@ -2423,7 +2423,9 @@ class ExtraKeysManager {
       sequence = sequence.toUpperCase();
     }
 
-    active.ws.send(JSON.stringify({ type: "input", data: sequence }));
+    // Queued send (ReconnectingWebSocket.sendInput): a key tapped while the
+    // socket reconnects is held and flushed in order instead of dropped.
+    active.ws.sendInput(sequence);
     this.resetModifiers();
     // Snap the view back to the prompt on synthetic key input, except for
     // scrollback-navigation keys (PgUp/PgDn). Single source of truth lives in
@@ -3256,9 +3258,9 @@ class ClipboardManager {
       }
       return;
     }
-    if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
-      terminalWs.send(JSON.stringify({ type: "input", data: text }));
-    }
+    // No xterm instance to paste through: send the raw text through the
+    // queued input path so a paste during a reconnect is not lost.
+    terminalWs?.sendInput?.(text);
   }
 
   escapeHtml(text) {
@@ -10462,7 +10464,9 @@ class TerminalManager {
   runSavedCommand(command) {
     const active = this.getActiveTerminal();
     if (!active?.ws) return;
-    active.ws.send(JSON.stringify({ type: "input", data: `${command}\r` }));
+    // Queued send: a saved command run while the socket reconnects is held
+    // (bounded 8 KB / 15 s) and flushed in order, not silently dropped.
+    active.ws.sendInput(`${command}\r`);
     active.terminal?.focus();
   }
 
