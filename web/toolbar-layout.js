@@ -1,6 +1,6 @@
-// Toolbar layout decisions that do not need a DOM: the desktop width budget
-// that picks the toolbar density tier. TerminalManager in app.js measures the
-// elements and applies the result.
+// Toolbar decisions that do not need a DOM: the desktop width budget that
+// picks the toolbar density tier, and the connection dot state.
+// TerminalManager in app.js measures the elements and applies the result.
 
 // Wrapped so its helpers never leak into (or clash with) the other classic
 // <script> globals; the public surface is the exported object below.
@@ -59,10 +59,40 @@
     return total;
   }
 
+  const STATUS_LABELS = {
+    connected: "Connected",
+    connecting: "Connecting",
+    reconnecting: "Reconnecting",
+    disconnected: "Disconnected",
+    idle: "No terminals open",
+  };
+
+  // The toolbar dot reports the active terminal's connection. With no
+  // terminal at all there is nothing to be disconnected from: show a neutral
+  // idle dot instead of the red error state. A terminal that is still
+  // (re)connecting keeps its state even before it is registered.
+  function getToolbarStatusIndicator({ status, terminalCount } = {}) {
+    const normalized = String(status || "")
+      .trim()
+      .toLowerCase();
+    let state = "disconnected";
+    if (
+      normalized === "connected" ||
+      normalized === "connecting" ||
+      normalized === "reconnecting"
+    ) {
+      state = normalized;
+    } else if (Number(terminalCount) === 0) {
+      state = "idle";
+    }
+    return { state, label: STATUS_LABELS[state] };
+  }
+
   const ToolbarLayout = {
     TOOLBAR_DENSITY_TIERS,
     getDesktopTabReserveWidth,
     sumTierWidths,
+    getToolbarStatusIndicator,
   };
 
   if (typeof window !== "undefined") {

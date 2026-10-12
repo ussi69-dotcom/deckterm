@@ -16590,9 +16590,14 @@ class TerminalManager {
 
   updateConnectionStatus(status) {
     if (!this.connectionStatus) return;
-    const normalized = this.normalizeConnectionStatus(status);
-    this.connectionStatus.className = "status-dot " + normalized;
-    this.connectionStatus.title = this.getConnectionStatusLabel(normalized);
+    const indicator = window.ToolbarLayout?.getToolbarStatusIndicator?.({
+      status,
+      terminalCount: this.terminals.size,
+    });
+    const state = indicator?.state || this.normalizeConnectionStatus(status);
+    const label = indicator?.label || this.getConnectionStatusLabel(state);
+    this.connectionStatus.className = "status-dot " + state;
+    this.connectionStatus.title = label;
   }
 
   changeFontSize(delta) {

@@ -3,6 +3,7 @@ import {
   TOOLBAR_DENSITY_TIERS,
   getDesktopTabReserveWidth,
   sumTierWidths,
+  getToolbarStatusIndicator,
 } from "./toolbar-layout";
 
 describe("getDesktopTabReserveWidth", () => {
@@ -62,5 +63,35 @@ describe("sumTierWidths", () => {
       "tight",
       "icon-only",
     ]);
+  });
+});
+
+describe("getToolbarStatusIndicator", () => {
+  test("shows a neutral idle state when there are no terminals", () => {
+    expect(
+      getToolbarStatusIndicator({ status: "disconnected", terminalCount: 0 }),
+    ).toEqual({ state: "idle", label: "No terminals open" });
+  });
+
+  test("keeps the real state while terminals exist", () => {
+    expect(
+      getToolbarStatusIndicator({ status: "disconnected", terminalCount: 1 }),
+    ).toEqual({ state: "disconnected", label: "Disconnected" });
+    expect(
+      getToolbarStatusIndicator({ status: "connected", terminalCount: 2 }),
+    ).toEqual({ state: "connected", label: "Connected" });
+    expect(
+      getToolbarStatusIndicator({ status: "exited", terminalCount: 1 }).state,
+    ).toBe("disconnected");
+  });
+
+  test("a terminal that is still connecting is never shown as idle", () => {
+    expect(
+      getToolbarStatusIndicator({ status: "connecting", terminalCount: 0 }),
+    ).toEqual({ state: "connecting", label: "Connecting" });
+    expect(
+      getToolbarStatusIndicator({ status: "Reconnecting", terminalCount: 0 })
+        .state,
+    ).toBe("reconnecting");
   });
 });

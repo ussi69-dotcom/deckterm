@@ -3454,6 +3454,12 @@ body.touch-input-mode .xterm .composition-view.active {
   color: var(--accent-red);
 }
 
+/* No terminal open: nothing is disconnected, so no red error dot. */
+.status-dot.idle {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
 .status-dot.connecting,
 .status-dot.reconnecting {
   color: var(--accent-orange);
