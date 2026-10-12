@@ -1,7 +1,7 @@
 ---
-status: open
+status: consumed
 updated: 2026-10-12
-next: Operator state for the 2026-10-12 QoL/modernization run. Re-read this file first after any compaction or relaunch; continue from "Next triggers".
+next: Run complete on dev (not promoted). Owner decisions and follow-ups live in docs/plans/2026-10-12-qol-modernization.md ("Not done here") and the KB backlog section "Follow-ups from the 2026-10-12 QoL pass". A new session needs no state from this file.
 ---
 
 # Operator state — DeckTerm QoL + modernization run (2026-10-12)
@@ -63,10 +63,15 @@ Wave 2 (after wave 1 merges): desktop polish (z-order P1, empty-state launcher, 
 - Adversarial review (`wf_55c0a587-055`): 12 confirmed, 0 refuted, no P1; 5 unverified P3. Fix workflow `deckterm-qol-fixes` run `wf_d57c0e0b-073` (task w5c2cowa5): worktrees qol/fix-frontend (R1-4,R6,R9,R10,U0), qol/fix-backend (R0,R7,R8,U4 + git read-only hardening), qol/fix-ui (R5,R11,U1-U3) from `0f79496`. Payload: scratchpad `findings-for-fix.json`.
 - Then: merge fixes, gate, restart, full e2e, after-screenshot visual pass (desktop+mobile) vs discovery, KB sync, owner report.
 
-## Next triggers
+- Review fixes merged; after-visual QA (desktop 18 of 22 discovery issues fixed, phone 17 incl. all three P1s) led to a polish wave (`qol/polish-toolbar`, `-render`, `-surfaces`, `-agentstate`), merged at `0cfa5d7`; unit 1638/0, push 14/0, tsc 0. Dev restarted 22:37 UTC (session preserved), pushed.
+- Final full e2e on that state: 168 pass / 16 fail, all 16 in `git-panel.spec.ts` (the new phone-landscape pinned row puts a hidden `[data-action="git"]` first in the DOM). Spec fixed in `a684417` (click `:visible`); git-panel 16/16; final full rerun 184/184, no retries (8.8 min).
+- KB synced 2026-10-12 (backlog, plan, readme, portfolio, agent memory, development log, root log). Worktrees under `/home/deploy/deckterm-qol/` and the `qol/*` branches were removed after checking each was clean and merged; private state dirs under `/tmp/claude-1001/` removed.
 
-1. Wave 1 completes → read each result, inspect diffs, merge in order into `dev`, add new test files to `test:unit`, run full gate.
-2. Then wave 2 workflow, then integration review (adversarial + Codex), restart dev, after-screenshots, KB sync, owner report (Czech).
+## Final state
+
+- `dev` = `origin/dev`; dev service runs it. Nothing on `main` or production.
+- Owner decisions (tier 3) and decided-for-the-owner items (tier 2): delivery record "Not done here" + the owner report in the session.
+- Host reboot scheduled by root for 2026-10-13 03:00 UTC (pending kernel): ends every tmux session on the host, prod and dev included. Not cancelled (owner decision).
 
 ## Traps learned
 
@@ -77,3 +82,4 @@ Wave 2 (after wave 1 merges): desktop polish (z-order P1, empty-state launcher, 
 - Unix socket path limit (108 bytes): private state dirs must be short (`/tmp/claude-1001/<x>`), not under the scratchpad.
 - `web/git-scm-view.test.js` used `delete global.fetch` → later files in the same bun process lost fetch (fixed `de0feb5` on qol/integration).
 - Codex bridge auth expired 2026-10-12 21:36 UTC (401 token_expired) → Codex review unavailable until the owner runs `codex login`.
+- Pinned actions render on three surfaces (desktop toolbar, phone bar, phone-landscape row); the landscape row comes first in the DOM, so e2e must click `[data-action=…]:visible`.
