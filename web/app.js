@@ -7221,6 +7221,10 @@ class TerminalManager {
     panel
       .querySelector("#sessions-refresh-btn")
       ?.addEventListener("click", () => this.refreshSessionsPanel());
+    panel.querySelector("#sessions-new-btn")?.addEventListener("click", () => {
+      this.closeSessionsPanel({ restoreFocus: false });
+      void this.createTerminal();
+    });
     panel.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();

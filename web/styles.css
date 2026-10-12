@@ -1944,6 +1944,51 @@ body.touch-input-mode .xterm .composition-view.active {
   inset: 0;
 }
 
+/* Sessions: a quiet one-line header (title + New / Refresh / Close) over a
+   scrolling list; the list keeps the attention ordering from task-signals. */
+.sessions-panel-shell {
+  gap: 12px;
+  padding: 14px 14px 16px;
+}
+
+.sessions-panel-header h3 {
+  margin: 0 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sessions-panel-header .task-panel-header-actions {
+  gap: 6px;
+}
+
+.sessions-new-btn {
+  height: 32px;
+  padding: 0 12px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sessions-new-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sessions-panel-header .btn-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.sessions-panel-header .btn-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.sessions-panel-body {
+  min-height: 0;
+  overflow-y: auto;
+}
+
 .task-panel-shell {
   position: absolute;
   right: 16px;

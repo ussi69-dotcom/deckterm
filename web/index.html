@@ -409,42 +409,45 @@
       <div id="sessions-panel" class="task-panel hidden" aria-hidden="true">
         <div class="task-panel-backdrop"></div>
         <section
-          class="task-panel-shell"
+          class="task-panel-shell sessions-panel-shell"
           role="dialog"
           aria-modal="true"
           aria-labelledby="sessions-panel-title"
         >
-          <div class="task-panel-header">
-            <div>
-              <div class="task-panel-kicker">Session Manager</div>
-              <h3 id="sessions-panel-title">Sessions</h3>
+          <div class="task-panel-header sessions-panel-header">
+            <h3 id="sessions-panel-title">Sessions</h3>
+            <div class="task-panel-header-actions">
+              <button
+                id="sessions-new-btn"
+                class="btn btn-primary sessions-new-btn"
+                type="button"
+                title="Open a new terminal session"
+              >
+                <i data-lucide="plus"></i>
+                <span>New session</span>
+              </button>
+              <button
+                id="sessions-refresh-btn"
+                class="btn-icon"
+                type="button"
+                title="Refresh the session list"
+                aria-label="Refresh the session list"
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+              <button
+                id="sessions-panel-close"
+                class="btn-icon"
+                type="button"
+                title="Close sessions panel"
+                aria-label="Close"
+              >
+                <i data-lucide="x"></i>
+              </button>
             </div>
-            <button
-              id="sessions-panel-close"
-              class="btn-icon"
-              title="Close sessions panel"
-              aria-label="Close"
-            >
-              <i data-lucide="x"></i>
-            </button>
           </div>
-          <div
-            style="
-              padding: 15px;
-              display: flex;
-              flex-direction: column;
-              gap: 12px;
-              height: calc(100% - 70px);
-              overflow-y: auto;
-            "
-          >
-            <button
-              id="sessions-refresh-btn"
-              class="btn btn-secondary btn-block"
-            >
-              Refresh Catalog
-            </button>
-            <div id="sessions-list" class="task-list" style="margin-top: 10px">
+          <div class="sessions-panel-body">
+            <div id="sessions-list" class="task-list">
               <!-- Dynamically loaded sessions -->
             </div>
           </div>
