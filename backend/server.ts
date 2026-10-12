@@ -89,8 +89,14 @@ import {
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
-import { TmuxTerminalBackend } from "./services/tmux-terminal-backend";
-import type { TerminalBackend } from "./services/terminal-backend";
+import {
+  TmuxTerminalBackend,
+  type TmuxSessionLiveness,
+} from "./services/tmux-terminal-backend";
+import type {
+  TerminalBackend,
+  TerminalBackendAttachResult,
+} from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
   TaskRunnerError,
@@ -1122,11 +1128,19 @@ export async function reconcileSessionsOnStartup(
         namespace: TMUX_SESSION_NAMESPACE,
         terminalId: session.id,
       });
-      if (!(await tmuxSessionExists(sessionName))) {
+      // Only proof of absence ends a row. An unreachable tmux server (EACCES,
+      // protocol mismatch after a tmux upgrade, a wedged server) used to read
+      // as "every session is missing" and ended live sessions wholesale.
+      const liveness = await tmuxSessionLiveness(sessionName);
+      if (liveness === "missing") {
         markTerminalSessionEnded(db, session.id);
         fixed++;
         console.log(
           `[reconciliation] Closed zombie session ${session.id} (DB was active, but tmux session was missing)`,
+        );
+      } else if (liveness === "unknown") {
+        console.warn(
+          `[reconciliation] tmux session ${sessionName} for ${session.id} is unknown (tmux server unreachable or not answering); leaving the row active`,
         );
       }
     }
@@ -1160,69 +1174,13 @@ async function recoverTmuxSessions(): Promise<number> {
     const state = await getFoundationState();
 
     for (const sessionName of sessions) {
-      const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
-      if (!parsed) continue;
-
-      const { terminalId: id } = parsed;
-      const recordedSession = getTerminalSession(state.db, id);
-      if (!recordedSession) {
-        console.warn(
-          `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
-        );
-        continue;
+      // One session that fails to attach must not strand every session
+      // listed after it.
+      try {
+        if (await recoverTmuxSession(state, sessionName)) recovered++;
+      } catch (err) {
+        console.error(`[tmux] Failed to recover session ${sessionName}:`, err);
       }
-      if (recordedSession.status !== "active") {
-        console.warn(
-          `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
-        );
-        continue;
-      }
-
-      const ownerId = recordedSession.actorUserId || "unknown";
-      const ownerEmail = resolveRecoveredOwnerEmail(
-        state,
-        recordedSession.actorUserId,
-      );
-
-      const { cwd, cols, rows, panePid, paneCurrentCommand } =
-        await getTmuxSessionInfo(sessionName);
-      const paneCapture = await captureTmuxPane(sessionName);
-      const processTree = panePid > 0 ? await getProcessTreeArgs(panePid) : [];
-      const recoveredRuntimeState = inferTmuxRuntimeState({
-        paneCurrentCommand,
-        processTree,
-        capture: paneCapture,
-        previousCapture: "",
-        previousState: {
-          running: false,
-          lastExitCode: null,
-          agentName: null,
-          agentState: null,
-        },
-        hasUserPrompted: true,
-      });
-      const recoveredTerminal = await createManagedTerminal({
-        id,
-        cwd: recordedSession.cwd || cwd,
-        cols,
-        rows,
-        ownerId,
-        ownerEmail,
-        sessionName,
-        initialRuntimeState: recoveredRuntimeState,
-        initialLastExitCode: recoveredRuntimeState.lastExitCode,
-        initialScrollback: paneCapture,
-      });
-      recoveredTerminal.hadSocketConnection = true;
-      recoveredTerminal.terminationScheduledAt =
-        recordedSession.terminationScheduledAt
-          ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
-          : undefined;
-
-      recovered++;
-      console.log(
-        `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
-      );
     }
 
     return recovered;
@@ -1231,6 +1189,36 @@ async function recoverTmuxSessions(): Promise<number> {
     console.log("[tmux] No existing sessions to recover");
     return 0;
   }
+}
+
+async function recoverTmuxSession(
+  state: FoundationState,
+  sessionName: string,
+): Promise<boolean> {
+  const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
+  if (!parsed) return false;
+
+  const { terminalId: id } = parsed;
+  const recordedSession = getTerminalSession(state.db, id);
+  if (!recordedSession) {
+    console.warn(
+      `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
+    );
+    return false;
+  }
+  if (recordedSession.status !== "active") {
+    console.warn(
+      `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
+    );
+    return false;
+  }
+  if (terminals.has(id)) return false;
+
+  await attachRecordedTmuxSession(state, recordedSession, sessionName);
+  console.log(
+    `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
+  );
+  return true;
 }
 
 function resolveRecoveredOwnerEmail(
@@ -1244,29 +1232,39 @@ function resolveRecoveredOwnerEmail(
   return row?.email || actorUserId;
 }
 
-async function tmuxSessionExists(sessionName: string): Promise<boolean> {
-  if (!TMUX_BACKEND || !tmuxTerminalBackend) return false;
-  return tmuxTerminalBackend.sessionExists(sessionName);
+async function tmuxSessionLiveness(
+  sessionName: string,
+): Promise<TmuxSessionLiveness> {
+  // Unreachable in tmux mode (the backend always exists there); "unknown"
+  // keeps a caller from ending a row it has no way to probe.
+  if (!TMUX_BACKEND || !tmuxTerminalBackend) return "unknown";
+  return tmuxTerminalBackend.sessionLiveness(sessionName);
 }
 
-async function restoreRecordedTmuxSession(
+// GET /api/terminals runs every few seconds per open tab; while the tmux
+// server stays unreachable, say so once a minute per session, not per poll.
+const TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS = 60_000;
+const tmuxLivenessUnknownWarnedAt = new Map<string, number>();
+
+function warnTmuxLivenessUnknown(id: string, sessionName: string) {
+  const now = Date.now();
+  const last = tmuxLivenessUnknownWarnedAt.get(id) ?? -Infinity;
+  if (now - last < TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS) return;
+  tmuxLivenessUnknownWarnedAt.set(id, now);
+  console.warn(
+    `[tmux] tmux session ${sessionName} for ${id} is unknown (tmux server unreachable or not answering); not restoring it now, row stays active`,
+  );
+}
+
+/**
+ * Builds the managed terminal for a recorded, still-active tmux session that
+ * nothing in this process is attached to (startup recovery, lazy restore).
+ */
+async function attachRecordedTmuxSession(
   state: FoundationState,
   recordedSession: RecordedTerminalSession,
-): Promise<Terminal | null> {
-  if (!TMUX_BACKEND || recordedSession.status !== "active") return null;
-
-  const existing = terminals.get(recordedSession.id);
-  if (existing) return existing;
-
-  const sessionName = buildTmuxSessionName({
-    namespace: TMUX_SESSION_NAMESPACE,
-    terminalId: recordedSession.id,
-  });
-  if (!(await tmuxSessionExists(sessionName))) {
-    markTerminalSessionEnded(state.db, recordedSession.id);
-    return null;
-  }
-
+  sessionName: string,
+): Promise<Terminal> {
   const ownerId = recordedSession.actorUserId || "unknown";
   const ownerEmail = resolveRecoveredOwnerEmail(
     state,
@@ -1290,6 +1288,10 @@ async function restoreRecordedTmuxSession(
     hasUserPrompted: true,
   });
 
+  // Another path may have attached this id while tmux was queried above.
+  const raced = terminals.get(recordedSession.id);
+  if (raced) return raced;
+
   const restoredTerminal = await createManagedTerminal({
     id: recordedSession.id,
     cwd: recordedSession.cwd || cwd,
@@ -1308,6 +1310,68 @@ async function restoreRecordedTmuxSession(
       ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
       : undefined;
   return restoredTerminal;
+}
+
+// Concurrent GET /api/terminals polls and a WebSocket upgrade can all find
+// the same active row with nothing attached in memory. They share ONE
+// restore: separate restores would each spawn a managed terminal (and a tmux
+// attach client), and all but the last would be orphaned.
+const tmuxRestoreFlights = new Map<string, Promise<Terminal | null>>();
+
+function restoreRecordedTmuxSession(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  if (!TMUX_BACKEND || recordedSession.status !== "active") {
+    return Promise.resolve(null);
+  }
+
+  const id = recordedSession.id;
+  const existing = terminals.get(id);
+  if (existing) return Promise.resolve(existing);
+
+  const inFlight = tmuxRestoreFlights.get(id);
+  if (inFlight) return inFlight;
+
+  // Every caller awaits the returned promise, so a rejection is handled.
+  const flight: Promise<Terminal | null> = restoreRecordedTmuxSessionNow(
+    state,
+    recordedSession,
+  ).finally(() => {
+    if (tmuxRestoreFlights.get(id) === flight) tmuxRestoreFlights.delete(id);
+  });
+  tmuxRestoreFlights.set(id, flight);
+  return flight;
+}
+
+async function restoreRecordedTmuxSessionNow(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  const id = recordedSession.id;
+  const sessionName = buildTmuxSessionName({
+    namespace: TMUX_SESSION_NAMESPACE,
+    terminalId: id,
+  });
+  const liveness = await tmuxSessionLiveness(sessionName);
+  if (liveness === "unknown") {
+    // Not proof the session ended: keep the row, try again on the next ask.
+    warnTmuxLivenessUnknown(id, sessionName);
+    return null;
+  }
+  tmuxLivenessUnknownWarnedAt.delete(id);
+  if (liveness === "missing") {
+    markTerminalSessionEnded(state.db, id);
+    return null;
+  }
+
+  // Re-check after the probe: another path may have attached the id or
+  // ended the row meanwhile.
+  const raced = terminals.get(id);
+  if (raced) return raced;
+  if (getTerminalSession(state.db, id)?.status !== "active") return null;
+
+  return attachRecordedTmuxSession(state, recordedSession, sessionName);
 }
 
 // Debug logger
@@ -5183,13 +5247,34 @@ async function createManagedTerminal({
     ? backendForExec(exec)
     : terminalBackend;
 
-  const closeAndRemoveTerminal = (
+  // Identity guard. A re-attach after a detach registers a NEWER handle under
+  // the same id; this handle's exit must never end, close or remove that one.
+  const ownsTerminalSlot = () => {
+    const current = terminals.get(id);
+    return !current || current.terminal === terminal;
+  };
+
+  // `registered` flips when this call puts its handle into `terminals`;
+  // `handleSettled` resolves then, or when the attach fails before that. The
+  // tmux exit path waits for it, so an attach client that dies while the
+  // handle is still being built is not judged against an empty slot.
+  let registered = false;
+  let markHandleSettled!: () => void;
+  const handleSettled = new Promise<void>((resolve) => {
+    markHandleSettled = resolve;
+  });
+
+  const finalizeTerminalExit = (
     exitCode: number,
     signalCode?: number | null,
   ) => {
-    // Deploy detach, not a real terminal exit: the shutdown routine already
-    // closed the sockets and (raw mode only) persisted ended synchronously.
-    if (shutdownInProgress) return;
+    if (!ownsTerminalSlot()) {
+      debug(
+        `Stale attach for terminal ${id} exited; a newer attach owns it, leaving it alone`,
+      );
+      terminal.close();
+      return;
+    }
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -5200,6 +5285,75 @@ async function createManagedTerminal({
     notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
     terminal.close();
+  };
+
+  // The tmux session outlived its attach client: drop this attach only. A
+  // plain close (no exit frame) makes ReconnectingWebSocket reconnect, and
+  // the upgrade lazily re-attaches through restoreRecordedTmuxSession.
+  const detachDeadAttach = (
+    exitCode: number,
+    signalCode: number | null | undefined,
+    sessionName: string,
+    liveness: TmuxSessionLiveness,
+  ) => {
+    console.warn(
+      `[lifecycle] attach client for ${id} exited (code=${exitCode}, signal=${signalCode ?? "none"}) but tmux session ${sessionName} is ${liveness}; detaching, row stays active`,
+    );
+    if (terminals.get(id)?.terminal === terminal) {
+      closeTerminalSockets(id);
+      removeTerminalState(id);
+    }
+    terminal.close();
+  };
+
+  const closeAndRemoveTerminal = (
+    exitCode: number,
+    signalCode?: number | null,
+  ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
+    // Legacy tmux: the PTY is a `tmux attach-session` client, and its exit is
+    // not proof the session ended — detach-client, a stray or child-first
+    // kill, or the OOM killer all leave the pane running. Probe before any
+    // DB write; only a session proven missing is a terminal exit. Raw and
+    // brokered terminals, and linked views (a second client on another
+    // terminal's session, which restore cannot re-attach), keep the direct
+    // path.
+    const probedSessionName = activeSessionName;
+    const reattachable =
+      TMUX_BACKEND &&
+      !exec &&
+      probedSessionName !== undefined &&
+      probedSessionName ===
+        buildTmuxSessionName({
+          namespace: TMUX_SESSION_NAMESPACE,
+          terminalId: id,
+        });
+    if (!reattachable || !tmuxTerminalBackend) {
+      finalizeTerminalExit(exitCode, signalCode);
+      return;
+    }
+    const probe = tmuxTerminalBackend.sessionLiveness(probedSessionName);
+    void Promise.all([probe, handleSettled])
+      .then(([liveness]) => {
+        if (shutdownInProgress) return;
+        // DELETE, the reapers and revocation remove the handle BEFORE they
+        // kill: a registered handle that is gone now was torn down on
+        // purpose, which stays a terminal exit whatever tmux says.
+        const tornDown = registered && !terminals.has(id);
+        if (liveness === "missing" || tornDown) {
+          finalizeTerminalExit(exitCode, signalCode);
+        } else {
+          detachDeadAttach(exitCode, signalCode, probedSessionName, liveness);
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[lifecycle] attach exit handling failed for ${id}:`,
+          err,
+        );
+      });
   };
 
   let tmuxPipePath: string | null = null;
@@ -5222,21 +5376,27 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
-  const attachResult = await backend.attach(attachSessionName, {
-    cwd,
-    cols,
-    rows,
-    terminal,
-    waitForClient: TMUX_BACKEND,
-    exec,
-    onExit(
-      _proc: Subprocess,
-      exitCode: number | null,
-      signalCode?: number | null,
-    ) {
-      closeAndRemoveTerminal(exitCode ?? 0, signalCode);
-    },
-  });
+  let attachResult: TerminalBackendAttachResult;
+  try {
+    attachResult = await backend.attach(attachSessionName, {
+      cwd,
+      cols,
+      rows,
+      terminal,
+      waitForClient: TMUX_BACKEND,
+      exec,
+      onExit(
+        _proc: Subprocess,
+        exitCode: number | null,
+        signalCode?: number | null,
+      ) {
+        closeAndRemoveTerminal(exitCode ?? 0, signalCode);
+      },
+    });
+  } catch (err) {
+    markHandleSettled();
+    throw err;
+  }
   const proc = attachResult.proc as Subprocess;
   tmuxPipePath = attachResult.pipePath ?? tmuxPipePath;
   tmuxPipeOffset = attachResult.pipeOffset ?? tmuxPipeOffset;
@@ -5281,7 +5441,9 @@ async function createManagedTerminal({
   };
 
   terminals.set(id, managedTerminal);
+  registered = true;
   getTerminalSockets(id);
+  markHandleSettled();
   if (initialScrollback) {
     // Recovery keeps the raw snapshot above for runtime-state inference, but
     // the fallback is terminal-bound and therefore needs terminal newlines.
