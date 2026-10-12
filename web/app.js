@@ -6600,6 +6600,8 @@ class TerminalManager {
       }
     } else if (surface === "mobile-primary") {
       button.className = "mobile-action-btn";
+    } else if (surface === "landscape-primary") {
+      button.className = "landscape-action-btn";
     } else {
       button.className = "tools-sheet-btn";
     }
@@ -6668,19 +6670,49 @@ class TerminalManager {
     });
   }
 
+  // Phone landscape hides the bottom action bar (styles.css), so its pinned
+  // actions also render as icon buttons in the toolbar row (shown only under
+  // body.phone-landscape). "More" is left out: the Menu button opens Tools.
+  renderLandscapeActionBar(root) {
+    if (!root) return;
+    root.replaceChildren();
+    this.getPrimaryActionIds("mobile")
+      .filter((actionId) => actionId !== "more" && actionId !== "font-size")
+      .forEach((actionId) => {
+        const button = this.createActionButton(actionId, "landscape-primary");
+        if (button) root.appendChild(button);
+      });
+  }
+
+  // Width of every density-elastic toolbar group (primary actions, IDE
+  // toggle, server-load chips) at each tier, measured by applying the tier
+  // and reading the layout. Actions use scrollWidth (their bar clips).
   measureDesktopActionWidthsByTier(root) {
     const toolbar = this.toolbar;
     if (!root || !toolbar) return null;
 
+    const ideButton = document.getElementById("ide-toggle-btn");
+    const stats = document.getElementById("server-stats");
     const previousDensity = root.dataset.density || "normal";
     const previousTabDensity = toolbar.dataset.tabDensity || "";
-    const widthsByTier = {};
-    const tiers = ["normal", "compact", "tight", "icon-only"];
+    const tiers = window.ToolbarLayout?.TOOLBAR_DENSITY_TIERS || [
+      "normal",
+      "compact",
+      "tight",
+      "icon-only",
+    ];
+    const widthOf = (element) =>
+      element && !element.hidden && element.offsetParent !== null
+        ? Math.ceil(element.getBoundingClientRect().width || 0)
+        : 0;
+    const groups = { actions: {}, ide: {}, stats: {} };
 
     tiers.forEach((tier) => {
       root.dataset.density = tier;
       toolbar.dataset.tabDensity = tier;
-      widthsByTier[tier] = Math.ceil(root.scrollWidth);
+      groups.actions[tier] = Math.ceil(root.scrollWidth);
+      groups.ide[tier] = widthOf(ideButton);
+      groups.stats[tier] = widthOf(stats);
     });
 
     root.dataset.density = previousDensity;
@@ -6690,6 +6722,15 @@ class TerminalManager {
       delete toolbar.dataset.tabDensity;
     }
 
+    const sum = window.ToolbarLayout?.sumTierWidths;
+    const widthsByTier = sum
+      ? sum([groups.actions, groups.ide, groups.stats])
+      : groups.actions;
+    // Current (applied-tier) footprint of the same groups.
+    widthsByTier.current =
+      Math.ceil(root.getBoundingClientRect().width || 0) +
+      widthOf(ideButton) +
+      widthOf(stats);
     return widthsByTier;
   }
 
@@ -6736,18 +6777,14 @@ class TerminalManager {
   }
 
   getDesktopTabReserveWidth(tabCount) {
+    const shared = window.ToolbarLayout?.getDesktopTabReserveWidth;
+    if (shared) return shared(tabCount);
     const count = Math.max(0, Math.trunc(Number(tabCount) || 0));
     if (!count) return 0;
-
-    const gap = 4;
     const widthFor = (columns, tabWidth) =>
-      columns * tabWidth + Math.max(0, columns - 1) * gap;
-
-    // Preserve four comfortable single-row tabs before spending horizontal
-    // space on full action labels. Beyond four, reserve enough room for the
-    // existing two-row layout at its 96px minimum.
+      columns * tabWidth + Math.max(0, columns - 1) * 4;
     if (count <= 4) return widthFor(count, 144);
-    return Math.max(widthFor(4, 144), widthFor(Math.ceil(count / 2), 96));
+    return Math.max(widthFor(5, 118), widthFor(Math.ceil(count / 2), 96));
   }
 
   syncDesktopTabLayout() {
@@ -6934,13 +6971,18 @@ class TerminalManager {
       return;
     }
 
+    // Budget: the elastic groups (actions, IDE toggle, server-load chips)
+    // plus the tab strip share one width; the tabs keep their reserve and
+    // the tier is the roomiest whose elastic footprint fits the rest.
     const widthsByTier = this.measureDesktopActionWidthsByTier(actionBar);
-    const actionWidth = Math.ceil(actionBar.getBoundingClientRect().width || 0);
+    const elasticWidth =
+      widthsByTier?.current ??
+      Math.ceil(actionBar.getBoundingClientRect().width || 0);
     const tabsWidth = Math.ceil(this.tabs?.getBoundingClientRect().width || 0);
     const tabCount = this.tabs?.querySelectorAll(".tab").length || 0;
     const availableWidth = Math.max(
       0,
-      actionWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
+      elasticWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
     );
     const fallbackDensity =
       actionBar.dataset.density ||
@@ -7144,6 +7186,9 @@ class TerminalManager {
       document.getElementById("mobile-action-bar"),
       "mobile",
       "mobile-primary",
+    );
+    this.renderLandscapeActionBar(
+      document.getElementById("landscape-primary-actions"),
     );
     this.renderToolsSheetGrid();
     initLucideIcons();
@@ -7355,7 +7400,7 @@ class TerminalManager {
   setupToolsSheet() {
     if (!this.toolsSheet) return;
 
-    const close = () => this.closeToolsSheet();
+    const close = () => this.closeToolsSheet({ restoreFocus: true });
 
     this.toolsSheet
       .querySelector(".tools-sheet-backdrop")
@@ -7363,6 +7408,81 @@ class TerminalManager {
     this.toolsSheet
       .querySelector("#tools-sheet-close")
       ?.addEventListener("click", close);
+    // Modal sheet: Escape closes it, Tab cycles inside it.
+    this.toolsSheet.addEventListener("keydown", (event) => {
+      if (this.toolsSheet.classList.contains("hidden")) return;
+      if (event.key === "Escape" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = this.getToolsSheetFocusableElements();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const inside = this.toolsSheet.contains(document.activeElement);
+      if (event.shiftKey && (document.activeElement === first || !inside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !inside)) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+  }
+
+  getToolsSheetFocusableElements() {
+    const panel = this.toolsSheet?.querySelector(".tools-sheet-panel");
+    if (!panel || this.toolsSheet.classList.contains("hidden")) return [];
+    return Array.from(
+      panel.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        !element.hidden &&
+        !element.closest("[hidden], .hidden") &&
+        element.getClientRects().length > 0,
+    );
+  }
+
+  // First control on open: the first action tile (not the directory field,
+  // which would pop the on-screen keyboard on touch).
+  focusToolsSheetFirstControl() {
+    const focusable = this.getToolsSheetFocusableElements();
+    const target =
+      focusable.find((element) => element.closest("#tools-sheet-grid")) ||
+      focusable.find(
+        (element) =>
+          !element.matches('input:not([type="checkbox"]), textarea'),
+      ) ||
+      focusable[0];
+    target?.focus({ preventScroll: true });
+  }
+
+  // The visible More / Menu trigger that should get focus back on close.
+  getToolsSheetTrigger() {
+    const opener = this.toolsSheetOpener;
+    if (
+      opener?.isConnected &&
+      !this.toolsSheet?.contains(opener) &&
+      opener.getClientRects().length > 0
+    ) {
+      return opener;
+    }
+    return (
+      Array.from(
+        document.querySelectorAll(
+          '#toolbar-toggle, [data-action="toggle-tools-sheet"]',
+        ),
+      ).find(
+        (element) =>
+          !this.toolsSheet?.contains(element) &&
+          element.getClientRects().length > 0,
+      ) || null
+    );
   }
 
   setupTaskPanel() {
@@ -9559,6 +9679,9 @@ class TerminalManager {
       .querySelectorAll('[data-action="toggle-tools-sheet"], #toolbar-toggle')
       .forEach((btn) => {
         btn.classList.toggle("active", isOpen);
+        if (!btn.closest("#tools-sheet")) {
+          btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+        }
       });
   }
 
@@ -9567,15 +9690,30 @@ class TerminalManager {
     if (!preserveLayoutEditor) {
       this.layoutEditorOpen = false;
     }
+    const wasHidden = this.toolsSheet.classList.contains("hidden");
+    if (wasHidden) {
+      const active = document.activeElement;
+      this.toolsSheetOpener =
+        active instanceof HTMLElement &&
+        active.matches('#toolbar-toggle, [data-action="toggle-tools-sheet"]')
+          ? active
+          : null;
+    }
     this.toolsSheet.classList.remove("hidden");
     this.toolsSheet.setAttribute("aria-hidden", "false");
     this.setOverflowToggleState(true);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasHidden) this.focusToolsSheetFirstControl();
   }
 
-  closeToolsSheet() {
+  // restoreFocus: the user dismissed the sheet (Escape, X, backdrop, the
+  // trigger again) -> focus returns to the More / Menu button. Closes caused
+  // by opening another surface leave focus to that surface.
+  closeToolsSheet({ restoreFocus = false } = {}) {
     if (!this.toolsSheet) return;
+    const wasOpen = !this.toolsSheet.classList.contains("hidden");
+    const focusWasInside = this.toolsSheet.contains(document.activeElement);
     this.cleanupLayoutDrag({ rerender: false });
     this.layoutEditorOpen = false;
     this.toolsSheet.classList.add("hidden");
@@ -9583,6 +9721,16 @@ class TerminalManager {
     this.setOverflowToggleState(false);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasOpen && (restoreFocus || focusWasInside)) {
+      const stranded =
+        !document.activeElement ||
+        document.activeElement === document.body ||
+        this.toolsSheet.contains(document.activeElement);
+      if (restoreFocus || stranded) {
+        this.getToolsSheetTrigger()?.focus({ preventScroll: true });
+      }
+    }
+    if (wasOpen) this.toolsSheetOpener = null;
   }
 
   toggleToolsSheet() {
@@ -9590,7 +9738,7 @@ class TerminalManager {
     if (this.toolsSheet.classList.contains("hidden")) {
       this.openToolsSheet();
     } else {
-      this.closeToolsSheet();
+      this.closeToolsSheet({ restoreFocus: true });
     }
   }
 
@@ -10061,6 +10209,19 @@ class TerminalManager {
         this.closeCommandPalette();
       }
     });
+
+    // The controller closes itself on Escape and after running a command,
+    // bypassing closeCommandPalette(); follow the root's visibility so the
+    // toolbar Palette button never stays lit on a closed palette.
+    if (typeof MutationObserver === "function") {
+      let wasOpen = !root.classList.contains("hidden");
+      new MutationObserver(() => {
+        const isOpen = !root.classList.contains("hidden");
+        if (isOpen === wasOpen) return;
+        wasOpen = isOpen;
+        this.syncSurfaceButtonState();
+      }).observe(root, { attributes: true, attributeFilter: ["class"] });
+    }
 
     this.registerCommandPaletteActions();
   }
@@ -13980,27 +14141,33 @@ class TerminalManager {
             savedSessionsById,
           }) || [];
 
-        for (const action of bootstrapActions) {
-          const terminalInfo = reconnectableTerminals.find(
-            (terminal) => terminal.id === action.terminalId,
-          );
-          if (!terminalInfo) continue;
+        this.restoringTabOrder = true;
+        try {
+          for (const action of bootstrapActions) {
+            const terminalInfo = reconnectableTerminals.find(
+              (terminal) => terminal.id === action.terminalId,
+            );
+            if (!terminalInfo) continue;
 
-          if (action.type === "linked-view") {
-            await this.bootstrapLinkedView(terminalInfo);
-            continue;
+            if (action.type === "linked-view") {
+              await this.bootstrapLinkedView(terminalInfo);
+              continue;
+            }
+
+            await this.reconnectToTerminal(
+              terminalInfo.id,
+              terminalInfo.cwd,
+              action.savedSession,
+              {
+                backendMode: terminalInfo.backendMode || null,
+                supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
+                agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
+              },
+            );
           }
-
-          await this.reconnectToTerminal(
-            terminalInfo.id,
-            terminalInfo.cwd,
-            action.savedSession,
-            {
-              backendMode: terminalInfo.backendMode || null,
-              supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
-              agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
-            },
-          );
+        } finally {
+          this.restoringTabOrder = false;
+          this.persistTabOrder();
         }
         return;
       }
@@ -16003,10 +16170,60 @@ class TerminalManager {
       this.clearDropTargets();
     });
 
-    this.tabs.appendChild(tab);
+    this.insertTabAtSavedRank(tab);
     this.renumberTabs();
     this.updateTabGroups();
     return tab;
+  }
+
+  // Reload re-creates tabs in the server's session order; while that startup
+  // restore runs, put each one back at its saved position
+  // (web/toolbar-layout.js). New tabs and unknown ones append.
+  insertTabAtSavedRank(tab) {
+    const helpers = window.ToolbarLayout;
+    const existing = Array.from(this.tabs.querySelectorAll(".tab"));
+    if (
+      !this.restoringTabOrder ||
+      !helpers?.getTabInsertionIndex ||
+      existing.length === 0
+    ) {
+      this.tabs.appendChild(tab);
+      return;
+    }
+    const savedOrder = helpers.loadTabOrder(this.getTabOrderStorage());
+    const index = helpers.getTabInsertionIndex(
+      savedOrder,
+      existing.map((element) => element.dataset.workspaceId),
+      tab.dataset.workspaceId,
+    );
+    const before = existing[index];
+    if (before) this.tabs.insertBefore(tab, before);
+    else this.tabs.appendChild(tab);
+  }
+
+  getTabOrderStorage() {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  // Saved on every render that changes the order; skipped while startup is
+  // still re-attaching tabs (a partial order would overwrite the saved one).
+  persistTabOrder() {
+    const helpers = window.ToolbarLayout;
+    if (!helpers?.saveTabOrder || this.restoringTabOrder) return;
+    const ids = Array.from(this.tabs.querySelectorAll(".tab"))
+      .map((tab) => tab.dataset.workspaceId)
+      .filter(Boolean);
+    // An empty strip (startup before the restore, or every tab closed) keeps
+    // the saved ranks; the next real tab overwrites them anyway.
+    if (ids.length === 0) return;
+    const key = ids.join("|");
+    if (key === this.persistedTabOrderKey) return;
+    this.persistedTabOrderKey = key;
+    helpers.saveTabOrder(this.getTabOrderStorage(), ids);
   }
 
   clearDropTargets() {
@@ -16026,7 +16243,7 @@ class TerminalManager {
       if (indexEl && indexEl.textContent !== number) {
         indexEl.textContent = number;
       }
-    });
+    });    this.persistTabOrder();
   }
 
   updateTabGroups() {
@@ -16601,9 +16818,14 @@ class TerminalManager {
 
   updateConnectionStatus(status) {
     if (!this.connectionStatus) return;
-    const normalized = this.normalizeConnectionStatus(status);
-    this.connectionStatus.className = "status-dot " + normalized;
-    this.connectionStatus.title = this.getConnectionStatusLabel(normalized);
+    const indicator = window.ToolbarLayout?.getToolbarStatusIndicator?.({
+      status,
+      terminalCount: this.terminals.size,
+    });
+    const state = indicator?.state || this.normalizeConnectionStatus(status);
+    const label = indicator?.label || this.getConnectionStatusLabel(state);
+    this.connectionStatus.className = "status-dot " + state;
+    this.connectionStatus.title = label;
   }
 
   changeFontSize(delta) {

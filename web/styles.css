@@ -3411,6 +3411,27 @@ body.touch-input-mode .xterm .composition-view.active {
   color: inherit;
 }
 
+/* The load chips follow the toolbar density tiers (syncDesktopToolbarDensity
+   counts them in the width budget): from "tight" on they drop the CPU/RAM/
+   DISK text and keep the value; the chip tooltip keeps the exact numbers. */
+.toolbar[data-tab-density="tight"] .server-stats,
+.toolbar[data-tab-density="icon-only"] .server-stats {
+  gap: 4px;
+}
+
+.toolbar[data-tab-density="tight"] .server-stats .stat-label,
+.toolbar[data-tab-density="icon-only"] .server-stats .stat-label {
+  display: none;
+}
+
+.toolbar[data-tab-density="tight"] .server-stats .stat {
+  padding: 3px 6px;
+}
+
+.toolbar[data-tab-density="icon-only"] .server-stats .stat {
+  padding: 3px 5px;
+}
+
 .server-stats .stat.warning {
   color: var(--accent-orange);
 }
@@ -3431,6 +3452,12 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .status-dot.disconnected {
   color: var(--accent-red);
+}
+
+/* No terminal open: nothing is disconnected, so no red error dot. */
+.status-dot.idle {
+  color: var(--text-muted);
+  opacity: 0.6;
 }
 
 .status-dot.connecting,
@@ -4635,6 +4662,17 @@ body.chrome-mobile .file-explorer-shell {
   height: 18px;
 }
 
+/* Menu icon while the Tools sheet is closed, X while it is open (the old
+   90-degree rotation turned the menu icon into "|||"). */
+.toolbar-toggle .toolbar-toggle-close,
+.toolbar-toggle.active .toolbar-toggle-open {
+  display: none;
+}
+
+.toolbar-toggle.active .toolbar-toggle-close {
+  display: block;
+}
+
 /* =============================================================================
    SCROLLBAR - wider, more visible, easier to grab
    ============================================================================= */
@@ -4748,6 +4786,128 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   display: none !important;
 }
 
+/* Touch toolbar tabs: a tab shrinks to the strip instead of running off the
+   screen (an agent badge made the active tab ~240px on a 150-190px strip,
+   clipping the close button). The label truncates first, the badge after it
+   (and collapses to a dot on narrow strips); the close keeps a 44x44 target.
+   Several tabs keep a 136px floor and scroll. */
+body.chrome-mobile .tabs {
+  min-width: 0;
+  container: deckterm-tabs / inline-size;
+}
+
+body.chrome-mobile .tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: min(100%, 136px);
+  max-width: 100%;
+  min-height: 44px;
+  padding: 0 0 0 10px;
+}
+
+body.chrome-mobile .tab > .tab-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+
+body.chrome-mobile .tab-label {
+  flex: 0 1 auto;
+  min-width: 2em;
+  max-width: none;
+  text-overflow: ellipsis;
+}
+
+body.chrome-mobile .tab-signal-badge {
+  flex: 0 0.001 auto;
+  min-width: 18px;
+  text-overflow: ellipsis;
+}
+
+body.chrome-mobile .tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  margin-left: -6px;
+  padding: 0;
+  font-size: 20px;
+}
+
+@container deckterm-tabs (max-width: 259px) {
+  /* :not([hidden]) lifts this over the per-signal badge colours. */
+  body.chrome-mobile .tab .tab-signal-badge:not([hidden]) {
+    flex: 0 0 8px;
+    width: 8px;
+    min-width: 8px;
+    height: 8px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    font-size: 0;
+    background: currentColor;
+  }
+
+  body.chrome-mobile .tab .tab-signal-badge:not([hidden])::before {
+    display: none;
+  }
+}
+
+/* Phone landscape: the bottom action bar is hidden (see above), so its
+   pinned actions (Files, Git, Paste, Compose by default) sit in the toolbar
+   as 44px icon buttons. Rendered by renderLandscapeActionBar(). */
+.landscape-primary-actions {
+  display: none;
+}
+
+body.phone-landscape .landscape-primary-actions:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.landscape-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.landscape-action-btn span {
+  display: none;
+}
+
+.landscape-action-btn svg {
+  width: 20px;
+  height: 20px;
+  stroke-width: 1.8;
+}
+
+.landscape-action-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.landscape-action-btn.active {
+  border-color: rgba(88, 166, 255, 0.45);
+  background: rgba(88, 166, 255, 0.14);
+  color: var(--text-primary);
+}
+
 @media (pointer: coarse) {
   .session-actions .btn-new,
   .sessions-trigger,
@@ -4790,9 +4950,6 @@ body.chrome-mobile .mobile-action-bar[hidden] {
     color: var(--text-primary);
   }
 
-  .toolbar-toggle.active svg {
-    transform: rotate(90deg);
-  }
 
   /* Mobile: Row 1 takes full width */
   .toolbar-row-1 {
