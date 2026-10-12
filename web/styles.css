@@ -6628,19 +6628,33 @@ body.ide-mode #workspace-area {
   color: var(--text-secondary, #999);
 }
 
+/* Primary action: the app's primary green, like every other primary button. */
 .ide-scm-commit-btn {
   flex: 1;
   border: none;
   border-radius: 4px;
-  background: var(--accent-blue, #0e639c);
+  background: var(--btn-green);
   color: #fff;
   cursor: pointer;
   padding: 5px 10px;
   font-size: 13px;
+  font-weight: 600;
 }
 
 .ide-scm-commit-btn:hover {
-  background: var(--accent-blue-hover, #1177bb);
+  background: var(--btn-green-hover);
+}
+
+.ide-scm-commit-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* Not a git repository: only the explanation + "Choose folder" remain. */
+.ide-scm-view.ide-scm-no-repo .ide-scm-commit,
+.ide-scm-view.ide-scm-no-repo .ide-scm-actions,
+.ide-scm-view.ide-scm-no-repo .ide-scm-sections {
+  display: none;
 }
 
 .ide-scm-commit-status {
@@ -6678,14 +6692,27 @@ body.ide-mode #workspace-area {
 }
 
 .ide-scm-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border: none;
   background: transparent;
   color: var(--text-secondary, #999);
   cursor: pointer;
   font-size: 14px;
   line-height: 1;
-  padding: 2px 5px;
+  padding: 3px;
   border-radius: 4px;
+}
+
+.ide-scm-action svg {
+  width: 15px;
+  height: 15px;
+}
+
+.ide-scm-action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
 }
 
 .ide-scm-action:hover {
@@ -6753,9 +6780,36 @@ body.ide-mode #workspace-area {
   background: var(--bg-hover, rgba(255, 255, 255, 0.06));
 }
 
-.ide-scm-file-name {
+.ide-scm-file:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+/* Name first, then the repo-relative directory, dimmed; the directory gives
+   way first when the sidebar is narrow. */
+.ide-scm-file-label {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   flex: 1;
+  min-width: 0;
   overflow: hidden;
+}
+
+.ide-scm-file-name {
+  flex: 0 1 auto;
+  min-width: 3em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ide-scm-file-dir {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 11px;
+  color: var(--text-secondary, #999);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -6766,7 +6820,8 @@ body.ide-mode #workspace-area {
   gap: 2px;
 }
 
-.ide-scm-file:hover .ide-scm-file-actions {
+.ide-scm-file:hover .ide-scm-file-actions,
+.ide-scm-file:focus-within .ide-scm-file-actions {
   display: flex;
 }
 
