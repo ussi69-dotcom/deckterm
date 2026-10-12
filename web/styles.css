@@ -8311,6 +8311,7 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
      appears after a short delay so normal sub-second connects do not flash.
    - input-dropped notice: shown when input typed while disconnected could not
      be delivered.
+   - close toast: message + Undo button layout.
    ============================================================================= */
 .tile[data-connection-status="connecting"]::after,
 .tile[data-connection-status="reconnecting"]::after {
@@ -8372,4 +8373,48 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   opacity: 1;
 }
 
+.session-close-toast {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: default;
+}
+
+.session-close-toast.hidden {
+  display: none;
+}
+
+.session-close-toast-message {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-close-toast-undo {
+  flex: 0 0 auto;
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 1px solid var(--accent-blue);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent-blue);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.session-close-toast-undo:hover,
+.session-close-toast-undo:focus-visible {
+  background: rgba(88, 166, 255, 0.12);
+}
+
+.session-close-toast-undo[hidden] {
+  display: none;
+}
 /* ===== end TERMINAL RELIABILITY ===== */

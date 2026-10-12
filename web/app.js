@@ -14949,6 +14949,12 @@ class TerminalManager {
     const terminalLabel = this.formatCwdLabel(t.cwd || "Terminal");
     const closingWorkspaceId = t.workspaceId;
     const wasActive = id === this.activeId;
+    // Snapshot what Undo needs before the registry entry goes away. A
+    // terminal whose process already ended has nothing to restore.
+    const terminalEnded = ["exited", "dead"].includes(t.connectionStatus);
+    const undoEntry = terminalEnded
+      ? null
+      : this.rememberClosedSessionForUndo(id, t);
 
     if (wasActive) this.closeTerminalSearch();
 
@@ -15030,11 +15036,17 @@ class TerminalManager {
         terminalLabel,
         result.terminationScheduledAt,
         Boolean(result.preservedByOtherClient),
+        { canUndo: Boolean(undoEntry) },
       );
       this.queueTelemetryRefresh(0);
     } catch (err) {
       console.warn("Could not schedule terminal close:", err);
-      this.showSessionCloseToast(terminalLabel, null);
+      // No termination was scheduled, so the session (if it still exists)
+      // stays in Sessions — but a failed request can also mean it is gone,
+      // so do not promise a one-click Undo here.
+      this.showSessionCloseToast(terminalLabel, null, false, {
+        canUndo: false,
+      });
     }
   }
 
@@ -15064,28 +15076,95 @@ class TerminalManager {
     } catch {}
   }
 
+  // Closes that happen together (closing a multi-pane tab closes every pane
+  // synchronously) share one Undo batch.
+  rememberClosedSessionForUndo(id, t) {
+    const now = Date.now();
+    const batch = this.closeUndoBatch;
+    const entry = {
+      id,
+      cwd: t.cwd || "",
+      savedSession: this.sessionRegistry.get(id) || null,
+      backendMode: t.backendMode || null,
+      supportsLinkedView: Boolean(t.supportsLinkedView),
+      wasActive: id === this.activeId,
+    };
+    if (batch && now - batch.startedAt < 1000) {
+      batch.entries.push(entry);
+    } else {
+      this.closeUndoBatch = { startedAt: now, entries: [entry] };
+    }
+    return entry;
+  }
+
+  // Undo for the close toast: reattach every session closed in the last
+  // batch through the same path the Sessions panel's "Restore" uses
+  // (cancel the scheduled termination, then reconnect into the saved
+  // workspace slot).
+  async undoRecentSessionClose() {
+    const batch = this.closeUndoBatch;
+    this.closeUndoBatch = null;
+    document.getElementById("session-close-toast")?.classList.add("hidden");
+    clearTimeout(this.sessionCloseToastTimer);
+    if (!batch?.entries?.length) return;
+    let focusId = null;
+    for (const entry of batch.entries) {
+      if (this.terminals.has(entry.id)) continue;
+      await this.cancelScheduledTerminalClose(entry.id);
+      await this.reconnectToTerminal(entry.id, entry.cwd, entry.savedSession, {
+        backendMode: entry.backendMode,
+        supportsLinkedView: entry.supportsLinkedView,
+      });
+      if (entry.wasActive || !focusId) focusId = entry.id;
+    }
+    if (focusId && this.terminals.has(focusId)) this.switchTo(focusId);
+    this.updateSessionsAvailableBadge();
+    this.queueTelemetryRefresh(0);
+  }
+
   showSessionCloseToast(
     label,
     terminationScheduledAt,
     preservedByOtherClient = false,
+    { canUndo = false } = {},
   ) {
     let toast = document.getElementById("session-close-toast");
     if (!toast) {
-      toast = document.createElement("button");
-      toast.type = "button";
+      toast = document.createElement("div");
       toast.id = "session-close-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
+      toast.className = "task-toast session-close-toast hidden";
+      toast.setAttribute("role", "status");
+      const message = document.createElement("button");
+      message.type = "button";
+      message.className = "session-close-toast-message";
+      message.title = "Open Sessions";
+      message.addEventListener("click", () => {
         toast.classList.add("hidden");
         this.openSessionsPanel();
       });
+      const undo = document.createElement("button");
+      undo.type = "button";
+      undo.className = "session-close-toast-undo";
+      undo.textContent = "Undo";
+      undo.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void this.undoRecentSessionClose();
+      });
+      toast.append(message, undo);
       document.getElementById("app")?.appendChild(toast);
     }
-    toast.textContent = preservedByOtherClient
-      ? `${label} closed here and remains active in another client. You can restore it from Sessions.`
+    const message = toast.querySelector(".session-close-toast-message");
+    const undo = toast.querySelector(".session-close-toast-undo");
+    const batchSize = this.closeUndoBatch?.entries?.length || 0;
+    const plural = batchSize > 1;
+    const subject = plural ? `${batchSize} terminals` : label;
+    const it = plural ? "them" : "it";
+    message.textContent = preservedByOtherClient
+      ? `${subject} closed here and ${plural ? "remain" : "remains"} active in another client. You can restore ${it} from Sessions.`
       : terminationScheduledAt
-        ? `${label} closed. Restore it from Sessions within 15 minutes.`
-        : `${label} closed, but automatic termination could not be scheduled. It remains in Sessions.`;
+        ? `${subject} closed. Restore ${it} from Sessions within 15 minutes.`
+        : `${subject} closed, but automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
+    undo.hidden = !(canUndo && batchSize > 0);
     toast.classList.remove("hidden");
     clearTimeout(this.sessionCloseToastTimer);
     this.sessionCloseToastTimer = setTimeout(
