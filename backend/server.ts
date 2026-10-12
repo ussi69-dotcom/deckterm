@@ -104,7 +104,10 @@ import {
   buildWorkerCommand,
   createTaskRunner,
 } from "./task-runner";
-import { syncTmuxSessionClients } from "./tmux-client-size";
+import {
+  createLatestWinsRunner,
+  syncTmuxSessionClients,
+} from "./tmux-client-size";
 import {
   buildTmuxSessionName,
   getTmuxSocketPath,
@@ -927,7 +930,7 @@ async function finalizeReconnectReady(
   if (TMUX_BACKEND) {
     if (term.sessionName) {
       try {
-        await syncTmuxSessionSize(term.sessionName, term.cols, term.rows);
+        await requestTerminalResize(term, term.cols, term.rows);
         await sendTmuxPaneCapture(ws, term.sessionName, terminalId, {
           waitMs: 120,
           reason: "refresh",
@@ -5249,6 +5252,44 @@ async function syncTmuxSessionSize(
   await tmuxTerminalBackend.resize(sessionName, cols, rows, options);
 }
 
+// One resize at a time per terminal, the last requested size wins (bug R1).
+// Unserialized resizes interleaved their tmux steps (resize-window of one,
+// resize-pane of another), and resizing the PTY before the tmux window let
+// tmux paint '│···' fill frames that wrapped into the browser's scrollback.
+const terminalResizeRunners = new WeakMap<
+  Terminal,
+  (size: { cols: number; rows: number }) => Promise<void>
+>();
+
+function requestTerminalResize(
+  term: Terminal,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  let run = terminalResizeRunners.get(term);
+  if (!run) {
+    run = createLatestWinsRunner(
+      async (size: { cols: number; rows: number }) => {
+        // A detached handle must not resize the session for its successor.
+        if (terminals.get(term.id) !== term) return;
+        if (TMUX_BACKEND && term.sessionName && tmuxTerminalBackend) {
+          await tmuxTerminalBackend.resizeAttached(
+            term.sessionName,
+            size.cols,
+            size.rows,
+            () => term.terminal.resize(size.cols, size.rows),
+          );
+          return;
+        }
+        term.terminal.resize(size.cols, size.rows);
+      },
+      (err) => debug(`Resize error for ${term.id}:`, err),
+    );
+    terminalResizeRunners.set(term, run);
+  }
+  return run({ cols, rows });
+}
+
 async function scrollTmuxSessionHistory(
   term: Terminal,
   direction: "up" | "down",
@@ -8437,20 +8478,9 @@ export function createWebApp() {
     term.cols = cols;
     term.rows = rows;
 
-    // Actually resize the PTY - this sends SIGWINCH to the process
-    try {
-      term.terminal.resize(cols, rows);
-
-      // Also resize tmux pane if using tmux backend
-      if (TMUX_BACKEND && term.sessionName) {
-        await syncTmuxSessionSize(term.sessionName, cols, rows);
-        debug(`Terminal ${id} tmux session resized to ${cols}x${rows}`);
-      }
-
-      debug(`Terminal ${id} resized to ${cols}x${rows}`);
-    } catch (err) {
-      debug(`Terminal ${id} resize error:`, err);
-    }
+    // Resize the PTY (SIGWINCH) and the tmux window, serialized per terminal.
+    await requestTerminalResize(term, cols, rows);
+    debug(`Terminal ${id} resized to ${cols}x${rows}`);
 
     return c.json({ ok: true, cols, rows });
   });
@@ -11524,23 +11554,7 @@ async function startOwnedWebServer(
                 debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
                 term.cols = parsed.cols;
                 term.rows = parsed.rows;
-                try {
-                  term.terminal.resize(parsed.cols, parsed.rows);
-                  if (TMUX_BACKEND && term.sessionName) {
-                    void syncTmuxSessionSize(
-                      term.sessionName,
-                      parsed.cols,
-                      parsed.rows,
-                    ).catch((err) => {
-                      debug(
-                        `[reconnect] tmux async resize failed for ${terminalId}:`,
-                        err,
-                      );
-                    });
-                  }
-                } catch (err) {
-                  debug(`Resize error for ${terminalId}:`, err);
-                }
+                void requestTerminalResize(term, parsed.cols, parsed.rows);
                 return;
               }
               if (parsed.type === "input") {
