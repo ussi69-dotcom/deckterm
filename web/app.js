@@ -6952,7 +6952,13 @@ class TerminalManager {
         return;
       }
       const esc = (v) => (this.escapeHtml ? this.escapeHtml(v) : v);
-      list.innerHTML = sessions
+      const signals = window.TaskSignals;
+      const seen = this.getAttentionSeenMap();
+      const now = Date.now();
+      const ordered = signals?.orderSessionsForPanel
+        ? signals.orderSessionsForPanel(sessions, seen)
+        : sessions;
+      list.innerHTML = ordered
         .map((s) => {
           const isLocallyOpen = this.terminals.has(s.id);
           const action = window.SessionActions.planSessionRowAction(s, {
@@ -6966,11 +6972,42 @@ class TerminalManager {
           const terminationLine = terminationScheduledAt
             ? `<small class="session-termination-countdown" data-termination-at="${terminationScheduledAt}"></small>`
             : "";
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${s.id}">
+          const title =
+            signals?.sessionDisplayTitle?.(s) || s.cwd || "Terminal";
+          const unseen = signals?.hasUnseenAttention?.(s, seen[s.id], {
+            isActiveVisible: s.id === this.getActiveVisibleTerminalId(),
+          });
+          const attentionKind = unseen ? s.attention.kind : "";
+          const attentionText = attentionKind
+            ? [s.attention.title, s.attention.body].filter(Boolean).join(" — ")
+            : "";
+          const agentState = String(s.agentState || "").toLowerCase();
+          const agentChip = s.agentName
+            ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
+            : s.running
+              ? `<span class="session-chip session-chip-running">Running</span>`
+              : "";
+          const attentionChip = attentionKind
+            ? `<span class="session-chip session-chip-attention" data-kind="${esc(attentionKind)}">${esc(ATTENTION_KIND_LABELS[attentionKind] || "Attention")}</span>`
+            : "";
+          const activityAt = signals?.sessionActivityAt?.(s) || 0;
+          const activity = activityAt
+            ? signals.formatActivityAge(now - activityAt)
+            : "";
+          const meta = [
+            esc(status),
+            esc(mode),
+            s.sessionName ? "tmux" : "",
+            activity ? `last activity ${esc(activity)}` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
           <div class="session-row-main">
-            <strong><span class="session-badge ${action.statusClass}">${dot}</span> ${s.id.slice(0, 8)}</strong>
+            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> <span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
-            <small>${esc(status)} · ${esc(mode)}${s.sessionName ? " · tmux" : ""}</small>
+            ${attentionText ? `<div class="session-row-attention">${esc(attentionText)}</div>` : ""}
+            <small>${meta}</small>
             ${terminationLine}
           </div>
           <span class="session-row-action" aria-hidden="true">${action.label}</span>

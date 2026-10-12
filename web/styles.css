@@ -2159,6 +2159,76 @@ body.touch-input-mode .xterm .composition-view.active {
   color: var(--text-secondary);
 }
 
+.session-row-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(110, 118, 129, 0.14);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.session-chip-agent {
+  border-color: rgba(210, 153, 34, 0.38);
+  background: rgba(210, 153, 34, 0.12);
+  color: #f2cf7f;
+}
+
+.session-chip-running {
+  border-color: rgba(121, 192, 255, 0.3);
+  background: rgba(121, 192, 255, 0.1);
+  color: #b6dcff;
+}
+
+.session-chip-attention[data-kind="needs-input"] {
+  border-color: rgba(240, 180, 41, 0.5);
+  background: rgba(240, 180, 41, 0.14);
+  color: #f7d27a;
+}
+
+.session-chip-attention[data-kind="done"] {
+  border-color: rgba(63, 185, 80, 0.4);
+  background: rgba(63, 185, 80, 0.12);
+  color: #9be7a9;
+}
+
+.session-chip-attention[data-kind="error"] {
+  border-color: rgba(248, 81, 73, 0.4);
+  background: rgba(248, 81, 73, 0.12);
+  color: #ffb3ad;
+}
+
+.session-row-attention {
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row[data-attention="needs-input"] {
+  border-color: rgba(240, 180, 41, 0.4);
+}
+
 .session-row-action {
   flex: 0 0 auto;
   padding: 6px 12px;
