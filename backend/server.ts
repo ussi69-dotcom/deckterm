@@ -246,7 +246,10 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
-import { forbiddenRootDetail } from "./forbidden-root";
+import {
+  forbiddenRootDetail,
+  rejectedPathMayBeMissing,
+} from "./forbidden-root";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -2121,19 +2124,17 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   );
 }
 
-// Whether a path refused by resolveAllowedPath exists at all, so the denial
-// can say "outside the allowed roots" instead of "outside the allowed roots or
-// does not exist". Legacy (service-account) view only — never consulted under
-// OS isolation, where the service account must not traverse a user's tree.
-async function rejectedPathExists(inputPath: string): Promise<boolean> {
-  if (!inputPath) return false;
-  try {
-    const fs = await import("fs/promises");
-    await fs.stat(resolve(inputPath));
-    return true;
-  } catch {
-    return false;
-  }
+// "…outside the allowed roots or does not exist" wording for a path refused by
+// resolveAllowedPath. Stats only paths lexically inside an allowed root (see
+// rejectedPathMayBeMissing), so it is no existence oracle for host paths.
+async function rejectedPathMayBeMissingForRoots(
+  inputPath: string,
+): Promise<boolean> {
+  const roots = [
+    ...ALLOWED_FILESYSTEM_ROOTS.map((root) => resolve(root)),
+    ...(await getAllowedRealRoots()),
+  ];
+  return rejectedPathMayBeMissing(inputPath, roots);
 }
 
 async function resolveAllowedPath(
@@ -3920,7 +3921,7 @@ async function resolveScopedFsPath(
           ...forbiddenRootDetail({
             path: clientPath,
             subject: "path",
-            mayBeMissing: !(await rejectedPathExists(clientPath)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(clientPath),
           }),
         },
       };
@@ -7199,7 +7200,7 @@ export function createWebApp() {
             ...forbiddenRootDetail({
               path: requestedRoot,
               subject: "project",
-              mayBeMissing: !(await rejectedPathExists(requestedRoot)),
+              mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedRoot),
             }),
           },
           403,
@@ -8563,7 +8564,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
           }),
           requestId,
         },
@@ -8665,7 +8666,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
           }),
         },
         403,

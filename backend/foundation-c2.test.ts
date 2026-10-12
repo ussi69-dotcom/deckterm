@@ -130,8 +130,22 @@ test("C2-1b: denied file access returns a structured, explainable payload", asyn
   expect(body.setting).toBe("ALLOWED_FILE_ROOTS");
   expect(body.message).toContain(join(outsideRoot, "nope.txt"));
   expect(body.message).toContain("ALLOWED_FILE_ROOTS");
-  // nope.txt does not exist, so the message cannot claim it is out of bounds.
-  expect(body.message).toContain("does not exist");
+  // Outside every root the answer must not depend on whether the path
+  // exists: "or does not exist" here would be a host-path existence oracle
+  // reachable before any grant check.
+  expect(body.message).not.toContain("does not exist");
+
+  // Inside an allowed root a refused path that is missing may say so.
+  const inside = join(allowedRoot, "nope.txt");
+  const insideRes = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/download?path=${encodeURIComponent(inside)}`,
+    ),
+  );
+  expect(insideRes.status).toBe(403);
+  const insideBody = await insideRes.json();
+  expect(insideBody.reason).toBe("no_matching_root");
+  expect(insideBody.message).toContain("does not exist");
 });
 
 test("C2-2: task create with a forbidden root is denied and writes a foundation audit deny row", async () => {
