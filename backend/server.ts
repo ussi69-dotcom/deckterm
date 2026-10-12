@@ -25,8 +25,12 @@ import {
   configuredBrowserBoundary,
   SECURITY_HEADERS,
 } from "./services/browser-boundary";
+import {
+  NO_STORE_CACHE_CONTROL,
+  createBuildFingerprint,
+  createStaticAssetServer,
+} from "./services/static-assets";
 import { Hono } from "hono";
-import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import type { ServerWebSocket, Subprocess } from "bun";
 import { Database } from "bun:sqlite";
@@ -428,6 +432,22 @@ const DECKTERM_RELEASE = ((): string => {
   }
   return "dev";
 })();
+// Served web files: ETag/304 + gzip for static assets, and a short build
+// fingerprint (/api/health `build`) so open tabs notice a new version. Both
+// resolve ./web against the working directory, as serveStatic did.
+const WEB_ROOT = "./web";
+const staticAssets = createStaticAssetServer({ root: WEB_ROOT });
+const webBuildFingerprint = createBuildFingerprint({
+  root: WEB_ROOT,
+  ttlMs: 5000,
+});
+declare module "hono" {
+  interface ContextVariableMap {
+    // Set when the static handler already chose this response's
+    // Cache-Control, so the global no-store middleware leaves it alone.
+    staticCacheManaged: boolean;
+  }
+}
 const DECKTERM_TASK_MAX_ROUNDS = parseInt(
   process.env.DECKTERM_TASK_MAX_ROUNDS || "5",
   10,
@@ -5528,21 +5548,27 @@ export function createWebApp() {
     await next();
   });
 
-  // No-cache headers - bypass CF cache
+  // No-cache headers - bypass CF cache. API, WebSocket and HTML responses stay
+  // no-store. Static web files set their own `private` browser-cache policy
+  // (ETag revalidation or immutable for versioned /assets/); `private` keeps
+  // Cloudflare from storing them, and the CDN headers below forbid it outright.
   app.use("/*", async (c, next) => {
     await next();
-    c.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    c.header("Pragma", "no-cache");
-    c.header("Expires", "0");
+    if (!c.get("staticCacheManaged")) {
+      c.header("Cache-Control", NO_STORE_CACHE_CONTROL);
+      c.header("Pragma", "no-cache");
+      c.header("Expires", "0");
+    }
     c.header("CDN-Cache-Control", "no-store");
     c.header("Cloudflare-CDN-Cache-Control", "no-store");
   });
 
   // Health endpoint
-  app.get("/api/health", (c) => {
+  app.get("/api/health", async (c) => {
     return c.json({
       status: "ok",
       release: DECKTERM_RELEASE,
+      build: await webBuildFingerprint.get().catch(() => null),
       terminals: terminals.size,
       maxTerminals: MAX_TERMINALS,
       uptime: process.uptime(),
@@ -10086,14 +10112,13 @@ export function createWebApp() {
     }
   });
 
-  // Serve static files
-  app.use(
-    "/*",
-    serveStatic({
-      root: "./web",
-      rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
-    }),
-  );
+  // Serve static files (see services/static-assets.ts for the cache policy)
+  app.use("/*", async (c, next) => {
+    const response = await staticAssets.handle(c.req.raw);
+    if (!response) return next();
+    c.set("staticCacheManaged", true);
+    return c.newResponse(response.body, response);
+  });
 
   return app;
 }
