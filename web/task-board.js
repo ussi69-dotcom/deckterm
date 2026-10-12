@@ -38,7 +38,49 @@ function groupTasksForBoard(tasks) {
   return columns;
 }
 
-const TaskBoard = { groupTasksForBoard, TASK_BOARD_COLUMNS };
+// Calm empty state shared by the floating Tasks panel and the IDE views. The
+// floating panel already shows the create form (with its Create Task button)
+// right above the list, so it gets a hint instead of a second button; the IDE
+// sidebar / board tab get ONE primary action that opens that form.
+function taskEmptyState({ surface } = {}) {
+  if (surface === "panel") {
+    return {
+      icon: "list-checks",
+      title: "No tasks yet",
+      hint: "Describe the work above and press Create Task to start an agent run.",
+      action: null,
+    };
+  }
+  return {
+    icon: "list-checks",
+    title: "No tasks yet",
+    hint: "A task runs a worker agent and a judge in their own terminals.",
+    action: { id: "new", label: "New task" },
+  };
+}
+
+// Content of the list/board toggle (lucide icon names, no text glyphs).
+// hasBoardTab: the IDE can open the full-width Task Board editor tab, so the
+// button always opens the board instead of toggling in place.
+function taskViewToggleContent({ mode, hasBoardTab = false } = {}) {
+  if (hasBoardTab) {
+    return {
+      icon: "layout-grid",
+      label: "Board",
+      title: "Open board in the editor area",
+    };
+  }
+  return mode === "board"
+    ? { icon: "list", label: "List", title: "Switch to list view" }
+    : { icon: "layout-grid", label: "Board", title: "Switch to board view" };
+}
+
+const TaskBoard = {
+  groupTasksForBoard,
+  TASK_BOARD_COLUMNS,
+  taskEmptyState,
+  taskViewToggleContent,
+};
 
 if (typeof window !== "undefined") {
   window.TaskBoard = TaskBoard;
@@ -51,4 +93,6 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof exports !== "undefined") {
   exports.groupTasksForBoard = groupTasksForBoard;
   exports.TASK_BOARD_COLUMNS = TASK_BOARD_COLUMNS;
+  exports.taskEmptyState = taskEmptyState;
+  exports.taskViewToggleContent = taskViewToggleContent;
 }

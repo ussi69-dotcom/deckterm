@@ -154,8 +154,9 @@ body {
   border-radius: 8px;
 }
 
-.notification-sound-toggle[data-mode="always"],
-.notification-sound-toggle[data-mode="unfocused"] {
+/* The default mode ("unfocused") looks like any other icon button; only the
+   non-default "always" mode is tinted, and "off" is struck through below. */
+.notification-sound-toggle[data-mode="always"] {
   border-color: rgba(88, 166, 255, 0.34);
   background: rgba(88, 166, 255, 0.08);
   color: var(--accent-blue);
@@ -369,6 +370,12 @@ body {
 .tabs[data-layout] .tab {
   min-height: 52px;
   box-sizing: border-box;
+}
+
+/* With zero tabs the strip still reserves the tab height, so the toolbar
+   does not jump from 64px to 54px when the last terminal closes. */
+.tabs[data-layout] {
+  min-height: 52px;
 }
 
 .tab:hover {
@@ -866,6 +873,205 @@ body {
   }
 }
 
+/* Zero-terminal launcher (web/workspace-launcher.js) */
+.workspace-launcher {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow: auto;
+  background: var(--bg-primary);
+}
+
+.workspace-launcher[hidden] {
+  display: none;
+}
+
+.launcher-card {
+  width: min(760px, 100%);
+  display: grid;
+  gap: 20px;
+  margin: auto;
+}
+
+.launcher-title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.launcher-subtitle {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.launcher-new {
+  justify-self: start;
+  height: 40px;
+  padding: 0 14px 0 12px;
+  gap: 8px;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.launcher-new svg {
+  width: 18px;
+  height: 18px;
+}
+
+.launcher-new .launcher-keys {
+  margin-left: 6px;
+}
+
+.launcher-new kbd {
+  background: rgba(0, 0, 0, 0.18);
+  border-color: rgba(255, 255, 255, 0.25);
+  color: #fff;
+}
+
+.launcher-columns {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 20px;
+}
+
+.launcher-section h3 {
+  margin: 0 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.launcher-list {
+  display: grid;
+  gap: 2px;
+}
+
+.launcher-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  cursor: pointer;
+}
+
+.launcher-row:hover,
+.launcher-row:focus-visible {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--border-primary);
+  outline: none;
+}
+
+.launcher-row > svg {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+}
+
+.launcher-row-text {
+  display: grid;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.launcher-row-title,
+.launcher-row-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.launcher-row-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.launcher-row-meta {
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.launcher-row-action {
+  flex: 0 0 auto;
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+.launcher-row-action.restorable {
+  color: var(--accent-orange);
+}
+
+.launcher-empty {
+  margin: 4px 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.launcher-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.launcher-shortcut {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.launcher-keys {
+  display: inline-flex;
+  gap: 3px;
+  white-space: nowrap;
+}
+
+/* Touch layouts have no keyboard to speak of: drop the key hints there. */
+@media (hover: none) and (pointer: coarse) {
+  .launcher-shortcuts,
+  .launcher-new .launcher-keys {
+    display: none;
+  }
+}
+
+.launcher-keys kbd {
+  display: inline-block;
+  min-width: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border-primary);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  line-height: 17px;
+  text-align: center;
+}
+
 /* Tile - floating window */
 .tile {
   position: absolute;
@@ -932,9 +1138,13 @@ body {
   transition: opacity 0.15s;
 }
 
+/* Shown on hover, when the controls themselves hold keyboard focus, in a
+   multi-pane workspace (the tab's own close button can't target one pane),
+   or while the close confirmation is open. NOT on plain .tile:focus-within:
+   the focused terminal's textarea made the x permanent on every active tile. */
 .tile:hover .tile-close-container,
-.tile:focus-within .tile-close-container,
-.tile.workspace-multi-pane.active .tile-close-container,
+.tile-close-container:focus-within,
+.tile.workspace-multi-pane .tile-close-container,
 .tile.close-confirm-open .tile-close-container {
   opacity: 1;
   pointer-events: auto;
@@ -1029,6 +1239,35 @@ body {
 
 .tile-close-confirm .confirm-cancel:hover {
   background: var(--bg-hover);
+}
+
+/* Desktop: park the pane controls in the reserved top-right gutter (the
+   xterm 8px padding + 14px scrollbar track, 22px wide), stacked vertically,
+   so they never cover terminal text. Touch layouts keep the 44px row below. */
+@media (hover: hover) and (pointer: fine) {
+  .tile-close-container {
+    top: 3px;
+    right: 1px;
+    flex-direction: column-reverse;
+    gap: 3px;
+  }
+
+  .tile-close-btn,
+  .tile-detach-btn {
+    width: 20px;
+    height: 20px;
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .tile-detach-btn {
+    font-size: 12px;
+  }
+
+  .tile.workspace-multi-pane:not(.active):not(:hover)
+    .tile-close-container:not(:focus-within) {
+    opacity: 0.55;
+  }
 }
 
 @media (pointer: coarse) {
@@ -1324,30 +1563,38 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
+/* One ghost style for every desktop toolbar action (Files, Git, Palette,
+   More, IDE and any pinned extra): no fill or border at rest, a soft fill on
+   hover, and the accent fill ONLY while that surface is open (.active, kept
+   in sync by syncSurfaceButtonState / the IDE view hook). */
 .toolbar-action-btn {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   height: 36px;
-  padding: 0 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-primary);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   transition:
-    transform 0.2s ease,
-    border-color 0.2s ease,
-    background 0.2s ease,
-    color 0.2s ease;
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
   flex-shrink: 0;
   white-space: nowrap;
 }
 
 .toolbar-action-btn:hover {
-  transform: translateY(-1px);
-  border-color: rgba(88, 166, 255, 0.35);
-  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.toolbar-action-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 .toolbar-action-btn svg {
@@ -1402,28 +1649,44 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
-.toolbar-action-btn-primary {
-  border-color: rgba(63, 185, 80, 0.26);
-  background: rgba(63, 185, 80, 0.1);
-}
-
-.toolbar-action-btn-primary:hover {
-  border-color: rgba(63, 185, 80, 0.45);
-  background: rgba(63, 185, 80, 0.16);
-}
-
-.toolbar-action-btn-secondary {
-  color: var(--text-secondary);
-}
-
-.toolbar-action-btn-secondary:hover {
+/* Primary/secondary tones used to tint Files/Git green; the toolbar now uses
+   the single ghost style above for every action. */
+.toolbar-action-btn.active,
+.toolbar-action-btn.active:hover {
+  border-color: rgba(88, 166, 255, 0.45);
+  background: rgba(88, 166, 255, 0.14);
   color: var(--text-primary);
 }
 
-.toolbar-action-btn.active {
-  border-color: rgba(88, 166, 255, 0.55);
-  background: rgba(88, 166, 255, 0.15);
-  color: var(--text-primary);
+.toolbar-action-btn.active svg {
+  color: var(--accent-blue);
+}
+
+#ide-toggle-btn[hidden] {
+  display: none;
+}
+
+/* The IDE toggle sits outside .desktop-primary-actions; follow the same
+   density tiers so it shrinks with its neighbours. */
+.toolbar[data-tab-density="compact"] .toolbar-ide-btn {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.toolbar[data-tab-density="tight"] .toolbar-ide-btn,
+.toolbar[data-tab-density="icon-only"] .toolbar-ide-btn {
+  height: 32px;
+  padding: 0 9px;
+}
+
+.toolbar[data-tab-density="icon-only"] .toolbar-ide-btn .btn-label {
+  display: none;
+}
+
+.toolbar-ide-btn .btn-label {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .dir-input {
@@ -1434,10 +1697,12 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .dir-input input {
   width: 140px;
+  height: 36px;
+  box-sizing: border-box;
   padding: 6px 10px;
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--text-primary);
   font-size: 12px;
   text-overflow: ellipsis;
@@ -1450,10 +1715,14 @@ body.touch-input-mode .xterm .composition-view.active {
   border-color: var(--accent-blue);
 }
 
+/* Explicitly opened sheets (More, Tasks/Sessions, Setup) stack ABOVE the
+   floating surface-windows layer (#surface-windows-layer, z-index 640) and the
+   sessions-dock sash (660): their backdrop must dim open windows too, not
+   slide underneath them. The layout-editor drag ghost (720) stays on top. */
 .tools-sheet {
   position: fixed;
   inset: 0;
-  z-index: 620;
+  z-index: 684;
   pointer-events: none;
 }
 
@@ -1940,7 +2209,7 @@ body.touch-input-mode .xterm .composition-view.active {
 .task-panel {
   position: fixed;
   inset: 0;
-  z-index: 610;
+  z-index: 680;
   pointer-events: none;
 }
 
@@ -1957,6 +2226,51 @@ body.touch-input-mode .xterm .composition-view.active {
 
 #sessions-panel .task-panel-backdrop {
   inset: 0;
+}
+
+/* Sessions: a quiet one-line header (title + New / Refresh / Close) over a
+   scrolling list; the list keeps the attention ordering from task-signals. */
+.sessions-panel-shell {
+  gap: 12px;
+  padding: 14px 14px 16px;
+}
+
+.sessions-panel-header h3 {
+  margin: 0 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sessions-panel-header .task-panel-header-actions {
+  gap: 6px;
+}
+
+.sessions-new-btn {
+  height: 32px;
+  padding: 0 12px;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.sessions-new-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.sessions-panel-header .btn-icon {
+  width: 32px;
+  height: 32px;
+}
+
+.sessions-panel-header .btn-icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.sessions-panel-body {
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .task-panel-shell {
@@ -2292,6 +2606,59 @@ body.touch-input-mode .xterm .composition-view.active {
   padding: 12px;
 }
 
+/* No selected task: no empty bordered box. The status line keeps its live
+   region but stops reserving a blank row. */
+.task-detail:empty {
+  display: none;
+}
+
+.task-status:empty {
+  min-height: 0;
+}
+
+#task-view-toggle {
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+#task-view-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.task-empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 22px 16px;
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.task-empty-state svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.6;
+  color: var(--text-muted);
+}
+
+.task-empty-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-empty-hint {
+  margin: 0;
+  max-width: 340px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .task-actions {
   flex-wrap: wrap;
 }
@@ -2358,7 +2725,7 @@ body.touch-input-mode .xterm .composition-view.active {
 .setup-panel {
   position: fixed;
   inset: 0;
-  z-index: 612;
+  z-index: 682;
   pointer-events: none;
 }
 
@@ -2992,19 +3359,42 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .server-stats {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   font-size: 11px;
-  font-family: "JetBrains Mono", monospace;
   color: var(--text-secondary);
-  margin-right: 8px;
+  margin-right: 4px;
   flex-shrink: 0;
 }
 
 .server-stats .stat {
-  padding: 2px 6px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 3px 7px;
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
   cursor: default;
+}
+
+.server-stats .stat-label {
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.server-stats .stat-value {
+  min-width: 3ch;
+  font-family: "JetBrains Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.server-stats .stat.warning .stat-label,
+.server-stats .stat.danger .stat-label {
+  color: inherit;
 }
 
 .server-stats .stat.warning {
@@ -3758,60 +4148,132 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
-/* Help Modal */
+/* Help Modal — rows generated from web/keyboard-shortcuts.js */
+.help-modal-content {
+  width: 860px;
+  max-height: 86vh;
+}
+
 .help-content {
-  padding: 20px;
+  padding: 18px 22px 20px;
   overflow-y: auto;
-  max-height: 60vh;
+  max-height: none;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
-.help-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 24px;
-  margin-bottom: 24px;
+.help-shortcuts {
+  columns: 2 360px;
+  column-gap: 36px;
 }
 
-.help-column h4 {
-  margin: 0 0 12px 0;
-  font-size: 14px;
-  color: var(--accent-blue);
+.help-section {
+  break-inside: avoid;
+  margin: 0 0 22px;
+}
+
+.help-section h4 {
+  margin: 0 0 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border-primary);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.08em;
 }
 
-.help-table {
-  width: 100%;
-  border-collapse: collapse;
+.help-rows {
+  display: grid;
+  /* One key-column width for every section so descriptions line up. */
+  grid-template-columns: minmax(150px, max-content) minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 16px;
+  row-gap: 2px;
+  margin: 0;
   font-size: 13px;
 }
 
-.help-table tr {
-  border-bottom: 1px solid var(--border-primary);
+.help-keys,
+.help-desc {
+  margin: 0;
+  padding: 5px 0;
 }
 
-.help-table tr:last-child {
-  border-bottom: none;
-}
-
-.help-table td {
-  padding: 8px 0;
-}
-
-.help-table td:first-child {
-  width: 50%;
+.help-keys {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 4px;
+  white-space: nowrap;
   color: var(--text-secondary);
 }
 
-.help-table kbd {
+.help-combo {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.help-key-or {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.help-gesture {
+  font-size: 12px;
+}
+
+.help-content kbd {
   display: inline-block;
-  padding: 2px 6px;
+  min-width: 20px;
+  padding: 1px 6px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border-primary);
+  border-bottom-width: 2px;
   border-radius: 4px;
+  color: var(--text-primary);
   font-size: 11px;
+  line-height: 18px;
+  text-align: center;
   font-family: "JetBrains Mono", monospace;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  white-space: nowrap;
+}
+
+.help-desc {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+  row-gap: 2px;
+  color: var(--text-primary);
+}
+
+.help-scope {
+  padding: 0 6px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  color: var(--text-secondary);
+  font-size: 10.5px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.help-scope-app-window {
+  border-style: dashed;
+}
+
+.help-note {
+  flex-basis: 100%;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+
+.help-footnote {
+  margin: 8px 0 16px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
 }
 
 .help-legend {
@@ -3820,9 +4282,12 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .help-legend h4 {
-  margin: 0 0 12px 0;
-  font-size: 14px;
-  color: var(--accent-blue);
+  margin: 0 0 8px 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
 }
 
 .help-legend p {
@@ -4446,9 +4911,8 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   /* Help modal responsive */
-  .help-grid {
-    grid-template-columns: 1fr;
-    gap: 16px;
+  .help-shortcuts {
+    columns: 1;
   }
 
   .help-content {
@@ -6231,29 +6695,44 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 
 .terminal-search-bar {
   position: absolute;
-  top: 8px;
-  right: 16px;
+  right: 28px;
+  bottom: 8px;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
+  gap: 4px;
+  padding: 4px 4px 4px 10px;
   background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
-  border-radius: 6px;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border-hover, #484f58);
+  border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
   z-index: 60;
+}
+
+/* Dodged to the top edge because the active match sat under the bar. Clear
+   of the pane controls in the top-right gutter. */
+.terminal-search-bar[data-placement="top"] {
+  top: 8px;
+  bottom: auto;
 }
 
 .terminal-search-bar.hidden {
   display: none;
 }
 
+.terminal-search-bar .search-bar-icon,
+.terminal-search-bar > svg:first-child {
+  width: 14px;
+  height: 14px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
 .terminal-search-bar .search-input {
-  width: 200px;
-  padding: 4px 8px;
+  width: 210px;
+  padding: 5px 8px;
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--text-primary);
   font-size: 13px;
   outline: none;
@@ -6264,27 +6743,57 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 }
 
 .terminal-search-bar .search-count {
-  min-width: 38px;
+  min-width: 52px;
+  padding: 0 4px;
   text-align: center;
   color: var(--text-secondary);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.terminal-search-bar.no-results .search-count {
+  color: var(--accent-orange, #d29922);
+}
+
+.terminal-search-bar.no-results .search-input {
+  border-color: rgba(210, 153, 34, 0.7);
 }
 
 .terminal-search-bar .search-btn {
-  padding: 4px 8px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  color: var(--text-secondary);
-  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border-primary);
+  border-radius: 5px;
+  color: var(--text-primary);
   cursor: pointer;
-  line-height: 1;
+}
+
+.terminal-search-bar .search-btn svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 2;
 }
 
 .terminal-search-bar .search-btn:hover {
   background: var(--bg-hover);
-  color: var(--text-primary);
+  border-color: var(--border-hover, #484f58);
+}
+
+.terminal-search-bar .search-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, #58a6ff);
+  outline-offset: 1px;
+}
+
+.terminal-search-bar .search-btn-close {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-secondary);
 }
 
 /* =============================================================================
@@ -6732,6 +7241,19 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   box-shadow: none;
 }
 
+/* Inside a window the titlebar already says "Tasks" and carries the close
+   button: drop the sheet's own eyebrow, title and close, keep the list/board
+   toggle as a slim right-aligned action. */
+.surface-window-body > .task-panel .task-panel-header > div:first-child,
+.surface-window-body > .task-panel #task-panel-close {
+  display: none;
+}
+
+.surface-window-body > .task-panel .task-panel-header {
+  justify-content: flex-end;
+  margin-bottom: -6px;
+}
+
 .surface-window-body > .file-editor-modal {
   position: static;
   inset: auto;
@@ -6843,8 +7365,40 @@ body.ide-mode #workspace-area {
   border-radius: 0;
 }
 
+.ide-activity-item {
+  position: relative;
+}
+
 .ide-activity-item:hover {
   color: var(--text-primary, #fff);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.ide-activity-item:hover svg {
+  stroke-width: 2.1;
+}
+
+/* Styled tooltip from data-tooltip (title + shortcut + what a click does). */
+.ide-activity-item[data-tooltip]:hover::after,
+.ide-activity-item[data-tooltip]:focus-visible::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 5px 9px;
+  border: 1px solid var(--border-hover, #484f58);
+  border-radius: 6px;
+  background: var(--bg-secondary, #161b22);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  color: var(--text-primary, #e6edf3);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: pre;
+  text-align: left;
+  pointer-events: none;
 }
 
 .ide-activity-item.active {
@@ -7508,9 +8062,65 @@ body.ide-mode #workspace-area {
 }
 
 .ide-tasks-empty {
-  padding: 8px 12px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 28px 16px;
+  text-align: center;
   font-size: 12px;
   color: var(--text-secondary, #999);
+}
+
+.ide-tasks-empty-icon,
+.ide-tasks-empty > svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.6;
+  color: var(--text-muted, #6e7681);
+}
+
+.ide-tasks-empty-title {
+  margin: 0;
+  color: var(--text-primary, #ddd);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ide-tasks-empty-hint {
+  margin: 0;
+  max-width: 260px;
+  line-height: 1.45;
+}
+
+.ide-tasks-empty-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 12px;
+  border: 1px solid rgba(63, 185, 80, 0.4);
+  border-radius: 6px;
+  background: var(--btn-green, #238636);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ide-tasks-empty-action:hover {
+  filter: brightness(1.1);
+}
+
+.ide-tasks-empty-action svg,
+.ide-tasks-action svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ide-tasks-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .ide-tasks-item {
