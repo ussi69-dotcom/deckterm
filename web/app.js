@@ -6659,19 +6659,35 @@ class TerminalManager {
     });
   }
 
+  // Width of every density-elastic toolbar group (primary actions, IDE
+  // toggle, server-load chips) at each tier, measured by applying the tier
+  // and reading the layout. Actions use scrollWidth (their bar clips).
   measureDesktopActionWidthsByTier(root) {
     const toolbar = this.toolbar;
     if (!root || !toolbar) return null;
 
+    const ideButton = document.getElementById("ide-toggle-btn");
+    const stats = document.getElementById("server-stats");
     const previousDensity = root.dataset.density || "normal";
     const previousTabDensity = toolbar.dataset.tabDensity || "";
-    const widthsByTier = {};
-    const tiers = ["normal", "compact", "tight", "icon-only"];
+    const tiers = window.ToolbarLayout?.TOOLBAR_DENSITY_TIERS || [
+      "normal",
+      "compact",
+      "tight",
+      "icon-only",
+    ];
+    const widthOf = (element) =>
+      element && !element.hidden && element.offsetParent !== null
+        ? Math.ceil(element.getBoundingClientRect().width || 0)
+        : 0;
+    const groups = { actions: {}, ide: {}, stats: {} };
 
     tiers.forEach((tier) => {
       root.dataset.density = tier;
       toolbar.dataset.tabDensity = tier;
-      widthsByTier[tier] = Math.ceil(root.scrollWidth);
+      groups.actions[tier] = Math.ceil(root.scrollWidth);
+      groups.ide[tier] = widthOf(ideButton);
+      groups.stats[tier] = widthOf(stats);
     });
 
     root.dataset.density = previousDensity;
@@ -6681,6 +6697,15 @@ class TerminalManager {
       delete toolbar.dataset.tabDensity;
     }
 
+    const sum = window.ToolbarLayout?.sumTierWidths;
+    const widthsByTier = sum
+      ? sum([groups.actions, groups.ide, groups.stats])
+      : groups.actions;
+    // Current (applied-tier) footprint of the same groups.
+    widthsByTier.current =
+      Math.ceil(root.getBoundingClientRect().width || 0) +
+      widthOf(ideButton) +
+      widthOf(stats);
     return widthsByTier;
   }
 
@@ -6727,18 +6752,14 @@ class TerminalManager {
   }
 
   getDesktopTabReserveWidth(tabCount) {
+    const shared = window.ToolbarLayout?.getDesktopTabReserveWidth;
+    if (shared) return shared(tabCount);
     const count = Math.max(0, Math.trunc(Number(tabCount) || 0));
     if (!count) return 0;
-
-    const gap = 4;
     const widthFor = (columns, tabWidth) =>
-      columns * tabWidth + Math.max(0, columns - 1) * gap;
-
-    // Preserve four comfortable single-row tabs before spending horizontal
-    // space on full action labels. Beyond four, reserve enough room for the
-    // existing two-row layout at its 96px minimum.
+      columns * tabWidth + Math.max(0, columns - 1) * 4;
     if (count <= 4) return widthFor(count, 144);
-    return Math.max(widthFor(4, 144), widthFor(Math.ceil(count / 2), 96));
+    return Math.max(widthFor(5, 118), widthFor(Math.ceil(count / 2), 96));
   }
 
   syncDesktopTabLayout() {
@@ -6925,13 +6946,18 @@ class TerminalManager {
       return;
     }
 
+    // Budget: the elastic groups (actions, IDE toggle, server-load chips)
+    // plus the tab strip share one width; the tabs keep their reserve and
+    // the tier is the roomiest whose elastic footprint fits the rest.
     const widthsByTier = this.measureDesktopActionWidthsByTier(actionBar);
-    const actionWidth = Math.ceil(actionBar.getBoundingClientRect().width || 0);
+    const elasticWidth =
+      widthsByTier?.current ??
+      Math.ceil(actionBar.getBoundingClientRect().width || 0);
     const tabsWidth = Math.ceil(this.tabs?.getBoundingClientRect().width || 0);
     const tabCount = this.tabs?.querySelectorAll(".tab").length || 0;
     const availableWidth = Math.max(
       0,
-      actionWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
+      elasticWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
     );
     const fallbackDensity =
       actionBar.dataset.density ||

@@ -3411,6 +3411,27 @@ body.touch-input-mode .xterm .composition-view.active {
   color: inherit;
 }
 
+/* The load chips follow the toolbar density tiers (syncDesktopToolbarDensity
+   counts them in the width budget): from "tight" on they drop the CPU/RAM/
+   DISK text and keep the value; the chip tooltip keeps the exact numbers. */
+.toolbar[data-tab-density="tight"] .server-stats,
+.toolbar[data-tab-density="icon-only"] .server-stats {
+  gap: 4px;
+}
+
+.toolbar[data-tab-density="tight"] .server-stats .stat-label,
+.toolbar[data-tab-density="icon-only"] .server-stats .stat-label {
+  display: none;
+}
+
+.toolbar[data-tab-density="tight"] .server-stats .stat {
+  padding: 3px 6px;
+}
+
+.toolbar[data-tab-density="icon-only"] .server-stats .stat {
+  padding: 3px 5px;
+}
+
 .server-stats .stat.warning {
   color: var(--accent-orange);
 }
