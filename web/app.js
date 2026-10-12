@@ -119,6 +119,9 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// /api/terminals telemetry poll cadence (see startTelemetryRefreshLoop).
+const TELEMETRY_VISIBLE_POLL_MS = 5000;
+const TELEMETRY_HIDDEN_POLL_MS = 30000;
 // Quick-open (Ctrl+P) file-tree cache TTL — the git branch cache never
 // expires (branch switches invalidate it explicitly), but the tree fetch
 // walks the live filesystem, so it is re-fetched after this window.
@@ -11307,12 +11310,18 @@ class TerminalManager {
     if (this.telemetryRefreshInterval) {
       clearInterval(this.telemetryRefreshInterval);
     }
-    // Hidden tabs skip the 5 s poll (each one costs tmux queries on the
-    // server) and catch up immediately when they become visible again; live
-    // state changes still arrive over the terminal WebSockets meanwhile.
+    // Visible tabs poll every 5 s. Hidden tabs slow down to every 30 s (each
+    // poll costs tmux queries on the server) but never stop: agent attention
+    // (needs-input / done) only arrives through this poll, and the local
+    // notification fallback for users without web push depends on it. A tab
+    // catches up immediately when it becomes visible again.
     this.telemetryRefreshInterval = setInterval(() => {
-      if (!document.hidden) this.queueTelemetryRefresh(0);
-    }, 5000);
+      if (document.hidden) {
+        const sinceLast = Date.now() - (this.telemetryLastStartedAt || 0);
+        if (sinceLast < TELEMETRY_HIDDEN_POLL_MS) return;
+      }
+      this.queueTelemetryRefresh(0);
+    }, TELEMETRY_VISIBLE_POLL_MS);
     if (!this.telemetryVisibilityHandler) {
       this.telemetryVisibilityHandler = () => {
         if (!document.hidden) this.queueTelemetryRefresh(0);
@@ -11339,6 +11348,7 @@ class TerminalManager {
         // Lets a cwd learned while this poll is in flight (OSC 7) win over
         // the older server snapshot.
         const requestStartedAt = Date.now();
+        this.telemetryLastStartedAt = requestStartedAt;
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
