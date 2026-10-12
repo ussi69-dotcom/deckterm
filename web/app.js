@@ -13983,27 +13983,33 @@ class TerminalManager {
             savedSessionsById,
           }) || [];
 
-        for (const action of bootstrapActions) {
-          const terminalInfo = reconnectableTerminals.find(
-            (terminal) => terminal.id === action.terminalId,
-          );
-          if (!terminalInfo) continue;
+        this.restoringTabOrder = true;
+        try {
+          for (const action of bootstrapActions) {
+            const terminalInfo = reconnectableTerminals.find(
+              (terminal) => terminal.id === action.terminalId,
+            );
+            if (!terminalInfo) continue;
 
-          if (action.type === "linked-view") {
-            await this.bootstrapLinkedView(terminalInfo);
-            continue;
+            if (action.type === "linked-view") {
+              await this.bootstrapLinkedView(terminalInfo);
+              continue;
+            }
+
+            await this.reconnectToTerminal(
+              terminalInfo.id,
+              terminalInfo.cwd,
+              action.savedSession,
+              {
+                backendMode: terminalInfo.backendMode || null,
+                supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
+                agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
+              },
+            );
           }
-
-          await this.reconnectToTerminal(
-            terminalInfo.id,
-            terminalInfo.cwd,
-            action.savedSession,
-            {
-              backendMode: terminalInfo.backendMode || null,
-              supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
-              agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
-            },
-          );
+        } finally {
+          this.restoringTabOrder = false;
+          this.persistTabOrder();
         }
         return;
       }
@@ -15992,10 +15998,60 @@ class TerminalManager {
       this.clearDropTargets();
     });
 
-    this.tabs.appendChild(tab);
+    this.insertTabAtSavedRank(tab);
     this.renumberTabs();
     this.updateTabGroups();
     return tab;
+  }
+
+  // Reload re-creates tabs in the server's session order; while that startup
+  // restore runs, put each one back at its saved position
+  // (web/toolbar-layout.js). New tabs and unknown ones append.
+  insertTabAtSavedRank(tab) {
+    const helpers = window.ToolbarLayout;
+    const existing = Array.from(this.tabs.querySelectorAll(".tab"));
+    if (
+      !this.restoringTabOrder ||
+      !helpers?.getTabInsertionIndex ||
+      existing.length === 0
+    ) {
+      this.tabs.appendChild(tab);
+      return;
+    }
+    const savedOrder = helpers.loadTabOrder(this.getTabOrderStorage());
+    const index = helpers.getTabInsertionIndex(
+      savedOrder,
+      existing.map((element) => element.dataset.workspaceId),
+      tab.dataset.workspaceId,
+    );
+    const before = existing[index];
+    if (before) this.tabs.insertBefore(tab, before);
+    else this.tabs.appendChild(tab);
+  }
+
+  getTabOrderStorage() {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  // Saved on every render that changes the order; skipped while startup is
+  // still re-attaching tabs (a partial order would overwrite the saved one).
+  persistTabOrder() {
+    const helpers = window.ToolbarLayout;
+    if (!helpers?.saveTabOrder || this.restoringTabOrder) return;
+    const ids = Array.from(this.tabs.querySelectorAll(".tab"))
+      .map((tab) => tab.dataset.workspaceId)
+      .filter(Boolean);
+    // An empty strip (startup before the restore, or every tab closed) keeps
+    // the saved ranks; the next real tab overwrites them anyway.
+    if (ids.length === 0) return;
+    const key = ids.join("|");
+    if (key === this.persistedTabOrderKey) return;
+    this.persistedTabOrderKey = key;
+    helpers.saveTabOrder(this.getTabOrderStorage(), ids);
   }
 
   clearDropTargets() {
@@ -16015,7 +16071,7 @@ class TerminalManager {
       if (indexEl && indexEl.textContent !== number) {
         indexEl.textContent = number;
       }
-    });
+    });    this.persistTabOrder();
   }
 
   updateTabGroups() {

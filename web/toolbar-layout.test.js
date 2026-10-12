@@ -4,7 +4,26 @@ import {
   getDesktopTabReserveWidth,
   sumTierWidths,
   getToolbarStatusIndicator,
+  normalizeTabOrder,
+  getTabInsertionIndex,
+  loadTabOrder,
+  saveTabOrder,
+  TAB_ORDER_STORAGE_KEY,
 } from "./toolbar-layout";
+
+function memoryStorage(initial = {}) {
+  const data = { ...initial };
+  return {
+    data,
+    getItem: (key) => (key in data ? data[key] : null),
+    setItem: (key, value) => {
+      data[key] = String(value);
+    },
+    removeItem: (key) => {
+      delete data[key];
+    },
+  };
+}
 
 describe("getDesktopTabReserveWidth", () => {
   test("reserves nothing without tabs", () => {
@@ -93,5 +112,59 @@ describe("getToolbarStatusIndicator", () => {
       getToolbarStatusIndicator({ status: "Reconnecting", terminalCount: 0 })
         .state,
     ).toBe("reconnecting");
+  });
+});
+
+describe("tab order persistence", () => {
+  test("normalizeTabOrder keeps unique non-empty string ids", () => {
+    expect(normalizeTabOrder(["ws-2", "", "ws-1", "ws-2", 4, null])).toEqual([
+      "ws-2",
+      "ws-1",
+    ]);
+    expect(normalizeTabOrder("nope")).toEqual([]);
+    expect(normalizeTabOrder(null)).toEqual([]);
+  });
+
+  test("insertion index restores the saved order whatever the attach order", () => {
+    const saved = ["ws-1", "ws-2", "ws-3"];
+    // Server hands the sessions back as ws-3, ws-1, ws-2.
+    const tabs = [];
+    for (const id of ["ws-3", "ws-1", "ws-2"]) {
+      tabs.splice(getTabInsertionIndex(saved, tabs, id), 0, id);
+    }
+    expect(tabs).toEqual(["ws-1", "ws-2", "ws-3"]);
+  });
+
+  test("unknown tabs are appended after the restored ones", () => {
+    const saved = ["ws-1", "ws-2"];
+    expect(getTabInsertionIndex(saved, ["ws-1", "ws-2"], "ws-9")).toBe(2);
+    expect(getTabInsertionIndex([], ["ws-1"], "ws-2")).toBe(1);
+    // A known tab goes before a tab created this session (unknown rank).
+    expect(getTabInsertionIndex(saved, ["ws-9"], "ws-1")).toBe(0);
+  });
+
+  test("load/save round-trip through storage and survive bad data", () => {
+    const storage = memoryStorage();
+    saveTabOrder(storage, ["ws-2", "ws-1"]);
+    expect(JSON.parse(storage.data[TAB_ORDER_STORAGE_KEY])).toEqual([
+      "ws-2",
+      "ws-1",
+    ]);
+    expect(loadTabOrder(storage)).toEqual(["ws-2", "ws-1"]);
+
+    storage.setItem(TAB_ORDER_STORAGE_KEY, "{not json");
+    expect(loadTabOrder(storage)).toEqual([]);
+    expect(loadTabOrder(null)).toEqual([]);
+    expect(() => saveTabOrder(null, ["ws-1"])).not.toThrow();
+    const throwing = {
+      getItem() {
+        throw new Error("denied");
+      },
+      setItem() {
+        throw new Error("quota");
+      },
+    };
+    expect(loadTabOrder(throwing)).toEqual([]);
+    expect(() => saveTabOrder(throwing, ["ws-1"])).not.toThrow();
   });
 });

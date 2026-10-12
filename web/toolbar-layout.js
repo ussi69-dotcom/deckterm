@@ -1,5 +1,6 @@
 // Toolbar decisions that do not need a DOM: the desktop width budget that
-// picks the toolbar density tier, and the connection dot state.
+// picks the toolbar density tier, the connection dot state, and the saved
+// workspace-tab order.
 // TerminalManager in app.js measures the elements and applies the result.
 
 // Wrapped so its helpers never leak into (or clash with) the other classic
@@ -88,11 +89,69 @@
     return { state, label: STATUS_LABELS[state] };
   }
 
+  // Workspace tabs are re-created one by one on reload in whatever order the
+  // server lists the sessions, so the visual order is saved (workspace ids)
+  // and each restored tab is inserted at its saved rank.
+  const TAB_ORDER_STORAGE_KEY = "deckterm-tab-order";
+  const TAB_ORDER_LIMIT = 200;
+
+  function normalizeTabOrder(value) {
+    if (!Array.isArray(value)) return [];
+    const seen = new Set();
+    const order = [];
+    for (const id of value) {
+      if (typeof id !== "string" || !id || seen.has(id)) continue;
+      seen.add(id);
+      order.push(id);
+      if (order.length >= TAB_ORDER_LIMIT) break;
+    }
+    return order;
+  }
+
+  // Index in existingIds (current visual order) before which newId belongs.
+  // Tabs without a saved rank (created this session) sort last.
+  function getTabInsertionIndex(savedOrder, existingIds, newId) {
+    const order = Array.isArray(savedOrder) ? savedOrder : [];
+    const existing = Array.isArray(existingIds) ? existingIds : [];
+    const rank = order.indexOf(newId);
+    if (rank === -1) return existing.length;
+    for (let index = 0; index < existing.length; index += 1) {
+      const otherRank = order.indexOf(existing[index]);
+      if (otherRank === -1 || otherRank > rank) return index;
+    }
+    return existing.length;
+  }
+
+  function loadTabOrder(storage) {
+    try {
+      const raw = storage?.getItem?.(TAB_ORDER_STORAGE_KEY);
+      return raw ? normalizeTabOrder(JSON.parse(raw)) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function saveTabOrder(storage, ids) {
+    try {
+      storage?.setItem?.(
+        TAB_ORDER_STORAGE_KEY,
+        JSON.stringify(normalizeTabOrder(ids)),
+      );
+    } catch {
+      // storage full or blocked: order simply is not remembered
+    }
+  }
+
   const ToolbarLayout = {
     TOOLBAR_DENSITY_TIERS,
     getDesktopTabReserveWidth,
     sumTierWidths,
     getToolbarStatusIndicator,
+    TAB_ORDER_STORAGE_KEY,
+    normalizeTabOrder,
+    getTabInsertionIndex,
+    loadTabOrder,
+    saveTabOrder,
   };
 
   if (typeof window !== "undefined") {
