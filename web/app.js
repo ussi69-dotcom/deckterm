@@ -6645,12 +6645,12 @@ class TerminalManager {
     const availableWidth = Math.floor(tabs.getBoundingClientRect().width || 0);
     const baseTabWidth =
       tabCount <= 1 ? 280 : tabCount <= 2 ? 240 : tabCount <= 3 ? 200 : 160;
-    // Wide screens: let tabs grow into the free strip (up to 360px, never
-    // more than half of it for a lone tab) instead of leaving a dead gap
-    // between the tabs and the directory field.
+    // Wide screens: let tabs grow into the free strip (up to 360px, sharing
+    // it as if there were one more tab, so a lone tab stays wider than each
+    // of two) instead of leaving a dead gap before the directory field.
     const preferredTabWidth = Math.max(
       baseTabWidth,
-      Math.min(360, Math.floor(availableWidth / Math.max(tabCount, 2)) - 4),
+      Math.min(360, Math.floor(availableWidth / (tabCount + 1)) - 4),
     );
     return (
       this.navigationSurface.getDesktopTabLayoutByWidth?.({
