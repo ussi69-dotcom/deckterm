@@ -5359,6 +5359,10 @@ class TerminalManager {
     this.telemetryRefreshInterval = null;
     this.viewportSyncFrame = 0;
     this.viewportFocusTimer = null;
+    // Tallest resting visible height per orientation ("portrait" /
+    // "landscape"); keyboard detection measures drops against it.
+    this.viewportBaselines = {};
+    this.viewportLayoutKey = "";
     this.notificationMode =
       settingsDefaults["notifications.soundMode"] || "unfocused";
     this.notificationSound = settingsDefaults["notifications.sound"] || "chime";
@@ -5819,22 +5823,39 @@ class TerminalManager {
   }
 
   setupViewportResizeHandling() {
-    if (!window.visualViewport) return;
-
     const scheduleViewportSync = () => {
       if (this.viewportSyncFrame) return;
       this.viewportSyncFrame = requestAnimationFrame(() => {
         this.viewportSyncFrame = 0;
-        this.handleViewportResize();
+        this.handleViewportResize({ fromViewportEvent: true });
       });
     };
 
+    // Keyboard detection depends on focus as well as on height (a height
+    // drop only counts as a keyboard while an input is focused), and the
+    // Android resizes-content keyboard resizes the layout viewport too.
+    window.addEventListener("resize", scheduleViewportSync);
+    window.addEventListener("orientationchange", scheduleViewportSync);
+    document.addEventListener("focusin", scheduleViewportSync);
+    document.addEventListener("focusout", scheduleViewportSync);
+
     const viewport = window.visualViewport;
-    viewport.addEventListener("resize", scheduleViewportSync);
-    viewport.addEventListener("scroll", scheduleViewportSync);
-    if ("onscrollend" in viewport) {
-      viewport.addEventListener("scrollend", scheduleViewportSync);
+    if (viewport) {
+      viewport.addEventListener("resize", scheduleViewportSync);
+      viewport.addEventListener("scroll", scheduleViewportSync);
+      if ("onscrollend" in viewport) {
+        viewport.addEventListener("scrollend", scheduleViewportSync);
+      }
     }
+    this.handleViewportResize({ fromViewportEvent: true });
+  }
+
+  // Touch-first layouts: phones (mobile chrome) and coarse-pointer tablets.
+  isTouchLayout() {
+    return (
+      platformDetector.isMobile ||
+      (platformDetector.hasTouch && platformDetector.isCoarsePointer)
+    );
   }
 
   setupTerminalRenderRecovery() {
@@ -14948,56 +14969,128 @@ class TerminalManager {
     this.syncFontSizeStepper();
   }
 
-  handleViewportResize() {
-    if (!window.visualViewport) return;
+  // Layout pass for touch devices. Sizes the app shell from the visual
+  // viewport (so the on-screen keyboard really shrinks the terminal instead
+  // of covering it), flags keyboard-open / phone-landscape for the compact
+  // chrome CSS, then re-fits the active terminal and keeps its prompt in
+  // view. Pure decisions live in mobile-layout.js (window.MobileLayout).
+  //
+  // fromViewportEvent: viewport/focus listeners pass true and the pass is
+  // skipped when nothing changed (visualViewport scroll fires often while
+  // panning). Direct callers (extra-keys toggles, action-bar changes) omit
+  // it: their chrome change needs the re-fit even at the same viewport size.
+  handleViewportResize({ fromViewportEvent = false } = {}) {
+    const helpers = window.MobileLayout;
+    if (!helpers) return;
 
     const viewport = window.visualViewport;
-    const windowHeight = window.innerHeight;
-    const viewportHeight = viewport.height;
-    const keyboardHeight = windowHeight - viewportHeight - viewport.offsetTop;
+    const touch = this.isTouchLayout();
+    const orientation = helpers.getOrientation({
+      screenOrientationType: window.screen?.orientation?.type,
+      screenWidth: window.screen?.width,
+      screenHeight: window.screen?.height,
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+    });
+    const layout = helpers.computeViewportLayout({
+      touch,
+      orientation,
+      innerHeight: window.innerHeight,
+      visualHeight: viewport?.height,
+      visualOffsetTop: viewport?.offsetTop,
+      visualScale: viewport?.scale,
+      inputFocused: this.isEditableElementFocused(),
+      baselines: this.viewportBaselines,
+    });
+    this.viewportBaselines = layout.baselines;
 
-    const extraKeys = document.getElementById("extra-keys");
-    const mobileActionBar = document.getElementById("mobile-action-bar");
-    const toolbarHeight = this.toolbar?.offsetHeight || 0;
-    const extraKeysHeight = extraKeys?.offsetHeight || 0;
-    const mobileActionBarHeight =
-      mobileActionBar && getComputedStyle(mobileActionBar).display !== "none"
-        ? mobileActionBar.offsetHeight || 0
-        : 0;
-    const isKeyboardOpen = keyboardHeight > 100;
-
-    if (isKeyboardOpen) {
-      // Show extra keys above virtual keyboard
-      this.extraKeys?.showForKeyboard();
-      extraKeys.style.position = "fixed";
-      extraKeys.style.bottom = `${keyboardHeight}px`;
-      extraKeys.style.left = "0";
-      extraKeys.style.right = "0";
-      extraKeys.style.zIndex = "1000";
-      this.container.style.height = `calc(${viewportHeight}px - ${toolbarHeight}px - ${extraKeysHeight}px - ${mobileActionBarHeight}px)`;
-      document.body.classList.add("virtual-keyboard-open");
+    const root = document.documentElement;
+    const body = document.body;
+    if (layout.appHeight !== null) {
+      root.style.setProperty("--app-vvh", `${layout.appHeight}px`);
+      root.style.setProperty("--app-vv-top", `${layout.appTop}px`);
     } else {
-      // Hide extra keys when keyboard closes (mobile only)
-      this.extraKeys?.hideForKeyboard();
-      extraKeys.style.cssText = "";
-      this.container.style.height = "";
-      document.body.classList.remove("virtual-keyboard-open");
+      root.style.removeProperty("--app-vvh");
+      root.style.removeProperty("--app-vv-top");
     }
+    body.classList.toggle("vv-sized", layout.appHeight !== null);
+    body.classList.toggle("virtual-keyboard-open", layout.keyboardOpen);
+    body.classList.toggle("phone-landscape", layout.phoneLandscape);
+    this.extraKeys?.syncQuickReplies?.({ relayout: false });
 
-    const active = this.terminals.get(this.activeId);
-    if (active) {
-      if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
-      this.viewportFocusTimer = setTimeout(
-        () => {
-          this.focusTerminal(this.activeId, {
-            syncSize: true,
-            scrollToPrompt: isKeyboardOpen || platformDetector.hasTouch,
-          });
-          this.disableMobileKeyboardFeatures(active.element);
-        },
-        isKeyboardOpen ? 50 : 0,
+    const layoutKey = [
+      layout.appHeight,
+      layout.appTop,
+      layout.keyboardOpen,
+      layout.phoneLandscape,
+      this.extraKeys?.quickRepliesEl?.hidden,
+    ].join("|");
+    const changed = layoutKey !== this.viewportLayoutKey;
+    this.viewportLayoutKey = layoutKey;
+    if (fromViewportEvent && !changed) return;
+
+    // Mobile tiles use pixel geometry from the container rect; refresh it so
+    // the tile follows the new shell height (window "resize" alone does not
+    // fire for an iOS keyboard). The tile ResizeObserver then re-fits xterm.
+    if (this.tileManager?.isMobile) {
+      this.tileManager.normalizeWorkspaceTiles(
+        this.tileManager.activeWorkspaceId,
       );
     }
+    this.extraKeys?.updateRowOverflowFades?.();
+
+    const activeId = this.activeId;
+    if (!this.terminals.get(activeId)) return;
+    if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
+    this.viewportFocusTimer = setTimeout(
+      () => {
+        this.viewportFocusTimer = null;
+        const active = this.terminals.get(activeId);
+        if (!active || activeId !== this.activeId) return;
+        const scrollToPrompt = layout.keyboardOpen || platformDetector.hasTouch;
+        if (
+          this.isEditableElementFocused() &&
+          !this.isTerminalInputFocused()
+        ) {
+          // Another input (sheet form, palette) owns focus: re-fit only,
+          // never pull focus back into the terminal.
+          this.fitTerminalState(active);
+          this.syncTerminalSize(activeId);
+          if (scrollToPrompt) this.scrollActiveTerminalToPrompt();
+          return;
+        }
+        this.focusTerminal(activeId, { syncSize: true, scrollToPrompt });
+        this.disableMobileKeyboardFeatures(active.element);
+      },
+      layout.keyboardOpen ? 50 : 0,
+    );
+  }
+
+  isEditableElementFocused() {
+    const el = document.activeElement;
+    if (!el || el === document.body) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const type = String(el.type || "text").toLowerCase();
+    return ![
+      "button",
+      "checkbox",
+      "color",
+      "file",
+      "hidden",
+      "image",
+      "radio",
+      "range",
+      "reset",
+      "submit",
+    ].includes(type);
+  }
+
+  isTerminalInputFocused() {
+    const el = document.activeElement;
+    return Boolean(el?.classList?.contains("xterm-helper-textarea"));
   }
 
   scrollActiveTerminalToPrompt() {

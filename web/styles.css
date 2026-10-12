@@ -3583,28 +3583,93 @@ body.fullscreen #terminal-container {
    VIRTUAL KEYBOARD ADJUSTMENTS
    ============================================================================= */
 
-body.virtual-keyboard-open #terminal-container {
-  transition: height 0.15s ease-out;
+/* Touch devices: the app shell follows the visual viewport (CSS variables
+   set by TerminalManager.handleViewportResize), so an on-screen keyboard
+   shrinks the terminal instead of covering it. 100dvh on #app stays the
+   fallback before the first layout pass and on desktop. */
+body.vv-sized #app {
+  position: fixed;
+  top: var(--app-vv-top, 0px);
+  left: 0;
+  right: 0;
+  height: var(--app-vvh, 100dvh);
+}
+
+/* viewport-fit=cover: keep content out of the notch / rounded corners. */
+#app {
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+body.chrome-mobile .toolbar {
+  padding-top: max(8px, env(safe-area-inset-top, 0px));
+}
+
+/* When the extra keys are the bottom-most bar, clear the home indicator. */
+body.chrome-mobile .extra-keys:has(+ .mobile-action-bar[hidden]),
+body.phone-landscape .extra-keys {
+  padding-bottom: max(6px, env(safe-area-inset-bottom, 0px));
+}
+
+/* Compact chrome while typing (keyboard open) and on phones in landscape:
+   no action bar (the toolbar menu opens the same actions), one key row,
+   tighter toolbar. */
+body.virtual-keyboard-open .mobile-action-bar,
+body.phone-landscape .mobile-action-bar {
+  display: none !important;
+}
+
+body.virtual-keyboard-open .extra-keys .extra-keys-row-2,
+body.phone-landscape .extra-keys .extra-keys-row-2,
+body.virtual-keyboard-open .extra-keys .ek-toggle,
+body.phone-landscape .extra-keys .ek-toggle {
+  display: none !important;
+}
+
+body.chrome-mobile.virtual-keyboard-open .toolbar,
+body.phone-landscape .toolbar {
+  padding-top: max(4px, env(safe-area-inset-top, 0px));
+  padding-bottom: 4px;
+  gap: 6px;
 }
 
 body.virtual-keyboard-open .extra-keys {
-  transition: bottom 0.15s ease-out;
   box-shadow: 0 -4px 20px rgba(0, 0, 0, 0.5);
-  /* Compact bar while virtual keyboard is open */
-  padding: 2px 8px;
-  padding-bottom: calc(2px + env(safe-area-inset-bottom, 0px));
-  padding-right: 40px;
-  gap: 2px;
+  /* The keyboard covers the home indicator: no bottom safe-area here. */
+  padding: 3px 8px;
+  gap: 3px;
 }
 
 body.virtual-keyboard-open .extra-keys .ek-btn {
-  height: 32px;
+  height: 40px;
   padding: 4px 8px;
 }
 
-/* Hide the secondary row while keyboard is open — single minimal strip */
-body.virtual-keyboard-open .extra-keys .extra-keys-row-2 {
+/* Landscape phone with the keyboard up has ~200px left: keys only. */
+body.phone-landscape.virtual-keyboard-open .quick-replies-row {
   display: none !important;
+}
+
+/* Sheets must hide the terminal completely on phones (no text bleeding
+   through translucent surfaces). */
+body.chrome-mobile .task-panel-shell,
+body.chrome-mobile .setup-panel-shell {
+  background: var(--bg-primary);
+}
+
+body.chrome-mobile .tools-sheet-panel,
+body.chrome-mobile .file-explorer-shell {
+  background: linear-gradient(180deg, var(--bg-secondary), var(--bg-primary));
+}
+
+/* A lone pane on a touch layout: its floating close (x) only covers terminal
+   text — the tab already has a close button. Multi-pane workspaces keep it
+   (it closes one pane), and an open close-confirmation stays reachable. */
+@media (pointer: coarse) {
+  .tile:not(.workspace-multi-pane):not(.close-confirm-open)
+    .tile-close-container {
+    display: none;
+  }
 }
 
 /* =============================================================================
