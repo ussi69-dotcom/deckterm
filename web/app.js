@@ -10065,6 +10065,19 @@ class TerminalManager {
       }
     });
 
+    // The controller closes itself on Escape and after running a command,
+    // bypassing closeCommandPalette(); follow the root's visibility so the
+    // toolbar Palette button never stays lit on a closed palette.
+    if (typeof MutationObserver === "function") {
+      let wasOpen = !root.classList.contains("hidden");
+      new MutationObserver(() => {
+        const isOpen = !root.classList.contains("hidden");
+        if (isOpen === wasOpen) return;
+        wasOpen = isOpen;
+        this.syncSurfaceButtonState();
+      }).observe(root, { attributes: true, attributeFilter: ["class"] });
+    }
+
     this.registerCommandPaletteActions();
   }
 
