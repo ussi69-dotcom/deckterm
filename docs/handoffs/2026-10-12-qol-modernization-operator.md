@@ -58,7 +58,10 @@ Wave 2 (after wave 1 merges): desktop polish (z-order P1, empty-state launcher, 
 - Wave 2 running: workflow `deckterm-qol-wave2` run `wf_3a7d8243-b5d` (task wnvlfx7iq), worktrees from `cc327b8`, ports 4292-4296, state dirs `/tmp/claude-1001/w2*`.
 - Full e2e on dev (wave 1 state): 174 pass / 9 fail → e2e-fix agent (background, main checkout, commits on `dev`: 3164a6e, ef8e4f4, 58d43b9, 2cecd94 …) fixing git-panel spec repo fixture, tab copy vs close, extra-keys selector scope, Settings focus/keyboard heuristic, cwd-contract specs.
 - Wave 2 done (5 slices). Merged in integration worktree `/home/deploy/deckterm-qol/integration` (branch `qol/integration`, from dev incl. early e2e-fix commits) — all auto-merged; tests wired `921d1a7`. Running there: unit+push gate (bx9pqbguw), Codex review `--base=b001e23` → `codex-review-w2.md` (bnyzhp0ci), adversarial review workflow `deckterm-qol-review` run `wf_55c0a587-055` (w0j67iuzf).
-- After the e2e-fix agent finishes: merge `qol/integration` into `dev` in the main checkout, restart dev, full e2e, fix review findings, after-screenshots.
+- e2e-fix agent done: full e2e 184/184 on dev (commits 3164a6e..03946c9; 3 product fixes). Trade-off to report: under tmux, commands shorter than ~2 s may not show "running"/"Command finished" (2 s sync TTL / pipe pump).
+- `qol/integration` merged into dev as `0f79496`; unit 1554/0, tsc 0; dev restarted 21:45 UTC (session preserved), pushed to origin/dev. Full e2e on this state running (`gate/e2e-full-dev2.log`).
+- Adversarial review (`wf_55c0a587-055`): 12 confirmed, 0 refuted, no P1; 5 unverified P3. Fix workflow `deckterm-qol-fixes` run `wf_d57c0e0b-073` (task w5c2cowa5): worktrees qol/fix-frontend (R1-4,R6,R9,R10,U0), qol/fix-backend (R0,R7,R8,U4 + git read-only hardening), qol/fix-ui (R5,R11,U1-U3) from `0f79496`. Payload: scratchpad `findings-for-fix.json`.
+- Then: merge fixes, gate, restart, full e2e, after-screenshot visual pass (desktop+mobile) vs discovery, KB sync, owner report.
 
 ## Next triggers
 
