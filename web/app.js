@@ -503,6 +503,12 @@ class ReconnectingWebSocket {
     this.reconnectGeneration = 0;
     this.openedOnce = false;
     this.awaitingReconnectReady = false;
+    // Input typed while the transport is connecting/reconnecting is held here
+    // (bounded: 8 KB / 15 s) and flushed in order once the connection is
+    // ready, instead of being silently dropped. Never replayed after an
+    // intentional close or after the terminal ended.
+    this.inputQueue = window.InputQueue ? new window.InputQueue() : null;
+    this.inputQueueTimer = null;
     this.connect();
   }
 
@@ -576,6 +582,7 @@ class ReconnectingWebSocket {
         if (data.type === "exit") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("exited", data.code);
           return;
@@ -583,6 +590,7 @@ class ReconnectingWebSocket {
         if (data.type === "terminal_dead") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("dead");
           return;
@@ -590,6 +598,7 @@ class ReconnectingWebSocket {
         if (data.type === "session_handoff") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("taken_over", data);
           socket.close();
@@ -628,6 +637,7 @@ class ReconnectingWebSocket {
     }
     if (this.retryCount >= this.maxRetries) {
       this.awaitingReconnectReady = false;
+      this.discardQueuedInput({ notify: true });
       this.callbacks.onStatusChange("failed");
       return;
     }
@@ -666,12 +676,14 @@ class ReconnectingWebSocket {
         if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("dead");
           return;
         }
         if (outcome === "blocked") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("setup_required");
           return;
         }
@@ -762,8 +774,73 @@ class ReconnectingWebSocket {
     return false;
   }
 
+  // Send terminal input, queueing it while the transport is not ready. Input
+  // already queued keeps its place: new input goes behind it until the flush,
+  // so keystrokes never reorder. Returns true when the input was sent or
+  // queued, false when it was refused (closed or ended terminal).
+  sendInput(data) {
+    if (typeof data !== "string" || !data) return false;
+    const queue = this.inputQueue;
+    const canSendNow =
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(queue && queue.length > 0);
+    if (canSendNow || !queue) {
+      return this.send(JSON.stringify({ type: "input", data }));
+    }
+    if (this.intentionallyClosed) return false;
+    const dropped = queue.push(data);
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    this.scheduleQueuedInputExpiry();
+    // A queued chunk behind an already-open socket (e.g. typed during a
+    // reconnect replay) still flushes once the server says ready.
+    return true;
+  }
+
+  flushQueuedInput(socket = this.ws) {
+    const queue = this.inputQueue;
+    if (!queue || queue.length === 0) return;
+    if (
+      !this.isCurrentSocket(socket) ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    this.clearQueuedInputExpiry();
+    const { items, dropped } = queue.drain();
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    for (const data of items) {
+      socket.send(JSON.stringify({ type: "input", data }));
+    }
+  }
+
+  discardQueuedInput({ notify = false } = {}) {
+    this.clearQueuedInputExpiry();
+    const discarded = this.inputQueue?.clear() || 0;
+    if (notify && discarded > 0) this.callbacks.onInputDropped?.(discarded);
+    return discarded;
+  }
+
+  scheduleQueuedInputExpiry() {
+    if (this.inputQueueTimer) return;
+    const waitMs = this.inputQueue?.msUntilNextExpiry();
+    if (waitMs === null || waitMs === undefined) return;
+    this.inputQueueTimer = setTimeout(() => {
+      this.inputQueueTimer = null;
+      const dropped = this.inputQueue?.prune() || 0;
+      if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+      this.scheduleQueuedInputExpiry();
+    }, waitMs + 50);
+  }
+
+  clearQueuedInputExpiry() {
+    clearTimeout(this.inputQueueTimer);
+    this.inputQueueTimer = null;
+  }
+
   close() {
     this.intentionallyClosed = true;
+    // The user closed this terminal: never replay what was typed into it.
+    this.discardQueuedInput();
     this.stopHeartbeat();
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
@@ -806,6 +883,9 @@ class ReconnectingWebSocket {
       "connected",
       resumed ? { resumed: true } : {},
     );
+    // Flush after the status handshake (reconnects: after the replay and the
+    // resize the client sent on replay-complete).
+    this.flushQueuedInput(socket);
   }
 
   startHeartbeat(socket = this.ws) {
@@ -12712,6 +12792,7 @@ class TerminalManager {
       onTerminalState: (message) => {
         this.applyTerminalRuntimeState(id, message);
       },
+      onInputDropped: () => this.showInputDroppedNotice(id),
       getReconnectBehavior: () => this.reconnectBehavior,
     });
 
@@ -12725,7 +12806,7 @@ class TerminalManager {
       if (inputState.pasteDepth > 0) {
         inputState.lastOnDataAt = performance.now();
         inputState.lastOnDataValue = data;
-        ws.send(JSON.stringify({ type: "input", data }));
+        ws.sendInput(data);
         return;
       }
 
@@ -12738,7 +12819,7 @@ class TerminalManager {
       inputState.lastOnDataAt = performance.now();
       inputState.lastOnDataValue = dedupedData;
       const finalData = this.applyExtraKeyModifiers(dedupedData);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
     });
 
     const inputFallbackCleanup = this.attachMobileInputFallback(
@@ -13031,7 +13112,7 @@ class TerminalManager {
       this.rememberFallbackEcho(inputState, data);
 
       const finalData = this.applyExtraKeyModifiers(data);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
 
       if (DEBUG) {
         dbg("[ExtraKeys] mobile input fallback:", {
@@ -13842,6 +13923,30 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
+  // Brief per-tile notice when input typed during a connect/reconnect could
+  // not be delivered (queue bound hit, input too old, or the terminal ended
+  // before the connection came back).
+  showInputDroppedNotice(id) {
+    const t = this.terminals.get(id);
+    const host = t?.element?.parentElement;
+    if (!t || t.disposed || !host) return;
+    let notice = t.inputDroppedNotice;
+    if (!notice || !notice.isConnected) {
+      notice = document.createElement("div");
+      notice.className = "tile-input-dropped";
+      notice.setAttribute("role", "status");
+      notice.setAttribute("aria-live", "polite");
+      notice.textContent = "Input not sent — connection was down";
+      host.appendChild(notice);
+      t.inputDroppedNotice = notice;
+    }
+    notice.classList.add("visible");
+    clearTimeout(t.inputDroppedTimer);
+    t.inputDroppedTimer = setTimeout(() => {
+      notice.classList.remove("visible");
+    }, 4000);
+  }
+
   performReconnectLayoutSync(
     id,
     { forceResize = false, scrollToPrompt = false } = {},
@@ -14191,6 +14296,7 @@ class TerminalManager {
           onLifecycle: (message) => this.handleReconnectLifecycle(id, message),
           onTerminalState: (message) =>
             this.applyTerminalRuntimeState(id, message),
+          onInputDropped: () => this.showInputDroppedNotice(id),
           getReconnectBehavior: () => this.reconnectBehavior,
         },
       );
@@ -14206,7 +14312,7 @@ class TerminalManager {
         if (inputState.pasteDepth > 0) {
           inputState.lastOnDataAt = performance.now();
           inputState.lastOnDataValue = data;
-          ws.send(JSON.stringify({ type: "input", data }));
+          ws.sendInput(data);
           return;
         }
 
@@ -14225,7 +14331,7 @@ class TerminalManager {
         const finalData = this.applyExtraKeyModifiers(dedupedData, {
           log: true,
         });
-        ws.send(JSON.stringify({ type: "input", data: finalData }));
+        ws.sendInput(finalData);
       });
 
       const inputFallbackCleanup = this.attachMobileInputFallback(

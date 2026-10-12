@@ -8303,3 +8303,73 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
       0 0 0 1px rgba(255, 255, 255, 0.03) inset;
   }
 }
+
+/* =============================================================================
+   TERMINAL RELIABILITY (qol/terminal-reliability)
+   - connecting chip: small per-tile status while the terminal socket is not
+     ready. Driven by the existing tile data-connection-status attribute; it
+     appears after a short delay so normal sub-second connects do not flash.
+   - input-dropped notice: shown when input typed while disconnected could not
+     be delivered.
+   ============================================================================= */
+.tile[data-connection-status="connecting"]::after,
+.tile[data-connection-status="reconnecting"]::after {
+  content: "Connecting…";
+  position: absolute;
+  top: 8px;
+  /* Clear the pane's detach/close buttons in the top-right corner. */
+  right: 72px;
+  z-index: 25;
+  padding: 2px 8px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  background: rgba(22, 27, 34, 0.92);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+  pointer-events: none;
+  opacity: 0;
+  animation: tile-connecting-chip-in 0.15s ease-out 0.4s forwards;
+}
+
+.tile[data-connection-status="reconnecting"]::after {
+  content: "Reconnecting…";
+}
+
+@keyframes tile-connecting-chip-in {
+  to {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tile[data-connection-status="connecting"]::after,
+  .tile[data-connection-status="reconnecting"]::after {
+    animation-duration: 0s;
+  }
+}
+
+.tile-input-dropped {
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  /* Above the reconnect/ended overlay (z-index 50) so it stays readable. */
+  z-index: 60;
+  max-width: calc(100% - 24px);
+  padding: 6px 12px;
+  border: 1px solid var(--accent-yellow, #d29922);
+  border-radius: 6px;
+  background: rgba(22, 27, 34, 0.95);
+  color: var(--text-primary);
+  font-size: 12px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.tile-input-dropped.visible {
+  opacity: 1;
+}
+
+/* ===== end TERMINAL RELIABILITY ===== */
