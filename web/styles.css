@@ -1030,6 +1030,14 @@ body {
   white-space: nowrap;
 }
 
+/* Touch layouts have no keyboard to speak of: drop the key hints there. */
+@media (hover: none) and (pointer: coarse) {
+  .launcher-shortcuts,
+  .launcher-new .launcher-keys {
+    display: none;
+  }
+}
+
 .launcher-keys kbd {
   display: inline-block;
   min-width: 18px;
