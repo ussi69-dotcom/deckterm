@@ -10528,6 +10528,9 @@ class TerminalManager {
     if (this.telemetryRefreshPromise) return this.telemetryRefreshPromise;
     this.telemetryRefreshPromise = (async () => {
       try {
+        // Lets a cwd learned while this poll is in flight (OSC 7) win over
+        // the older server snapshot.
+        const requestStartedAt = Date.now();
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
@@ -10559,12 +10562,18 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
-          const hasClientCwd =
-            typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
-          if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
-            terminal.cwd = next.cwd;
-            this.sessionRegistry.update(id, { cwd: next.cwd });
-          }
+          // Under tmux the server reads the pane's live cwd on every poll, so
+          // it is authoritative (bash emits no OSC 7 and tmux would not
+          // forward it). The raw backend only knows the spawn cwd, so there
+          // it just fills a missing client cwd.
+          const liveCwd = window.LiveCwd?.resolveServerLiveCwd?.({
+            clientCwd: terminal.cwd,
+            serverCwd: next.cwd,
+            backendMode: next.backendMode || terminal.backendMode,
+            clientCwdUpdatedAt: terminal.cwdUpdatedAt || 0,
+            requestStartedAt,
+          });
+          if (liveCwd) this.applyLiveCwd(id, liveCwd);
         });
 
         this.updateTabGroups();
@@ -10975,19 +10984,62 @@ class TerminalManager {
     return terminal.parser.registerOscHandler(7, (data) => {
       const cwd = this.parseOsc7Cwd(data);
       if (!cwd) return false;
-      const t = this.terminals.get(id);
-      if (!t) return true;
-      t.cwd = cwd;
-      if (t.workspaceId && this.activeId === id) {
-        this.setDirectoryValue(cwd);
-        this.updateWorkspaceLabel(t.workspaceId, cwd);
-        this.rememberWorkspaceById(t.workspaceId, cwd);
-      }
-      this.updateTabGroups();
-      // Update session registry with new cwd
-      this.sessionRegistry.update(id, { cwd });
+      this.applyLiveCwd(id, cwd);
       if (DEBUG) dbg("osc7 cwd", { id, cwd });
       return true;
+    });
+  }
+
+  // One path for every live cwd change (OSC 7 from the shell, or the server's
+  // tmux pane cwd from the telemetry poll): tab/workspace label, session
+  // registry and — for the active terminal — the working-directory field and
+  // the Files/Git surfaces that follow it. The field keeps a draft the user
+  // is editing (setDirectoryValue's draft lock).
+  applyLiveCwd(id, cwd) {
+    const t = this.terminals.get(id);
+    if (!t || t.disposed || typeof cwd !== "string" || !cwd) return false;
+    const previousCwd = t.cwd;
+    t.cwdUpdatedAt = Date.now();
+    if (previousCwd === cwd) return false;
+    t.cwd = cwd;
+    if (t.workspaceId && this.activeId === id) {
+      this.setDirectoryValue(cwd);
+      this.updateWorkspaceLabel(t.workspaceId, cwd);
+      this.rememberWorkspaceById(t.workspaceId, cwd);
+      this.followLiveCwdInSurfaces(t.workspaceId, previousCwd, cwd);
+    }
+    this.updateTabGroups();
+    this.sessionRegistry.update(id, { cwd });
+    return true;
+  }
+
+  // Move the Files explorer (and with it the Git panel, which resolves its
+  // cwd from the explorer first) to the new cwd — but only while it still
+  // shows the terminal's previous cwd. A user who navigated the explorer
+  // elsewhere keeps their place.
+  followLiveCwdInSurfaces(workspaceId, previousCwd, cwd) {
+    const explorer = this.fileExplorer;
+    const explorerPath =
+      explorer && explorer.currentWorkspaceId === workspaceId
+        ? explorer.currentPath
+        : null;
+    if (
+      !window.LiveCwd?.shouldSurfaceFollowCwd?.({
+        surfacePath: explorerPath,
+        previousCwd,
+      })
+    ) {
+      return;
+    }
+    if (explorerPath) {
+      // loadDir records the new path synchronously, so the git refresh
+      // below already resolves the new cwd through getGitCwd().
+      Promise.resolve(explorer.loadDir(cwd, workspaceId)).catch((err) => {
+        if (DEBUG) dbg("live cwd explorer follow failed", err);
+      });
+    }
+    Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
+      if (DEBUG) dbg("live cwd git refresh failed", err);
     });
   }
 
