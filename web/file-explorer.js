@@ -1,21 +1,67 @@
 const FILE_EXPLORER_MOBILE_BREAKPOINT = 768;
 
-const FILE_ICONS = {
-  js: "📜",
-  ts: "📜",
-  json: "📋",
-  md: "📝",
-  txt: "📝",
-  html: "🌐",
-  css: "🎨",
-  png: "🖼",
-  jpg: "🖼",
-  jpeg: "🖼",
-  pdf: "📕",
-  zip: "📦",
-  sh: "⚙️",
-  py: "🐍",
+// Lucide icon per file type (a deliberately small map — the icon is a cue,
+// not a language detector). Keys are lower-cased extensions or, for
+// extension-less conventional names, the whole lower-cased file name.
+const FILE_ICON_GROUPS = {
+  "file-code": [
+    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "py", "rb", "go",
+    "rs", "java", "kt", "swift", "c", "h", "cc", "cpp", "hpp", "cs", "php",
+    "lua", "pl", "r", "scala", "dart", "zig", "html", "htm", "css", "scss",
+    "sass", "less", "vue", "svelte", "sql", "graphql", "xml", "dockerfile",
+  ],
+  "file-json": [
+    "json", "jsonc", "json5", "yaml", "yml", "toml", "ini", "conf", "cfg",
+    "lock", "webmanifest",
+  ],
+  "file-text": ["md", "mdx", "txt", "rst", "log", "csv", "tsv", "pdf", "adoc"],
+  image: [
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "avif", "tif",
+    "tiff",
+  ],
+  archive: ["zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "deb", "rpm"],
+  terminal: [
+    "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "makefile", "bashrc",
+    "zshrc", "profile", "bash_profile", "envrc",
+  ],
 };
+
+const FILE_ICON_BY_KEY = Object.fromEntries(
+  Object.entries(FILE_ICON_GROUPS).flatMap(([icon, keys]) =>
+    keys.map((key) => [key, icon]),
+  ),
+);
+
+function fileIconName(item) {
+  if (item?.isParent) return "folder-up";
+  if (item?.isDir) return "folder";
+  const name = String(item?.name || "").toLowerCase();
+  if (!name) return "file";
+  const dot = name.lastIndexOf(".");
+  const ext = dot >= 0 ? name.slice(dot + 1) : "";
+  return FILE_ICON_BY_KEY[ext] || FILE_ICON_BY_KEY[name] || "file";
+}
+
+// Swap the <i data-lucide> placeholders inside `root` for SVGs. Scoped to
+// `root` so a re-render never re-scans the whole document; decorative, so a
+// missing library or icon name is ignored.
+function renderLucideIcons(root) {
+  if (!root || typeof window === "undefined" || !window.lucide?.createIcons) {
+    return;
+  }
+  try {
+    window.lucide.createIcons({ root });
+  } catch {
+    // decorative only
+  }
+}
+
+function createIconElement(name) {
+  const icon = document.createElement("i");
+  icon.setAttribute("data-lucide", name);
+  icon.setAttribute("aria-hidden", "true");
+  return icon;
+}
 
 function normalizeExplorerPath(value) {
   const next = String(value || "").trim();
@@ -205,14 +251,19 @@ function formatFileSize(bytes) {
   return resolveFormatByteSize()(nextBytes);
 }
 
-function getItemIcon(item) {
-  if (item?.isDir) return "📁";
-  const ext =
-    String(item?.name || "")
-      .split(".")
-      .pop()
-      ?.toLowerCase() || "";
-  return FILE_ICONS[ext] || "📄";
+// Keep the root crumb and the deepest `maxVisible - 2` crumbs; everything in
+// between collapses into one non-interactive ellipsis entry whose `path` is
+// the deepest hidden folder (shown as its tooltip).
+function compactBreadcrumbs(crumbs, maxVisible = 4) {
+  const list = Array.isArray(crumbs) ? crumbs : [];
+  if (list.length <= maxVisible) return list;
+  const tailCount = Math.max(1, maxVisible - 2);
+  const hidden = list.slice(1, list.length - tailCount);
+  return [
+    list[0],
+    { label: "…", path: hidden[hidden.length - 1].path, ellipsis: true },
+    ...list.slice(list.length - tailCount),
+  ];
 }
 
 class FileExplorerController {
@@ -461,14 +512,20 @@ class FileExplorerController {
       this.trashButtonEl = document.createElement("button");
       this.trashButtonEl.type = "button";
       this.trashButtonEl.id = "file-explorer-trash-btn";
-      this.trashButtonEl.className = "btn btn-secondary";
-      this.trashButtonEl.textContent = "Trash";
+      this.trashButtonEl.className = "btn-icon file-explorer-action";
+      this.trashButtonEl.title = "Trash";
+      this.trashButtonEl.setAttribute("aria-label", "Trash");
+      this.trashButtonEl.appendChild(createIconElement("trash-2"));
       this.trashButtonEl.addEventListener("click", () => void this.openTrash());
       toolbar.appendChild(this.trashButtonEl);
+      renderLucideIcons(toolbar);
       this.fileNoticeEl = document.createElement("div");
       this.fileNoticeEl.className = "file-operation-notice";
       this.fileNoticeEl.hidden = true;
-      toolbar.after(this.fileNoticeEl);
+      // The notice spans the full width below the breadcrumb/actions bar.
+      (toolbar.closest?.(".file-explorer-bar") || toolbar).after(
+        this.fileNoticeEl,
+      );
     }
 
     const closeSelectors = [
@@ -798,11 +855,25 @@ class FileExplorerController {
         // points to a navigable (in-root) path. breadcrumbSegments() emits only
         // segments at or below the root — never "/" or "home" etc. above it.
         const rootPath = snapshot.rootPath || snapshot.path;
-        const crumbs = breadcrumbSegments(snapshot.path, rootPath);
+        const allCrumbs = breadcrumbSegments(snapshot.path, rootPath);
+        const crumbs = compactBreadcrumbs(allCrumbs, 4);
 
         crumbs.forEach((crumb, i) => {
           if (i > 0) {
-            this.breadcrumbEl.appendChild(document.createTextNode(" / "));
+            const separator = document.createElement("span");
+            separator.className = "file-breadcrumb-separator";
+            separator.setAttribute("aria-hidden", "true");
+            separator.textContent = "/";
+            this.breadcrumbEl.appendChild(separator);
+          }
+          if (crumb.ellipsis) {
+            const ellipsis = document.createElement("span");
+            ellipsis.className = "file-breadcrumb-ellipsis";
+            ellipsis.textContent = crumb.label;
+            ellipsis.title = crumb.path;
+            ellipsis.setAttribute("aria-hidden", "true");
+            this.breadcrumbEl.appendChild(ellipsis);
+            return;
           }
           const link = document.createElement("button");
           link.type = "button";
@@ -810,6 +881,7 @@ class FileExplorerController {
           link.textContent = crumb.label;
           link.dataset.path = crumb.path;
           link.setAttribute("aria-label", `Open folder ${crumb.label}`);
+          link.title = crumb.path;
           if (i === crumbs.length - 1)
             link.setAttribute("aria-current", "location");
           // Capture crumb.path in a const so the closure captures the right value.
@@ -888,6 +960,7 @@ class FileExplorerController {
         snapshot.items.forEach((item) => {
           this.listEl.appendChild(this.createItemElement(item, snapshot));
         });
+        renderLucideIcons(this.listEl);
       }
       const pending = this.pendingListFocus;
       if (pending && pending.workspaceId !== snapshot.workspaceId) {
@@ -964,8 +1037,8 @@ class FileExplorerController {
 
     const iconEl = document.createElement("span");
     iconEl.className = "file-icon";
-    iconEl.textContent = getItemIcon(item);
     iconEl.setAttribute("aria-hidden", "true");
+    iconEl.appendChild(createIconElement(fileIconName(item)));
 
     const nameEl = document.createElement("button");
     nameEl.type = "button";
@@ -1063,7 +1136,7 @@ class FileExplorerController {
       editBtn.type = "button";
       editBtn.className = "edit";
       editBtn.title = "Edit";
-      editBtn.textContent = "✎";
+      editBtn.appendChild(createIconElement("square-pen"));
       // The edit button is a single explicit open → PREVIEW (VS Code: a single
       // open action previews; editing or a double-click pins it).
       editBtn.addEventListener("click", (event) => {
@@ -1078,7 +1151,7 @@ class FileExplorerController {
       downloadBtn.type = "button";
       downloadBtn.className = "download";
       downloadBtn.title = "Download";
-      downloadBtn.textContent = "⬇";
+      downloadBtn.appendChild(createIconElement("download"));
       downloadBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         this.downloadFile(item.path);
@@ -1092,7 +1165,7 @@ class FileExplorerController {
       renameBtn.type = "button";
       renameBtn.className = "rename";
       renameBtn.title = "Rename";
-      renameBtn.textContent = "✏";
+      renameBtn.appendChild(createIconElement("text-cursor-input"));
       renameBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         void this.renameItem(item);
@@ -1105,7 +1178,7 @@ class FileExplorerController {
       deleteBtn.type = "button";
       deleteBtn.className = "delete danger";
       deleteBtn.title = "Delete";
-      deleteBtn.textContent = "🗑";
+      deleteBtn.appendChild(createIconElement("trash-2"));
       deleteBtn.addEventListener("click", (event) => {
         event.stopPropagation();
         void this.deleteItem(item.path, item.isDir);
@@ -2203,6 +2276,8 @@ const FileExplorerModule = {
   FileExplorerController,
   resolveFileExplorerMode,
   breadcrumbSegments,
+  compactBreadcrumbs,
+  fileIconName,
 };
 
 if (typeof window !== "undefined") {
@@ -2218,4 +2293,6 @@ if (typeof exports !== "undefined") {
   exports.FileExplorerController = FileExplorerController;
   exports.resolveFileExplorerMode = resolveFileExplorerMode;
   exports.breadcrumbSegments = breadcrumbSegments;
+  exports.compactBreadcrumbs = compactBreadcrumbs;
+  exports.fileIconName = fileIconName;
 }

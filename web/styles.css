@@ -2836,11 +2836,9 @@ body.touch-input-mode .xterm .composition-view.active {
   min-width: 320px;
   height: calc(100vh - var(--toolbar-height) - 28px);
   pointer-events: auto;
-  border: 1px solid rgba(48, 54, 61, 0.92);
-  border-radius: 24px;
-  background:
-    linear-gradient(180deg, rgba(88, 166, 255, 0.06), rgba(13, 17, 23, 0) 18%),
-    linear-gradient(180deg, rgba(22, 27, 34, 0.98), rgba(13, 17, 23, 0.98));
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-secondary);
   box-shadow:
     0 24px 60px rgba(0, 0, 0, 0.45),
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
@@ -2849,74 +2847,101 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .file-explorer-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.file-explorer-kicker {
-  color: var(--accent-blue);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  margin-bottom: 6px;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
 .file-explorer-header h3 {
   margin: 0;
-  font-size: 22px;
-  line-height: 1.1;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
-.file-explorer-header-actions {
+/* Breadcrumb + compact icon actions share one row. */
+.file-explorer-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
+  min-height: 34px;
+  padding: 3px 4px 3px 8px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
-.file-explorer-path-hint {
-  display: inline-flex;
+.file-explorer-breadcrumb.breadcrumb {
+  display: flex;
+  flex: 1 1 auto;
   align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 600;
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  background: none;
+  border-bottom: none;
+  font-size: 12px;
   white-space: nowrap;
 }
 
-.file-explorer-breadcrumb {
-  background: rgba(255, 255, 255, 0.03);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.file-explorer-breadcrumb span {
+.file-explorer-breadcrumb > span {
   color: var(--text-secondary);
 }
 
-.file-explorer-toolbar {
-  padding: 12px 16px;
-  gap: 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+.file-explorer-breadcrumb .file-breadcrumb-button {
+  flex: 0 1 auto;
+  min-width: 2ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.file-explorer-toolbar .btn {
-  flex: 1 1 auto;
-  min-width: 0;
+/* The current folder keeps its name readable; ancestors give way first. */
+.file-explorer-breadcrumb .file-breadcrumb-button[aria-current="location"] {
+  flex-shrink: 0;
+  max-width: 70%;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.file-breadcrumb-separator,
+.file-breadcrumb-ellipsis {
+  flex: 0 0 auto;
+  padding: 0 2px;
+  color: var(--text-muted);
+}
+
+.file-explorer-toolbar.file-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: 0;
+  padding: 0;
+  border-bottom: none;
+}
+
+.file-explorer-action.btn-icon {
+  width: 26px;
+  height: 26px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.file-explorer-action.btn-icon:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.file-explorer-action.btn-icon svg {
+  width: 16px;
+  height: 16px;
 }
 
 .file-explorer-list {
   flex: 1;
   min-height: 0;
   max-height: none;
-  padding: 16px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0)),
-    transparent;
+  padding: 4px;
 }
 
 /* #file-explorer-list also carries the shared `.file-list` class (used by a
@@ -2933,38 +2958,27 @@ body.touch-input-mode .xterm .composition-view.active {
 .file-explorer-empty {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 16px;
+  gap: 6px;
+  margin: 8px 6px;
+  padding: 12px;
   border: 1px dashed rgba(139, 148, 158, 0.28);
-  border-radius: 16px;
-  background: rgba(22, 27, 34, 0.62);
+  border-radius: 8px;
   color: var(--text-secondary);
   line-height: 1.5;
 }
 
 .file-explorer-empty strong {
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .file-explorer-empty span {
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .file-explorer-drop-zone {
   inset: 16px;
-  border-radius: 20px;
-}
-
-.file-explorer-footer {
-  display: none;
-  padding: 14px 16px calc(18px + env(safe-area-inset-bottom, 0px));
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(13, 17, 23, 0.82);
-}
-
-.file-explorer-footer .btn {
-  width: 100%;
+  border-radius: 12px;
 }
 
 /* =============================================================================
@@ -3726,11 +3740,13 @@ body.touch-input-mode .xterm .composition-view.active {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 6px;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 4px 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .file-item:hover {
@@ -3739,17 +3755,32 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .file-item.selected {
   background: rgba(88, 166, 255, 0.14);
-  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-color: rgba(88, 166, 255, 0.35);
 }
 
 .file-item .file-icon {
-  font-size: 18px;
-  width: 24px;
-  text-align: center;
+  display: inline-flex;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.file-item .file-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+}
+
+.file-item.is-dir .file-icon {
+  color: #d9a441;
 }
 
 .file-item .file-name {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 3ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3760,24 +3791,17 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .file-item .file-size {
-  font-size: 12px;
+  flex: 0 0 auto;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
+/* Row actions sit in the row's flow AFTER the filename (never on top of
+   it): the name only ellipsizes to make room while they are shown. */
 .file-item .file-actions {
   display: none;
-  gap: 4px;
-  /* Overlay, not flex flow: 4 non-shrinking buttons in the row's flex flow
-     forced .file-name (flex:1, basis 0%) down to a sliver ("o.") once the
-     row got narrow. Positioning them out-of-flow means the name keeps the
-     row's full width and only visually cedes space on hover/focus. */
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  background: var(--bg-tertiary);
-  padding: 2px 4px;
-  border-radius: 4px;
+  flex: 0 0 auto;
+  gap: 1px;
 }
 
 .file-item:hover .file-actions,
@@ -3785,21 +3809,28 @@ body.touch-input-mode .xterm .composition-view.active {
   display: flex;
 }
 
-/* Actions overlay the size column too, so hide it out of the way rather than
-   let it collide with the buttons. */
 .file-item:hover .file-size,
 .file-item:focus-within .file-size {
   display: none;
 }
 
 .file-item .file-actions button {
-  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   background: transparent;
-  border: 1px solid var(--border-primary);
+  border: 1px solid transparent;
   border-radius: 4px;
-  color: var(--text-muted);
-  font-size: 12px;
+  color: var(--text-secondary);
   cursor: pointer;
+}
+
+.file-item .file-actions button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .file-item .file-actions button:hover {
@@ -3811,6 +3842,27 @@ body.touch-input-mode .xterm .composition-view.active {
   background: rgba(248, 81, 73, 0.2);
   border-color: var(--accent-red);
   color: var(--accent-red);
+}
+
+/* Touch: 44px rows and targets. */
+@media (pointer: coarse) {
+  .file-item {
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .file-item .file-actions button,
+  .file-explorer-action.btn-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .file-item .file-icon,
+  .file-item .file-icon svg {
+    width: 18px;
+    height: 18px;
+    flex-basis: 18px;
+  }
 }
 
 .file-drop-zone {
@@ -4326,19 +4378,19 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   .file-explorer-header {
-    padding: 18px 16px 14px;
+    padding: calc(6px + env(safe-area-inset-top, 0px)) 6px 6px 16px;
   }
 
   .file-explorer-header h3 {
-    font-size: 24px;
+    font-size: 17px;
   }
 
-  .file-explorer-path-hint {
-    display: none;
+  .file-explorer-bar {
+    padding-left: 12px;
   }
 
-  .file-explorer-footer {
-    display: block;
+  .file-explorer-list {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
   }
 
   .tools-sheet-panel {
