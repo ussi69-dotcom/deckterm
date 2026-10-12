@@ -674,37 +674,41 @@
       >
         <div class="command-palette-panel">
           <div class="command-palette-header">
-            <div class="command-palette-title-row">
-              <span id="command-palette-title" class="command-palette-kicker"
-                >Command palette</span
-              >
-              <span class="command-palette-shortcut">Ctrl+Shift+P</span>
+            <span id="command-palette-title" class="command-palette-title"
+              >Command palette</span
+            >
+            <div class="command-palette-search">
+              <i
+                data-lucide="search"
+                class="command-palette-search-icon"
+                aria-hidden="true"
+              ></i>
+              <input
+                id="command-palette-input"
+                aria-label="Search commands, files, and workspaces"
+                type="text"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                enterkeyhint="go"
+                placeholder="Search commands and files"
+              />
             </div>
-            <input
-              id="command-palette-input"
-              aria-label="Search commands, files, and workspaces"
-              type="text"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="Search actions, workspaces, and views..."
-            />
           </div>
           <div
             id="command-palette-results"
             class="command-palette-results"
             role="listbox"
             aria-label="Command palette results"
-          >
-            <div class="command-palette-section">
-              <div class="command-palette-section-label">Actions</div>
-              <div class="command-palette-empty">
-                Start typing to filter actions, workspaces, and view toggles.
-              </div>
-            </div>
-          </div>
-          <div class="command-palette-footer">
-            <span>Enter to run</span>
-            <span>Esc to close</span>
+          ></div>
+          <div class="command-palette-footer" aria-hidden="true">
+            <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+            <span><kbd>Enter</kbd> run</span>
+            <span><kbd>Esc</kbd> close</span>
+            <span class="command-palette-modes"
+              ><kbd>@</kbd> sessions <kbd>$</kbd> commands <kbd>/</kbd>
+              folders</span
+            >
           </div>
         </div>
       </div>

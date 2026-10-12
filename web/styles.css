@@ -3286,9 +3286,9 @@ body.touch-input-mode .xterm .composition-view.active {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: clamp(28px, 8vh, 84px) 16px 24px;
-  background: rgba(3, 7, 12, 0.58);
-  backdrop-filter: blur(12px);
+  padding: clamp(24px, 8vh, 80px) 16px 24px;
+  background: rgba(3, 7, 12, 0.5);
+  backdrop-filter: blur(6px);
 }
 
 .command-palette.hidden {
@@ -3296,123 +3296,134 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .command-palette-panel {
-  width: min(720px, 100%);
+  width: min(680px, 100%);
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(88, 166, 255, 0.16);
-  border-radius: 18px;
-  background:
-    linear-gradient(
-      180deg,
-      rgba(88, 166, 255, 0.08) 0%,
-      rgba(13, 17, 23, 0) 20%
-    ),
-    rgba(13, 17, 23, 0.96);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-secondary);
   box-shadow:
-    0 24px 60px rgba(0, 0, 0, 0.46),
+    0 18px 48px rgba(0, 0, 0, 0.5),
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
 .command-palette-header {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
-.command-palette-title-row {
+/* Names the dialog for assistive tech; the input carries its own label. */
+.command-palette-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.command-palette-search {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
 }
 
-.command-palette-kicker {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent-blue);
-}
-
-.command-palette-shortcut {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 11px;
+.command-palette-search-icon {
+  position: absolute;
+  left: 10px;
+  width: 16px;
+  height: 16px;
   color: var(--text-muted);
+  pointer-events: none;
 }
 
 #command-palette-input {
   width: 100%;
-  padding: 14px 16px;
-  border: 1px solid rgba(88, 166, 255, 0.18);
-  border-radius: 12px;
-  background: rgba(22, 27, 34, 0.88);
+  height: 34px;
+  padding: 0 10px 0 34px;
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-radius: 6px;
+  background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: "JetBrains Mono", monospace;
-  font-size: 15px;
+  font: inherit;
+  font-size: 14px;
+}
+
+#command-palette-input::placeholder {
+  color: var(--text-muted);
 }
 
 #command-palette-input:focus {
   outline: none;
-  border-color: rgba(88, 166, 255, 0.72);
-  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.12);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
 }
 
 #command-palette-input:focus-visible {
   box-shadow:
-    0 0 0 3px rgba(88, 166, 255, 0.12),
-    0 0 0 2px var(--focus-ring);
+    0 0 0 2px rgba(88, 166, 255, 0.18),
+    0 0 0 1px var(--focus-ring);
 }
 
 .command-palette-results {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  max-height: min(52vh, 440px);
-  padding: 16px 18px;
+  min-height: 0;
+  max-height: min(62vh, 520px);
+  padding: 4px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .command-palette-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+}
+
+.command-palette-section + .command-palette-section {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .command-palette-section-label {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  padding: 4px 8px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 16px;
   text-transform: uppercase;
   color: var(--text-muted);
 }
 
 .command-palette-empty {
-  padding: 16px 18px;
-  border: 1px dashed rgba(139, 148, 158, 0.28);
-  border-radius: 14px;
-  background: rgba(22, 27, 34, 0.66);
+  padding: 14px 10px;
   color: var(--text-secondary);
   font-size: 13px;
-  line-height: 1.5;
+  text-align: center;
 }
 
 .command-palette-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid transparent;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.command-palette-item:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .command-palette-item.selected {
-  border-color: rgba(88, 166, 255, 0.4);
-  background: rgba(88, 166, 255, 0.12);
+  background: rgba(56, 139, 253, 0.2);
+  box-shadow: inset 2px 0 0 var(--accent-blue);
 }
 
 .command-palette-item:focus-visible {
@@ -3420,36 +3431,119 @@ body.touch-input-mode .xterm .composition-view.active {
   outline-offset: -2px;
 }
 
-.command-palette-item-title {
-  font-size: 14px;
+.command-palette-item-icon {
+  display: inline-flex;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.command-palette-item-icon svg,
+.command-palette-item-icon i {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+}
+
+.command-palette-item.selected .command-palette-item-icon {
   color: var(--text-primary);
 }
 
-.command-palette-item-meta {
-  display: inline-flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
+/* Title and detail share one line; the detail yields first. */
+.command-palette-item-text {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
-.command-palette-chip {
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
+.command-palette-item-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-palette-item-detail {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.command-palette-match {
+  background: none;
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.command-palette-item-key {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border-primary);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-primary);
   color: var(--text-secondary);
+  font-family: inherit;
   font-size: 11px;
-  line-height: 1.2;
+  line-height: 16px;
+  white-space: nowrap;
 }
 
 .command-palette-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 18px 16px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  font-size: 12px;
+  gap: 4px 14px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-primary);
+  font-size: 11px;
   color: var(--text-muted);
+}
+
+.command-palette-footer kbd {
+  display: inline-block;
+  min-width: 16px;
+  margin-right: 2px;
+  padding: 0 4px;
+  border: 1px solid var(--border-primary);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 15px;
+  text-align: center;
+}
+
+.command-palette-modes {
+  margin-left: auto;
+}
+
+/* Touch: 44px targets, no keyboard hints, and the sheet sits at the TOP of
+   the visual viewport so the on-screen keyboard never covers the results. */
+@media (pointer: coarse) {
+  .command-palette-item {
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .command-palette-item-detail {
+    font-size: 13px;
+  }
+
+  .command-palette-item-key,
+  .command-palette-footer {
+    display: none;
+  }
 }
 
 /* =============================================================================
@@ -4338,36 +4432,41 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   .command-palette {
-    align-items: flex-end;
+    top: var(--app-vv-top, 0px);
+    bottom: auto;
+    height: var(--app-vvh, 100dvh);
+    align-items: flex-start;
     padding: 0;
     background: rgba(3, 7, 12, 0.7);
   }
 
   .command-palette-panel {
     width: 100%;
-    max-height: min(82dvh, 680px);
+    max-height: 100%;
+    border-top: none;
     border-right: none;
-    border-bottom: none;
     border-left: none;
-    border-radius: 20px 20px 0 0;
+    border-radius: 0 0 14px 14px;
   }
 
   .command-palette-header {
-    padding: 18px 16px 14px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 10px 8px;
+  }
+
+  #command-palette-input {
+    height: 44px;
+    /* 16px keeps iOS from zooming the page on focus. */
+    font-size: 16px;
   }
 
   .command-palette-results {
-    max-height: min(50dvh, 380px);
-    padding: 14px 16px;
-  }
-
-  .command-palette-empty,
-  .command-palette-item {
-    min-height: 52px;
+    flex: 1 1 auto;
+    max-height: none;
+    padding: 4px 6px 8px;
   }
 
   .command-palette-footer {
-    padding: 12px 16px calc(16px + env(safe-area-inset-bottom));
+    display: none;
   }
 
   .tab {

@@ -6067,8 +6067,10 @@ class TerminalManager {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
       // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
-      this.fileExplorer.onOpenFile = (path, intent) =>
+      this.fileExplorer.onOpenFile = (path, intent) => {
+        this.recordPaletteFileOpen(path);
         this.handleExplorerOpenFile(path, intent);
+      };
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -9755,11 +9757,16 @@ class TerminalManager {
     }
 
     this.commandPaletteRegistry = new ActionRegistryCtor();
+    this.paletteMru =
+      window.PaletteProviders?.createPaletteMruStore?.(window.localStorage) ||
+      null;
     this.commandPalette = new CommandPaletteCtor({
       root,
       input,
       results,
       registry: this.commandPaletteRegistry,
+      onRun: (result) => this.recordPaletteUse(result),
+      rankOf: (result) => this.getPaletteUseRank(result),
     });
 
     root.addEventListener("click", (event) => {
@@ -9863,6 +9870,63 @@ class TerminalManager {
 
   getCommandPaletteQuery() {
     return String(this.commandPalette?.input?.value || "").trim();
+  }
+
+  // Palette MRU: files opened (absolute paths) and commands run (action ids).
+  recordPaletteUse(result) {
+    const id = String(result?.id || "");
+    if (!id || !this.paletteMru) return;
+    if (id.startsWith("quick-open:") || id.startsWith("recent-file:")) {
+      return; // recorded by the file open itself (recordPaletteFileOpen)
+    }
+    this.paletteMru.touch("commands", id);
+  }
+
+  recordPaletteFileOpen(path) {
+    if (path) this.paletteMru?.touch("files", String(path));
+  }
+
+  getPaletteUseRank(result) {
+    const id = String(result?.id || "");
+    if (!this.paletteMru || !id) return -1;
+    if (id.startsWith("recent-file:")) {
+      return this.paletteMru.rankOf("files", id.slice("recent-file:".length));
+    }
+    return this.paletteMru.rankOf("commands", id);
+  }
+
+  openFileFromPalette(path) {
+    this.recordPaletteFileOpen(path);
+    this.handleExplorerOpenFile(path, { pinned: true });
+  }
+
+  paletteFileIcon(name) {
+    return (
+      window.FileExplorerController?.fileIconName?.({ name, isDir: false }) ||
+      "file"
+    );
+  }
+
+  // Quick-open file row: basename as the title, its directory (relative to
+  // the searched project) as the dim detail.
+  buildPaletteFileAction(file, { id, keywords, priority, detailPrefix = "" }) {
+    const split = window.PaletteProviders.splitFilePath(
+      file.relativePath || file.path,
+    );
+    const truncate = window.PaletteProviders.truncatePathMiddle;
+    const detail = [detailPrefix, split.dir ? truncate(split.dir, 56) : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return {
+      id,
+      title: split.base || file.path,
+      group: "Files",
+      icon: this.paletteFileIcon(split.base),
+      keywords,
+      meta: detail ? [detail] : null,
+      priority,
+      run: () => this.openFileFromPalette(file.path),
+    };
   }
 
   isPaletteDirectoryQuery(query) {
@@ -9978,6 +10042,8 @@ class TerminalManager {
         id: "new-terminal",
         title: "New Terminal",
         group: "Actions",
+        icon: "square-terminal",
+        keybinding: "Ctrl+N",
         keywords: ["workspace", "shell", "tab"],
         priority: 50,
         run: () => this.createTerminal(),
@@ -9986,6 +10052,8 @@ class TerminalManager {
         id: "split-workspace",
         title: "Split Workspace",
         group: "Actions",
+        icon: "columns-2",
+        keybinding: "Ctrl+Shift+D",
         keywords: ["split", "pane", "terminal"],
         priority: 45,
         run: () => this.splitWorkspace(),
@@ -9994,6 +10062,7 @@ class TerminalManager {
         id: "detach-terminal-pane",
         title: "Move Pane to New Tab",
         group: "Actions",
+        icon: "square-arrow-out-up-right",
         keywords: ["detach", "unmerge", "ungroup", "pane", "tab"],
         priority: 45,
         run: () => this.detachTerminalToWorkspace(),
@@ -10002,6 +10071,7 @@ class TerminalManager {
         id: "new-task-workspace",
         title: "New Task Workspace",
         group: "Actions",
+        icon: "bot",
         keywords: ["agent", "worker", "judge", "task"],
         priority: 44,
         run: () => this.openTaskPanel({ focusTitle: true }),
@@ -10010,6 +10080,7 @@ class TerminalManager {
         id: "open-tasks",
         title: "Open Tasks",
         group: "Actions",
+        icon: "list-todo",
         keywords: ["agent", "runner", "worker", "judge"],
         priority: 43,
         run: () => this.openTaskPanel(),
@@ -10018,6 +10089,7 @@ class TerminalManager {
         id: "open-git",
         title: "Open Git",
         group: "Actions",
+        icon: "git-branch",
         keywords: ["repo", "branch", "diff"],
         priority: 40,
         run: () => this.openGitPanel(),
@@ -10026,6 +10098,7 @@ class TerminalManager {
         id: "open-file-manager",
         title: "Open File Manager",
         group: "Actions",
+        icon: "folder-open",
         keywords: ["files", "explorer", "browse"],
         priority: 40,
         run: () => this.openFileExplorer(),
@@ -10034,6 +10107,7 @@ class TerminalManager {
         id: "open-clipboard",
         title: "Open Clipboard",
         group: "Actions",
+        icon: "clipboard",
         keywords: ["paste", "copy", "history"],
         priority: 30,
         run: () => this.clipboardManager.togglePanel(),
@@ -10042,6 +10116,7 @@ class TerminalManager {
         id: "open-settings",
         title: "Open Settings",
         group: "Actions",
+        icon: "settings",
         keywords: ["settings", "preferences", "config", "options"],
         priority: 35,
         run: () => this.openSettings(),
@@ -10050,6 +10125,8 @@ class TerminalManager {
         id: "search-terminal",
         title: "Search in Terminal",
         group: "Views",
+        icon: "search",
+        keybinding: "Ctrl+F",
         keywords: ["find", "search", "terminal"],
         run: () => this.openTerminalSearch(),
       },
@@ -10057,6 +10134,7 @@ class TerminalManager {
         id: "toggle-line-wrap",
         title: "Toggle Line Wrap",
         group: "Views",
+        icon: "wrap-text",
         keywords: ["wrap", "lines", "overflow"],
         run: () => this.toggleWrapLines(),
       },
@@ -10064,6 +10142,7 @@ class TerminalManager {
         id: "toggle-sessions-dock",
         title: "Dock Sessions to Bottom",
         group: "Views",
+        icon: "panel-bottom",
         keywords: ["dock", "panel", "bottom", "sessions", "terminal"],
         run: () => this.toggleSessionsDock(),
       },
@@ -10071,6 +10150,8 @@ class TerminalManager {
         id: "toggle-fullscreen",
         title: "Toggle Fullscreen",
         group: "Views",
+        icon: "maximize",
+        keybinding: "F11",
         keywords: ["fullscreen", "focus", "zen"],
         run: () => this.toggleFullscreen(),
       },
@@ -10078,6 +10159,8 @@ class TerminalManager {
         id: "font-increase",
         title: "Increase Font Size",
         group: "Views",
+        icon: "zoom-in",
+        keybinding: "Ctrl+=",
         keywords: ["zoom", "font", "larger"],
         run: () => this.changeFontSize(1),
       },
@@ -10085,6 +10168,8 @@ class TerminalManager {
         id: "font-decrease",
         title: "Decrease Font Size",
         group: "Views",
+        icon: "zoom-out",
+        keybinding: "Ctrl+-",
         keywords: ["zoom", "font", "smaller"],
         run: () => this.changeFontSize(-1),
       },
@@ -10092,6 +10177,8 @@ class TerminalManager {
         id: "open-help",
         title: "Open Help",
         group: "Views",
+        icon: "circle-help",
+        keybinding: "F1",
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
@@ -10099,6 +10186,7 @@ class TerminalManager {
         id: "toggle-ide-mode",
         title: "Toggle IDE Mode",
         group: "Views",
+        icon: "layout-panel-left",
         keywords: ["ide", "editor", "mode", "workspace"],
         run: () => this.toggleIdeMode(),
       },
@@ -10117,6 +10205,7 @@ class TerminalManager {
           id: `go-to-directory:${query}`,
           title: "Go to Directory...",
           group: "Actions",
+          icon: "folder-input",
           keywords: [query, "directory", "cwd", "jump", "open path"],
           meta: [query],
           priority: 48,
@@ -10133,26 +10222,45 @@ class TerminalManager {
     // comes from this provider via descending priority.
     this.commandPaletteRegistry.registerProvider((context = {}) => {
       const query = this.getCommandPaletteQuery();
-      if (!this.isPaletteBareQuery(query)) return [];
-
       const files = Array.isArray(context.quickOpenFiles)
         ? context.quickOpenFiles
         : [];
+
+      // Empty query: the few most recently opened files of this project.
+      if (!query) {
+        const byPath = new Map(files.map((file) => [file.path, file]));
+        return (this.paletteMru?.list("files") || [])
+          .map((path) => byPath.get(path))
+          .filter(Boolean)
+          .slice(0, 5)
+          .map((file, index) =>
+            this.buildPaletteFileAction(file, {
+              id: `recent-file:${file.path}`,
+              keywords: [],
+              priority: 30 - index,
+              detailPrefix: "recent",
+            }),
+          );
+      }
+      if (!this.isPaletteBareQuery(query)) return [];
+
       const matches = window.PaletteProviders.filterQuickOpenFiles(
         query,
         files,
         50,
+        {
+          mruRank: (file) =>
+            this.paletteMru ? this.paletteMru.rankOf("files", file.path) : -1,
+        },
       );
 
-      return matches.map((file, index) => ({
-        id: `quick-open:${file.path}`,
-        title: file.relativePath || file.path,
-        group: "Files",
-        keywords: [query],
-        meta: [file.path],
-        priority: 50 - index,
-        run: () => this.handleExplorerOpenFile(file.path, { pinned: true }),
-      }));
+      return matches.map((file, index) =>
+        this.buildPaletteFileAction(file, {
+          id: `quick-open:${file.path}`,
+          keywords: [query],
+          priority: 50 - index,
+        }),
+      );
     });
 
     this.commandPaletteRegistry.registerProvider((context = {}) => {
@@ -10162,7 +10270,7 @@ class TerminalManager {
       });
 
       if (newFolderAction) {
-        contextualActions.push(newFolderAction);
+        contextualActions.push({ icon: "folder-plus", ...newFolderAction });
       }
 
       if (context.canCreateLinkedView) {
@@ -10170,6 +10278,7 @@ class TerminalManager {
           id: "open-linked-view",
           title: "Open Linked View",
           group: "Contextual",
+          icon: "link",
           keywords: ["tmux", "linked", "shared"],
           run: () => this.createLinkedView(),
         });
@@ -10180,6 +10289,7 @@ class TerminalManager {
           id: "toggle-extra-keys",
           title: "Toggle Extra Keys",
           group: "Contextual",
+          icon: "keyboard",
           keywords: ["keyboard", "modifiers", "mobile"],
           meta: context.extraKeysVisible ? ["Visible"] : ["Hidden"],
           run: () => this.extraKeys?.toggle(),
@@ -10191,8 +10301,9 @@ class TerminalManager {
           id: `reveal-cwd:${context.cwd}`,
           title: "Reveal Current CWD in Files",
           group: "Contextual",
+          icon: "folder-search",
           keywords: ["files", "explorer", "cwd", "reveal", context.cwd],
-          meta: [context.cwd],
+          meta: [window.PaletteProviders.truncatePathMiddle(context.cwd, 56)],
           priority: 38,
           run: () => this.revealCurrentCwdInFilesFromPalette(context.cwd),
         });
@@ -10203,6 +10314,7 @@ class TerminalManager {
           id: `checkout-git-branch:${context.cwd}`,
           title: "Checkout Git Branch",
           group: "Contextual",
+          icon: "git-branch",
           keywords: ["checkout", "branch", "git", context.cwd],
           meta: context.currentGitBranch
             ? [`Current: ${context.currentGitBranch}`]
@@ -10216,14 +10328,14 @@ class TerminalManager {
         openGitBranches: (cwd) => this.openGitBranchesFromPalette(cwd),
       });
       if (openGitBranchesAction) {
-        contextualActions.push(openGitBranchesAction);
+        contextualActions.push({ icon: "git-branch", ...openGitBranchesAction });
       }
 
       contextualActions.push(
         ...buildGitBranchActions(context, {
           switchBranch: (cwd, branch) =>
             this.switchGitBranchFromPalette(cwd, branch),
-        }),
+        }).map((action) => ({ icon: "git-branch", ...action })),
       );
 
       if (context.paneCount > 1) {
@@ -10232,6 +10344,8 @@ class TerminalManager {
             id: "focus-next-pane",
             title: "Focus Next Pane",
             group: "Contextual",
+            icon: "arrow-down",
+            keybinding: "Alt+Shift+↓",
             keywords: ["pane", "terminal", "next", "down"],
             run: () => this.switchToAdjacentPane(1),
           },
@@ -10239,6 +10353,8 @@ class TerminalManager {
             id: "focus-previous-pane",
             title: "Focus Previous Pane",
             group: "Contextual",
+            icon: "arrow-up",
+            keybinding: "Alt+Shift+↑",
             keywords: ["pane", "terminal", "previous", "up"],
             run: () => this.switchToAdjacentPane(-1),
           },
@@ -10252,6 +10368,7 @@ class TerminalManager {
           id: "close-editor-tab",
           title: "Close Editor Tab",
           group: "Contextual",
+          icon: "x",
           keywords: ["editor", "tab", "close"],
           run: () => this.closeActiveEditorTabFromPalette(),
         });
@@ -10259,6 +10376,7 @@ class TerminalManager {
           id: "next-editor-tab",
           title: "Next Editor Tab",
           group: "Contextual",
+          icon: "chevron-right",
           keywords: ["editor", "tab", "next"],
           run: () => this.stepActiveEditorTab(1),
         });
@@ -10266,6 +10384,7 @@ class TerminalManager {
           id: "previous-editor-tab",
           title: "Previous Editor Tab",
           group: "Contextual",
+          icon: "chevron-left",
           keywords: ["editor", "tab", "previous", "prev"],
           run: () => this.stepActiveEditorTab(-1),
         });
@@ -10276,6 +10395,7 @@ class TerminalManager {
           id: "open-task-board-tab",
           title: "Open Task Board",
           group: "Contextual",
+          icon: "square-kanban",
           keywords: ["tasks", "board", "kanban", "agent"],
           run: () => this.openTaskBoardTab(),
         });
@@ -10285,37 +10405,27 @@ class TerminalManager {
     });
 
     this.commandPaletteRegistry.registerProvider(() => {
+      const truncate = window.PaletteProviders.truncatePathMiddle;
       return this.loadRecentWorkspaceEntries()
         .map((entry) => {
           const cwd = this.normalizeWorkspaceCwd(entry.cwd);
           if (!cwd) return null;
-
-          const existingWorkspaceId = this.findWorkspaceIdByCwd(cwd);
-          const activeWorkspaceId = this.terminals.get(
-            this.activeId,
-          )?.workspaceId;
-          const metadata = [entry.label];
-
-          if (entry.label !== cwd) {
-            metadata.push(cwd);
-          }
-          if (existingWorkspaceId === activeWorkspaceId) {
-            metadata.push("Active");
-          } else if (existingWorkspaceId) {
-            metadata.push("Open");
-          }
+          // An open workspace in this cwd already has its own row below;
+          // listing it again as "recent" would only duplicate it.
+          if (this.findWorkspaceIdByCwd(cwd)) return null;
 
           return {
             id: `recent-workspace:${cwd}`,
-            title: "Recent Workspace",
+            title: entry.label || this.formatCwdLabel(cwd),
             group: "Workspaces",
+            icon: "history",
             keywords: [
               entry.label,
               cwd,
               `recent ${entry.label}`,
               "recent workspace",
             ],
-            meta: metadata,
+            meta: ["Recent workspace", truncate(cwd, 56)],
             priority: 42,
             run: () => this.switchOrCreateWorkspaceForCwd(cwd),
           };
@@ -10343,7 +10453,9 @@ class TerminalManager {
             metadata.push("Active");
           }
           if (snapshot.cwd) {
-            metadata.push(snapshot.cwd);
+            metadata.push(
+              window.PaletteProviders.truncatePathMiddle(snapshot.cwd, 56),
+            );
           }
           if (snapshot.count > 1) {
             metadata.push(`${snapshot.count} terminals`);
@@ -10356,6 +10468,7 @@ class TerminalManager {
             id: `workspace:${workspaceId}`,
             title: label,
             group: "Workspaces",
+            icon: "square-terminal",
             keywords: [
               workspaceId,
               index,
@@ -10391,19 +10504,22 @@ class TerminalManager {
           window.SessionActions.planSessionRowAction(session, options),
       });
 
-      return entries.map((entry, index) => ({
-        id: `palette-session:${entry.session.id}`,
-        title: this.formatCwdLabel(entry.session.cwd) || entry.session.id,
-        group: "Sessions",
-        keywords: [query],
-        meta: [
-          entry.plan.label,
-          entry.plan.statusClass === "active" ? "● live" : "○ ended",
-          entry.session.id,
-        ],
-        priority: 100 - index,
-        run: () => void this.handleSessionRowActivate(entry.session.id),
-      }));
+      return entries.map((entry, index) => {
+        const described = window.PaletteProviders.describePaletteSession(
+          entry.session,
+          entry.plan,
+        );
+        return {
+          id: `palette-session:${entry.session.id}`,
+          title: described.title,
+          group: "Sessions",
+          icon: entry.session.agentName ? "bot" : "square-terminal",
+          keywords: [query],
+          meta: [described.hint, described.detail],
+          priority: 100 - index,
+          run: () => void this.handleSessionRowActivate(entry.session.id),
+        };
+      });
     });
 
     // "$" mode — saved commands (localStorage), run in the active terminal.
@@ -10424,6 +10540,7 @@ class TerminalManager {
         id: `palette-command:${entry.name}`,
         title: entry.name,
         group: "Commands",
+        icon: "terminal",
         keywords: [query],
         meta: [entry.command],
         priority: 100 - index,
@@ -10434,6 +10551,7 @@ class TerminalManager {
         id: "palette-command-save",
         title: "Save command…",
         group: "Commands",
+        icon: "bookmark",
         keywords: [query],
         meta: ["new $ shortcut"],
         priority: 1,
@@ -10444,6 +10562,7 @@ class TerminalManager {
           id: "palette-command-remove",
           title: "Remove command…",
           group: "Commands",
+          icon: "trash-2",
           keywords: [query],
           meta: ["delete a $ shortcut"],
           priority: 0,
