@@ -8,9 +8,10 @@ const ACTION_RECENT_WORKSPACES_MAX_ENTRIES = 10;
 
 const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
   desktopPrimary: Object.freeze(["files", "git", "palette", "more"]),
-  mobilePrimary: Object.freeze(["files", "git", "paste", "more"]),
+  mobilePrimary: Object.freeze(["files", "git", "paste", "compose", "more"]),
   overflow: Object.freeze([
     "palette",
+    "compose",
     "setup",
     "settings",
     "tasks",
