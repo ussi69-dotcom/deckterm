@@ -223,8 +223,9 @@
             note: shortcut.note || "",
             scope: shortcut.scope || SHORTCUT_SCOPE_ANYWHERE,
             scopeLabel:
-              SHORTCUT_SCOPE_LABELS[shortcut.scope || SHORTCUT_SCOPE_ANYWHERE] ||
-              "",
+              SHORTCUT_SCOPE_LABELS[
+                shortcut.scope || SHORTCUT_SCOPE_ANYWHERE
+              ] || "",
           })),
       }))
       .filter((section) => section.rows.length > 0);
@@ -266,7 +267,10 @@
   // "/" key with Shift) never produces terminal input, so it works with a
   // focused terminal; F1 and a bare "?" only count outside the terminal and
   // outside editable fields, so TUIs such as htop keep F1.
-  function isHelpShortcut(event, { inTerminal = false, editable = false } = {}) {
+  function isHelpShortcut(
+    event,
+    { inTerminal = false, editable = false } = {},
+  ) {
     if (!event) return false;
     const ctrl = Boolean(event.ctrlKey || event.metaKey);
     if (

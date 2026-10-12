@@ -99,13 +99,21 @@ test("isHelpShortcut: Ctrl+Shift+? anywhere, F1 and ? only outside the terminal"
     code: "",
     ...o,
   });
-  const ctrlShiftSlash = ev({ ctrlKey: true, shiftKey: true, key: "?", code: "Slash" });
+  const ctrlShiftSlash = ev({
+    ctrlKey: true,
+    shiftKey: true,
+    key: "?",
+    code: "Slash",
+  });
   expect(isHelpShortcut(ctrlShiftSlash, { inTerminal: true })).toBe(true);
   // Layouts where Shift+/ is not "?" still match on the physical key.
   expect(
-    isHelpShortcut(ev({ ctrlKey: true, shiftKey: true, key: "_", code: "Slash" }), {
-      inTerminal: true,
-    }),
+    isHelpShortcut(
+      ev({ ctrlKey: true, shiftKey: true, key: "_", code: "Slash" }),
+      {
+        inTerminal: true,
+      },
+    ),
   ).toBe(true);
 
   expect(isHelpShortcut(ev({ key: "F1" }), { inTerminal: true })).toBe(false);
@@ -131,12 +139,22 @@ test("compactCombos folds alternatives that share their modifiers", () => {
       ["Alt", "Shift", "↓"],
     ]),
   ).toEqual({ prefix: ["Alt", "Shift"], finals: ["↑", "↓"] });
-  expect(compactCombos([["Ctrl", "+"], ["Ctrl", "-"]])).toEqual({
+  expect(
+    compactCombos([
+      ["Ctrl", "+"],
+      ["Ctrl", "-"],
+    ]),
+  ).toEqual({
     prefix: ["Ctrl"],
     finals: ["+", "-"],
   });
   expect(compactCombos([["Ctrl", "+"]])).toBeNull();
-  expect(compactCombos([["Ctrl", "A"], ["Alt", "B"]])).toBeNull();
+  expect(
+    compactCombos([
+      ["Ctrl", "A"],
+      ["Alt", "B"],
+    ]),
+  ).toBeNull();
   expect(compactCombos([["F1"], ["F2"]])).toBeNull();
   expect(compactCombos(null)).toBeNull();
 });

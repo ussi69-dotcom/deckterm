@@ -36,7 +36,10 @@ test("planLauncherSessions: live sessions first (newest first), then ended ones"
     kind: "attach",
     actionLabel: "Attach",
   });
-  expect(sessions[2]).toMatchObject({ kind: "open-here", actionLabel: "Open here" });
+  expect(sessions[2]).toMatchObject({
+    kind: "open-here",
+    actionLabel: "Open here",
+  });
 });
 
 test("planLauncherSessions: restorable closes say Restore; open tabs and junk are skipped; max 5", () => {
@@ -60,9 +63,12 @@ test("planLauncherSessions: restorable closes say Restore; open tabs and junk ar
 });
 
 test("planLauncherSessions: a custom title function wins (agent-attention titles)", () => {
-  const sessions = planLauncherSessions([live("a", "/p/q", 1, { name: "build" })], {
-    titleOf: (s) => s.name || "?",
-  });
+  const sessions = planLauncherSessions(
+    [live("a", "/p/q", 1, { name: "build" })],
+    {
+      titleOf: (s) => s.name || "?",
+    },
+  );
   expect(sessions[0].title).toBe("build");
 });
 
@@ -99,13 +105,26 @@ test("planRecentDirectories: current dir first, then by activity, unique, max 5"
 test("planLauncherShortcuts picks the listed shortcuts in order, skipping unknown ids", () => {
   const shortcuts = [
     { id: "help", keys: [["Ctrl", "Shift", "?"]], label: "Keyboard shortcuts" },
-    { id: "command-palette", keys: [["Ctrl", "Shift", "P"]], label: "Command palette" },
+    {
+      id: "command-palette",
+      keys: [["Ctrl", "Shift", "P"]],
+      label: "Command palette",
+    },
     { id: "mouse", gesture: "Drag", label: "Drag" },
   ];
   expect(
-    planLauncherShortcuts(shortcuts, ["command-palette", "nope", "help", "mouse"]),
+    planLauncherShortcuts(shortcuts, [
+      "command-palette",
+      "nope",
+      "help",
+      "mouse",
+    ]),
   ).toEqual([
-    { id: "command-palette", label: "Command palette", keys: ["Ctrl", "Shift", "P"] },
+    {
+      id: "command-palette",
+      label: "Command palette",
+      keys: ["Ctrl", "Shift", "P"],
+    },
     { id: "help", label: "Keyboard shortcuts", keys: ["Ctrl", "Shift", "?"] },
   ]);
   expect(planLauncherShortcuts(null, ["help"])).toEqual([]);

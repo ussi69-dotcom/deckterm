@@ -79,9 +79,7 @@ test("taskViewToggleContent: lucide icons instead of text glyphs", () => {
     title: "Switch to list view",
   });
   // With a Task Board editor tab available the button always OPENS the board.
-  expect(
-    taskViewToggleContent({ mode: "board", hasBoardTab: true }),
-  ).toEqual({
+  expect(taskViewToggleContent({ mode: "board", hasBoardTab: true })).toEqual({
     icon: "layout-grid",
     label: "Board",
     title: "Open board in the editor area",

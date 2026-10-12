@@ -132,12 +132,12 @@ test("SEARCH_DECORATIONS: the active match is visibly distinct from the others",
 test("formatSearchCount: blank until results arrive, n/total afterwards", () => {
   expect(formatSearchCount({ query: "", resultCount: null })).toBe("");
   expect(formatSearchCount({ query: "x", resultCount: null })).toBe("");
-  expect(formatSearchCount({ query: "x", resultCount: 0, resultIndex: -1 })).toBe(
-    "No results",
-  );
-  expect(formatSearchCount({ query: "x", resultCount: 45, resultIndex: 2 })).toBe(
-    "3/45",
-  );
+  expect(
+    formatSearchCount({ query: "x", resultCount: 0, resultIndex: -1 }),
+  ).toBe("No results");
+  expect(
+    formatSearchCount({ query: "x", resultCount: 45, resultIndex: 2 }),
+  ).toBe("3/45");
   // The addon caps highlights at 1000 and then reports index -1.
   expect(
     formatSearchCount({ query: "x", resultCount: 1000, resultIndex: -1 }),
@@ -158,22 +158,47 @@ test("searchBarPlacement: starts at the bottom so the first line stays readable"
 test("searchBarPlacement: dodges the active match", () => {
   // Match under the bottom bar -> move to the top.
   expect(
-    searchBarPlacement({ activeRow: 38, rows: 40, coveredRows: 3, current: "bottom" }),
+    searchBarPlacement({
+      activeRow: 38,
+      rows: 40,
+      coveredRows: 3,
+      current: "bottom",
+    }),
   ).toBe("top");
   // Match under the top bar -> back to the bottom.
   expect(
-    searchBarPlacement({ activeRow: 1, rows: 40, coveredRows: 3, current: "top" }),
+    searchBarPlacement({
+      activeRow: 1,
+      rows: 40,
+      coveredRows: 3,
+      current: "top",
+    }),
   ).toBe("bottom");
   // Match clear of the bar -> stay put (no jumping around).
   expect(
-    searchBarPlacement({ activeRow: 20, rows: 40, coveredRows: 3, current: "top" }),
+    searchBarPlacement({
+      activeRow: 20,
+      rows: 40,
+      coveredRows: 3,
+      current: "top",
+    }),
   ).toBe("top");
   expect(
-    searchBarPlacement({ activeRow: 2, rows: 40, coveredRows: 3, current: "bottom" }),
+    searchBarPlacement({
+      activeRow: 2,
+      rows: 40,
+      coveredRows: 3,
+      current: "bottom",
+    }),
   ).toBe("bottom");
   // Off-screen rows (scrolled away) keep the current placement.
   expect(
-    searchBarPlacement({ activeRow: -4, rows: 40, coveredRows: 3, current: "top" }),
+    searchBarPlacement({
+      activeRow: -4,
+      rows: 40,
+      coveredRows: 3,
+      current: "top",
+    }),
   ).toBe("top");
 });
 

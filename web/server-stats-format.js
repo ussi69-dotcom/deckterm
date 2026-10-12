@@ -39,7 +39,8 @@
     const disk = percentOf(stats?.disk?.percent);
     const value = (n) => (n === null ? "--%" : `${n}%`);
 
-    let ramTitle = ram === null ? "Memory: no data yet" : `Memory: ${ram}% in use`;
+    let ramTitle =
+      ram === null ? "Memory: no data yet" : `Memory: ${ram}% in use`;
     const total = Number(stats?.memory?.totalBytes);
     const available = Number(stats?.memory?.availableBytes);
     if (ram !== null && total > 0 && Number.isFinite(available)) {

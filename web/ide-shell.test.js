@@ -939,10 +939,16 @@ test("activityItemTooltip: view title, its shortcut, and what a click does", () 
   ).toBe("Explorer (Ctrl+Shift+E)");
   // Active + open: a click hides the sidebar; active + collapsed: shows it.
   expect(
-    activityItemTooltip({ title: "Explorer" }, { active: true, collapsed: false }),
+    activityItemTooltip(
+      { title: "Explorer" },
+      { active: true, collapsed: false },
+    ),
   ).toBe("Explorer\nClick to hide the sidebar");
   expect(
-    activityItemTooltip({ title: "Explorer" }, { active: true, collapsed: true }),
+    activityItemTooltip(
+      { title: "Explorer" },
+      { active: true, collapsed: true },
+    ),
   ).toBe("Explorer\nClick to show the sidebar");
   // Junk-tolerant.
   expect(activityItemTooltip(null)).toBe("");
