@@ -9536,10 +9536,8 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   outline-offset: 1px;
 }
 
-/* Group header action (stage all / unstage all) */
-.git-file-group-header {
-  position: relative;
-}
+/* Group header action (stage all / unstage all). The header itself is
+   position: sticky (see "File groups" above); do not reset it here. */
 .git-group-action {
   visibility: hidden;
   margin-left: auto;
