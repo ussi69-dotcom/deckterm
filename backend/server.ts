@@ -32,6 +32,7 @@ import {
   parseProcessTable,
   type ProcessSnapshot,
 } from "./services/runtime-sync-cache";
+import { createCpuUsageMeter } from "./services/cpu-usage";
 import {
   NO_STORE_CACHE_CONTROL,
   createBuildFingerprint,
@@ -64,6 +65,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { assertPortAvailable } from "./port-probe";
+import { cpus } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   classifyAgentOutputPhase,
@@ -448,6 +450,7 @@ const webBuildFingerprint = createBuildFingerprint({
   root: WEB_ROOT,
   ttlMs: 5000,
 });
+const hostCpuUsage = createCpuUsageMeter({ readCpus: () => cpus() });
 declare module "hono" {
   interface ContextVariableMap {
     // Set when the static handler already chose this response's
@@ -6546,13 +6549,8 @@ export function createWebApp() {
     const os = await import("os");
     const fs = await import("fs/promises");
 
-    const cpus = os.cpus();
-    const cpuUsage =
-      cpus.reduce((acc, cpu) => {
-        const total = Object.values(cpu.times).reduce((a, b) => a + b, 0);
-        const idle = cpu.times.idle;
-        return acc + ((total - idle) / total) * 100;
-      }, 0) / cpus.length;
+    // Busy share since the previous /api/stats read (not since boot).
+    const cpuUsage = await hostCpuUsage.read();
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
