@@ -87,8 +87,11 @@ test.describe("Git Panel - Lazygit-inspired", () => {
     await page.click('[data-action="git"]');
     await page.waitForSelector("#git-panel:not(.hidden)");
 
-    // Click close button
-    await page.click(".panel-close");
+    // Desktop hosts Git in a surface window whose titlebar owns the close
+    // button (the panel's own close is hidden there to avoid a double x).
+    await page
+      .locator('.surface-window[data-window-id="git"] .surface-window-close')
+      .click();
 
     // Panel should be hidden
     await expect(page.locator("#git-panel")).toHaveClass(/hidden/);

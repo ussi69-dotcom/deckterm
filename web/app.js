@@ -4222,7 +4222,7 @@ class GitManager {
         hideWhenEmpty: true,
         files: this.state.files.merge || [],
         groupAction: null,
-        groupActionGlyph: "",
+        groupActionIcon: "",
         groupActionTitle: "",
       },
       {
@@ -4231,7 +4231,7 @@ class GitManager {
         icon: "\u2713",
         files: this.state.files.staged,
         groupAction: "unstage-all",
-        groupActionGlyph: "\u2212",
+        groupActionIcon: "minus",
         groupActionTitle: "Unstage all",
       },
       {
@@ -4240,7 +4240,7 @@ class GitManager {
         icon: "\u2022",
         files: this.state.files.changes,
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
       {
@@ -4249,7 +4249,7 @@ class GitManager {
         icon: "\u25cb",
         files: this.state.files.untracked || [],
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
     ];
@@ -4288,7 +4288,7 @@ class GitManager {
             <span class="git-file-group-count" aria-label="${countLabel}">${files.length}</span>
             ${
               section.groupAction
-                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+                ? `<button type="button" class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}"><i data-lucide="${section.groupActionIcon}" aria-hidden="true"></i><span class="git-group-action-label" aria-hidden="true">${section.groupActionTitle}</span></button>`
                 : ""
             }
           </div>
@@ -4304,6 +4304,12 @@ class GitManager {
     }
 
     container.innerHTML = html;
+    // Row and group actions are lucide placeholders; hydrate just this list.
+    try {
+      window.lucide?.createIcons?.({ root: container });
+    } catch {
+      // icons are decorative; buttons keep their aria-labels
+    }
 
     // Keep the selection when its file is still listed; otherwise fall back
     // to the first rendered row (highlightSelectedFile picks it by index).
@@ -4343,12 +4349,16 @@ class GitManager {
       el.addEventListener("click", (e) => {
         const file = this.findFile(el.dataset.path);
 
-        if (e.target.classList.contains("git-file-stage")) {
+        // Action buttons hold lucide SVGs: match the button, not the target.
+        const action = e.target.closest?.(
+          ".git-file-stage, .git-file-open, .git-file-discard",
+        );
+        if (action?.classList.contains("git-file-stage")) {
           this.toggleStage(el.dataset.path, file?.staged);
           return;
         }
 
-        if (e.target.classList.contains("git-file-open")) {
+        if (action?.classList.contains("git-file-open")) {
           const cwd = (this.state.cwd || this.currentCwd || "").replace(
             /\/$/,
             "",
@@ -4359,7 +4369,7 @@ class GitManager {
           return;
         }
 
-        if (e.target.classList.contains("git-file-discard")) {
+        if (action?.classList.contains("git-file-discard")) {
           this.discardFile(file || { path: el.dataset.path });
           return;
         }
@@ -4759,6 +4769,7 @@ class GitManager {
       const colorClass = statusClass(letter);
       const discardTitle =
         letter === "U" ? "Delete untracked file" : "Discard changes";
+      const stageTitle = file.staged ? "Unstage" : "Stage";
       const pathAttr = this.escapeHtml(file.path);
       html += `
         <div class="git-file ${isSelected ? "selected" : ""}" role="listitem" tabindex="0" aria-label="${this.escapeHtml(fileName)}, ${statusWord(letter)}${dir ? `, in ${this.escapeHtml(dir)}` : ""}" data-path="${pathAttr}" data-index="${index}" style="--tree-depth:${depth}">
@@ -4767,9 +4778,9 @@ class GitManager {
             ${dir ? `<span class="git-file-dir">${this.escapeHtml(dir)}</span>` : ""}
           </span>
           <div class="git-file-actions">
-            <button class="git-file-open" title="Open file">⤢</button>
-            <button class="git-file-discard" title="${discardTitle}">⟲</button>
-            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "−" : "+"}</button>
+            <button type="button" class="git-file-open" title="Open file" aria-label="Open ${this.escapeHtml(fileName)}"><i data-lucide="file-symlink" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-discard" title="${discardTitle}" aria-label="${discardTitle}: ${this.escapeHtml(fileName)}"><i data-lucide="undo-2" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-stage" title="${stageTitle}" aria-label="${stageTitle} ${this.escapeHtml(fileName)}"><i data-lucide="${file.staged ? "minus" : "plus"}" aria-hidden="true"></i></button>
           </div>
           <span class="git-file-status ${colorClass}">${this.escapeHtml(letter)}</span>
         </div>

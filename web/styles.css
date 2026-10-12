@@ -5891,15 +5891,17 @@ body.chrome-mobile .compose-sheet-history-item {
   padding: 8px;
 }
 
+/* Compact list rows (same density as the IDE SCM view): name plus dimmed
+   directory, no card background; actions appear on hover/selection. */
 .git-file {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px;
-  background: var(--bg-tertiary);
-  border-radius: 6px;
-  margin-bottom: 6px;
-  transition: background 0.2s;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
 .git-file:hover {
@@ -6711,7 +6713,8 @@ body.chrome-mobile .compose-sheet-history-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
+  min-height: 24px;
+  padding: 2px 8px;
   padding-left: calc(8px + (var(--tree-depth, 0) * 14px));
   border-radius: 4px;
   color: var(--text-secondary);
@@ -6738,7 +6741,6 @@ body.chrome-mobile .compose-sheet-history-item {
 .git-tree-folder-name {
   min-width: 0;
   overflow: hidden;
-  font-family: "JetBrains Mono", monospace;
   color: var(--text-primary);
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -6758,6 +6760,8 @@ body.chrome-mobile .compose-sheet-history-item {
 .git-file-label .git-file-path {
   flex: 0 1 auto;
   min-width: 3em;
+  font-family: inherit;
+  font-size: 13px;
 }
 
 .git-file-dir {
@@ -7814,6 +7818,19 @@ body.chrome-mobile .compose-sheet-history-item {
 .surface-window-body > #git-panel.side-panel {
   width: 100%;
   max-width: none;
+}
+
+/* Inside a window the titlebar already says "Git" and carries the close
+   button: drop the panel's own title and close, keep branch, sync label and
+   the Pull/Push/Fetch/Stash/Refresh actions as a slim toolbar. */
+.surface-window-body > #git-panel .git-panel-header > h3,
+.surface-window-body > #git-panel .git-panel-header > .panel-close {
+  display: none;
+}
+
+.surface-window-body > #git-panel .git-panel-header {
+  padding-top: 4px;
+  padding-bottom: 4px;
 }
 
 /* The window titlebar replaces the explorer's own header on desktop */
@@ -9591,29 +9608,44 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   background: var(--bg-hover, rgba(255, 255, 255, 0.1));
 }
 
-/* Row hover actions (VS Code style: hidden until hover/selected) */
+/* Row hover actions (VS Code style: hidden until hover/selected). Hidden
+   actions take no width, so file names are not cut short. Touch layouts show
+   them on every row (see the pointer: coarse block). */
 .git-file .git-file-actions {
-  display: flex;
+  display: none;
+  align-items: center;
   gap: 2px;
-  visibility: hidden;
+  opacity: 1;
 }
 .git-file:hover .git-file-actions,
 .git-file.selected .git-file-actions,
 .git-file:focus-within .git-file-actions {
-  visibility: visible;
+  display: flex;
 }
 .git-file-open,
-.git-file-discard {
-  padding: 2px 6px;
+.git-file-discard,
+.git-file .git-file-stage {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   background: transparent;
   border: none;
   border-radius: 4px;
   color: var(--text-secondary);
-  font-size: 12px;
   cursor: pointer;
 }
+.git-file-actions svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.9;
+  pointer-events: none;
+}
 .git-file-open:hover,
-.git-file-discard:hover {
+.git-file-discard:hover,
+.git-file .git-file-stage:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
@@ -9626,15 +9658,30 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 /* Group header action (stage all / unstage all). The header itself is
    position: sticky (see "File groups" above); do not reset it here. */
 .git-group-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   visibility: hidden;
   margin-left: auto;
-  padding: 0 6px;
+  padding: 1px 6px;
   background: transparent;
   border: none;
   border-radius: 4px;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
   cursor: pointer;
+}
+.git-group-action svg {
+  width: 13px;
+  height: 13px;
+  pointer-events: none;
+}
+/* Desktop: icon only (the tooltip names it); touch shows the label. */
+.git-group-action-label {
+  display: none;
 }
 .git-file-group-header:hover .git-group-action,
 .git-file-group-header:focus-within .git-group-action {
@@ -9647,6 +9694,42 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 .git-group-action:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
+}
+
+/* Touch: placed after the base row/group rules so it wins the cascade. */
+@media (pointer: coarse) {
+  /* No hover on touch: row actions and Stage all are always shown, as
+     44px targets. */
+  .git-file .git-file-actions {
+    display: flex;
+  }
+
+  .git-file-open,
+  .git-file-discard,
+  .git-file .git-file-stage {
+    width: 44px;
+    height: 44px;
+  }
+
+  .git-file-actions svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .git-group-action {
+    visibility: visible;
+    min-height: 44px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+
+  .git-group-action-label {
+    display: inline;
+  }
+
+  .git-file-label .git-file-path {
+    font-size: 14px;
+  }
 }
 
 /* Sync (ahead/behind) label in the panel header */
