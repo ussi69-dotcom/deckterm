@@ -2144,6 +2144,12 @@ class ExtraKeysManager {
     const row2 = document.querySelector(".extra-keys-row-2");
 
     let touchedKey = null;
+    // touchstart is preventDefault-ed (keeps focus in the terminal so the
+    // on-screen keyboard stays up), which also blocks native scrolling of
+    // the key rows. Swipes are therefore scrolled by hand: a horizontal move
+    // past EK_SWIPE_SLOP_PX turns the touch into a row scroll, not a key.
+    const EK_SWIPE_SLOP_PX = 8;
+    let swipe = null;
 
     extraKeys.addEventListener(
       "touchstart",
@@ -2157,7 +2163,33 @@ class ExtraKeysManager {
             btn.dataset.key ||
             (btn.id === "extra-keys-toggle" ? "TOGGLE" : null);
           dbg("[ExtraKeys] touchedKey set to:", touchedKey);
+          const row = btn.closest(".extra-keys-row");
+          const touch = e.touches?.[0];
+          swipe =
+            row && touch
+              ? {
+                  row,
+                  startX: touch.clientX,
+                  startScrollLeft: row.scrollLeft,
+                  active: false,
+                }
+              : null;
         }
+      },
+      { passive: false, capture: true },
+    );
+
+    extraKeys.addEventListener(
+      "touchmove",
+      (e) => {
+        const touch = e.touches?.[0];
+        if (!swipe || !touch) return;
+        const dx = touch.clientX - swipe.startX;
+        if (!swipe.active && Math.abs(dx) < EK_SWIPE_SLOP_PX) return;
+        e.preventDefault();
+        swipe.active = true;
+        touchedKey = null;
+        swipe.row.scrollLeft = swipe.startScrollLeft - dx;
       },
       { passive: false, capture: true },
     );
@@ -2168,6 +2200,7 @@ class ExtraKeysManager {
         dbg("[ExtraKeys] touchend, touchedKey:", touchedKey);
         e.preventDefault();
         e.stopImmediatePropagation();
+        swipe = null;
         if (touchedKey) {
           if (touchedKey === "TOGGLE") {
             this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
@@ -2207,27 +2240,33 @@ class ExtraKeysManager {
     // On mobile: always visible
     this.updateVisibility();
 
-    // Restore the persisted secondary-row collapsed state (default: expanded).
+    // Restore the persisted secondary-row collapsed state (default: collapsed).
     // settingsStore's cache is empty until settingsReady resolves (a server
     // round-trip), so applying it synchronously here always reads the
     // fallback on a fresh browser/profile — apply now (so there's no flash
     // of the wrong state once localStorage IS warm) and re-apply once
     // settingsReady resolves in case the synchronous read missed a
     // server-persisted value.
+    // Default is collapsed (F-keys are rarely needed; one row leaves the
+    // terminal more room); an explicit expand is persisted per actor.
     this.setExtraKeysRow2Collapsed(
       Boolean(
-        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
       ),
       { persist: false },
     );
     void this.tm?.settingsReady?.then(() => {
       this.setExtraKeysRow2Collapsed(
         Boolean(
-          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
         ),
         { persist: false },
       );
     });
+
+    this.quickRepliesEl = document.getElementById("quick-replies");
+    this.renderQuickReplies();
+    this.setupRowOverflowFade();
 
     // Setup toggle button handler
     document
@@ -2340,7 +2379,9 @@ class ExtraKeysManager {
     );
     btns.forEach((btn) => {
       const mod = btn.dataset.key.toLowerCase();
-      btn.classList.toggle("active", this.modifiers[mod] || false);
+      const latched = Boolean(this.modifiers[mod]);
+      btn.classList.toggle("active", latched);
+      btn.setAttribute("aria-pressed", latched ? "true" : "false");
     });
   }
 
@@ -2385,11 +2426,10 @@ class ExtraKeysManager {
     this.visible = Boolean(visible);
     this.updateVisibility();
     // Showing/hiding the row (and its ⋯ toggle) changes how much vertical
-    // space the terminal has. The container-height calc in
-    // handleViewportResize is otherwise only re-run on the next
-    // visualViewport resize/scroll event — trigger it now so a toggle (e.g.
-    // via the More-sheet action) reclaims/consumes the freed space
-    // synchronously, same as setExtraKeysRow2Collapsed already does.
+    // space the terminal has. Mobile tiles use pixel geometry, so the layout
+    // pass in handleViewportResize must re-run now (not on the next
+    // visualViewport event) to re-fit the terminal into the freed/consumed
+    // space, same as setExtraKeysRow2Collapsed does.
     this.tm?.handleViewportResize?.();
   }
 
@@ -2425,6 +2465,7 @@ class ExtraKeysManager {
       this.extraKeysEl.classList.add("hidden");
       toggleBtn?.classList.remove("active");
     }
+    this.updateRowOverflowFades();
   }
 
   // Collapse/expand the secondary extra-keys row + sync the toggle glyph, and
@@ -2435,38 +2476,95 @@ class ExtraKeysManager {
     const toggle = document.getElementById("extra-keys-toggle");
     if (!row2) return;
     row2.classList.toggle("hidden", Boolean(collapsed));
-    if (toggle) toggle.textContent = collapsed ? "⋯" : "⋮";
+    if (toggle) {
+      const label = collapsed ? "Show function keys" : "Hide function keys";
+      toggle.textContent = collapsed ? "⋯" : "⋮";
+      toggle.title = label;
+      toggle.setAttribute("aria-label", label);
+      toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+    this.updateRowOverflowFade(row2);
     if (persist) {
       this.tm?.settingsStore?.set(
         "terminal.extraKeysRow2Collapsed",
         Boolean(collapsed),
       );
     }
-    // The container-height calc that accounts for the extra-keys row (see
-    // handleViewportResize) is otherwise only re-run on the next
-    // visualViewport resize/scroll event. Trigger it immediately so a
-    // row-2 collapse/expand while the on-screen keyboard is already open
-    // reclaims/consumes the freed vertical space right away, not on the
-    // next keyboard toggle.
+    // Re-run the layout pass (see handleViewportResize) immediately so a
+    // row-2 collapse/expand re-fits the terminal into the freed/consumed
+    // vertical space right away, not on the next viewport event.
     this.tm?.handleViewportResize?.();
   }
 
-  // Called by viewport resize handler for mobile keyboard. Mobile no longer
-  // forces visibility here (bug: extra-keys-visibility-pref-ignored-on-mobile)
-  // — the keyboard opening only REPOSITIONS the row (handleViewportResize's
-  // own inline-style bottom offset, applied unconditionally regardless of
-  // this.visible). Whether the row shows at all is governed solely by the
-  // persisted terminal.extraKeysVisible pref now, same as desktop, so a user
-  // who explicitly hid it (via Settings or the More-sheet action) stays hidden
-  // across keyboard open/close.
-  showForKeyboard() {
-    // No-op: see comment above.
+  // Agent quick-reply chips live in the first extra-keys row, so they share
+  // its focus-preserving touch handling and the handleKey send path.
+  renderQuickReplies() {
+    const root = this.quickRepliesEl;
+    const replies = window.QuickReplies?.QUICK_REPLIES;
+    if (!root || !replies) return;
+    root.replaceChildren(
+      ...replies.map((reply) => {
+        const chip = document.createElement("span");
+        chip.className = "ek-btn ek-chip";
+        chip.dataset.key = reply.key;
+        chip.dataset.replyId = reply.id;
+        chip.setAttribute("role", "button");
+        chip.setAttribute("aria-label", reply.ariaLabel);
+        chip.textContent = reply.label;
+        return chip;
+      }),
+    );
   }
 
-  hideForKeyboard() {
-    // Visibility is owned by terminal.extraKeysVisible on every platform.
-    // A viewport resize (including applyVisibility()'s immediate layout pass)
-    // must never overwrite an explicit user preference.
+  // Show the chips while the active terminal runs an agent on a touch
+  // layout. A visibility change resizes the terminal area, so it re-runs the
+  // viewport layout pass unless the caller is that pass.
+  syncQuickReplies({ relayout = true } = {}) {
+    const root = this.quickRepliesEl;
+    const helpers = window.QuickReplies;
+    if (!root || !helpers) return;
+    const active = this.tm?.terminals?.get(this.tm.activeId);
+    const visible = helpers.shouldShowQuickReplies({
+      touchLayout: Boolean(this.tm?.isTouchLayout?.()),
+      agentName: active?.agentName ?? null,
+    });
+    root.dataset.state = helpers.getQuickReplyState({
+      agentState: active?.agentState ?? null,
+    });
+    if (root.hidden === !visible) return;
+    root.hidden = !visible;
+    this.updateRowOverflowFade(root);
+    if (relayout) this.tm?.handleViewportResize?.();
+  }
+
+  setupRowOverflowFade() {
+    if (!this.extraKeysEl) return;
+    this.extraKeysEl.querySelectorAll(".extra-keys-row").forEach((row) => {
+      row.addEventListener("scroll", () => this.updateRowOverflowFade(row), {
+        passive: true,
+      });
+    });
+    window.addEventListener("resize", () => this.updateRowOverflowFades());
+    this.updateRowOverflowFades();
+  }
+
+  updateRowOverflowFades() {
+    this.extraKeysEl
+      ?.querySelectorAll(".extra-keys-row")
+      .forEach((row) => this.updateRowOverflowFade(row));
+  }
+
+  // Fade the row edge(s) that hide keys, as a hint that the row scrolls.
+  updateRowOverflowFade(row) {
+    const getFade = window.MobileLayout?.getRowOverflowFade;
+    if (!row || !getFade) return;
+    const fade = getFade({
+      scrollLeft: row.scrollLeft,
+      scrollWidth: row.scrollWidth,
+      clientWidth: row.clientWidth,
+    });
+    row.classList.toggle("ek-fade-start", fade.start);
+    row.classList.toggle("ek-fade-end", fade.end);
   }
 }
 
@@ -14544,6 +14642,9 @@ class TerminalManager {
         tile.detachButton.setAttribute("aria-label", label);
       }
     });
+    // Agent runtime state changes land here (applyTerminalRuntimeState ->
+    // updateTabGroups), so the quick-reply chips follow the agent.
+    this.extraKeys?.syncQuickReplies?.();
   }
 
   groupWithPrevious() {
@@ -14761,6 +14862,7 @@ class TerminalManager {
     this.updateConnectionStatus(this.getTerminalConnectionStatus(t));
     this.updateLinkedViewButton();
     this.refreshCommandPalette();
+    this.extraKeys?.syncQuickReplies?.();
     void this.syncRightSurfaceForWorkspace();
     return true;
   }

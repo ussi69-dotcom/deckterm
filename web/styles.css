@@ -2833,7 +2833,6 @@ body.touch-input-mode .xterm .composition-view.active {
   background: var(--bg-secondary);
   border-top: 1px solid var(--border-primary);
   padding: 4px 8px;
-  padding-right: 40px;
   gap: 4px;
   flex-shrink: 0;
   position: relative;
@@ -2859,11 +2858,66 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
-.extra-keys-row.hidden {
+.extra-keys-row.hidden,
+.quick-replies-row[hidden] {
   display: none;
 }
 
+/* Key rows + the row toggle side by side; the toggle never scrolls away. */
+.extra-keys-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.extra-keys-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Edge fade: hints that a row scrolls sideways (classes set by
+   ExtraKeysManager.updateRowOverflowFade from the row's scroll position). */
+.extra-keys-row.ek-fade-end {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    #000 calc(100% - 32px),
+    transparent
+  );
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+
+.extra-keys-row.ek-fade-start {
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 32px);
+  mask-image: linear-gradient(to right, transparent, #000 32px);
+}
+
+.extra-keys-row.ek-fade-start.ek-fade-end {
+  -webkit-mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 32px,
+    #000 calc(100% - 32px),
+    transparent
+  );
+  mask-image: linear-gradient(
+    to right,
+    transparent,
+    #000 32px,
+    #000 calc(100% - 32px),
+    transparent
+  );
+}
+
 .ek-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+  white-space: nowrap;
   min-width: 44px;
   height: 40px;
   padding: 6px 10px;
@@ -2874,7 +2928,13 @@ body.touch-input-mode .xterm .composition-view.active {
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
-  transition: all 0.15s;
+  /* Never animate size: the layout pass measures the bar right after the
+     keyboard-open compaction and must see the final height. */
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s,
+    transform 0.15s;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
@@ -2893,15 +2953,14 @@ body.touch-input-mode .xterm .composition-view.active {
   transform: scale(0.95);
 }
 
-.ek-btn.ek-modifier {
-  background: rgba(31, 111, 235, 0.15);
-  border-color: rgba(31, 111, 235, 0.3);
-}
-
+/* Modifiers look like any other key at rest; latched (applies to the next
+   key) is an unmistakable solid accent with an inner ring. */
 .ek-btn.ek-modifier.active {
   background: #1f6feb;
   color: #fff;
-  border-color: #1f6feb;
+  border-color: #58a6ff;
+  box-shadow: inset 0 0 0 1px #58a6ff;
+  font-weight: 700;
 }
 
 .ek-btn.ek-icon {
@@ -2918,24 +2977,54 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .ek-toggle {
-  position: absolute;
-  right: 8px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 28px;
-  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 44px;
+  width: 44px;
+  height: 44px;
   padding: 0;
-  background: var(--bg-hover);
-  border: none;
-  border-radius: 50%;
-  color: var(--text-muted);
-  font-size: 14px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-hover);
+  border-radius: 8px;
+  color: var(--text-primary);
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1;
   cursor: pointer;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .ek-toggle:hover {
-  background: var(--border-hover);
-  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+
+.ek-toggle[aria-expanded="true"] {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+}
+
+/* Agent quick replies: compact pill chips in the first extra-keys row,
+   emphasised while the agent is quiet (likely waiting for an answer). */
+.quick-replies-row {
+  gap: 6px;
+}
+
+.ek-btn.ek-chip {
+  min-width: 44px;
+  height: 40px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-weight: 600;
+}
+
+.quick-replies-row[data-state="waiting"] .ek-chip {
+  background: rgba(31, 111, 235, 0.16);
+  border-color: rgba(88, 166, 255, 0.5);
+  color: #cae8ff;
 }
 
 /* Hide extra keys on desktop by default (JS will show if saved state) */
@@ -4077,8 +4166,7 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   .extra-keys {
-    padding: 8px 12px;
-    padding-right: 40px;
+    padding: 6px 8px 6px 12px;
     gap: 6px;
   }
 
@@ -4134,8 +4222,8 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 
 @media (max-width: 400px) {
   .ek-btn {
-    min-width: 40px;
-    height: 40px;
+    min-width: 44px;
+    height: 44px;
     font-size: 11px;
   }
 
