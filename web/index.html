@@ -31,8 +31,17 @@
       <header class="toolbar">
         <!-- ROW 1: Always visible - toggle, new, tabs, status -->
         <div class="toolbar-row-1">
-          <button id="toolbar-toggle" class="toolbar-toggle" title="Menu">
-            <i data-lucide="menu"></i>
+          <button
+            id="toolbar-toggle"
+            class="toolbar-toggle"
+            title="Menu"
+            aria-label="Menu"
+            aria-haspopup="dialog"
+            aria-controls="tools-sheet"
+            aria-expanded="false"
+          >
+            <i data-lucide="menu" class="toolbar-toggle-open"></i>
+            <i data-lucide="x" class="toolbar-toggle-close"></i>
           </button>
 
           <div
@@ -147,11 +156,16 @@
 
       <div id="tools-sheet" class="tools-sheet hidden" aria-hidden="true">
         <div class="tools-sheet-backdrop"></div>
-        <div class="tools-sheet-panel">
+        <div
+          class="tools-sheet-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="tools-sheet-title"
+        >
           <div class="tools-sheet-header">
             <div>
               <div class="tools-sheet-kicker">Current workspace</div>
-              <h2>Tools</h2>
+              <h2 id="tools-sheet-title">Tools</h2>
             </div>
             <button
               id="tools-sheet-close"

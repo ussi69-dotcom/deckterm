@@ -4662,6 +4662,17 @@ body.chrome-mobile .file-explorer-shell {
   height: 18px;
 }
 
+/* Menu icon while the Tools sheet is closed, X while it is open (the old
+   90-degree rotation turned the menu icon into "|||"). */
+.toolbar-toggle .toolbar-toggle-close,
+.toolbar-toggle.active .toolbar-toggle-open {
+  display: none;
+}
+
+.toolbar-toggle.active .toolbar-toggle-close {
+  display: block;
+}
+
 /* =============================================================================
    SCROLLBAR - wider, more visible, easier to grab
    ============================================================================= */
@@ -4817,9 +4828,6 @@ body.chrome-mobile .mobile-action-bar[hidden] {
     color: var(--text-primary);
   }
 
-  .toolbar-toggle.active svg {
-    transform: rotate(90deg);
-  }
 
   /* Mobile: Row 1 takes full width */
   .toolbar-row-1 {

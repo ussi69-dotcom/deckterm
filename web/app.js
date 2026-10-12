@@ -7372,7 +7372,7 @@ class TerminalManager {
   setupToolsSheet() {
     if (!this.toolsSheet) return;
 
-    const close = () => this.closeToolsSheet();
+    const close = () => this.closeToolsSheet({ restoreFocus: true });
 
     this.toolsSheet
       .querySelector(".tools-sheet-backdrop")
@@ -7380,6 +7380,81 @@ class TerminalManager {
     this.toolsSheet
       .querySelector("#tools-sheet-close")
       ?.addEventListener("click", close);
+    // Modal sheet: Escape closes it, Tab cycles inside it.
+    this.toolsSheet.addEventListener("keydown", (event) => {
+      if (this.toolsSheet.classList.contains("hidden")) return;
+      if (event.key === "Escape" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = this.getToolsSheetFocusableElements();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const inside = this.toolsSheet.contains(document.activeElement);
+      if (event.shiftKey && (document.activeElement === first || !inside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !inside)) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+  }
+
+  getToolsSheetFocusableElements() {
+    const panel = this.toolsSheet?.querySelector(".tools-sheet-panel");
+    if (!panel || this.toolsSheet.classList.contains("hidden")) return [];
+    return Array.from(
+      panel.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        !element.hidden &&
+        !element.closest("[hidden], .hidden") &&
+        element.getClientRects().length > 0,
+    );
+  }
+
+  // First control on open: the first action tile (not the directory field,
+  // which would pop the on-screen keyboard on touch).
+  focusToolsSheetFirstControl() {
+    const focusable = this.getToolsSheetFocusableElements();
+    const target =
+      focusable.find((element) => element.closest("#tools-sheet-grid")) ||
+      focusable.find(
+        (element) =>
+          !element.matches('input:not([type="checkbox"]), textarea'),
+      ) ||
+      focusable[0];
+    target?.focus({ preventScroll: true });
+  }
+
+  // The visible More / Menu trigger that should get focus back on close.
+  getToolsSheetTrigger() {
+    const opener = this.toolsSheetOpener;
+    if (
+      opener?.isConnected &&
+      !this.toolsSheet?.contains(opener) &&
+      opener.getClientRects().length > 0
+    ) {
+      return opener;
+    }
+    return (
+      Array.from(
+        document.querySelectorAll(
+          '#toolbar-toggle, [data-action="toggle-tools-sheet"]',
+        ),
+      ).find(
+        (element) =>
+          !this.toolsSheet?.contains(element) &&
+          element.getClientRects().length > 0,
+      ) || null
+    );
   }
 
   setupTaskPanel() {
@@ -9562,6 +9637,9 @@ class TerminalManager {
       .querySelectorAll('[data-action="toggle-tools-sheet"], #toolbar-toggle')
       .forEach((btn) => {
         btn.classList.toggle("active", isOpen);
+        if (!btn.closest("#tools-sheet")) {
+          btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+        }
       });
   }
 
@@ -9570,15 +9648,30 @@ class TerminalManager {
     if (!preserveLayoutEditor) {
       this.layoutEditorOpen = false;
     }
+    const wasHidden = this.toolsSheet.classList.contains("hidden");
+    if (wasHidden) {
+      const active = document.activeElement;
+      this.toolsSheetOpener =
+        active instanceof HTMLElement &&
+        active.matches('#toolbar-toggle, [data-action="toggle-tools-sheet"]')
+          ? active
+          : null;
+    }
     this.toolsSheet.classList.remove("hidden");
     this.toolsSheet.setAttribute("aria-hidden", "false");
     this.setOverflowToggleState(true);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasHidden) this.focusToolsSheetFirstControl();
   }
 
-  closeToolsSheet() {
+  // restoreFocus: the user dismissed the sheet (Escape, X, backdrop, the
+  // trigger again) -> focus returns to the More / Menu button. Closes caused
+  // by opening another surface leave focus to that surface.
+  closeToolsSheet({ restoreFocus = false } = {}) {
     if (!this.toolsSheet) return;
+    const wasOpen = !this.toolsSheet.classList.contains("hidden");
+    const focusWasInside = this.toolsSheet.contains(document.activeElement);
     this.cleanupLayoutDrag({ rerender: false });
     this.layoutEditorOpen = false;
     this.toolsSheet.classList.add("hidden");
@@ -9586,6 +9679,16 @@ class TerminalManager {
     this.setOverflowToggleState(false);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasOpen && (restoreFocus || focusWasInside)) {
+      const stranded =
+        !document.activeElement ||
+        document.activeElement === document.body ||
+        this.toolsSheet.contains(document.activeElement);
+      if (restoreFocus || stranded) {
+        this.getToolsSheetTrigger()?.focus({ preventScroll: true });
+      }
+    }
+    if (wasOpen) this.toolsSheetOpener = null;
   }
 
   toggleToolsSheet() {
@@ -9593,7 +9696,7 @@ class TerminalManager {
     if (this.toolsSheet.classList.contains("hidden")) {
       this.openToolsSheet();
     } else {
-      this.closeToolsSheet();
+      this.closeToolsSheet({ restoreFocus: true });
     }
   }
 
