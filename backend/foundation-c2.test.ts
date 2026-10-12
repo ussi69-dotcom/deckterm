@@ -130,6 +130,8 @@ test("C2-1b: denied file access returns a structured, explainable payload", asyn
   expect(body.setting).toBe("ALLOWED_FILE_ROOTS");
   expect(body.message).toContain(join(outsideRoot, "nope.txt"));
   expect(body.message).toContain("ALLOWED_FILE_ROOTS");
+  // nope.txt does not exist, so the message cannot claim it is out of bounds.
+  expect(body.message).toContain("does not exist");
 });
 
 test("C2-2: task create with a forbidden root is denied and writes a foundation audit deny row", async () => {
@@ -151,6 +153,8 @@ test("C2-2: task create with a forbidden root is denied and writes a foundation 
   expect(denied.reason).toBe("forbidden_root");
   expect(denied.path).toBe(outsideRoot);
   expect(denied.message).toContain("ALLOWED_FILE_ROOTS");
+  // outsideRoot exists, so the denial says plainly that it is out of bounds.
+  expect(denied.message).not.toContain("does not exist");
 
   // taskRunner already throws for forbidden roots, but C2 routes the decision
   // through the foundation layer so it is audited consistently with file/git/terminal.

@@ -2057,6 +2057,21 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   );
 }
 
+// Whether a path refused by resolveAllowedPath exists at all, so the denial
+// can say "outside the allowed roots" instead of "outside the allowed roots or
+// does not exist". Legacy (service-account) view only — never consulted under
+// OS isolation, where the service account must not traverse a user's tree.
+async function rejectedPathExists(inputPath: string): Promise<boolean> {
+  if (!inputPath) return false;
+  try {
+    const fs = await import("fs/promises");
+    await fs.stat(resolve(inputPath));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function resolveAllowedPath(
   inputPath: string,
   opts: { allowMissing?: boolean } = {},
@@ -3687,7 +3702,7 @@ async function resolveScopedFsPath(
           ...forbiddenRootDetail({
             path: clientPath,
             subject: "path",
-            mayBeMissing: true,
+            mayBeMissing: !(await rejectedPathExists(clientPath)),
           }),
         },
       };
@@ -6868,7 +6883,7 @@ export function createWebApp() {
             ...forbiddenRootDetail({
               path: requestedRoot,
               subject: "project",
-              mayBeMissing: true,
+              mayBeMissing: !(await rejectedPathExists(requestedRoot)),
             }),
           },
           403,
@@ -8232,7 +8247,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: true,
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
           }),
           requestId,
         },
@@ -8334,7 +8349,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: true,
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
           }),
         },
         403,
