@@ -170,15 +170,19 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       const extraKeysToggle = page.locator("#extra-keys-toggle");
       const row2 = page.locator(".extra-keys-row-2");
 
+      // The F-key row starts collapsed (one key row leaves the terminal more
+      // room); the toggle expands it and reports the state.
+      await expect(row2).toHaveClass(/\bhidden\b/);
+      await expect(extraKeysToggle).toHaveAttribute("aria-expanded", "false");
+
+      await extraKeysToggle.click();
+      await page.waitForTimeout(100);
       await expect(row2).not.toHaveClass(/\bhidden\b/);
+      await expect(extraKeysToggle).toHaveAttribute("aria-expanded", "true");
 
       await extraKeysToggle.click();
       await page.waitForTimeout(100);
       await expect(row2).toHaveClass(/\bhidden\b/);
-
-      await extraKeysToggle.click();
-      await page.waitForTimeout(100);
-      await expect(row2).not.toHaveClass(/\bhidden\b/);
     });
   });
 

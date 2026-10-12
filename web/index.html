@@ -4,10 +4,10 @@
     <meta charset="utf-8" />
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1, interactive-widget=resizes-content"
+      content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"
     />
     <title>DeckTerm</title>
-    <meta name="theme-color" content="#238636" />
+    <meta name="theme-color" content="#161b22" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-title" content="DeckTerm" />
     <link rel="manifest" href="/manifest.webmanifest" />
@@ -580,48 +580,67 @@
 
       <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
       <div id="extra-keys" class="extra-keys">
-        <div class="extra-keys-row">
-          <span data-key="ESC" class="ek-btn">ESC</span>
-          <span data-key="TAB" class="ek-btn">TAB</span>
-          <span data-key="CTRL" class="ek-btn ek-modifier">CTRL</span>
-          <span data-key="ALT" class="ek-btn ek-modifier">ALT</span>
-          <span data-key="SHIFT" class="ek-btn ek-modifier">SHIFT</span>
-          <span data-key="UP" class="ek-btn ek-icon"
-            ><i data-lucide="chevron-up"></i
-          ></span>
-          <span data-key="DOWN" class="ek-btn ek-icon"
-            ><i data-lucide="chevron-down"></i
-          ></span>
-          <span data-key="LEFT" class="ek-btn ek-icon"
-            ><i data-lucide="chevron-left"></i
-          ></span>
-          <span data-key="RIGHT" class="ek-btn ek-icon"
-            ><i data-lucide="chevron-right"></i
-          ></span>
-          <span data-key="HOME" class="ek-btn">HOME</span>
-          <span data-key="END" class="ek-btn">END</span>
-          <span data-key="INS" class="ek-btn">INS</span>
-          <span data-key="DEL" class="ek-btn">DEL</span>
+        <!-- Agent quick replies: filled + shown by ExtraKeysManager while the
+             active terminal runs a coding agent (touch layouts only). -->
+        <div
+          id="quick-replies"
+          class="extra-keys-row quick-replies-row"
+          role="group"
+          aria-label="Quick replies"
+          hidden
+        ></div>
+        <div class="extra-keys-main">
+          <div class="extra-keys-rows">
+            <div class="extra-keys-row extra-keys-row-1">
+              <span data-key="ESC" class="ek-btn">ESC</span>
+              <span data-key="TAB" class="ek-btn">TAB</span>
+              <span data-key="CTRL" class="ek-btn ek-modifier" aria-pressed="false">CTRL</span>
+              <span data-key="ALT" class="ek-btn ek-modifier" aria-pressed="false">ALT</span>
+              <span data-key="SHIFT" class="ek-btn ek-modifier" aria-pressed="false">SHIFT</span>
+              <span data-key="UP" class="ek-btn ek-icon" aria-label="Up"
+                ><i data-lucide="chevron-up"></i
+              ></span>
+              <span data-key="DOWN" class="ek-btn ek-icon" aria-label="Down"
+                ><i data-lucide="chevron-down"></i
+              ></span>
+              <span data-key="LEFT" class="ek-btn ek-icon" aria-label="Left"
+                ><i data-lucide="chevron-left"></i
+              ></span>
+              <span data-key="RIGHT" class="ek-btn ek-icon" aria-label="Right"
+                ><i data-lucide="chevron-right"></i
+              ></span>
+              <span data-key="HOME" class="ek-btn">HOME</span>
+              <span data-key="END" class="ek-btn">END</span>
+              <span data-key="INS" class="ek-btn">INS</span>
+              <span data-key="DEL" class="ek-btn">DEL</span>
+            </div>
+            <div class="extra-keys-row extra-keys-row-2 hidden">
+              <span data-key="F1" class="ek-btn">F1</span>
+              <span data-key="F2" class="ek-btn">F2</span>
+              <span data-key="F3" class="ek-btn">F3</span>
+              <span data-key="F4" class="ek-btn">F4</span>
+              <span data-key="F5" class="ek-btn">F5</span>
+              <span data-key="F6" class="ek-btn">F6</span>
+              <span data-key="F7" class="ek-btn">F7</span>
+              <span data-key="F8" class="ek-btn">F8</span>
+              <span data-key="F9" class="ek-btn">F9</span>
+              <span data-key="F10" class="ek-btn">F10</span>
+              <span data-key="F11" class="ek-btn">F11</span>
+              <span data-key="F12" class="ek-btn">F12</span>
+              <span data-key="PGUP" class="ek-btn">PgUp</span>
+              <span data-key="PGDN" class="ek-btn">PgDn</span>
+            </div>
+          </div>
+          <span
+            id="extra-keys-toggle"
+            class="ek-toggle"
+            role="button"
+            title="Show function keys"
+            aria-label="Show function keys"
+            aria-expanded="false"
+            >⋯</span
+          >
         </div>
-        <div class="extra-keys-row extra-keys-row-2 hidden">
-          <span data-key="F1" class="ek-btn">F1</span>
-          <span data-key="F2" class="ek-btn">F2</span>
-          <span data-key="F3" class="ek-btn">F3</span>
-          <span data-key="F4" class="ek-btn">F4</span>
-          <span data-key="F5" class="ek-btn">F5</span>
-          <span data-key="F6" class="ek-btn">F6</span>
-          <span data-key="F7" class="ek-btn">F7</span>
-          <span data-key="F8" class="ek-btn">F8</span>
-          <span data-key="F9" class="ek-btn">F9</span>
-          <span data-key="F10" class="ek-btn">F10</span>
-          <span data-key="F11" class="ek-btn">F11</span>
-          <span data-key="F12" class="ek-btn">F12</span>
-          <span data-key="PGUP" class="ek-btn">PgUp</span>
-          <span data-key="PGDN" class="ek-btn">PgDn</span>
-        </div>
-        <span id="extra-keys-toggle" class="ek-toggle" title="More keys"
-          >⋯</span
-        >
       </div>
 
       <nav
@@ -940,6 +959,8 @@
     <script src="/editor-tabs.js?v=20260705a"></script>
     <script src="/input-fallback.js?v=20260415a"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
+    <script src="/mobile-layout.js?v=20261012a"></script>
+    <script src="/quick-replies.js?v=20261012a"></script>
     <script src="/terminal-selection.js?v=20260819b"></script>
     <script src="/assets/diff2html-3.4.56.min.js"></script>
     <script src="/app.js?v=20260829a"></script>

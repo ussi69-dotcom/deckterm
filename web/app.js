@@ -93,6 +93,10 @@ const KEY_SEQUENCES = {
   F10: "\x1b[21~",
   F11: "\x1b[23~",
   F12: "\x1b[24~",
+  // Agent quick-reply chips (quick-replies.js) send through the same table.
+  ENTER: "\r",
+  SHIFT_TAB: "\x1b[Z",
+  CTRL_C: "\x03",
 };
 
 const TERMINAL_FONT_FAMILY =
@@ -2231,6 +2235,12 @@ class ExtraKeysManager {
     const row2 = document.querySelector(".extra-keys-row-2");
 
     let touchedKey = null;
+    // touchstart is preventDefault-ed (keeps focus in the terminal so the
+    // on-screen keyboard stays up), which also blocks native scrolling of
+    // the key rows. Swipes are therefore scrolled by hand: a horizontal move
+    // past EK_SWIPE_SLOP_PX turns the touch into a row scroll, not a key.
+    const EK_SWIPE_SLOP_PX = 8;
+    let swipe = null;
 
     extraKeys.addEventListener(
       "touchstart",
@@ -2244,7 +2254,33 @@ class ExtraKeysManager {
             btn.dataset.key ||
             (btn.id === "extra-keys-toggle" ? "TOGGLE" : null);
           dbg("[ExtraKeys] touchedKey set to:", touchedKey);
+          const row = btn.closest(".extra-keys-row");
+          const touch = e.touches?.[0];
+          swipe =
+            row && touch
+              ? {
+                  row,
+                  startX: touch.clientX,
+                  startScrollLeft: row.scrollLeft,
+                  active: false,
+                }
+              : null;
         }
+      },
+      { passive: false, capture: true },
+    );
+
+    extraKeys.addEventListener(
+      "touchmove",
+      (e) => {
+        const touch = e.touches?.[0];
+        if (!swipe || !touch) return;
+        const dx = touch.clientX - swipe.startX;
+        if (!swipe.active && Math.abs(dx) < EK_SWIPE_SLOP_PX) return;
+        e.preventDefault();
+        swipe.active = true;
+        touchedKey = null;
+        swipe.row.scrollLeft = swipe.startScrollLeft - dx;
       },
       { passive: false, capture: true },
     );
@@ -2255,6 +2291,7 @@ class ExtraKeysManager {
         dbg("[ExtraKeys] touchend, touchedKey:", touchedKey);
         e.preventDefault();
         e.stopImmediatePropagation();
+        swipe = null;
         if (touchedKey) {
           if (touchedKey === "TOGGLE") {
             this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
@@ -2294,27 +2331,33 @@ class ExtraKeysManager {
     // On mobile: always visible
     this.updateVisibility();
 
-    // Restore the persisted secondary-row collapsed state (default: expanded).
+    // Restore the persisted secondary-row collapsed state (default: collapsed).
     // settingsStore's cache is empty until settingsReady resolves (a server
     // round-trip), so applying it synchronously here always reads the
     // fallback on a fresh browser/profile — apply now (so there's no flash
     // of the wrong state once localStorage IS warm) and re-apply once
     // settingsReady resolves in case the synchronous read missed a
     // server-persisted value.
+    // Default is collapsed (F-keys are rarely needed; one row leaves the
+    // terminal more room); an explicit expand is persisted per actor.
     this.setExtraKeysRow2Collapsed(
       Boolean(
-        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
       ),
       { persist: false },
     );
     void this.tm?.settingsReady?.then(() => {
       this.setExtraKeysRow2Collapsed(
         Boolean(
-          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
         ),
         { persist: false },
       );
     });
+
+    this.quickRepliesEl = document.getElementById("quick-replies");
+    this.renderQuickReplies();
+    this.setupRowOverflowFade();
 
     // Setup toggle button handler
     document
@@ -2427,7 +2470,9 @@ class ExtraKeysManager {
     );
     btns.forEach((btn) => {
       const mod = btn.dataset.key.toLowerCase();
-      btn.classList.toggle("active", this.modifiers[mod] || false);
+      const latched = Boolean(this.modifiers[mod]);
+      btn.classList.toggle("active", latched);
+      btn.setAttribute("aria-pressed", latched ? "true" : "false");
     });
   }
 
@@ -2472,11 +2517,10 @@ class ExtraKeysManager {
     this.visible = Boolean(visible);
     this.updateVisibility();
     // Showing/hiding the row (and its ⋯ toggle) changes how much vertical
-    // space the terminal has. The container-height calc in
-    // handleViewportResize is otherwise only re-run on the next
-    // visualViewport resize/scroll event — trigger it now so a toggle (e.g.
-    // via the More-sheet action) reclaims/consumes the freed space
-    // synchronously, same as setExtraKeysRow2Collapsed already does.
+    // space the terminal has. Mobile tiles use pixel geometry, so the layout
+    // pass in handleViewportResize must re-run now (not on the next
+    // visualViewport event) to re-fit the terminal into the freed/consumed
+    // space, same as setExtraKeysRow2Collapsed does.
     this.tm?.handleViewportResize?.();
   }
 
@@ -2512,6 +2556,7 @@ class ExtraKeysManager {
       this.extraKeysEl.classList.add("hidden");
       toggleBtn?.classList.remove("active");
     }
+    this.updateRowOverflowFades();
   }
 
   // Collapse/expand the secondary extra-keys row + sync the toggle glyph, and
@@ -2522,38 +2567,95 @@ class ExtraKeysManager {
     const toggle = document.getElementById("extra-keys-toggle");
     if (!row2) return;
     row2.classList.toggle("hidden", Boolean(collapsed));
-    if (toggle) toggle.textContent = collapsed ? "⋯" : "⋮";
+    if (toggle) {
+      const label = collapsed ? "Show function keys" : "Hide function keys";
+      toggle.textContent = collapsed ? "⋯" : "⋮";
+      toggle.title = label;
+      toggle.setAttribute("aria-label", label);
+      toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+    this.updateRowOverflowFade(row2);
     if (persist) {
       this.tm?.settingsStore?.set(
         "terminal.extraKeysRow2Collapsed",
         Boolean(collapsed),
       );
     }
-    // The container-height calc that accounts for the extra-keys row (see
-    // handleViewportResize) is otherwise only re-run on the next
-    // visualViewport resize/scroll event. Trigger it immediately so a
-    // row-2 collapse/expand while the on-screen keyboard is already open
-    // reclaims/consumes the freed vertical space right away, not on the
-    // next keyboard toggle.
+    // Re-run the layout pass (see handleViewportResize) immediately so a
+    // row-2 collapse/expand re-fits the terminal into the freed/consumed
+    // vertical space right away, not on the next viewport event.
     this.tm?.handleViewportResize?.();
   }
 
-  // Called by viewport resize handler for mobile keyboard. Mobile no longer
-  // forces visibility here (bug: extra-keys-visibility-pref-ignored-on-mobile)
-  // — the keyboard opening only REPOSITIONS the row (handleViewportResize's
-  // own inline-style bottom offset, applied unconditionally regardless of
-  // this.visible). Whether the row shows at all is governed solely by the
-  // persisted terminal.extraKeysVisible pref now, same as desktop, so a user
-  // who explicitly hid it (via Settings or the More-sheet action) stays hidden
-  // across keyboard open/close.
-  showForKeyboard() {
-    // No-op: see comment above.
+  // Agent quick-reply chips live in the first extra-keys row, so they share
+  // its focus-preserving touch handling and the handleKey send path.
+  renderQuickReplies() {
+    const root = this.quickRepliesEl;
+    const replies = window.QuickReplies?.QUICK_REPLIES;
+    if (!root || !replies) return;
+    root.replaceChildren(
+      ...replies.map((reply) => {
+        const chip = document.createElement("span");
+        chip.className = "ek-btn ek-chip";
+        chip.dataset.key = reply.key;
+        chip.dataset.replyId = reply.id;
+        chip.setAttribute("role", "button");
+        chip.setAttribute("aria-label", reply.ariaLabel);
+        chip.textContent = reply.label;
+        return chip;
+      }),
+    );
   }
 
-  hideForKeyboard() {
-    // Visibility is owned by terminal.extraKeysVisible on every platform.
-    // A viewport resize (including applyVisibility()'s immediate layout pass)
-    // must never overwrite an explicit user preference.
+  // Show the chips while the active terminal runs an agent on a touch
+  // layout. A visibility change resizes the terminal area, so it re-runs the
+  // viewport layout pass unless the caller is that pass.
+  syncQuickReplies({ relayout = true } = {}) {
+    const root = this.quickRepliesEl;
+    const helpers = window.QuickReplies;
+    if (!root || !helpers) return;
+    const active = this.tm?.terminals?.get(this.tm.activeId);
+    const visible = helpers.shouldShowQuickReplies({
+      touchLayout: Boolean(this.tm?.isTouchLayout?.()),
+      agentName: active?.agentName ?? null,
+    });
+    root.dataset.state = helpers.getQuickReplyState({
+      agentState: active?.agentState ?? null,
+    });
+    if (root.hidden === !visible) return;
+    root.hidden = !visible;
+    this.updateRowOverflowFade(root);
+    if (relayout) this.tm?.handleViewportResize?.();
+  }
+
+  setupRowOverflowFade() {
+    if (!this.extraKeysEl) return;
+    this.extraKeysEl.querySelectorAll(".extra-keys-row").forEach((row) => {
+      row.addEventListener("scroll", () => this.updateRowOverflowFade(row), {
+        passive: true,
+      });
+    });
+    window.addEventListener("resize", () => this.updateRowOverflowFades());
+    this.updateRowOverflowFades();
+  }
+
+  updateRowOverflowFades() {
+    this.extraKeysEl
+      ?.querySelectorAll(".extra-keys-row")
+      .forEach((row) => this.updateRowOverflowFade(row));
+  }
+
+  // Fade the row edge(s) that hide keys, as a hint that the row scrolls.
+  updateRowOverflowFade(row) {
+    const getFade = window.MobileLayout?.getRowOverflowFade;
+    if (!row || !getFade) return;
+    const fade = getFade({
+      scrollLeft: row.scrollLeft,
+      scrollWidth: row.scrollWidth,
+      clientWidth: row.clientWidth,
+    });
+    row.classList.toggle("ek-fade-start", fade.start);
+    row.classList.toggle("ek-fade-end", fade.end);
   }
 }
 
@@ -5676,6 +5778,10 @@ class TerminalManager {
     this.telemetryRefreshInterval = null;
     this.viewportSyncFrame = 0;
     this.viewportFocusTimer = null;
+    // Tallest resting visible height per orientation ("portrait" /
+    // "landscape"); keyboard detection measures drops against it.
+    this.viewportBaselines = {};
+    this.viewportLayoutKey = "";
     this.notificationMode =
       settingsDefaults["notifications.soundMode"] || "unfocused";
     this.notificationSound = settingsDefaults["notifications.sound"] || "chime";
@@ -6143,22 +6249,39 @@ class TerminalManager {
   }
 
   setupViewportResizeHandling() {
-    if (!window.visualViewport) return;
-
     const scheduleViewportSync = () => {
       if (this.viewportSyncFrame) return;
       this.viewportSyncFrame = requestAnimationFrame(() => {
         this.viewportSyncFrame = 0;
-        this.handleViewportResize();
+        this.handleViewportResize({ fromViewportEvent: true });
       });
     };
 
+    // Keyboard detection depends on focus as well as on height (a height
+    // drop only counts as a keyboard while an input is focused), and the
+    // Android resizes-content keyboard resizes the layout viewport too.
+    window.addEventListener("resize", scheduleViewportSync);
+    window.addEventListener("orientationchange", scheduleViewportSync);
+    document.addEventListener("focusin", scheduleViewportSync);
+    document.addEventListener("focusout", scheduleViewportSync);
+
     const viewport = window.visualViewport;
-    viewport.addEventListener("resize", scheduleViewportSync);
-    viewport.addEventListener("scroll", scheduleViewportSync);
-    if ("onscrollend" in viewport) {
-      viewport.addEventListener("scrollend", scheduleViewportSync);
+    if (viewport) {
+      viewport.addEventListener("resize", scheduleViewportSync);
+      viewport.addEventListener("scroll", scheduleViewportSync);
+      if ("onscrollend" in viewport) {
+        viewport.addEventListener("scrollend", scheduleViewportSync);
+      }
     }
+    this.handleViewportResize({ fromViewportEvent: true });
+  }
+
+  // Touch-first layouts: phones (mobile chrome) and coarse-pointer tablets.
+  isTouchLayout() {
+    return (
+      platformDetector.isMobile ||
+      (platformDetector.hasTouch && platformDetector.isCoarsePointer)
+    );
   }
 
   setupTerminalRenderRecovery() {
@@ -15249,6 +15372,9 @@ class TerminalManager {
         tile.detachButton.setAttribute("aria-label", label);
       }
     });
+    // Agent runtime state changes land here (applyTerminalRuntimeState ->
+    // updateTabGroups), so the quick-reply chips follow the agent.
+    this.extraKeys?.syncQuickReplies?.();
   }
 
   groupWithPrevious() {
@@ -15467,6 +15593,7 @@ class TerminalManager {
     this.updateConnectionStatus(this.getTerminalConnectionStatus(t));
     this.updateLinkedViewButton();
     this.refreshCommandPalette();
+    this.extraKeys?.syncQuickReplies?.();
     void this.syncRightSurfaceForWorkspace();
     return true;
   }
@@ -15788,56 +15915,128 @@ class TerminalManager {
     this.syncFontSizeStepper();
   }
 
-  handleViewportResize() {
-    if (!window.visualViewport) return;
+  // Layout pass for touch devices. Sizes the app shell from the visual
+  // viewport (so the on-screen keyboard really shrinks the terminal instead
+  // of covering it), flags keyboard-open / phone-landscape for the compact
+  // chrome CSS, then re-fits the active terminal and keeps its prompt in
+  // view. Pure decisions live in mobile-layout.js (window.MobileLayout).
+  //
+  // fromViewportEvent: viewport/focus listeners pass true and the pass is
+  // skipped when nothing changed (visualViewport scroll fires often while
+  // panning). Direct callers (extra-keys toggles, action-bar changes) omit
+  // it: their chrome change needs the re-fit even at the same viewport size.
+  handleViewportResize({ fromViewportEvent = false } = {}) {
+    const helpers = window.MobileLayout;
+    if (!helpers) return;
 
     const viewport = window.visualViewport;
-    const windowHeight = window.innerHeight;
-    const viewportHeight = viewport.height;
-    const keyboardHeight = windowHeight - viewportHeight - viewport.offsetTop;
+    const touch = this.isTouchLayout();
+    const orientation = helpers.getOrientation({
+      screenOrientationType: window.screen?.orientation?.type,
+      screenWidth: window.screen?.width,
+      screenHeight: window.screen?.height,
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+    });
+    const layout = helpers.computeViewportLayout({
+      touch,
+      orientation,
+      innerHeight: window.innerHeight,
+      visualHeight: viewport?.height,
+      visualOffsetTop: viewport?.offsetTop,
+      visualScale: viewport?.scale,
+      inputFocused: this.isEditableElementFocused(),
+      baselines: this.viewportBaselines,
+    });
+    this.viewportBaselines = layout.baselines;
 
-    const extraKeys = document.getElementById("extra-keys");
-    const mobileActionBar = document.getElementById("mobile-action-bar");
-    const toolbarHeight = this.toolbar?.offsetHeight || 0;
-    const extraKeysHeight = extraKeys?.offsetHeight || 0;
-    const mobileActionBarHeight =
-      mobileActionBar && getComputedStyle(mobileActionBar).display !== "none"
-        ? mobileActionBar.offsetHeight || 0
-        : 0;
-    const isKeyboardOpen = keyboardHeight > 100;
-
-    if (isKeyboardOpen) {
-      // Show extra keys above virtual keyboard
-      this.extraKeys?.showForKeyboard();
-      extraKeys.style.position = "fixed";
-      extraKeys.style.bottom = `${keyboardHeight}px`;
-      extraKeys.style.left = "0";
-      extraKeys.style.right = "0";
-      extraKeys.style.zIndex = "1000";
-      this.container.style.height = `calc(${viewportHeight}px - ${toolbarHeight}px - ${extraKeysHeight}px - ${mobileActionBarHeight}px)`;
-      document.body.classList.add("virtual-keyboard-open");
+    const root = document.documentElement;
+    const body = document.body;
+    if (layout.appHeight !== null) {
+      root.style.setProperty("--app-vvh", `${layout.appHeight}px`);
+      root.style.setProperty("--app-vv-top", `${layout.appTop}px`);
     } else {
-      // Hide extra keys when keyboard closes (mobile only)
-      this.extraKeys?.hideForKeyboard();
-      extraKeys.style.cssText = "";
-      this.container.style.height = "";
-      document.body.classList.remove("virtual-keyboard-open");
+      root.style.removeProperty("--app-vvh");
+      root.style.removeProperty("--app-vv-top");
     }
+    body.classList.toggle("vv-sized", layout.appHeight !== null);
+    body.classList.toggle("virtual-keyboard-open", layout.keyboardOpen);
+    body.classList.toggle("phone-landscape", layout.phoneLandscape);
+    this.extraKeys?.syncQuickReplies?.({ relayout: false });
 
-    const active = this.terminals.get(this.activeId);
-    if (active) {
-      if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
-      this.viewportFocusTimer = setTimeout(
-        () => {
-          this.focusTerminal(this.activeId, {
-            syncSize: true,
-            scrollToPrompt: isKeyboardOpen || platformDetector.hasTouch,
-          });
-          this.disableMobileKeyboardFeatures(active.element);
-        },
-        isKeyboardOpen ? 50 : 0,
+    const layoutKey = [
+      layout.appHeight,
+      layout.appTop,
+      layout.keyboardOpen,
+      layout.phoneLandscape,
+      this.extraKeys?.quickRepliesEl?.hidden,
+    ].join("|");
+    const changed = layoutKey !== this.viewportLayoutKey;
+    this.viewportLayoutKey = layoutKey;
+    if (fromViewportEvent && !changed) return;
+
+    // Mobile tiles use pixel geometry from the container rect; refresh it so
+    // the tile follows the new shell height (window "resize" alone does not
+    // fire for an iOS keyboard). The tile ResizeObserver then re-fits xterm.
+    if (this.tileManager?.isMobile) {
+      this.tileManager.normalizeWorkspaceTiles(
+        this.tileManager.activeWorkspaceId,
       );
     }
+    this.extraKeys?.updateRowOverflowFades?.();
+
+    const activeId = this.activeId;
+    if (!this.terminals.get(activeId)) return;
+    if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
+    this.viewportFocusTimer = setTimeout(
+      () => {
+        this.viewportFocusTimer = null;
+        const active = this.terminals.get(activeId);
+        if (!active || activeId !== this.activeId) return;
+        const scrollToPrompt = layout.keyboardOpen || platformDetector.hasTouch;
+        if (
+          this.isEditableElementFocused() &&
+          !this.isTerminalInputFocused()
+        ) {
+          // Another input (sheet form, palette) owns focus: re-fit only,
+          // never pull focus back into the terminal.
+          this.fitTerminalState(active);
+          this.syncTerminalSize(activeId);
+          if (scrollToPrompt) this.scrollActiveTerminalToPrompt();
+          return;
+        }
+        this.focusTerminal(activeId, { syncSize: true, scrollToPrompt });
+        this.disableMobileKeyboardFeatures(active.element);
+      },
+      layout.keyboardOpen ? 50 : 0,
+    );
+  }
+
+  isEditableElementFocused() {
+    const el = document.activeElement;
+    if (!el || el === document.body) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const type = String(el.type || "text").toLowerCase();
+    return ![
+      "button",
+      "checkbox",
+      "color",
+      "file",
+      "hidden",
+      "image",
+      "radio",
+      "range",
+      "reset",
+      "submit",
+    ].includes(type);
+  }
+
+  isTerminalInputFocused() {
+    const el = document.activeElement;
+    return Boolean(el?.classList?.contains("xterm-helper-textarea"));
   }
 
   scrollActiveTerminalToPrompt() {
