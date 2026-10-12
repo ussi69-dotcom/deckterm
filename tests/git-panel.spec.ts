@@ -7,8 +7,15 @@ import {
   test,
   waitForTerminal,
 } from "./fixtures";
+import type { Page } from "@playwright/test";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
+
+// The Git action renders on several surfaces (desktop toolbar, phone bottom
+// bar, phone-landscape pinned row); only one is visible at a time.
+async function openGitPanel(page: Page) {
+  await page.locator('[data-action="git"]:visible').first().click();
+}
 
 // The panel shows a calm "Not a Git repository" state outside a repository
 // (history, diff, branch control and commit box are hidden there), so the
@@ -29,7 +36,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
 
   test("should open git panel and show UI elements", async ({ page }) => {
     // Click git button
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
 
     // Panel should be visible
     await expect(page.locator("#git-panel")).toBeVisible();
@@ -46,7 +53,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   test("should display git status files when in a git repo", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     const filesContainer = page.locator("#git-files");
@@ -57,7 +64,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should display commit history", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Wait a bit for git operations to complete
@@ -72,7 +79,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
 
   test("should close panel with Escape key", async ({ page }) => {
     // Open panel
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Press Escape to close
@@ -84,7 +91,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
 
   test("should close panel with close button", async ({ page }) => {
     // Open panel
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Desktop hosts Git in a surface window whose titlebar owns the close
@@ -98,7 +105,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should show diff area", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Diff area should be present
@@ -108,7 +115,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should toggle branch list when clicking branch", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Click branch to toggle list
@@ -131,7 +138,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   test("should toggle branches with 'b' keyboard shortcut", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Press 'b' to toggle branches
@@ -143,7 +150,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should show commit area with message input", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Commit area should be visible
@@ -162,7 +169,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   test("should focus commit message input with 'c' keyboard shortcut", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Press 'c' to focus commit message
@@ -176,7 +183,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   test("should refresh git status with 'r' keyboard shortcut", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Press 'r' to refresh (should not throw error)
@@ -187,7 +194,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should refresh with refresh button", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Click refresh button
@@ -198,7 +205,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should show keyboard shortcuts in bottom bar", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Shortcuts bar should be visible
@@ -216,7 +223,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   test("should not process keyboard shortcuts when typing in message input", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Focus message input
@@ -236,7 +243,7 @@ test.describe("Git Panel - Lazygit-inspired", () => {
   });
 
   test("should have split panel layout", async ({ page }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     // Left panel should contain files and branches
@@ -270,7 +277,7 @@ test.describe("Git Panel - outside a repository", () => {
   test("shows the calm not-a-repository state instead of empty panes", async ({
     page,
   }) => {
-    await page.click('[data-action="git"]');
+    await openGitPanel(page);
     await page.waitForSelector("#git-panel:not(.hidden)");
 
     const panel = page.locator("#git-panel");
