@@ -2268,6 +2268,20 @@ body.touch-input-mode .xterm .composition-view.active {
   height: 16px;
 }
 
+/* Touch: 44px targets for New session, Refresh and Close. */
+@media (pointer: coarse) {
+  .sessions-new-btn {
+    height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+
+  .sessions-panel-header .btn-icon {
+    width: 44px;
+    height: 44px;
+  }
+}
+
 .sessions-panel-body {
   min-height: 0;
   overflow-y: auto;
@@ -3655,7 +3669,7 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .ek-btn.ek-chip {
   min-width: 44px;
-  height: 40px;
+  height: 44px;
   padding: 0 14px;
   border-radius: 999px;
   font-weight: 600;
@@ -5626,6 +5640,14 @@ body.chrome-mobile .toast-dismiss {
 .compose-sheet-close:focus-visible {
   background: var(--bg-hover);
   color: var(--text-primary);
+}
+
+@media (pointer: coarse) {
+  .compose-sheet-close {
+    width: 44px;
+    height: 44px;
+    margin: -10px -10px 0 0;
+  }
 }
 
 .compose-sheet-input {
@@ -9800,6 +9822,13 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 .settings-category-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
+}
+
+@media (pointer: coarse) {
+  .settings-category-btn {
+    min-height: 44px;
+    font-size: 14px;
+  }
 }
 
 .settings-main {
