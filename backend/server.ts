@@ -286,6 +286,7 @@ type Terminal = {
   sessionName?: string; // tmux session name (when TMUX_BACKEND=1)
   scrollback: string[]; // ring buffer of recent terminal output chunks
   scrollbackBytes: number; // current bytes in ring buffer
+  scrollbackChunkBytes: number[]; // byte length of each scrollback chunk (parallel array)
   hadSocketConnection: boolean; // tracks whether a websocket was ever connected
   running: boolean;
   lastExitCode: number | null;
@@ -3967,8 +3968,10 @@ function appendScrollback(terminalId: string, data: string) {
   const chunks = data.split(/(?<=\n)/g);
   for (const chunk of chunks) {
     if (!chunk) continue;
+    const bytes = Buffer.byteLength(chunk);
     term.scrollback.push(chunk);
-    term.scrollbackBytes += Buffer.byteLength(chunk);
+    term.scrollbackChunkBytes.push(bytes);
+    term.scrollbackBytes += bytes;
   }
 
   while (
@@ -3976,8 +3979,9 @@ function appendScrollback(terminalId: string, data: string) {
     term.scrollbackBytes > SCROLLBACK_MAX_BYTES
   ) {
     const removed = term.scrollback.shift();
+    const removedBytes = term.scrollbackChunkBytes.shift();
     if (!removed) break;
-    term.scrollbackBytes -= Buffer.byteLength(removed);
+    term.scrollbackBytes -= removedBytes ?? Buffer.byteLength(removed);
   }
 }
 
@@ -4359,7 +4363,9 @@ function handoffTmuxSession(
 function broadcastTerminalOutput(id: string, data: string) {
   const sockets = terminalSockets.get(id);
   if (!sockets || sockets.size === 0) return;
-  debug(`PTY ${id} data (${data.length} bytes)`);
+  if (DEBUG) debug(`PTY ${id} data (${data.length} bytes)`);
+  // Hot path: serialise the v2 envelope at most once per chunk, not per socket.
+  let v2Frame: string | null = null;
   for (const ws of sockets) {
     const reconnectState = socketReconnectState.get(ws);
     if (reconnectState?.pendingReady || reconnectState?.replaying) {
@@ -4367,13 +4373,12 @@ function broadcastTerminalOutput(id: string, data: string) {
     }
     try {
       if (ws.data.type === "terminal" && ws.data.protocol === "v2") {
-        ws.send(
-          JSON.stringify({
-            type: "terminal_event",
-            kind: "output",
-            data,
-          }),
-        );
+        v2Frame ??= JSON.stringify({
+          type: "terminal_event",
+          kind: "output",
+          data,
+        });
+        ws.send(v2Frame);
       } else {
         ws.send(data);
       }
@@ -5128,6 +5133,7 @@ async function createManagedTerminal({
     sessionName,
     scrollback: [],
     scrollbackBytes: 0,
+    scrollbackChunkBytes: [],
     hadSocketConnection: false,
     running: initialRuntimeState?.running || false,
     lastExitCode:
