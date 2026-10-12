@@ -55,12 +55,18 @@ import { basename, dirname, join, relative, resolve } from "node:path";
 import { assertPortAvailable } from "./port-probe";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  applyTerminalNotificationEvents,
   classifyAgentOutputPhase,
+  createAttentionTracker,
   createGitWorktreeDetector,
+  createTerminalNotificationParseState,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
   parseShellIntegrationChunk,
+  parseTerminalNotifications,
   resolveAgentOutputState,
+  type AttentionTracker,
+  type TerminalNotificationParseState,
 } from "./telemetry";
 import { isCloudflareAudienceAllowed } from "./cloudflare-access-guards";
 import {
@@ -285,6 +291,13 @@ type Terminal = {
   // forgeable in-band data — never feeds transitions or authz).
   recentTools: Array<{ name: string; summary: string; at: number }>;
   toolRate: { windowStart: number; count: number };
+  // Agent attention (OSC 9/777/99 notifications + OSC 9;4 progress) read
+  // from raw pane output. In-memory only: untrusted in-band data that never
+  // feeds transitions, authz, or the persisted event log.
+  notificationParse: TerminalNotificationParseState;
+  attention: AttentionTracker;
+  lastCompletionPushAt?: number;
+  tmuxPipeRead?: Promise<string>;
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
   tmuxPipePath: string | null;
@@ -784,7 +797,7 @@ function applyParsedShellIntegrationState(
 function processShellIntegrationChunk(
   term: Terminal,
   chunk: string,
-  options: { emitOutput?: boolean } = {},
+  options: { emitOutput?: boolean; source?: "live" | "pipe" } = {},
 ) {
   const parsed = parseShellIntegrationChunk(chunk, {
     carry: term.shellIntegrationCarry || "",
@@ -795,6 +808,45 @@ function processShellIntegrationChunk(
     agentState: term.agentState || null,
   });
   applyParsedShellIntegrationState(term, parsed, options);
+  if (
+    term.attention.progress &&
+    parsed.events.some(
+      (event) => event.type === "running-done" || event.type === "agent-done",
+    )
+  ) {
+    // A finished command/agent cannot still be reporting progress.
+    term.attention = { ...term.attention, progress: null };
+  }
+  processTerminalNotifications(term, chunk, options.source || "live");
+}
+
+// Notification escapes are read from exactly one raw source per terminal:
+// tmux swallows unknown OSC sequences (and passthrough is off), so tmux-backed
+// terminals read them from the pipe-pane log; raw PTYs from the live stream.
+// Pipe deltas start at the attach-time offset, so they are always new output.
+function processTerminalNotifications(
+  term: Terminal,
+  chunk: string,
+  source: "live" | "pipe",
+) {
+  const expectedSource = term.tmuxPipePath ? "pipe" : "live";
+  if (source !== expectedSource) return;
+  const parsed = parseTerminalNotifications(chunk, term.notificationParse);
+  term.notificationParse = parsed.state;
+  if (parsed.events.length === 0) return;
+  const applied = applyTerminalNotificationEvents(
+    term.attention,
+    parsed.events,
+    { now: Date.now(), agentName: term.agentName },
+  );
+  term.attention = applied.tracker;
+  for (const attention of applied.accepted) {
+    if (attention.kind === "needs-input") {
+      notifyCompletionPush(term, "input");
+    } else if (attention.kind === "done") {
+      notifyCompletionPush(term, "agent");
+    }
+  }
 }
 
 function clearAgentRespondingTimer(term: Terminal) {
@@ -1275,7 +1327,24 @@ async function getFoundationState(): Promise<FoundationState> {
   return foundationStatePromise;
 }
 
-function notifyCompletionPush(term: Terminal, kind: "agent" | "command") {
+// An agent's own "done" notification and DeckTerm's turn/command completion
+// detection often fire for the same moment; one push per burst is enough. A
+// needs-input push is never swallowed by an earlier completion push.
+const COMPLETION_PUSH_DEDUPE_MS = 5_000;
+
+function notifyCompletionPush(
+  term: Terminal,
+  kind: "agent" | "command" | "input",
+) {
+  const now = Date.now();
+  if (
+    kind !== "input" &&
+    term.lastCompletionPushAt &&
+    now - term.lastCompletionPushAt < COMPLETION_PUSH_DEDUPE_MS
+  ) {
+    return;
+  }
+  term.lastCompletionPushAt = now;
   void getFoundationState()
     .then((state) =>
       dispatchCompletionPush({
@@ -4164,6 +4233,9 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
     recentTools: term.recentTools,
+    attention: term.attention.attention,
+    progress: term.attention.progress,
+    lastActivityAt: Math.max(term.lastActivityAt, term.lastOutputAt || 0),
     backendMode: getBackendMode(),
     supportsLinkedView: supportsLinkedView(term),
     sharedSessionKey: term.sessionName || null,
@@ -4700,6 +4772,24 @@ async function captureTmuxPane(sessionName: string): Promise<string> {
 
 async function readTmuxPipeDelta(term: Terminal): Promise<string> {
   if (!term.tmuxPipePath) return "";
+  // Single reader per terminal: the attention pump and /api/terminals polls
+  // both drain the pipe; two concurrent reads from the same offset would
+  // process the same bytes twice. The waiting caller gets nothing new.
+  if (term.tmuxPipeRead) {
+    await term.tmuxPipeRead.catch(() => "");
+    return "";
+  }
+  const read = readTmuxPipeDeltaOnce(term);
+  term.tmuxPipeRead = read;
+  try {
+    return await read;
+  } finally {
+    if (term.tmuxPipeRead === read) term.tmuxPipeRead = undefined;
+  }
+}
+
+async function readTmuxPipeDeltaOnce(term: Terminal): Promise<string> {
+  if (!term.tmuxPipePath) return "";
   // Brokered terminals read their fd-safe spool via the per-uid backend; legacy
   // uses the shared tmux backend.
   const backend =
@@ -4931,12 +5021,41 @@ async function getProcessTreeArgs(rootPid: number): Promise<string[]> {
   return processTree;
 }
 
+// Drains tmux pipe logs between /api/terminals polls so agent notifications
+// (and the web push they trigger) arrive while no browser tab is polling —
+// hidden tabs are throttled and a closed browser does not poll at all.
+// Same processing as the poll path (emitOutput:false); only the timing moves.
+const TMUX_PIPE_PUMP_INTERVAL_MS = 2_000;
+let tmuxPipePumpRunning = false;
+
+async function pumpTmuxPipeOutput(): Promise<void> {
+  if (!TMUX_BACKEND || tmuxPipePumpRunning || shutdownInProgress) return;
+  tmuxPipePumpRunning = true;
+  try {
+    for (const term of Array.from(terminals.values())) {
+      if (!term.sessionName || !term.tmuxPipePath) continue;
+      const delta = await readTmuxPipeDelta(term).catch(() => "");
+      if (delta && terminals.get(term.id) === term) {
+        processShellIntegrationChunk(term, delta, {
+          emitOutput: false,
+          source: "pipe",
+        });
+      }
+    }
+  } finally {
+    tmuxPipePumpRunning = false;
+  }
+}
+
 async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
   if (!TMUX_BACKEND || !term.sessionName) return;
 
   const pipeDelta = await readTmuxPipeDelta(term);
   if (pipeDelta) {
-    processShellIntegrationChunk(term, pipeDelta, { emitOutput: false });
+    processShellIntegrationChunk(term, pipeDelta, {
+      emitOutput: false,
+      source: "pipe",
+    });
   }
 
   const { cwd, panePid, paneCurrentCommand } = await getTmuxSessionInfo(
@@ -5112,6 +5231,8 @@ async function createManagedTerminal({
     agentRespondingTimer: null,
     recentTools: [],
     toolRate: { windowStart: 0, count: 0 },
+    notificationParse: createTerminalNotificationParseState(),
+    attention: createAttentionTracker(),
     shellIntegrationCarry: "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
@@ -11044,6 +11165,11 @@ async function startOwnedWebServer(
     setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
     setInterval(reapDetachedSessions, 15 * 60 * 1000),
     setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+    setInterval(() => {
+      void pumpTmuxPipeOutput().catch((err) =>
+        debug("[tmux] pipe pump failed:", err),
+      );
+    }, TMUX_PIPE_PUMP_INTERVAL_MS),
   ];
 
   // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
