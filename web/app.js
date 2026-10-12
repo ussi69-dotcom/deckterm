@@ -93,6 +93,10 @@ const KEY_SEQUENCES = {
   F10: "\x1b[21~",
   F11: "\x1b[23~",
   F12: "\x1b[24~",
+  // Agent quick-reply chips (quick-replies.js) send through the same table.
+  ENTER: "\r",
+  SHIFT_TAB: "\x1b[Z",
+  CTRL_C: "\x03",
 };
 
 const TERMINAL_FONT_FAMILY =
