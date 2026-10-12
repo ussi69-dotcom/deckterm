@@ -15547,6 +15547,20 @@ class TerminalManager {
             }
           }
 
+          // A selection does not survive a grid change: tmux redraws the pane
+          // at the new size, so the selected cells now hold other text (or
+          // nothing). Left in place it showed as a stray highlight block in
+          // the inactive pane after a split, and a copy would take the wrong
+          // text (R3). Only on a real grid change, never per keystroke, and
+          // not on touch layouts, where the keyboard opening or closing
+          // resizes the grid in the middle of a long-press copy.
+          if (
+            (t.terminal.cols !== prevCols || t.terminal.rows !== prevRows) &&
+            !this.isTouchLayout() &&
+            t.terminal.hasSelection?.()
+          ) {
+            t.terminal.clearSelection();
+          }
           // Always send resize - terminal will work even if small
           this.scheduleResize(id);
 
