@@ -6271,6 +6271,106 @@ class TerminalManager {
     document.body.dataset.bootstrapState = isPending ? "pending" : "ready";
     const newButton = document.getElementById("new-terminal");
     if (newButton) newButton.disabled = isPending;
+    // Bootstrap may end with zero terminals (nothing to restore and the
+    // create failed): show the launcher instead of a blank canvas.
+    if (!isPending) this.syncWorkspaceLauncher();
+  }
+
+  // --- Zero-terminal launcher -------------------------------------------------
+  // Shown in #terminal-container whenever no terminal is open (after
+  // bootstrap): New terminal, restorable/recent sessions, recent directories
+  // and key shortcuts. Planning/DOM: web/workspace-launcher.js.
+
+  syncWorkspaceLauncher({ refresh = false } = {}) {
+    if (!window.WorkspaceLauncher || !this.container) return;
+    const show = !this.bootstrapPending && this.terminals.size === 0;
+    let root = document.getElementById("workspace-launcher");
+    if (!show) {
+      if (root) root.hidden = true;
+      this.workspaceLauncherVisible = false;
+      return;
+    }
+    if (!root) {
+      root = document.createElement("div");
+      root.id = "workspace-launcher";
+      root.className = "workspace-launcher";
+      this.container.appendChild(root);
+    }
+    const wasVisible = Boolean(this.workspaceLauncherVisible);
+    root.hidden = false;
+    this.workspaceLauncherVisible = true;
+    if (!wasVisible || refresh) {
+      void this.refreshWorkspaceLauncher({ focus: !wasVisible });
+    }
+  }
+
+  async refreshWorkspaceLauncher({ focus = false } = {}) {
+    const root = document.getElementById("workspace-launcher");
+    if (!root || root.hidden) return;
+    const token = (this.workspaceLauncherToken =
+      (this.workspaceLauncherToken || 0) + 1);
+    // Re-rendering replaces the buttons: remember whether focus was inside so
+    // it can come back (otherwise a refresh drops focus to <body>).
+    const focusNewButton = () =>
+      root
+        .querySelector("#launcher-new-terminal")
+        ?.focus({ preventScroll: true });
+    let keepFocus = focus || root.contains(document.activeElement);
+    // Paint at once from the cached catalog, then again with fresh data.
+    this.renderWorkspaceLauncher(root, { loading: !this._sessionCatalog });
+    if (keepFocus) focusNewButton();
+    try {
+      const res = await fetch("/api/terminals", {
+        headers: { "x-deckterm-client-id": this.clientInstanceId },
+      });
+      if (res.ok) {
+        this._sessionCatalog = await res.json();
+        this.updateSessionsAvailableBadge(this._sessionCatalog);
+      }
+    } catch {
+      // Keep the cached catalog; the launcher still offers New terminal.
+    }
+    if (token !== this.workspaceLauncherToken || root.hidden) return;
+    keepFocus = keepFocus || root.contains(document.activeElement);
+    this.renderWorkspaceLauncher(root, { loading: false });
+    if (keepFocus) focusNewButton();
+  }
+
+  renderWorkspaceLauncher(root, { loading = false } = {}) {
+    const api = window.WorkspaceLauncher;
+    if (!api || !root) return;
+    const catalog = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    const standalone = Boolean(
+      window.matchMedia?.("(display-mode: standalone)")?.matches,
+    );
+    api.renderWorkspaceLauncher(
+      root,
+      document,
+      {
+        loading,
+        sessions: api.planLauncherSessions(catalog, {
+          openIds: [...this.terminals.keys()],
+          titleOf: window.TaskSignals?.sessionDisplayTitle,
+        }),
+        directories: api.planRecentDirectories({
+          currentCwd: this.getCurrentDirectoryValue(),
+          catalog,
+          registry: this.sessionRegistry?.sessions,
+        }),
+        shortcuts: api.planLauncherShortcuts(
+          window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+        ),
+        newHint: api.newTerminalHint({ standalone }),
+      },
+      {
+        onNewTerminal: () => void this.createTerminal(),
+        onSession: (id) => void this.handleSessionRowActivate(id),
+        onDirectory: (cwd) => void this.createTerminal(false, { cwd }),
+      },
+    );
+    initLucideIcons();
   }
 
   setupViewportResizeHandling() {
@@ -13762,6 +13862,7 @@ class TerminalManager {
       awaitingReconnectReady: false,
       connectionStatus: "connecting",
     });
+    this.syncWorkspaceLauncher();
 
     dbg(`[reconnect] Terminal ${id} stored in Map with isReconnection=true`);
 
@@ -15341,6 +15442,7 @@ class TerminalManager {
         awaitingReconnectReady: false,
         connectionStatus: "connecting",
       });
+      this.syncWorkspaceLauncher();
 
       // Register with session registry for reconnection persistence
       this.sessionRegistry.register(id, {
@@ -15906,6 +16008,7 @@ class TerminalManager {
     this.tileManager.removeTile(id);
     this.terminals.delete(id);
     this.sessionRegistry.remove(id);
+    this.syncWorkspaceLauncher();
 
     const workspaceFallback =
       this.resolveWorkspaceTerminalId(closingWorkspaceId);
@@ -15948,6 +16051,8 @@ class TerminalManager {
         { canUndo: Boolean(undoEntry) },
       );
       this.queueTelemetryRefresh(0);
+      // The closed session is now restorable: list it in the launcher.
+      this.syncWorkspaceLauncher({ refresh: true });
     } catch (err) {
       console.warn("Could not schedule terminal close:", err);
       // No termination was scheduled, so the session (if it still exists)
