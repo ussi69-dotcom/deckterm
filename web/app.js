@@ -6275,10 +6275,19 @@ class TerminalManager {
   }
 
   normalizeTerminalGrid({ cols, rows }) {
+    const sizing = window.TerminalSizing;
     return (
-      window.TerminalSizing?.normalizeTerminalGrid?.({
+      sizing?.normalizeTerminalGrid?.({
         cols,
         rows,
+        // Fewer rows on touch while the keyboard is open (R2); undefined from
+        // a stale cached terminal-sizing.js keeps the old 8-row floor.
+        minRows: sizing.minTerminalRows?.({
+          touch: this.isTouchLayout(),
+          keyboardOpen: document.body.classList.contains(
+            "virtual-keyboard-open",
+          ),
+        }),
         maxCols: platformDetector.isMobile
           ? Number.POSITIVE_INFINITY
           : DESKTOP_MAX_TERMINAL_COLS,

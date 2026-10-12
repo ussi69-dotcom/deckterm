@@ -4,6 +4,7 @@ import {
   clampPanelHeightPercent,
   estimateTerminalGrid,
   minPanelHeightPx,
+  minTerminalRows,
   normalizeTerminalGrid,
   predictInitialTilePixels,
 } from "./terminal-sizing";
@@ -90,6 +91,44 @@ test("normalizeTerminalGrid preserves smaller mobile terminal sizes", () => {
       maxRows: 60,
     }),
   ).toEqual({ cols: 44, rows: 36 });
+});
+
+// --- minTerminalRows (R2: phone landscape + keyboard clipped the prompt) ----
+
+test("minTerminalRows keeps the 8-row floor outside a touch keyboard", () => {
+  expect(minTerminalRows({ touch: false, keyboardOpen: false })).toBe(8);
+  expect(minTerminalRows({ touch: true, keyboardOpen: false })).toBe(8);
+  // A desktop never has a virtual keyboard; a stray flag must not shrink it.
+  expect(minTerminalRows({ touch: false, keyboardOpen: true })).toBe(8);
+  expect(minTerminalRows()).toBe(8);
+});
+
+test("minTerminalRows allows 3 rows on touch while the keyboard is open", () => {
+  expect(minTerminalRows({ touch: true, keyboardOpen: true })).toBe(3);
+});
+
+test("a touch terminal with the keyboard open fits its rows in a 96px box", () => {
+  // Phone landscape 852x393 with the keyboard up: #terminal-container is
+  // 96px high (visual-after landscape2-12-keyboard). The fit there used to be
+  // clamped to 8 rows, which pushed the prompt below the clip.
+  const containerHeight = 96;
+  for (const cellHeight of [14, 15, 17, 19]) {
+    const fitted = estimateTerminalGrid({
+      width: 852,
+      height: containerHeight,
+      cellWidth: 8,
+      cellHeight,
+      verticalPadding: 16,
+      minRows: 1,
+    });
+    const { rows } = normalizeTerminalGrid({
+      cols: fitted.cols,
+      rows: fitted.rows,
+      minRows: minTerminalRows({ touch: true, keyboardOpen: true }),
+    });
+    expect(rows).toBeGreaterThanOrEqual(3);
+    expect(rows * cellHeight).toBeLessThanOrEqual(containerHeight);
+  }
 });
 
 // --- minPanelHeightPx (bug A3c: IDE terminal panel must fit >= 24 rows) ----
