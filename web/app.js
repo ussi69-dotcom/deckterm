@@ -7305,7 +7305,10 @@ class TerminalManager {
     return cwd.replace(/\/+$/, "");
   }
 
-  setDirectoryValue(value, { force = false, userDraft = false } = {}) {
+  setDirectoryValue(
+    value,
+    { force = false, userDraft = false, persist = true } = {},
+  ) {
     const next = String(value || "");
     if (userDraft) {
       this.markDirectoryDraftEdited();
@@ -7330,7 +7333,9 @@ class TerminalManager {
     // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
     // recurse). The value is only a navigation default; the backend file gates
     // remain the authorization boundary (Codex #4 — do not trust it).
-    this.settingsStore?.set("files.defaultCwd", next);
+    // persist:false — a live cwd the shell merely `cd`-ed into is shown but
+    // never saved: only values the user commits become the default.
+    if (persist) this.settingsStore?.set("files.defaultCwd", next);
   }
 
   setupToolsSheet() {
@@ -11337,6 +11342,8 @@ class TerminalManager {
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
+        // Live cwd adoption checks the allowed roots (cached after once).
+        await this.ensureAllowedRoots();
         this._sessionCatalog = Array.isArray(serverTerminals)
           ? serverTerminals
           : [];
@@ -12105,20 +12112,62 @@ class TerminalManager {
       this.updateWorkspaceLabel(t.workspaceId, cwd);
       this.rememberWorkspaceById(t.workspaceId, cwd);
     }
+    t.cwdIsLive = true;
     const plan = this.planLiveCwdSurfaces({
       source,
       active,
+      cwd,
       workspaceId: t.workspaceId,
       previousCwd,
     });
-    if (plan.field) this.setDirectoryValue(cwd);
+    if (plan.field) this.setDirectoryValue(cwd, { persist: false });
     this.followLiveCwdInSurfaces(t.workspaceId, cwd, plan);
     this.updateTabGroups();
     this.sessionRegistry.update(id, { cwd });
     return true;
   }
 
-  planLiveCwdSurfaces({ source, active, workspaceId, previousCwd }) {
+  // Allowed roots (realpaths) from /api/foundation/status, cached so a live
+  // cwd outside them never lands in the working-directory field. null until
+  // known; a failed fetch is retried after a minute, a good list is
+  // refreshed every 5 minutes.
+  async ensureAllowedRoots() {
+    const now = Date.now();
+    const age = now - (this.allowedRootsFetchedAt || 0);
+    if (this.allowedRoots ? age < 5 * 60_000 : age < 60_000) {
+      return this.allowedRoots;
+    }
+    if (this.allowedRootsPromise) return this.allowedRootsPromise;
+    this.allowedRootsFetchedAt = now;
+    this.allowedRootsPromise = (async () => {
+      try {
+        const res = await fetch("/api/foundation/status");
+        if (!res.ok) return this.allowedRoots;
+        const status = await res.json();
+        const roots = (Array.isArray(status?.roots) ? status.roots : [])
+          .filter((root) => root && root.status !== "missing")
+          .map((root) => root.path)
+          .filter((path) => typeof path === "string" && path);
+        if (roots.length) this.allowedRoots = roots;
+      } catch (err) {
+        if (DEBUG) dbg("allowed roots fetch failed", err);
+      } finally {
+        this.allowedRootsPromise = null;
+      }
+      return this.allowedRoots;
+    })();
+    return this.allowedRootsPromise;
+  }
+
+  // true / false, or null while the roots list is unknown.
+  isCwdInAllowedRoots(cwd) {
+    return (
+      window.LiveCwd?.isCwdWithinRoots?.(cwd, this.allowedRoots || null) ??
+      null
+    );
+  }
+
+  planLiveCwdSurfaces({ source, active, cwd, workspaceId, previousCwd }) {
     const explorer = this.fileExplorer;
     const explorerOnWorkspace = Boolean(
       explorer && workspaceId && explorer.currentWorkspaceId === workspaceId,
@@ -12129,6 +12178,7 @@ class TerminalManager {
       window.LiveCwd?.planLiveCwdAdoption?.({
         source,
         active,
+        inRoots: this.isCwdInAllowedRoots(cwd),
         explorerOnWorkspace: explorerOnWorkspace && Boolean(explorerPath),
         explorerFollows: window.LiveCwd.shouldSurfaceFollowCwd({
           surfacePath: explorerPath,
@@ -15490,27 +15540,61 @@ class TerminalManager {
     }
     await this.waitForFontMetrics();
 
-    const cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
+    let cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
     const { cols, rows } = this.estimateInitialTerminalSize(split);
 
     try {
-      const res = await fetch("/api/terminals", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, cols, rows }),
-      });
+      const postTerminal = (requestCwd) =>
+        fetch("/api/terminals", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: requestCwd, cols, rows }),
+        });
+      let res = await postTerminal(cwd);
 
       if (!res.ok) {
         // Surface the backend's real reason (e.g. SQLITE_BUSY-driven 500,
         // max-terminals limit, bad cwd) instead of a generic, doubled message.
         let reason = `HTTP ${res.status}`;
+        let denialReason = null;
         try {
           const body = await res.json();
           reason = body.message || body.error || reason;
+          denialReason = body.reason || null;
         } catch (_) {
           /* non-JSON body — keep the status code */
         }
-        throw new Error(reason);
+        // An implicit cwd (the field / saved default) outside the allowed
+        // roots: start in the server's default root instead of failing.
+        if (
+          window.LiveCwd?.shouldRetryCreateWithoutCwd?.({
+            status: res.status,
+            reason: denialReason,
+            cwd,
+            explicitCwd: Boolean(cwdOverride),
+          })
+        ) {
+          const rejectedCwd = cwd;
+          cwd = undefined;
+          res = await postTerminal(undefined);
+          if (res.ok) {
+            this.notify({
+              key: "terminal-default-root",
+              kind: "info",
+              title: "Opened in the default folder",
+              body: `${rejectedCwd} is outside the allowed folders.`,
+            });
+          } else {
+            reason = `HTTP ${res.status}`;
+            try {
+              const body = await res.json();
+              reason = body.message || body.error || reason;
+            } catch (_) {
+              /* non-JSON body — keep the status code */
+            }
+          }
+        }
+        if (!res.ok) throw new Error(reason);
       }
 
       const terminalInfo = await res.json();
@@ -16144,7 +16228,12 @@ class TerminalManager {
     }
     this.tileManager.setActive(id);
     if (t?.workspaceId && t.cwd) {
-      this.setDirectoryValue(t.cwd, { force: true });
+      // A live cwd (the shell's `cd`) is shown but not saved as the default,
+      // and one known to be outside the allowed roots stays out of the field
+      // (New terminal would only get a 403 there).
+      if (this.isCwdInAllowedRoots(t.cwd) !== false) {
+        this.setDirectoryValue(t.cwd, { force: true, persist: !t.cwdIsLive });
+      }
       this.updateWorkspaceLabel(t.workspaceId, t.cwd);
       this.rememberWorkspaceById(t.workspaceId, t.cwd);
     }
