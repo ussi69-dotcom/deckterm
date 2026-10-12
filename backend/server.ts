@@ -26,6 +26,13 @@ import {
   SECURITY_HEADERS,
 } from "./services/browser-boundary";
 import {
+  collectProcessTreeArgs,
+  createLazyOnce,
+  createSingleFlightCache,
+  parseProcessTable,
+  type ProcessSnapshot,
+} from "./services/runtime-sync-cache";
+import {
   NO_STORE_CACHE_CONTROL,
   createBuildFingerprint,
   createStaticAssetServer,
@@ -4906,52 +4913,49 @@ async function completeTmuxReconnectReplay(
   }
 }
 
-async function getProcessTreeArgs(rootPid: number): Promise<string[]> {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
-
+async function readProcessSnapshot(): Promise<ProcessSnapshot> {
   const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], {
     stdout: "pipe",
     stderr: "pipe",
   });
   const output = await new Response(proc.stdout).text();
   await proc.exited;
-
-  const childrenByParent = new Map<number, number[]>();
-  const argsByPid = new Map<number, string>();
-
-  for (const line of output.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (!match) continue;
-    const pid = Number.parseInt(match[1] || "", 10);
-    const ppid = Number.parseInt(match[2] || "", 10);
-    const args = (match[3] || "").trim();
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !args) continue;
-    argsByPid.set(pid, args);
-    const siblings = childrenByParent.get(ppid) || [];
-    siblings.push(pid);
-    childrenByParent.set(ppid, siblings);
-  }
-
-  const processTree: string[] = [];
-  const stack = [rootPid];
-  const visited = new Set<number>();
-
-  while (stack.length > 0) {
-    const pid = stack.pop();
-    if (!pid || visited.has(pid)) continue;
-    visited.add(pid);
-    const args = argsByPid.get(pid);
-    if (args) processTree.push(args);
-    const children = childrenByParent.get(pid) || [];
-    for (let index = children.length - 1; index >= 0; index--) {
-      stack.push(children[index]);
-    }
-  }
-
-  return processTree;
+  return parseProcessTable(output);
 }
 
-async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
+// Pass a snapshot to share one `ps` run across many sessions (GET
+// /api/terminals); without one a fresh snapshot is taken.
+async function getProcessTreeArgs(
+  rootPid: number,
+  snapshot?: ProcessSnapshot | Promise<ProcessSnapshot>,
+): Promise<string[]> {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  return collectProcessTreeArgs(
+    await (snapshot ?? readProcessSnapshot()),
+    rootPid,
+  );
+}
+
+// Concurrent and back-to-back /api/terminals polls (every open tab polls)
+// share one tmux runtime sync per terminal for this long.
+const TMUX_RUNTIME_SYNC_TTL_MS = 2000;
+const tmuxRuntimeSyncFlights = createSingleFlightCache<Terminal, void>({
+  ttlMs: TMUX_RUNTIME_SYNC_TTL_MS,
+});
+
+function syncTmuxRuntimeStateShared(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot>,
+): Promise<void> {
+  return tmuxRuntimeSyncFlights.run(term, () =>
+    syncTmuxRuntimeState(term, getProcessSnapshot),
+  );
+}
+
+async function syncTmuxRuntimeState(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot> = readProcessSnapshot,
+): Promise<void> {
   if (!TMUX_BACKEND || !term.sessionName) return;
 
   const pipeDelta = await readTmuxPipeDelta(term);
@@ -4969,7 +4973,7 @@ async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
   const [capture, processTree] = await Promise.all([
     captureTmuxPane(term.sessionName).catch(() => ""),
     panePid > 0
-      ? getProcessTreeArgs(panePid).catch(() => [])
+      ? getProcessTreeArgs(panePid, getProcessSnapshot()).catch(() => [])
       : Promise.resolve([]),
   ]);
   const nextRuntimeState = inferTmuxRuntimeState({
@@ -7516,6 +7520,9 @@ export function createWebApp() {
       endedLimit: TERMINAL_LIST_ENDED_LIMIT,
     });
     const seenIds = new Set<string>();
+    // One `ps` snapshot per request, taken only if some session needs a
+    // fresh runtime sync (cached syncs reuse their earlier result).
+    const getProcessSnapshot = createLazyOnce(readProcessSnapshot);
 
     const list = await Promise.all(
       recordedSessions.map(async (recordedSession) => {
@@ -7528,7 +7535,10 @@ export function createWebApp() {
         if (restoredTerm) {
           seenIds.add(restoredTerm.id);
           if (TMUX_BACKEND && restoredTerm.sessionName) {
-            await syncTmuxRuntimeState(restoredTerm).catch((err) => {
+            await syncTmuxRuntimeStateShared(
+              restoredTerm,
+              getProcessSnapshot,
+            ).catch((err) => {
               debug(`[tmux] runtime sync failed for ${restoredTerm.id}:`, err);
             });
           }
@@ -7583,9 +7593,11 @@ export function createWebApp() {
         .map(async (t) => {
           ensureTerminalSessionRecorded(state, t);
           if (TMUX_BACKEND && t.sessionName) {
-            await syncTmuxRuntimeState(t).catch((err) => {
-              debug(`[tmux] runtime sync failed for ${t.id}:`, err);
-            });
+            await syncTmuxRuntimeStateShared(t, getProcessSnapshot).catch(
+              (err) => {
+                debug(`[tmux] runtime sync failed for ${t.id}:`, err);
+              },
+            );
           }
           return {
             ...serializeTerminal(t, requestingClientId),
