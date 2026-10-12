@@ -2643,7 +2643,9 @@ class ExtraKeysManager {
     const visible = helpers.shouldShowQuickReplies({
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
+      agentState: active?.agentState ?? null,
       attention: active?.attention ?? null,
+      attentionBaselineSeq: active?.quickReplyAttentionBaseline ?? null,
     });
     root.dataset.state = helpers.getQuickReplyState({
       agentState: active?.agentState ?? null,
@@ -11718,6 +11720,19 @@ class TerminalManager {
     const completedAgentTurn =
       nextAgentTurnCompletedAt > 0 &&
       nextAgentTurnCompletedAt !== previousAgentTurnCompletedAt;
+
+    // A new agent session: attention seen so far belongs to an earlier run
+    // and must not drive its quick-reply chips.
+    const quickReplies = window.QuickReplies;
+    if (typeof quickReplies?.quickReplyAttentionBaseline === "function") {
+      terminal.quickReplyAttentionBaseline =
+        quickReplies.quickReplyAttentionBaseline({
+          previousAgentName: terminal.agentName || null,
+          nextAgentName,
+          attention: terminal.attention || null,
+          currentBaseline: terminal.quickReplyAttentionBaseline ?? null,
+        });
+    }
 
     terminal.running = nextRunning;
     terminal.busy = nextRunning;

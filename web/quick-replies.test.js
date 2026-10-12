@@ -3,9 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   QUICK_REPLIES,
-  QUICK_REPLY_ATTENTION_WINDOW_MS,
   getQuickReplySequence,
   getQuickReplyState,
+  quickReplyAttentionBaseline,
   shouldShowQuickReplies,
 } from "./quick-replies.js";
 
@@ -138,24 +138,61 @@ describe("shouldShowQuickReplies", () => {
     const now = 10_000_000;
     const base = { touchLayout: true, agentName: "claude", now };
 
-    test("a recent needs-input notification shows the chips", () => {
+    test("a needs-input notification shows the chips while the agent waits", () => {
       expect(
         shouldShowQuickReplies({
           ...base,
+          agentState: "thinking",
           attention: { kind: "needs-input", at: now - 30_000, seq: 3 },
         }),
       ).toBe(true);
     });
 
-    test("an older needs-input notification no longer does", () => {
+    test("no fixed cutoff: an hour-old needs-input still shows them", () => {
       expect(
         shouldShowQuickReplies({
           ...base,
-          attention: {
-            kind: "needs-input",
-            at: now - QUICK_REPLY_ATTENTION_WINDOW_MS - 1,
-            seq: 3,
-          },
+          agentState: null,
+          attention: { kind: "needs-input", at: now - 60 * 60_000, seq: 3 },
+        }),
+      ).toBe(true);
+    });
+
+    test("needs-input hides them while the agent is responding again", () => {
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          agentState: "Responding",
+          attention: { kind: "needs-input", at: now - 1000, seq: 3 },
+        }),
+      ).toBe(false);
+    });
+
+    test("attention from before the current agent session is ignored", () => {
+      // A Codex "done" from an earlier run in this terminal: the new session
+      // sends no notifications, so the agent-session rule applies.
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          attention: { kind: "done", at: now - 60_000, seq: 4 },
+          attentionBaselineSeq: 4,
+        }),
+      ).toBe(true);
+      // An old needs-input is ignored too (no stale "waiting" signal).
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          agentState: "responding",
+          attention: { kind: "needs-input", at: now - 60_000, seq: 2 },
+          attentionBaselineSeq: 4,
+        }),
+      ).toBe(true);
+      // A notification from this session counts again.
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          attention: { kind: "done", at: now, seq: 5 },
+          attentionBaselineSeq: 4,
         }),
       ).toBe(false);
     });
@@ -194,5 +231,47 @@ describe("getQuickReplyState", () => {
     expect(getQuickReplyState({ agentState: null })).toBe("waiting");
     expect(getQuickReplyState({ agentState: "Responding" })).toBe("busy");
     expect(getQuickReplyState()).toBe("waiting");
+  });
+});
+
+describe("quickReplyAttentionBaseline", () => {
+  test("re-baselines only when a new agent session starts", () => {
+    const attention = { kind: "done", at: 1, seq: 7 };
+    // Agent appears: everything seen so far predates it.
+    expect(
+      quickReplyAttentionBaseline({
+        previousAgentName: null,
+        nextAgentName: "claude",
+        attention,
+        currentBaseline: null,
+      }),
+    ).toBe(7);
+    // Same agent keeps its baseline.
+    expect(
+      quickReplyAttentionBaseline({
+        previousAgentName: "claude",
+        nextAgentName: "claude",
+        attention: { kind: "needs-input", at: 2, seq: 9 },
+        currentBaseline: 7,
+      }),
+    ).toBe(7);
+    // A different agent starts a new session.
+    expect(
+      quickReplyAttentionBaseline({
+        previousAgentName: "claude",
+        nextAgentName: "codex",
+        attention: { kind: "needs-input", at: 2, seq: 9 },
+        currentBaseline: 7,
+      }),
+    ).toBe(9);
+    // No attention yet: nothing to ignore.
+    expect(
+      quickReplyAttentionBaseline({
+        previousAgentName: null,
+        nextAgentName: "claude",
+        attention: null,
+        currentBaseline: 3,
+      }),
+    ).toBeNull();
   });
 });

@@ -52,39 +52,65 @@ function getQuickReplySequence(replyOrKey, keySequences) {
   return key.length === 1 ? key : null;
 }
 
-// How long an agent's "needs your input" notification keeps the chips up.
-const QUICK_REPLY_ATTENTION_WINDOW_MS = 5 * 60 * 1000;
+function attentionSeqOf(attention) {
+  const seq = Number(attention?.seq);
+  return Number.isFinite(seq) && seq > 0 ? seq : 0;
+}
 
 /**
- * True when the session's latest agent notification (OSC 9/777/99, reported
- * as `attention` by /api/terminals) is a recent "needs your input".
+ * The attention seq that marks the start of the current agent session:
+ * notifications at or below it came from an earlier program or agent run in
+ * the same terminal (the server never resets the latest notification). A new
+ * session starts when an agent appears or a different agent takes over;
+ * otherwise the current baseline is kept. null = nothing to ignore.
  */
-function isRecentInputRequest(attention, now = Date.now()) {
-  if (attention?.kind !== "needs-input") return false;
-  const at = Number(attention.at);
-  if (!Number.isFinite(at)) return false;
-  return now - at <= QUICK_REPLY_ATTENTION_WINDOW_MS;
+function quickReplyAttentionBaseline({
+  previousAgentName = null,
+  nextAgentName = null,
+  attention = null,
+  currentBaseline = null,
+} = {}) {
+  const next = typeof nextAgentName === "string" ? nextAgentName.trim() : "";
+  const prev =
+    typeof previousAgentName === "string" ? previousAgentName.trim() : "";
+  if (!next || next === prev) return currentBaseline ?? null;
+  const seq = attentionSeqOf(attention);
+  return seq > 0 ? seq : null;
 }
 
 /**
  * The chip row shows on touch layouts while the active terminal has an agent
  * session. When the agent sends notifications (the server's `attention`
- * signal), the row narrows to the moments it asked for input recently;
- * without that signal agentState cannot tell "working" from "waiting", so
+ * signal), the latest one from this session decides: a "needs your input"
+ * keeps the chips up for as long as the agent is not responding (no fixed
+ * cutoff: the agent asks once and waits), any other kind hides them.
+ * Without that signal agentState cannot tell "working" from "waiting", so
  * the row stays for the whole session (which also avoids re-fitting the
- * terminal on every output burst).
+ * terminal on every output burst). Attention at or below
+ * `attentionBaselineSeq` predates the session and is ignored.
  */
 function shouldShowQuickReplies({
   touchLayout = false,
   agentName = null,
+  agentState = null,
   attention = null,
-  now = Date.now(),
+  attentionBaselineSeq = null,
 } = {}) {
   if (!touchLayout) return false;
   if (!(typeof agentName === "string" && agentName.trim().length > 0)) {
     return false;
   }
-  return attention?.kind ? isRecentInputRequest(attention, now) : true;
+  if (!attention?.kind) return true;
+  const baseline = Number(attentionBaselineSeq);
+  if (
+    attentionBaselineSeq !== null &&
+    Number.isFinite(baseline) &&
+    attentionSeqOf(attention) <= baseline
+  ) {
+    return true;
+  }
+  if (attention.kind !== "needs-input") return false;
+  return getQuickReplyState({ agentState }) !== "busy";
 }
 
 /**
@@ -99,9 +125,8 @@ function getQuickReplyState({ agentState = null } = {}) {
 
 const QuickReplies = {
   QUICK_REPLIES,
-  QUICK_REPLY_ATTENTION_WINDOW_MS,
   getQuickReplySequence,
-  isRecentInputRequest,
+  quickReplyAttentionBaseline,
   shouldShowQuickReplies,
   getQuickReplyState,
 };
