@@ -684,8 +684,18 @@ function buildRecommendations(
     "Keep only SSH and HTTPS public; do not open the DeckTerm app port directly.",
   );
 
+  recommendations.push(AGENT_NOTIFICATION_TIP);
+
   return recommendations;
 }
+
+// Informational only — DeckTerm never edits agent config. DeckTerm reads
+// OSC 9 / 777 / 99 notifications from pane output (tab dot, app badge, push).
+// Inside DeckTerm's tmux neither agent auto-detects a notifying terminal:
+// Claude Code "auto" and Codex "auto" fall back to nothing / a bare bell, and
+// Codex's default "unfocused" condition may never see the pane as unfocused.
+export const AGENT_NOTIFICATION_TIP =
+  'Optional agent alerts: so DeckTerm can mark a tab and push "needs your input" or "finished", let your agent send terminal notifications. Claude Code: set "preferredNotifChannel": "iterm2" in ~/.claude/settings.json ("ghostty" and "kitty" work too; "auto" and "terminal_bell" send nothing DeckTerm reads). Codex: in ~/.codex/config.toml under [tui] set notifications = true, notification_method = "osc9" and notification_condition = "always".';
 
 function getPrimaryOrigin(config: DoctorConfig, publicOrigin?: string) {
   return (

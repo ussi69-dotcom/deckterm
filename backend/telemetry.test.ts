@@ -7,7 +7,15 @@ import {
   parseShellIntegrationChunk,
   resolveAgentOutputState,
   toSummaryLine,
+  applyTerminalNotificationEvents,
+  classifyAttentionText,
+  createAttentionTracker,
+  createTerminalNotificationParseState,
+  parseTerminalNotifications,
+  sanitizeNotificationText,
+  type AgentName,
   type ShellIntegrationParseState,
+  type TerminalNotificationEvent,
 } from "./telemetry";
 
 const START = "\x1b]9;9;deckterm;running;start\x07";
@@ -435,4 +443,312 @@ test("inferTmuxRuntimeState preserves explicit agent state across markerless tmu
     agentName: "codex",
     agentState: "thinking",
   });
+});
+
+// ---------------------------------------------------------------------------
+// Terminal notification escapes (OSC 9 / 777 / 99, OSC 9;4 progress)
+// ---------------------------------------------------------------------------
+
+const OSC9 = (text: string) => `\x1b]9;${text}\x07`;
+const OSC777 = (title: string, body: string) =>
+  `\x1b]777;notify;${title};${body}\x1b\\`;
+const OSC99 = (meta: string, payload: string) =>
+  `\x1b]99;${meta};${payload}\x1b\\`;
+const PROGRESS = (state: number, percent?: number) =>
+  `\x1b]9;4;${state}${percent === undefined ? "" : `;${percent}`}\x07`;
+const TMUX_WRAP = (seq: string) =>
+  `\x1bPtmux;${seq.replace(/\x1b/g, "\x1b\x1b")}\x1b\\`;
+
+function parseAll(chunks: string[]) {
+  let state = createTerminalNotificationParseState();
+  const events: TerminalNotificationEvent[] = [];
+  for (const chunk of chunks) {
+    const result = parseTerminalNotifications(chunk, state);
+    state = result.state;
+    events.push(...result.events);
+  }
+  return { events, state };
+}
+
+test("parseTerminalNotifications reads an iTerm2 OSC 9 notification", () => {
+  const { events } = parseAll([
+    `before${OSC9("Claude needs your permission")}after`,
+  ]);
+  expect(events).toEqual([
+    {
+      type: "notify",
+      source: "osc9",
+      title: "",
+      body: "Claude needs your permission",
+    },
+  ]);
+});
+
+test("parseTerminalNotifications ignores DeckTerm 9;9 markers and ConEmu subcommands", () => {
+  const { events } = parseAll([
+    "\x1b]9;9;deckterm;running;start\x07",
+    "\x1b]9;9;/home/user\x07",
+    "\x1b]9;1;500\x07",
+    "\x1b]9;12\x07",
+  ]);
+  expect(events).toEqual([]);
+});
+
+test("parseTerminalNotifications keeps DeckTerm markers authoritative in the shell parser", () => {
+  const chunk = `${START}${OSC9("Agent turn complete")}${DONE(0)}`;
+  const shell = parseShellIntegrationChunk(chunk);
+  expect(shell.events).toEqual([
+    { type: "running-start" },
+    { type: "running-done", exitCode: 0 },
+  ]);
+  const { events } = parseAll([chunk]);
+  expect(events).toEqual([
+    { type: "notify", source: "osc9", title: "", body: "Agent turn complete" },
+  ]);
+});
+
+test("parseTerminalNotifications reads OSC 777 notify with title and body", () => {
+  const { events } = parseAll([OSC777("Claude Code", "Waiting; for input")]);
+  expect(events).toEqual([
+    {
+      type: "notify",
+      source: "osc777",
+      title: "Claude Code",
+      body: "Waiting; for input",
+    },
+  ]);
+});
+
+test("parseTerminalNotifications ignores non-notify OSC 777 payloads", () => {
+  expect(parseAll(["\x1b]777;preexec\x07"]).events).toEqual([]);
+});
+
+test("parseTerminalNotifications assembles a chunked kitty OSC 99 notification", () => {
+  const { events } = parseAll([
+    OSC99("i=7:d=0:p=title", "Claude Code"),
+    OSC99("i=7:p=body", "Claude is waiting for your input"),
+    OSC99("i=7:d=1:a=focus", ""),
+  ]);
+  expect(events).toEqual([
+    {
+      type: "notify",
+      source: "osc99",
+      title: "Claude Code",
+      body: "Claude is waiting for your input",
+    },
+  ]);
+});
+
+test("parseTerminalNotifications decodes base64 kitty payloads and ignores unsupported payload types", () => {
+  const encoded = Buffer.from("Build finished", "utf8").toString("base64");
+  const { events } = parseAll([
+    OSC99("i=1:p=?", ""),
+    OSC99("i=2:p=icon", "abc"),
+    OSC99("e=1", encoded),
+  ]);
+  expect(events).toEqual([
+    { type: "notify", source: "osc99", title: "Build finished", body: "" },
+  ]);
+});
+
+test("parseTerminalNotifications reads OSC 9;4 progress states", () => {
+  const { events } = parseAll([
+    PROGRESS(1, 42),
+    PROGRESS(3),
+    PROGRESS(2, 150),
+    PROGRESS(4, 10),
+    PROGRESS(0),
+  ]);
+  expect(events).toEqual([
+    { type: "progress", state: "normal", percent: 42 },
+    { type: "progress", state: "indeterminate", percent: null },
+    { type: "progress", state: "error", percent: 100 },
+    { type: "progress", state: "paused", percent: 10 },
+    { type: "progress", state: null, percent: null },
+  ]);
+});
+
+test("parseTerminalNotifications ignores malformed OSC 9;4 progress", () => {
+  expect(parseAll(["\x1b]9;4;9;50\x07", "\x1b]9;4;x\x07"]).events).toEqual([]);
+});
+
+test("parseTerminalNotifications joins sequences split across chunks", () => {
+  const seq = OSC777("Codex", "Approval requested: rm -rf build");
+  for (let split = 1; split < seq.length; split++) {
+    const { events, state } = parseAll([
+      `x${seq.slice(0, split)}`,
+      `${seq.slice(split)}y`,
+    ]);
+    expect(events).toEqual([
+      {
+        type: "notify",
+        source: "osc777",
+        title: "Codex",
+        body: "Approval requested: rm -rf build",
+      },
+    ]);
+    expect(state.carry).toBe("");
+  }
+});
+
+test("parseTerminalNotifications unwraps tmux DCS passthrough (Codex/Claude inside tmux)", () => {
+  const wrapped = TMUX_WRAP(OSC9("Approval requested: git push"));
+  const { events } = parseAll([wrapped.slice(0, 9), wrapped.slice(9)]);
+  expect(events).toEqual([
+    {
+      type: "notify",
+      source: "osc9",
+      title: "",
+      body: "Approval requested: git push",
+    },
+  ]);
+  expect(parseAll([TMUX_WRAP(PROGRESS(1, 5))]).events).toEqual([
+    { type: "progress", state: "normal", percent: 5 },
+  ]);
+});
+
+test("parseTerminalNotifications bounds the carry for an unterminated malicious OSC", () => {
+  let state = createTerminalNotificationParseState();
+  const huge = "A".repeat(64 * 1024);
+  let result = parseTerminalNotifications(`\x1b]9;${huge}`, state);
+  expect(result.events).toEqual([]);
+  expect(result.state.carry.length).toBeLessThanOrEqual(8192);
+  for (let i = 0; i < 20; i++) {
+    result = parseTerminalNotifications(huge, result.state);
+    expect(result.state.carry.length).toBeLessThanOrEqual(8192);
+  }
+  // The tail of the oversized sequence never turns into an event, and the
+  // parser recovers for the next well-formed notification.
+  result = parseTerminalNotifications(`tail\x07${OSC9("done")}`, result.state);
+  expect(result.events).toEqual([
+    { type: "notify", source: "osc9", title: "", body: "done" },
+  ]);
+});
+
+test("parseTerminalNotifications sanitizes control characters and caps text at 200 chars", () => {
+  const nasty = `‮evil\x00\x08\x9b31m ${"x".repeat(500)}`;
+  const { events } = parseAll([OSC777(`T\x7fitle`, nasty)]);
+  expect(events).toHaveLength(1);
+  const event = events[0] as Extract<
+    TerminalNotificationEvent,
+    { type: "notify" }
+  >;
+  expect(event.title).toBe("Title");
+  expect(event.body.startsWith("evil31m x")).toBe(true);
+  expect(Array.from(event.body).length).toBeLessThanOrEqual(200);
+  expect(/[\x00-\x1f\x7f-\x9f‪-‮]/.test(event.body)).toBe(false);
+});
+
+test("sanitizeNotificationText collapses whitespace and keeps unicode", () => {
+  expect(sanitizeNotificationText("  hotovo\n\t✓  ")).toBe("hotovo ✓");
+  expect(sanitizeNotificationText("😀".repeat(300))).toBe("😀".repeat(200));
+});
+
+test("classifyAttentionText maps Claude Code and Codex texts to attention kinds", () => {
+  const cases: Array<[string, string, AgentName | null, string]> = [
+    ["", "Claude needs your permission to use Bash", "claude", "needs-input"],
+    ["Permission needed", "Claude needs your permission", null, "needs-input"],
+    ["", "Claude is waiting for your input", "claude", "needs-input"],
+    ["", "Approval requested: npm test", "codex", "needs-input"],
+    ["", "Codex wants to edit src/app.ts", "codex", "needs-input"],
+    ["", "Question: which branch?", "codex", "needs-input"],
+    ["", "Plan mode prompt: Ship it?", "codex", "needs-input"],
+    ["", "Agent turn complete", "codex", "done"],
+    ["", "Fixed the failing parser test", "codex", "done"],
+    ["", "Task completed", null, "done"],
+    ["Build", "finished in 3s", null, "done"],
+    ["", "Build failed: 3 errors", null, "error"],
+    ["", "Hello there", null, "info"],
+  ];
+  for (const [title, body, agentName, kind] of cases) {
+    expect(classifyAttentionText({ title, body }, { agentName })).toBe(
+      kind as never,
+    );
+  }
+});
+
+test("applyTerminalNotificationEvents assigns monotonic seq and rate-limits per session", () => {
+  let tracker = createAttentionTracker();
+  const notify = (body: string) => ({
+    type: "notify" as const,
+    source: "osc9" as const,
+    title: "",
+    body,
+  });
+
+  let result = applyTerminalNotificationEvents(
+    tracker,
+    [notify("Task completed")],
+    { now: 10_000, agentName: null },
+  );
+  tracker = result.tracker;
+  expect(result.accepted).toHaveLength(1);
+  expect(tracker.attention).toMatchObject({
+    kind: "done",
+    title: "",
+    body: "Task completed",
+    at: 10_000,
+  });
+  const firstSeq = tracker.attention!.seq;
+  expect(firstSeq).toBeGreaterThanOrEqual(10_000);
+
+  // Same-or-lower priority inside the 2 s window is dropped.
+  result = applyTerminalNotificationEvents(
+    tracker,
+    [notify("Task completed"), notify("hello")],
+    { now: 11_000, agentName: null },
+  );
+  tracker = result.tracker;
+  expect(result.accepted).toHaveLength(0);
+  expect(tracker.attention!.seq).toBe(firstSeq);
+
+  // A higher-priority event (needs input) still gets through.
+  result = applyTerminalNotificationEvents(
+    tracker,
+    [notify("Claude needs your permission")],
+    { now: 11_500, agentName: "claude" },
+  );
+  tracker = result.tracker;
+  expect(result.accepted.map((a) => a.kind)).toEqual(["needs-input"]);
+  expect(tracker.attention!.seq).toBeGreaterThan(firstSeq);
+
+  // After the window anything is accepted again; seq stays monotonic even if
+  // the clock goes backwards.
+  const before = tracker.attention!.seq;
+  result = applyTerminalNotificationEvents(
+    tracker,
+    [notify("Task completed")],
+    { now: 5_000, agentName: null },
+  );
+  expect(result.accepted).toHaveLength(0);
+  result = applyTerminalNotificationEvents(
+    result.tracker,
+    [notify("Task completed")],
+    { now: 20_000, agentName: null },
+  );
+  expect(result.accepted).toHaveLength(1);
+  expect(result.tracker.attention!.seq).toBeGreaterThan(before);
+});
+
+test("applyTerminalNotificationEvents tracks and clears progress without rate limiting", () => {
+  let result = applyTerminalNotificationEvents(
+    createAttentionTracker(),
+    [
+      { type: "progress", state: "normal", percent: 10 },
+      { type: "progress", state: "normal", percent: 20 },
+    ],
+    { now: 1_000, agentName: null },
+  );
+  expect(result.tracker.progress).toEqual({
+    state: "normal",
+    percent: 20,
+    at: 1_000,
+  });
+  expect(result.accepted).toEqual([]);
+  result = applyTerminalNotificationEvents(
+    result.tracker,
+    [{ type: "progress", state: null, percent: null }],
+    { now: 1_100, agentName: null },
+  );
+  expect(result.tracker.progress).toBe(null);
 });

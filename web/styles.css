@@ -320,6 +320,7 @@ body {
 }
 
 .tab {
+  position: relative;
   display: grid;
   grid-template-columns: auto auto auto minmax(0, 1fr) auto;
   align-items: center;
@@ -512,6 +513,15 @@ body {
   visibility: hidden;
 }
 
+/* Stacked copy (label above badge): the badge has its own row, so its slot
+   never changes the label's width. Collapse a hidden badge there so the label
+   centers in the pinned-height tab instead of sitting a row too high. */
+.tabs[data-layout] .tab[data-copy-fit="wrapped"] .tab-signal-badge[hidden],
+.tabs[data-layout] .tab[data-copy-fit="truncated"] .tab-signal-badge[hidden],
+.tabs[data-layout] .tab[data-copy-fit="cramped"] .tab-signal-badge[hidden] {
+  display: none;
+}
+
 .tab[data-mode="read"] {
   border-color: #f59e0b !important;
 }
@@ -524,14 +534,151 @@ body {
   margin-left: 4px;
 }
 
+/* Running is a calm, normal state (blue + a slow pulse dot). Red is kept for
+   failures: a non-zero exit and the error attention dot. */
 .tab[data-primary-signal="running"] {
-  border-color: rgba(248, 81, 73, 0.35);
+  border-color: rgba(121, 192, 255, 0.3);
 }
 
 .tab[data-primary-signal="running"] .tab-signal-badge {
-  background: rgba(248, 81, 73, 0.12);
-  border-color: rgba(248, 81, 73, 0.35);
-  color: #ffb3ad;
+  gap: 5px;
+  background: rgba(121, 192, 255, 0.1);
+  border-color: rgba(121, 192, 255, 0.3);
+  color: #b6dcff;
+}
+
+.tab[data-primary-signal="running"] .tab-signal-badge::before {
+  content: "";
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #79c0ff;
+  animation: tab-running-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes tab-running-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.tab[data-exit-status="error"] {
+  border-color: rgba(248, 81, 73, 0.4);
+}
+
+/* Unseen agent attention (OSC 9/777/99 notification) — colour by kind. */
+.tab-attention {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8b949e;
+  box-shadow: 0 0 0 2px var(--bg-tertiary);
+  pointer-events: none;
+}
+
+.tab-attention[hidden] {
+  display: none;
+}
+
+.tab-attention[data-kind="needs-input"] {
+  background: #f0b429;
+  animation: tab-attention-ring 2s ease-out infinite;
+}
+
+.tab-attention[data-kind="done"] {
+  background: #3fb950;
+}
+
+.tab-attention[data-kind="error"] {
+  background: #f85149;
+}
+
+.tab-attention[data-kind="info"] {
+  background: #79c0ff;
+}
+
+@keyframes tab-attention-ring {
+  0% {
+    box-shadow:
+      0 0 0 2px var(--bg-tertiary),
+      0 0 0 2px rgba(240, 180, 41, 0.55);
+  }
+  100% {
+    box-shadow:
+      0 0 0 2px var(--bg-tertiary),
+      0 0 0 7px rgba(240, 180, 41, 0);
+  }
+}
+
+/* OSC 9;4 progress: a thin underline inside the tab. */
+.tab-progress {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 3px;
+  height: 2px;
+  border-radius: 1px;
+  background: rgba(121, 192, 255, 0.16);
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.tab-progress[hidden] {
+  display: none;
+}
+
+.tab-progress::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--tab-progress, 0%);
+  background: #79c0ff;
+  transition: width 0.3s ease;
+}
+
+.tab-progress[data-state="error"]::after {
+  background: #f85149;
+}
+
+.tab-progress[data-state="paused"]::after {
+  background: #d29922;
+}
+
+.tab-progress[data-state="indeterminate"]::after {
+  width: 35%;
+  animation: tab-progress-indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes tab-progress-indeterminate {
+  0% {
+    left: -35%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab[data-primary-signal="running"] .tab-signal-badge::before,
+  .tab-attention[data-kind="needs-input"],
+  .tab-progress::after {
+    animation: none;
+    transition: none;
+  }
+
+  .tab-progress[data-state="indeterminate"]::after {
+    left: 0;
+    width: 100%;
+    opacity: 0.6;
+  }
 }
 
 .tab[data-primary-signal="agent"] {
@@ -2010,6 +2157,76 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .session-badge.ended {
   color: var(--text-secondary);
+}
+
+.session-row-title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.session-row-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(110, 118, 129, 0.14);
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.session-chip-agent {
+  border-color: rgba(210, 153, 34, 0.38);
+  background: rgba(210, 153, 34, 0.12);
+  color: #f2cf7f;
+}
+
+.session-chip-running {
+  border-color: rgba(121, 192, 255, 0.3);
+  background: rgba(121, 192, 255, 0.1);
+  color: #b6dcff;
+}
+
+.session-chip-attention[data-kind="needs-input"] {
+  border-color: rgba(240, 180, 41, 0.5);
+  background: rgba(240, 180, 41, 0.14);
+  color: #f7d27a;
+}
+
+.session-chip-attention[data-kind="done"] {
+  border-color: rgba(63, 185, 80, 0.4);
+  background: rgba(63, 185, 80, 0.12);
+  color: #9be7a9;
+}
+
+.session-chip-attention[data-kind="error"] {
+  border-color: rgba(248, 81, 73, 0.4);
+  background: rgba(248, 81, 73, 0.12);
+  color: #ffb3ad;
+}
+
+.session-row-attention {
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-row[data-attention="needs-input"] {
+  border-color: rgba(240, 180, 41, 0.4);
 }
 
 .session-row-action {

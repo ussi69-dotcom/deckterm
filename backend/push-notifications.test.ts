@@ -223,4 +223,30 @@ describe("push validation and delivery", () => {
       "https://push.example.test/retry",
     ]);
   });
+
+  test("needs-input delivery uses a generic body", async () => {
+    const state = await createState();
+    const subscription = validSubscription("https://push.example.test/input");
+    upsertPushSubscription(state.db, {
+      userId: "user-a",
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth,
+    });
+    const payloads: string[] = [];
+    const result = await dispatchCompletionPush({
+      db: state.db,
+      config: validConfig(),
+      userId: "user-a",
+      terminalId: "secret-terminal-id",
+      kind: "input",
+      send: (async (_subscription, payload) => {
+        payloads.push(String(payload));
+        return { statusCode: 201, headers: {}, body: "" };
+      }) as typeof import("web-push").sendNotification,
+    });
+    expect(result.delivered).toBe(1);
+    expect(JSON.parse(payloads[0]).body).toBe("Agent needs your input");
+    expect(payloads[0]).not.toContain("secret-terminal-id");
+  });
 });
