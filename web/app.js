@@ -5879,6 +5879,9 @@ class TerminalManager {
 
   fitTerminalState(terminalState) {
     if (!terminalState?.fitAddon || !terminalState?.terminal) return null;
+    // Deferred callers (rAF/timers) can outlive a closed terminal; fitting a
+    // disposed xterm throws inside its render service.
+    if (terminalState.disposed) return null;
     terminalState.fitAddon.fit();
     return this.normalizeTerminalGeometry(terminalState);
   }
@@ -14007,6 +14010,7 @@ class TerminalManager {
     if (!t?.fitAddon || !t?.terminal) return;
 
     requestAnimationFrame(() => {
+      if (t.disposed) return;
       try {
         this.fitTerminalState(t);
         this.sendResize(id, t.terminal.cols, t.terminal.rows, {
@@ -14164,10 +14168,12 @@ class TerminalManager {
     }
 
     const observer = new ResizeObserver(() => {
+      if (t.disposed) return;
       if (!t.element || t.element.offsetParent === null) return;
       if (t.fitFrame) return;
       t.fitFrame = requestAnimationFrame(() => {
         t.fitFrame = 0;
+        if (t.disposed) return;
         try {
           const prevCols = t.terminal?.cols;
           const prevRows = t.terminal?.rows;
@@ -14946,6 +14952,9 @@ class TerminalManager {
 
     if (wasActive) this.closeTerminalSearch();
 
+    // Everything deferred (rAF fits, resize timers, layout syncs) checks this
+    // before touching the xterm instance.
+    t.disposed = true;
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
@@ -14956,7 +14965,11 @@ class TerminalManager {
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
+    if (t.inputDroppedTimer) clearTimeout(t.inputDroppedTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.resizeObserver = null;
+    t.resizeTimer = null;
+    t.fitFrame = 0;
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
     // The webgl addon must be disposed BEFORE terminal.dispose() — disposing
@@ -14969,6 +14982,7 @@ class TerminalManager {
       }
       t.webglAddon = null;
     }
+    this.quiesceXtermForDispose(t.terminal);
     try {
       t.terminal?.dispose?.();
     } catch (err) {
@@ -15022,6 +15036,32 @@ class TerminalManager {
       console.warn("Could not schedule terminal close:", err);
       this.showSessionCloseToast(terminalLabel, null);
     }
+  }
+
+  // xterm 5.3 leaves two deferred callbacks un-cancelled on dispose: the
+  // render service's paused-resize idle task (queued when a hidden terminal
+  // is resized) and the viewport's refresh animation frame. Either firing
+  // after dispose throws "Cannot read properties of undefined (reading
+  // 'handleResize' / 'dimensions')". Neutralize both before disposing.
+  quiesceXtermForDispose(terminal) {
+    const core = terminal?._core;
+    if (!core) return;
+    try {
+      // set() replaces whatever resize is queued with a no-op.
+      core._renderService?._pausedResizeTask?.set?.(() => {});
+    } catch {}
+    const viewport = core.viewport;
+    if (!viewport) return;
+    try {
+      if (viewport._refreshAnimationFrame != null) {
+        cancelAnimationFrame(viewport._refreshAnimationFrame);
+        viewport._refreshAnimationFrame = null;
+      }
+      // The viewport also schedules syncScrollArea from timers we cannot
+      // reach; make any late call a no-op on this dead instance.
+      viewport.syncScrollArea = () => {};
+      viewport._innerRefresh = () => {};
+    } catch {}
   }
 
   showSessionCloseToast(
