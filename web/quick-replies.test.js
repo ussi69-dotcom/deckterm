@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   QUICK_REPLIES,
+  QUICK_REPLY_ATTENTION_WINDOW_MS,
   getQuickReplySequence,
   getQuickReplyState,
   shouldShowQuickReplies,
@@ -131,6 +132,59 @@ describe("shouldShowQuickReplies", () => {
       }),
     ).toBe(false);
     expect(shouldShowQuickReplies()).toBe(false);
+  });
+
+  describe("with the agent attention signal from /api/terminals", () => {
+    const now = 10_000_000;
+    const base = { touchLayout: true, agentName: "claude", now };
+
+    test("a recent needs-input notification shows the chips", () => {
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          attention: { kind: "needs-input", at: now - 30_000, seq: 3 },
+        }),
+      ).toBe(true);
+    });
+
+    test("an older needs-input notification no longer does", () => {
+      expect(
+        shouldShowQuickReplies({
+          ...base,
+          attention: {
+            kind: "needs-input",
+            at: now - QUICK_REPLY_ATTENTION_WINDOW_MS - 1,
+            seq: 3,
+          },
+        }),
+      ).toBe(false);
+    });
+
+    test("any other latest notification hides them", () => {
+      for (const kind of ["done", "error", "info"]) {
+        expect(
+          shouldShowQuickReplies({
+            ...base,
+            attention: { kind, at: now - 1000, seq: 4 },
+          }),
+        ).toBe(false);
+      }
+    });
+
+    test("no signal keeps the agent-session rule", () => {
+      expect(shouldShowQuickReplies({ ...base, attention: null })).toBe(true);
+      expect(shouldShowQuickReplies({ ...base, attention: {} })).toBe(true);
+    });
+
+    test("still needs a touch layout and an agent", () => {
+      const attention = { kind: "needs-input", at: now, seq: 1 };
+      expect(
+        shouldShowQuickReplies({ ...base, touchLayout: false, attention }),
+      ).toBe(false);
+      expect(
+        shouldShowQuickReplies({ ...base, agentName: null, attention }),
+      ).toBe(false);
+    });
   });
 });
 

@@ -3,12 +3,13 @@
 // /api/health reports `build`, a short fingerprint of the served web files.
 // The tab remembers the build it saw at load and re-checks when it becomes
 // visible again, when the browser comes back online, and every 10 minutes
-// while visible. When the build changes it shows a small non-blocking toast
-// with a Reload button. Other code (e.g. the WebSocket reconnect path) can
-// ask for a check through window.ReleaseWatch.check(); checks are throttled.
+// while visible. When the build changes it shows a non-blocking toast with a
+// Reload button (through the shared toast service). Other code (e.g. the
+// WebSocket reconnect path) can ask for a check through
+// window.ReleaseWatch.check(); checks are throttled.
 //
 // The pure parts (comparison, throttling, scheduling) are exported for Bun
-// unit tests; the DOM toast is browser-only.
+// unit tests; the toast is browser-only.
 
 const RELEASE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 const RELEASE_CHECK_MIN_GAP_MS = 30 * 1000;
@@ -116,66 +117,32 @@ async function fetchServedBuild() {
   return body?.build ?? null;
 }
 
-// Reuses the existing toast look (.clipboard-toast), placed at the top; a
-// later pass unifies the toast systems.
-function createUpdateToast(doc, { onReload, onDismiss }) {
-  const toast = doc.createElement("div");
-  toast.className = "clipboard-toast release-watch-toast hidden";
-  toast.setAttribute("role", "status");
-  toast.setAttribute("aria-live", "polite");
-  // Below the toolbar rather than the clipboard toast's bottom slot, which
-  // on phones sits on top of the extra-keys row.
-  Object.assign(toast.style, {
-    top: "calc(env(safe-area-inset-top, 0px) + 72px)",
-    bottom: "auto",
+// Rendered by the shared toast service (web/toast-service.js): a sticky
+// warning with a Reload action. Dismissing it (×) remembers that build so it
+// does not come back until a newer one is served.
+function showUpdateToast(win, { onReload, onDismiss }) {
+  return win.ToastService?.show?.({
+    key: "release-watch",
+    className: "release-watch-toast",
+    kind: "info",
+    title: "DeckTerm was updated",
+    body: "Reload to use the new version.",
+    timeoutMs: null,
+    actions: [{ label: "Reload", primary: true, run: () => onReload() }],
+    onClose: (reason) => {
+      if (reason === "dismiss") onDismiss();
+    },
   });
-
-  const message = doc.createElement("span");
-  message.className = "toast-message";
-  message.textContent = "DeckTerm was updated";
-  message.style.whiteSpace = "nowrap";
-
-  const reload = doc.createElement("button");
-  reload.type = "button";
-  reload.className = "toast-copy";
-  reload.textContent = "Reload";
-  reload.addEventListener("click", () => onReload());
-
-  const dismiss = doc.createElement("button");
-  dismiss.type = "button";
-  dismiss.className = "release-watch-dismiss";
-  dismiss.setAttribute("aria-label", "Dismiss update notice");
-  dismiss.title = "Dismiss";
-  dismiss.textContent = "×";
-  Object.assign(dismiss.style, {
-    background: "none",
-    border: "none",
-    color: "var(--text-secondary)",
-    cursor: "pointer",
-    fontSize: "18px",
-    lineHeight: "1",
-    padding: "0 2px",
-  });
-  dismiss.addEventListener("click", () => onDismiss());
-
-  toast.append(message, reload, dismiss);
-  (doc.getElementById("app") || doc.body).appendChild(toast);
-  return toast;
 }
 
 function initReleaseWatch(win, doc) {
-  let toast = null;
   const watcher = createReleaseWatcher({
     fetchBuild: fetchServedBuild,
     onUpdate: () => {
-      toast ??= createUpdateToast(doc, {
+      showUpdateToast(win, {
         onReload: () => win.location.reload(),
-        onDismiss: () => {
-          watcher.dismiss();
-          toast?.classList.add("hidden");
-        },
+        onDismiss: () => watcher.dismiss(),
       });
-      toast.classList.remove("hidden");
     },
   });
   startReleaseWatch({ watcher, document: doc, window: win });

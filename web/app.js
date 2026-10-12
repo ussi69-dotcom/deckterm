@@ -480,6 +480,15 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-paste",
     desktopTone: "secondary",
   }),
+  compose: Object.freeze({
+    label: "Compose",
+    icon: "message-square-text",
+    action: "compose",
+    mobileId: "mobile-compose-btn",
+    toolsId: "tools-sheet-compose",
+    desktopTone: "secondary",
+    description: "Write a message in a text box and send it to the terminal",
+  }),
   copy: Object.freeze({
     label: "Copy",
     icon: "copy",
@@ -795,6 +804,14 @@ class ReconnectingWebSocket {
       return true;
     }
     return false;
+  }
+
+  // True when input would go straight out: socket open, nothing queued.
+  isReadyForInput() {
+    return (
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(this.inputQueue && this.inputQueue.length > 0)
+    );
   }
 
   // Send terminal input, queueing it while the transport is not ready. Input
@@ -2623,6 +2640,7 @@ class ExtraKeysManager {
     const visible = helpers.shouldShowQuickReplies({
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
+      attention: active?.attention ?? null,
     });
     root.dataset.state = helpers.getQuickReplyState({
       agentState: active?.agentState ?? null,
@@ -2755,7 +2773,6 @@ class ClipboardManager {
     this.maxHistory = 20;
     this.maxItemSize = 200 * 1024; // 200KB
     this.panel = null;
-    this.toast = null;
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
@@ -2773,7 +2790,6 @@ class ClipboardManager {
 
   init() {
     this.createPanel();
-    this.createToast();
   }
 
   createPanel() {
@@ -2826,22 +2842,6 @@ class ClipboardManager {
     document.getElementById("app").appendChild(this.panel);
   }
 
-  createToast() {
-    this.toast = document.createElement("div");
-    this.toast.className = "clipboard-toast hidden";
-    this.toast.innerHTML = `
-      <span class="toast-message"></span>
-      <button class="toast-copy">Copy</button>
-    `;
-    document.getElementById("app").appendChild(this.toast);
-
-    this.toast.querySelector(".toast-copy").addEventListener("click", () => {
-      if (this.pendingCopy) {
-        this.copyWithGesture(this.pendingCopy);
-      }
-    });
-  }
-
   // Handle OSC52 from terminal
   handleOsc52(data) {
     // Parse: c;<base64>
@@ -2857,11 +2857,7 @@ class ClipboardManager {
 
       // Size limit check
       if (text.length > this.maxItemSize) {
-        this.showToast(
-          "Content too large. Click to download.",
-          "download",
-          text,
-        );
+        this.showToast("Too large for the clipboard", "download", text);
         return;
       }
 
@@ -2959,7 +2955,12 @@ class ClipboardManager {
     });
   }
 
-  showToast(message, type, data = null) {
+  // Clipboard notices go through the shared toast service under one key, so
+  // a new clipboard notice replaces the previous one instead of stacking.
+  // `type` keeps the historical vocabulary: success | error | pending |
+  // download. "pending" with data offers a Copy action (the async clipboard
+  // needs a user gesture); "download" offers the oversized text as a file.
+  showToast(message, type, data = null, { timeoutMs } = {}) {
     const now = Date.now();
 
     // Debounce success toasts (2 second cooldown)
@@ -2971,23 +2972,68 @@ class ClipboardManager {
       this.lastToastTime = now;
     }
 
-    const toast = this.toast;
-    const msgEl = toast.querySelector(".toast-message");
-    const copyBtn = toast.querySelector(".toast-copy");
-
-    msgEl.textContent = message;
-    toast.className = `clipboard-toast ${type}`;
-    copyBtn.style.display = type === "pending" ? "inline-block" : "none";
-
-    toast.classList.remove("hidden");
-
-    if (type === "success" || type === "error") {
-      setTimeout(() => toast.classList.add("hidden"), 2000);
+    const actions = [];
+    let kind = "info";
+    if (type === "success") kind = "success";
+    else if (type === "error") kind = "error";
+    else if (type === "download") {
+      kind = "warning";
+      if (typeof data === "string") {
+        actions.push({
+          label: "Download",
+          primary: true,
+          run: () => this.downloadText(data),
+        });
+      }
+    } else if (type === "pending") {
+      kind = data ? "info" : "warning";
+      if (data && this.pendingCopy) {
+        actions.push({
+          label: "Copy",
+          primary: true,
+          // copyWithGesture's result replaces this toast via the same key.
+          dismiss: false,
+          run: () => {
+            if (this.pendingCopy) this.copyWithGesture(this.pendingCopy);
+          },
+        });
+      }
     }
+
+    window.ToastService?.show({
+      key: "clipboard",
+      className: "clipboard-toast",
+      kind,
+      title: message,
+      actions,
+      timeoutMs:
+        timeoutMs !== undefined
+          ? timeoutMs
+          : type === "success"
+            ? 2500
+            : undefined,
+    });
   }
 
   hideToast() {
-    this.toast.classList.add("hidden");
+    window.ToastService?.dismiss("clipboard");
+  }
+
+  downloadText(text) {
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `deckterm-clipboard-${Date.now()}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error("Clipboard download failed:", err);
+      this.showToast("Download failed", "error");
+    }
   }
 
   showPanel() {
@@ -3191,7 +3237,7 @@ class ClipboardManager {
   }
 
   async handleImagePaste(blob, terminalWs, terminal = null, inputState = null) {
-    this.showToast("Uploading image...", "pending");
+    this.showToast("Uploading image…", "info", null, { timeoutMs: null });
 
     try {
       const formData = new FormData();
@@ -7184,6 +7230,7 @@ class TerminalManager {
     else if (action === "clipboard") this.clipboardManager.togglePanel();
     else if (action === "copy") this.copySelection();
     else if (action === "paste") await this.pasteClipboard();
+    else if (action === "compose") this.openComposeSheet();
     else if (action === "font-decrease") this.changeFontSize(-1);
     else if (action === "font-increase") this.changeFontSize(1);
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
@@ -8879,28 +8926,21 @@ class TerminalManager {
     this.taskSignalLast = Array.isArray(tasks) ? tasks : [];
   }
 
+  // Shared toast entry point (web/toast-service.js). Returns the toast handle,
+  // or null when the service is unavailable (e.g. a stale cached script).
+  notify(options) {
+    return window.ToastService?.show?.(options) ?? null;
+  }
+
   showTaskToast(transition) {
-    let toast = document.getElementById("task-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "task-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        void this.openTaskPanel();
-      });
-      document.getElementById("app")?.appendChild(toast);
-    }
-    const verb =
-      transition.to === "complete"
-        ? "completed ✅"
-        : transition.to === "failed"
-          ? "failed ❌"
-          : "needs your input ⏸";
-    toast.textContent = `Task "${transition.title}" ${verb}`;
-    toast.classList.remove("hidden");
-    clearTimeout(this.taskToastTimer);
-    this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
+    const describe = window.TaskSignals?.describeTaskTransitionToast;
+    if (typeof describe !== "function") return;
+    this.notify({
+      ...describe(transition),
+      actions: [
+        { label: "Open", run: () => void this.openTaskPanel() },
+      ],
+    });
   }
 
   getTaskViewMode() {
@@ -10312,6 +10352,14 @@ class TerminalManager {
         run: () => this.openFileExplorer(),
       },
       {
+        id: "compose-message",
+        title: "Compose message…",
+        group: "Actions",
+        keywords: ["compose", "write", "message", "prompt", "send", "dictate"],
+        priority: 35,
+        run: () => this.openComposeSheet(),
+      },
+      {
         id: "open-clipboard",
         title: "Open Clipboard",
         group: "Actions",
@@ -11311,7 +11359,7 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
-          this.applyTerminalAttention(terminal, next);
+          this.applyTerminalAttention(terminal, next, id);
           // Under tmux the server reads the pane's live cwd on every poll, so
           // it is authoritative (bash emits no OSC 7 and tmux would not
           // forward it). The raw backend only knows the spawn cwd, so there
@@ -11701,7 +11749,7 @@ class TerminalManager {
   // it has shown per session (localStorage) so tabs and the app badge mark
   // only unseen events. Alerts reuse the completion sound/notification path.
 
-  applyTerminalAttention(terminal, next) {
+  applyTerminalAttention(terminal, next, id = terminal?.id) {
     const signals = window.TaskSignals;
     // A stale cached task-signals.js (older than this app.js) lacks the
     // attention helpers: skip attention rather than break telemetry refresh.
@@ -11712,7 +11760,47 @@ class TerminalManager {
     terminal.attention = next?.attention || null;
     terminal.progress = signals.normalizeProgress(next?.progress);
     terminal.lastActivityAt = Number(next?.lastActivityAt) || null;
-    if (fresh) this.maybeNotifyAttention(terminal, fresh);
+    if (fresh) {
+      this.maybeNotifyAttention(terminal, fresh);
+      this.maybeToastAttention(id, terminal, fresh);
+    }
+  }
+
+  // In-page toast for a fresh agent notification while the page is visible
+  // (hidden tabs get the system notification above). Open jumps to it.
+  maybeToastAttention(id, terminal, attention) {
+    const signals = window.TaskSignals;
+    if (
+      !id ||
+      typeof signals?.shouldToastAttention !== "function" ||
+      typeof signals?.describeAttentionToast !== "function"
+    ) {
+      return;
+    }
+    const show = signals.shouldToastAttention(attention, {
+      pageVisible: document.visibilityState === "visible",
+      isActiveVisible: id === this.getActiveVisibleTerminalId(),
+    });
+    if (!show) return;
+    const actions =
+      id === this.activeId
+        ? []
+        : [
+            {
+              label: "Open",
+              primary: true,
+              run: () => {
+                if (this.terminals.has(id)) this.switchTo(id);
+              },
+            },
+          ];
+    this.notify({
+      ...signals.describeAttentionToast(attention, {
+        sessionId: id,
+        label: this.formatCwdLabel(terminal.cwd || "") || "Terminal",
+      }),
+      actions,
+    });
   }
 
   maybeNotifyAttention(terminal, attention) {
@@ -12769,12 +12857,21 @@ class TerminalManager {
     // Wrap save() with a minimal success toast (failures already surface their
     // own alert from mountInto's save). The Mod-s keymap inside the editor view
     // routes through this wrapped handle, so a successful Ctrl/Cmd+S flashes
-    // "Saved ✓" — keeping feedback cheap without a status bar.
+    // "Saved" — keeping feedback cheap without a status bar. Autosave also
+    // goes through this wrapper; it stays quiet while autosave is on.
     const innerSave = handle.save;
     if (typeof innerSave === "function") {
       handle.save = async () => {
         const ok = await innerSave();
-        if (ok) this.showToast?.("Saved ✓", "success");
+        if (ok && !this.editorAutosaveMs) {
+          this.notify({
+            key: "editor-save",
+            kind: "success",
+            title: "Saved",
+            body: String(tab.ref || "").split("/").pop(),
+            timeoutMs: 2000,
+          });
+        }
         return ok;
       };
     }
@@ -15089,28 +15186,22 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
-  // Brief per-tile notice when input typed during a connect/reconnect could
-  // not be delivered (queue bound hit, input too old, or the terminal ended
-  // before the connection came back).
+  // Notice when input typed during a connect/reconnect could not be delivered
+  // (queue bound hit, input too old, or the terminal ended before the
+  // connection came back). One toast per terminal; repeats replace it.
   showInputDroppedNotice(id) {
     const t = this.terminals.get(id);
-    const host = t?.element?.parentElement;
-    if (!t || t.disposed || !host) return;
-    let notice = t.inputDroppedNotice;
-    if (!notice || !notice.isConnected) {
-      notice = document.createElement("div");
-      notice.className = "tile-input-dropped";
-      notice.setAttribute("role", "status");
-      notice.setAttribute("aria-live", "polite");
-      notice.textContent = "Input not sent — connection was down";
-      host.appendChild(notice);
-      t.inputDroppedNotice = notice;
-    }
-    notice.classList.add("visible");
-    clearTimeout(t.inputDroppedTimer);
-    t.inputDroppedTimer = setTimeout(() => {
-      notice.classList.remove("visible");
-    }, 4000);
+    if (!t || t.disposed) return;
+    const label = this.formatCwdLabel?.(t.cwd || "") || "";
+    this.notify({
+      key: `input-dropped:${id}`,
+      kind: "warning",
+      title: "Input not sent — connection was down",
+      body: label
+        ? `${label}: retype it once the terminal is connected.`
+        : "Retype it once the terminal is connected.",
+      timeoutMs: 6000,
+    });
   }
 
   performReconnectLayoutSync(
@@ -16110,8 +16201,8 @@ class TerminalManager {
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
-    if (t.inputDroppedTimer) clearTimeout(t.inputDroppedTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.composeSubmit?.cancel();
     t.resizeObserver = null;
     t.resizeTimer = null;
     t.fitFrame = 0;
@@ -16246,8 +16337,7 @@ class TerminalManager {
   async undoRecentSessionClose() {
     const batch = this.closeUndoBatch;
     this.closeUndoBatch = null;
-    document.getElementById("session-close-toast")?.classList.add("hidden");
-    clearTimeout(this.sessionCloseToastTimer);
+    window.ToastService?.dismiss?.("session-close");
     if (!batch?.entries?.length) return;
     let focusId = null;
     for (const entry of batch.entries) {
@@ -16264,55 +16354,44 @@ class TerminalManager {
     this.queueTelemetryRefresh(0);
   }
 
+  // The close toast keeps id="session-close-toast" (e2e) and offers Undo
+  // (reattach the batch just closed) plus a shortcut into Sessions.
   showSessionCloseToast(
     label,
     terminationScheduledAt,
     preservedByOtherClient = false,
     { canUndo = false } = {},
   ) {
-    let toast = document.getElementById("session-close-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "session-close-toast";
-      toast.className = "task-toast session-close-toast hidden";
-      toast.setAttribute("role", "status");
-      const message = document.createElement("button");
-      message.type = "button";
-      message.className = "session-close-toast-message";
-      message.title = "Open Sessions";
-      message.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        this.openSessionsPanel();
-      });
-      const undo = document.createElement("button");
-      undo.type = "button";
-      undo.className = "session-close-toast-undo";
-      undo.textContent = "Undo";
-      undo.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void this.undoRecentSessionClose();
-      });
-      toast.append(message, undo);
-      document.getElementById("app")?.appendChild(toast);
-    }
-    const message = toast.querySelector(".session-close-toast-message");
-    const undo = toast.querySelector(".session-close-toast-undo");
     const batchSize = this.closeUndoBatch?.entries?.length || 0;
     const plural = batchSize > 1;
     const subject = plural ? `${batchSize} terminals` : label;
     const it = plural ? "them" : "it";
-    message.textContent = preservedByOtherClient
-      ? `${subject} closed here and ${plural ? "remain" : "remains"} active in another client. You can restore ${it} from Sessions.`
-      : terminationScheduledAt
-        ? `${subject} closed. Restore ${it} from Sessions within 15 minutes.`
-        : `${subject} closed, but automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
-    undo.hidden = !(canUndo && batchSize > 0);
-    toast.classList.remove("hidden");
-    clearTimeout(this.sessionCloseToastTimer);
-    this.sessionCloseToastTimer = setTimeout(
-      () => toast.classList.add("hidden"),
-      9000,
-    );
+    const scheduled = Boolean(terminationScheduledAt);
+    const body = preservedByOtherClient
+      ? `${plural ? "They remain" : "It remains"} active in another client. You can restore ${it} from Sessions.`
+      : scheduled
+        ? `Restore ${it} from Sessions within 15 minutes.`
+        : `Automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
+    const actions = [];
+    if (canUndo && batchSize > 0) {
+      actions.push({
+        label: "Undo",
+        primary: true,
+        ariaLabel: plural ? `Reopen ${batchSize} terminals` : `Reopen ${label}`,
+        run: () => this.undoRecentSessionClose(),
+      });
+    }
+    actions.push({ label: "Sessions", run: () => this.openSessionsPanel() });
+    this.notify({
+      key: "session-close",
+      id: "session-close-toast",
+      className: "session-close-toast",
+      kind: preservedByOtherClient || scheduled ? "info" : "warning",
+      title: `${subject} closed`,
+      body,
+      actions,
+      timeoutMs: 15000,
+    });
   }
 
   sendResize(id, colsOverride = null, rowsOverride = null, options = {}) {
@@ -16502,6 +16581,100 @@ class TerminalManager {
     const selection = active.terminal.getSelection();
     if (selection)
       navigator.clipboard.writeText(selection).catch(console.error);
+  }
+
+  // --- Compose sheet (web/compose-sheet.js) ---------------------------------
+  // A real text box for writing a message to the active terminal (phones
+  // first; desktop through the palette). It targets the terminal that was
+  // active when it opened.
+  openComposeSheet() {
+    const helpers = window.ComposeSheet;
+    const targetId = this.activeId;
+    const target = this.terminals.get(targetId);
+    if (!helpers?.ComposeSheet || !target) {
+      if (!target) {
+        this.notify({
+          key: "compose",
+          kind: "warning",
+          title: "No terminal to write to",
+          body: "Open a terminal first.",
+        });
+      }
+      return;
+    }
+    this.closeToolsSheet?.();
+    if (!this.composeSheet) {
+      let storage = null;
+      try {
+        storage = window.localStorage;
+      } catch {
+        storage = null;
+      }
+      this.composeSheet = new helpers.ComposeSheet({
+        document,
+        storage,
+        onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
+        onClose: ({ restoreFocus }) => {
+          // On touch, refocusing xterm would pop the keyboard back up.
+          if (restoreFocus && !this.isTouchLayout() && this.activeId) {
+            this.focusTerminal(this.activeId);
+          }
+        },
+      });
+    }
+    this.composeTargetId = targetId;
+    this.composeSheet.open({
+      targetLabel: this.formatCwdLabel(target.cwd || "") || "terminal",
+    });
+  }
+
+  // Paste through xterm (bracketed-paste markers when the program asked for
+  // them) into the queued input path, then — for Send — a separate deferred
+  // Enter once that input has settled (see scheduleDeferredSubmit).
+  sendComposedText(id, plan) {
+    const helpers = window.ComposeSheet;
+    const t = this.terminals.get(id);
+    if (!plan || !t || t.disposed || !t.ws || !helpers) {
+      this.notify({
+        key: "compose",
+        kind: "error",
+        title: "Message not sent",
+        body: "That terminal is no longer open.",
+      });
+      return false;
+    }
+    const readyAtStart = Boolean(t.ws.isReadyForInput?.());
+    this.clipboardManager.executePaste(
+      plan.text,
+      t.ws,
+      t.terminal,
+      t.inputState,
+    );
+    if (!plan.submit) return true;
+    t.composeSubmit?.cancel();
+    t.composeSubmit = helpers.scheduleDeferredSubmit({
+      readyAtStart,
+      delayMs: plan.submitDelayMs,
+      isReady: () =>
+        this.terminals.get(id) === t &&
+        !t.disposed &&
+        Boolean(t.ws?.isReadyForInput?.()),
+      send: () => {
+        t.composeSubmit = null;
+        t.ws.sendInput("\r");
+      },
+      onGiveUp: () => {
+        t.composeSubmit = null;
+        if (this.terminals.get(id) !== t || t.disposed) return;
+        this.notify({
+          key: `compose-submit:${id}`,
+          kind: "warning",
+          title: "Message inserted but not submitted",
+          body: "The terminal was not connected. Press Enter once it is.",
+        });
+      },
+    });
+    return true;
   }
 
   async pasteClipboard() {
