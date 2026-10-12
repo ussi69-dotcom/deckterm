@@ -1,11 +1,30 @@
-import { expect, test, waitForTerminal } from "./fixtures";
+import {
+  cleanupTempDir,
+  createExplorerFixtureDir,
+  createGitFixtureRepo,
+  createWorkspaceInDir,
+  expect,
+  test,
+  waitForTerminal,
+} from "./fixtures";
 
 const APP_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
+// The panel shows a calm "Not a Git repository" state outside a repository
+// (history, diff, branch control and commit box are hidden there), so the
+// repository layout is asserted from inside a real fixture repository.
 test.describe("Git Panel - Lazygit-inspired", () => {
+  let repoDir: string;
+
   test.beforeEach(async ({ page }) => {
+    repoDir = await createGitFixtureRepo();
     await page.goto(APP_URL);
     await waitForTerminal(page);
+    await createWorkspaceInDir(page, repoDir);
+  });
+
+  test.afterEach(async () => {
+    await cleanupTempDir(repoDir);
   });
 
   test("should open git panel and show UI elements", async ({ page }) => {
@@ -20,8 +39,8 @@ test.describe("Git Panel - Lazygit-inspired", () => {
     await expect(page.locator(".git-left-panel")).toBeVisible();
     await expect(page.locator(".git-right-panel")).toBeVisible();
 
-    // Should show branch element (may be empty if not in a git repo)
-    await expect(page.locator("#git-branch")).toBeAttached();
+    // Branch control shows the fixture repository's branch
+    await expect(page.locator("#git-branch")).toContainText("main");
   });
 
   test("should display git status files when in a git repo", async ({
@@ -30,13 +49,11 @@ test.describe("Git Panel - Lazygit-inspired", () => {
     await page.click('[data-action="git"]');
     await page.waitForSelector("#git-panel:not(.hidden)");
 
-    // Wait for files list to be present
-    await expect(page.locator("#git-files")).toBeVisible();
-
-    // If we're in a git repo, should have some content or be empty
-    // We can't assume files exist, so just check the container exists
     const filesContainer = page.locator("#git-files");
-    await expect(filesContainer).toBeAttached();
+    await expect(filesContainer).toBeVisible();
+    await expect(filesContainer).toContainText("staged.txt");
+    await expect(filesContainer).toContainText("changed.txt");
+    await expect(page.locator("#git-panel")).not.toHaveClass(/git-no-repo/);
   });
 
   test("should display commit history", async ({ page }) => {
@@ -230,5 +247,38 @@ test.describe("Git Panel - Lazygit-inspired", () => {
     await expect(rightPanel).toBeVisible();
     await expect(rightPanel.locator("#git-diff")).toBeVisible();
     await expect(rightPanel.locator("#git-history")).toBeVisible();
+  });
+});
+
+test.describe("Git Panel - outside a repository", () => {
+  let plainDir: string;
+
+  test.beforeEach(async ({ page }) => {
+    plainDir = (await createExplorerFixtureDir()).root;
+    await page.goto(APP_URL);
+    await waitForTerminal(page);
+    await createWorkspaceInDir(page, plainDir);
+  });
+
+  test.afterEach(async () => {
+    await cleanupTempDir(plainDir);
+  });
+
+  test("shows the calm not-a-repository state instead of empty panes", async ({
+    page,
+  }) => {
+    await page.click('[data-action="git"]');
+    await page.waitForSelector("#git-panel:not(.hidden)");
+
+    const panel = page.locator("#git-panel");
+    await expect(panel).toHaveClass(/git-no-repo/);
+    await expect(panel.locator(".git-empty-title")).toHaveText(
+      "Not a Git repository",
+    );
+    await expect(
+      panel.locator('[data-git-action="choose-folder"]'),
+    ).toBeVisible();
+    await expect(page.locator(".git-right-panel")).toBeHidden();
+    await expect(page.locator("#git-branch")).toHaveText("");
   });
 });
