@@ -38,6 +38,26 @@ function statusClass(letter) {
   }
 }
 
+// Spoken form of a status letter (row aria-labels).
+function statusWord(letter) {
+  switch (letter) {
+    case "M":
+      return "modified";
+    case "A":
+      return "added";
+    case "D":
+      return "deleted";
+    case "U":
+      return "untracked";
+    case "R":
+      return "renamed";
+    case "C":
+      return "conflict";
+    default:
+      return "changed";
+  }
+}
+
 // Splits status files into the four Source Control groups. `merge` (conflicted
 // files) is checked FIRST — a conflict takes priority over every other
 // classification, mirroring statusLetter()'s precedence (Track D slice D3).
@@ -169,7 +189,7 @@ function gitSyncActions(sync) {
       op: "push",
       label: upstream ? "Push" : "Publish branch",
       title: upstream ? "Push" : "Publish branch (push -u origin)",
-      icon: upstream ? "arrow-up-from-line" : "cloud-upload",
+      icon: "arrow-up-from-line",
       glyph: "\u2191",
       disabled: false,
     },
@@ -190,6 +210,29 @@ function gitSyncActions(sync) {
       disabled: false,
     },
   ];
+}
+
+// Markup for the "current folder is not a git repository" state shared by the
+// Git panel and the IDE Source Control view: an explanation plus a button
+// (data-git-action="choose-folder") that the host wires to the working
+// directory picker. `escape` is the host's HTML escaper; the path is
+// user-controlled.
+function notRepositoryStateHtml(cwd, escape) {
+  const esc = typeof escape === "function" ? escape : (t) => String(t);
+  const pathLine = cwd
+    ? `<code class="git-empty-path" title="${esc(cwd)}">${esc(cwd)}</code>`
+    : "";
+  return `
+    <div class="git-empty-state" role="status">
+      <i data-lucide="folder-git-2" class="git-empty-icon" aria-hidden="true"></i>
+      <p class="git-empty-title">Not a Git repository</p>
+      <p class="git-empty-text">The current working folder is not inside a Git repository.</p>
+      ${pathLine}
+      <p class="git-empty-text">Switch to a project folder to see its changes.</p>
+      <button type="button" class="btn btn-secondary git-empty-action" data-git-action="choose-folder">
+        <i data-lucide="folder-open" aria-hidden="true"></i><span>Choose folder</span>
+      </button>
+    </div>`;
 }
 
 // Builds the folder tree for a group's files: { folders: Map, files: [] },
@@ -254,6 +297,8 @@ if (typeof module !== "undefined" && module.exports) {
     isNotRepositoryStatus,
     gitSyncActions,
     buildFileTree,
+    notRepositoryStateHtml,
+    statusWord,
   };
 }
 
@@ -268,4 +313,6 @@ if (typeof exports !== "undefined") {
   exports.isNotRepositoryStatus = isNotRepositoryStatus;
   exports.gitSyncActions = gitSyncActions;
   exports.buildFileTree = buildFileTree;
+  exports.notRepositoryStateHtml = notRepositoryStateHtml;
+  exports.statusWord = statusWord;
 }

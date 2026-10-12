@@ -10,6 +10,8 @@ import {
   isNotRepositoryStatus,
   gitSyncActions,
   buildFileTree,
+  notRepositoryStateHtml,
+  statusWord,
 } from "./git-scm.js";
 
 test("statusLetter follows VS Code letters", () => {
@@ -232,4 +234,41 @@ test("buildFileTree compact mode merges single-child folder chains", () => {
   expect(docs.fullPath).toBe("tmp/docs");
   expect(docs.files.map((f) => f.path)).toEqual(["tmp/docs/y.md"]);
   expect(docs.folders.get("deep").fullPath).toBe("tmp/docs/deep");
+});
+
+const escapeForTest = (t) =>
+  String(t)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+
+test("notRepositoryStateHtml is a calm empty state with a choose-folder action", () => {
+  const html = notRepositoryStateHtml("/home/me/notes", escapeForTest);
+  expect(html).toContain("git-empty-state");
+  expect(html).toContain("Not a Git repository");
+  expect(html).toContain("/home/me/notes");
+  expect(html).toContain('data-git-action="choose-folder"');
+  // Not the red error banner.
+  expect(html).not.toContain('class="error"');
+});
+
+test("notRepositoryStateHtml escapes the folder path", () => {
+  const html = notRepositoryStateHtml('/tmp/<b>"x"', escapeForTest);
+  expect(html).toContain("/tmp/&lt;b&gt;&quot;x&quot;");
+  expect(html).not.toContain("<b>");
+  // Without a path it still explains the state.
+  expect(notRepositoryStateHtml("", escapeForTest)).toContain(
+    "Not a Git repository",
+  );
+});
+
+test("statusWord spells out a status letter for screen readers", () => {
+  expect(statusWord("M")).toBe("modified");
+  expect(statusWord("A")).toBe("added");
+  expect(statusWord("D")).toBe("deleted");
+  expect(statusWord("U")).toBe("untracked");
+  expect(statusWord("R")).toBe("renamed");
+  expect(statusWord("C")).toBe("conflict");
+  expect(statusWord("?")).toBe("changed");
 });
