@@ -8053,12 +8053,17 @@ class TerminalManager {
             return;
           }
           const active = document.activeElement;
+          // Focus that fell back to <body> was lost, not chosen: the same
+          // viewport change re-renders the action bars and removes the
+          // button the synchronous close had just focused.
+          const focusLost = !active || active === document.body;
           const activeIsVisible =
             active instanceof HTMLElement && active.getClientRects().length;
           // The responsive terminal lifecycle can focus xterm's helper
           // textarea after Settings closes. Repair that stale focus, but do
           // not override a visible control selected by the user meanwhile.
           if (
+            !focusLost &&
             activeIsVisible &&
             !active.classList.contains("xterm-helper-textarea")
           ) {
