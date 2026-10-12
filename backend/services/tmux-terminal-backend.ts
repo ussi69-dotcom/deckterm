@@ -27,6 +27,44 @@ export type TmuxPipeDelta = {
   offset: number;
 };
 
+export type TmuxSessionLiveness = "alive" | "missing" | "unknown";
+
+// A healthy server answers has-session in milliseconds; a wedged one (e.g.
+// SIGSTOPped) would otherwise block the caller forever.
+export const TMUX_LIVENESS_TIMEOUT_MS = 5_000;
+
+/**
+ * Classifies one `tmux has-session` run. tmux exits 1 both when the session
+ * is gone and when it cannot reach the server at all, so the exit code alone
+ * cannot tell "ended" from "unreachable". Only these messages prove absence:
+ * - `can't find session: …` — the server answered without that session;
+ * - `no server running on …` — the socket is stale (ECONNREFUSED);
+ * - `error connecting to … (No such file or directory)` — no socket file,
+ *   so no server (the same end-don't-adopt policy as an unrecoverable row).
+ * Everything else — EACCES, protocol mismatch after a tmux upgrade, a lost
+ * server, a probe we killed on timeout — is "unknown".
+ */
+export function classifyTmuxHasSession({
+  exitCode,
+  stderr,
+  timedOut = false,
+}: {
+  exitCode: number | null;
+  stderr: string;
+  timedOut?: boolean;
+}): TmuxSessionLiveness {
+  if (timedOut) return "unknown";
+  if (exitCode === 0) return "alive";
+  if (
+    /^can't find session/m.test(stderr) ||
+    /^no server running on /m.test(stderr) ||
+    /^error connecting to .* \(No such file or directory\)$/m.test(stderr)
+  ) {
+    return "missing";
+  }
+  return "unknown";
+}
+
 export type TmuxTerminalBackendOptions = {
   namespace: string;
   socketPath: string;
@@ -339,12 +377,45 @@ export class TmuxTerminalBackend implements TerminalBackend {
   }
 
   async sessionExists(sessionName: string): Promise<boolean> {
-    const proc = await this.spawnTmux(["has-session", "-t", sessionName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const exitCode = await proc.exited;
-    return exitCode === 0;
+    return (await this.sessionLiveness(sessionName)) === "alive";
+  }
+
+  /**
+   * Tri-state liveness of one session. Only "missing" is proof that a catalog
+   * row may be ended; "unknown" (server unreachable, wedged, or the probe
+   * could not run) must leave it alone. Never starts a server.
+   */
+  async sessionLiveness(
+    sessionName: string,
+    timeoutMs = TMUX_LIVENESS_TIMEOUT_MS,
+  ): Promise<TmuxSessionLiveness> {
+    let proc: Subprocess<"ignore", "ignore", "pipe">;
+    try {
+      // `=` asks for an exact name: a bare target also matches a prefix.
+      proc = (await this.spawnTmux(["has-session", "-t", `=${sessionName}`], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      })) as Subprocess<"ignore", "ignore", "pipe">;
+    } catch {
+      return "unknown";
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, timeoutMs);
+    try {
+      const [exitCode, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stderr).text().catch(() => ""),
+      ]);
+      return classifyTmuxHasSession({ exitCode, stderr, timedOut });
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async getSessionInfo(sessionName: string): Promise<TmuxSessionInfo> {
