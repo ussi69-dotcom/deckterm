@@ -4786,6 +4786,128 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   display: none !important;
 }
 
+/* Touch toolbar tabs: a tab shrinks to the strip instead of running off the
+   screen (an agent badge made the active tab ~240px on a 150-190px strip,
+   clipping the close button). The label truncates first, the badge after it
+   (and collapses to a dot on narrow strips); the close keeps a 44x44 target.
+   Several tabs keep a 136px floor and scroll. */
+body.chrome-mobile .tabs {
+  min-width: 0;
+  container: deckterm-tabs / inline-size;
+}
+
+body.chrome-mobile .tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 1 auto;
+  min-width: min(100%, 136px);
+  max-width: 100%;
+  min-height: 44px;
+  padding: 0 0 0 10px;
+}
+
+body.chrome-mobile .tab > .tab-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+
+body.chrome-mobile .tab-label {
+  flex: 0 1 auto;
+  min-width: 2em;
+  max-width: none;
+  text-overflow: ellipsis;
+}
+
+body.chrome-mobile .tab-signal-badge {
+  flex: 0 0.001 auto;
+  min-width: 18px;
+  text-overflow: ellipsis;
+}
+
+body.chrome-mobile .tab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 44px;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  margin-left: -6px;
+  padding: 0;
+  font-size: 20px;
+}
+
+@container deckterm-tabs (max-width: 259px) {
+  /* :not([hidden]) lifts this over the per-signal badge colours. */
+  body.chrome-mobile .tab .tab-signal-badge:not([hidden]) {
+    flex: 0 0 8px;
+    width: 8px;
+    min-width: 8px;
+    height: 8px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    font-size: 0;
+    background: currentColor;
+  }
+
+  body.chrome-mobile .tab .tab-signal-badge:not([hidden])::before {
+    display: none;
+  }
+}
+
+/* Phone landscape: the bottom action bar is hidden (see above), so its
+   pinned actions (Files, Git, Paste, Compose by default) sit in the toolbar
+   as 44px icon buttons. Rendered by renderLandscapeActionBar(). */
+.landscape-primary-actions {
+  display: none;
+}
+
+body.phone-landscape .landscape-primary-actions:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.landscape-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.landscape-action-btn span {
+  display: none;
+}
+
+.landscape-action-btn svg {
+  width: 20px;
+  height: 20px;
+  stroke-width: 1.8;
+}
+
+.landscape-action-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.landscape-action-btn.active {
+  border-color: rgba(88, 166, 255, 0.45);
+  background: rgba(88, 166, 255, 0.14);
+  color: var(--text-primary);
+}
+
 @media (pointer: coarse) {
   .session-actions .btn-new,
   .sessions-trigger,

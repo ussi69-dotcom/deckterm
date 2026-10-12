@@ -6591,6 +6591,8 @@ class TerminalManager {
       }
     } else if (surface === "mobile-primary") {
       button.className = "mobile-action-btn";
+    } else if (surface === "landscape-primary") {
+      button.className = "landscape-action-btn";
     } else {
       button.className = "tools-sheet-btn";
     }
@@ -6657,6 +6659,20 @@ class TerminalManager {
         }
       }
     });
+  }
+
+  // Phone landscape hides the bottom action bar (styles.css), so its pinned
+  // actions also render as icon buttons in the toolbar row (shown only under
+  // body.phone-landscape). "More" is left out: the Menu button opens Tools.
+  renderLandscapeActionBar(root) {
+    if (!root) return;
+    root.replaceChildren();
+    this.getPrimaryActionIds("mobile")
+      .filter((actionId) => actionId !== "more" && actionId !== "font-size")
+      .forEach((actionId) => {
+        const button = this.createActionButton(actionId, "landscape-primary");
+        if (button) root.appendChild(button);
+      });
   }
 
   // Width of every density-elastic toolbar group (primary actions, IDE
@@ -7161,6 +7177,9 @@ class TerminalManager {
       document.getElementById("mobile-action-bar"),
       "mobile",
       "mobile-primary",
+    );
+    this.renderLandscapeActionBar(
+      document.getElementById("landscape-primary-actions"),
     );
     this.renderToolsSheetGrid();
     initLucideIcons();
