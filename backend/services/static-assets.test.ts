@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gunzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 import {
   acceptsGzip,
   cacheControlForPolicy,
@@ -38,6 +38,11 @@ beforeAll(() => {
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
+
+// Test gzip stand-in: a real gzip stream, so responses stay decodable.
+function realGzip(bytes: Uint8Array): Uint8Array {
+  return gzipSync(bytes);
+}
 
 function get(path: string, headers: Record<string, string> = {}) {
   return new Request(`http://deckterm.test${path}`, { headers });
@@ -185,6 +190,89 @@ describe("createStaticAssetServer", () => {
     );
     expect(revalidated?.status).toBe(304);
     expect(revalidated?.headers.get("ETag")).toBe(gzEtag);
+  });
+
+  test("gzip runs off the event loop (no Bun.gzipSync)", async () => {
+    // A synchronous gzip of the 2.5 MB font or the 1 MB CodeMirror bundle
+    // stalls every terminal WebSocket frame for tens of milliseconds.
+    const original = Bun.gzipSync;
+    let syncCalls = 0;
+    (Bun as { gzipSync: unknown }).gzipSync = (...args: unknown[]) => {
+      syncCalls++;
+      return (original as (...a: unknown[]) => unknown)(...args);
+    };
+    try {
+      const server = createStaticAssetServer({ root });
+      const res = await server.handle(
+        get("/app.js", { "Accept-Encoding": "gzip" }),
+      );
+      expect(res?.headers.get("Content-Encoding")).toBe("gzip");
+      const body = new Uint8Array(await res!.arrayBuffer());
+      expect(gunzipSync(body).toString("utf8")).toBe(bigScript);
+      expect(syncCalls).toBe(0);
+    } finally {
+      (Bun as { gzipSync: unknown }).gzipSync = original;
+    }
+  });
+
+  test("concurrent cold requests read, hash and gzip a file once", async () => {
+    let reads = 0;
+    let gzips = 0;
+    const server = createStaticAssetServer({
+      root,
+      readFile: async (abs) => {
+        reads++;
+        await Bun.sleep(20);
+        return new Uint8Array(await Bun.file(abs).arrayBuffer());
+      },
+      gzip: async (bytes) => {
+        gzips++;
+        await Bun.sleep(20);
+        return new Uint8Array(realGzip(bytes));
+      },
+    });
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () =>
+        server.handle(get("/app.js", { "Accept-Encoding": "gzip" })),
+      ),
+    );
+    expect(reads).toBe(1);
+    expect(gzips).toBe(1);
+    const etags = new Set(responses.map((r) => r?.headers.get("ETag")));
+    expect(etags.size).toBe(1);
+    for (const res of responses) {
+      const body = new Uint8Array(await res!.arrayBuffer());
+      expect(gunzipSync(body).toString("utf8")).toBe(bigScript);
+    }
+
+    // Warm: neither runs again.
+    await server.handle(get("/app.js", { "Accept-Encoding": "gzip" }));
+    expect(reads).toBe(1);
+    expect(gzips).toBe(1);
+  });
+
+  test("a failed gzip is not cached; the next request retries", async () => {
+    let gzips = 0;
+    const server = createStaticAssetServer({
+      root,
+      gzip: async (bytes) => {
+        gzips++;
+        if (gzips === 1) throw new Error("boom");
+        return new Uint8Array(realGzip(bytes));
+      },
+    });
+    const failed = await server.handle(
+      get("/app.js", { "Accept-Encoding": "gzip" }),
+    );
+    // Falls back to the identity body instead of failing the request.
+    expect(failed?.status).toBe(200);
+    expect(failed?.headers.get("Content-Encoding")).toBeNull();
+    expect(await failed?.text()).toBe(bigScript);
+    const retried = await server.handle(
+      get("/app.js", { "Accept-Encoding": "gzip" }),
+    );
+    expect(retried?.headers.get("Content-Encoding")).toBe("gzip");
+    expect(gzips).toBe(2);
   });
 
   test("small bodies and non-compressible types are not gzipped", async () => {
