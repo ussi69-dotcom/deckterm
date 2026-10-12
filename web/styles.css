@@ -332,9 +332,28 @@ body {
   font-size: 13px;
   cursor: grab;
   user-select: none;
-  transition: all 0.15s ease;
+  /* Visual properties only: animating layout (column-gap, padding) made the
+     copy-fit stage measurements read mid-transition geometry. */
+  transition:
+    background-color 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    opacity 0.15s ease,
+    transform 0.15s ease;
   flex-shrink: 0;
   border: 1px solid transparent;
+}
+
+/* Pin the copy and the close button to the last two tracks. Auto placement
+   shifted them one track left whenever .tab-count is display:none, which put
+   the close button in the 0-wide flexible track where it overflowed leftwards
+   across the label and the signal badge. */
+.tab > .tab-copy {
+  grid-column: -3 / -2;
+}
+
+.tab > .tab-close {
+  grid-column: -2 / -1;
 }
 
 .tabs[data-layout="wrapped"] .tab {
