@@ -553,9 +553,11 @@ test("pane activity stays accessible without rendering an in-pane status banner"
         return { width: style.width, height: style.height };
       }),
     );
+  // 20px: the desktop pane controls live in the 22px scrollbar gutter so
+  // they never cover terminal text (2026-10-12 desktop polish).
   expect(desktopControlSizes).toEqual([
-    { width: "24px", height: "24px" },
-    { width: "24px", height: "24px" },
+    { width: "20px", height: "20px" },
+    { width: "20px", height: "20px" },
   ]);
 });
 

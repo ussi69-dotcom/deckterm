@@ -913,9 +913,13 @@ body {
   transition: opacity 0.15s;
 }
 
+/* Shown on hover, when the controls themselves hold keyboard focus, in a
+   multi-pane workspace (the tab's own close button can't target one pane),
+   or while the close confirmation is open. NOT on plain .tile:focus-within:
+   the focused terminal's textarea made the x permanent on every active tile. */
 .tile:hover .tile-close-container,
-.tile:focus-within .tile-close-container,
-.tile.workspace-multi-pane.active .tile-close-container,
+.tile-close-container:focus-within,
+.tile.workspace-multi-pane .tile-close-container,
 .tile.close-confirm-open .tile-close-container {
   opacity: 1;
   pointer-events: auto;
@@ -1010,6 +1014,35 @@ body {
 
 .tile-close-confirm .confirm-cancel:hover {
   background: var(--bg-hover);
+}
+
+/* Desktop: park the pane controls in the reserved top-right gutter (the
+   xterm 8px padding + 14px scrollbar track, 22px wide), stacked vertically,
+   so they never cover terminal text. Touch layouts keep the 44px row below. */
+@media (hover: hover) and (pointer: fine) {
+  .tile-close-container {
+    top: 3px;
+    right: 1px;
+    flex-direction: column-reverse;
+    gap: 3px;
+  }
+
+  .tile-close-btn,
+  .tile-detach-btn {
+    width: 20px;
+    height: 20px;
+    font-size: 14px;
+    line-height: 1;
+  }
+
+  .tile-detach-btn {
+    font-size: 12px;
+  }
+
+  .tile.workspace-multi-pane:not(.active):not(:hover)
+    .tile-close-container:not(:focus-within) {
+    opacity: 0.55;
+  }
 }
 
 @media (pointer: coarse) {
