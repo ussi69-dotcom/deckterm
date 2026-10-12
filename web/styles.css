@@ -4627,85 +4627,235 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 }
 
 /* =============================================================================
-   CLIPBOARD TOAST
+   TOASTS (qol/toasts-compose) — one stacked notification region for every
+   transient notice (web/toast-service.js). Desktop: bottom-right, newest
+   nearest the corner. Touch / compact chrome: top, just below the toolbar,
+   newest first. Max 3 visible (enforced in JS).
    ============================================================================= */
 
-.clipboard-toast {
+.toast-region {
   position: fixed;
-  bottom: 80px;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 10px 20px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
-  border-radius: 8px;
-  z-index: 1000;
+  right: 16px;
+  bottom: 16px;
+  z-index: 1300;
   display: flex;
-  align-items: center;
-  gap: 12px;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
-  transition: opacity 0.2s;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  width: min(380px, calc(100vw - 32px));
+  pointer-events: none;
 }
 
-.clipboard-toast.hidden {
+.toast-region:empty {
   display: none;
 }
 
-.clipboard-toast.success {
-  border-color: var(--accent-green);
+body.chrome-mobile .toast-region {
+  top: calc(var(--toolbar-overlay-offset, 48px) + 8px);
+  bottom: auto;
+  left: 8px;
+  right: 8px;
+  width: auto;
+  align-items: stretch;
+  flex-direction: column-reverse;
 }
 
-.clipboard-toast.success .toast-message {
-  color: var(--accent-green);
-}
-
-.clipboard-toast.pending {
-  border-color: var(--accent-orange);
-}
-
-.clipboard-toast.pending .toast-message {
-  color: var(--accent-orange);
-}
-
-.clipboard-toast.error {
-  border-color: var(--accent-red);
-}
-
-.clipboard-toast.error .toast-message {
-  color: var(--accent-red);
-}
-
-.toast-message {
+.toast {
+  --toast-accent: var(--accent-blue);
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 8px 12px 12px;
+  overflow: hidden;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-hover);
+  border-left: 3px solid var(--toast-accent);
+  border-radius: 8px;
+  box-shadow:
+    0 10px 28px rgba(0, 0, 0, 0.45),
+    0 2px 6px rgba(0, 0, 0, 0.3);
+  color: var(--text-primary);
   font-size: 13px;
+  line-height: 1.4;
+  pointer-events: auto;
+  animation: toast-in 0.18s ease-out;
+}
+
+.toast[data-kind="success"] {
+  --toast-accent: var(--accent-green);
+}
+
+.toast[data-kind="warning"] {
+  --toast-accent: var(--accent-orange);
+}
+
+.toast[data-kind="error"] {
+  --toast-accent: var(--accent-red);
+}
+
+.toast.is-leaving {
+  opacity: 0;
+  transform: translateY(4px);
+  transition:
+    opacity 0.15s ease-in,
+    transform 0.15s ease-in;
+}
+
+.toast-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  margin-top: 1px;
+  color: var(--toast-accent);
+}
+
+.toast-content {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.toast-title {
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.toast-body {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+
+.toast-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.toast-action {
+  min-height: 28px;
+  padding: 4px 12px;
+  border: 1px solid var(--border-hover);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.toast-action-primary {
+  border-color: var(--toast-accent);
+  color: var(--toast-accent);
+}
+
+.toast-action:hover,
+.toast-action:focus-visible {
+  background: var(--bg-hover);
+}
+
+.toast-dismiss {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  margin: -4px 0 0;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.toast-dismiss:hover,
+.toast-dismiss:focus-visible {
+  background: var(--bg-hover);
   color: var(--text-primary);
 }
 
-.toast-copy {
-  padding: 6px 12px;
-  background: var(--btn-green);
-  border: none;
-  border-radius: 4px;
-  color: white;
-  font-size: 12px;
-  font-weight: 500;
-  cursor: pointer;
-  transition: background 0.2s;
+.toast-action:focus-visible,
+.toast-dismiss:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
-.toast-copy:hover {
-  background: var(--btn-green-hover);
+.toast-progress {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.06);
 }
+
+.toast-progress-bar {
+  display: block;
+  height: 100%;
+  background: var(--toast-accent);
+  opacity: 0.7;
+  transform-origin: left center;
+  animation-name: toast-progress;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+
+.toast.is-paused .toast-progress-bar {
+  animation-play-state: paused;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes toast-progress {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+body.chrome-mobile .toast {
+  padding-top: 12px;
+  padding-bottom: 14px;
+}
+
+body.chrome-mobile .toast-action,
+body.chrome-mobile .toast-dismiss {
+  min-height: 36px;
+}
+
+body.chrome-mobile .toast-dismiss {
+  width: 36px;
+  height: 36px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast,
+  .toast.is-leaving {
+    animation: none;
+    transition: none;
+  }
+}
+/* ===== end TOASTS ===== */
 
 /* Mobile adjustments */
 @media (max-width: 768px) {
   .clipboard-panel {
     width: 100%;
     max-width: 300px;
-  }
-
-  .clipboard-toast {
-    bottom: calc(var(--extra-keys-height) + 20px);
-    max-width: calc(100% - 40px);
   }
 }
 
@@ -6269,7 +6419,7 @@ body.chrome-mobile .mobile-action-bar[hidden] {
 }
 
 /* =============================================================================
-   TASK SIGNAL BADGE + TRANSITION TOAST
+   TASK SIGNAL BADGE (transition toasts use the shared TOASTS block)
    ============================================================================= */
 
 .task-signal-badge {
@@ -6295,25 +6445,6 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   display: none;
 }
 
-.task-toast {
-  position: fixed;
-  bottom: 18px;
-  right: 18px;
-  max-width: 340px;
-  padding: 10px 14px;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-primary);
-  border-radius: 8px;
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5);
-  color: var(--text-primary);
-  font-size: 13px;
-  cursor: pointer;
-  z-index: 200;
-}
-
-.task-toast.hidden {
-  display: none;
-}
 
 /* =============================================================================
    TASK BOARD (kanban view in the task panel)
@@ -9088,9 +9219,8 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
    - connecting chip: small per-tile status while the terminal socket is not
      ready. Driven by the existing tile data-connection-status attribute; it
      appears after a short delay so normal sub-second connects do not flash.
-   - input-dropped notice: shown when input typed while disconnected could not
-     be delivered.
-   - close toast: message + Undo button layout.
+   (The input-not-sent notice and the close toast now render through the
+   shared TOASTS block.)
    ============================================================================= */
 .tile[data-connection-status="connecting"]::after,
 .tile[data-connection-status="reconnecting"]::after {
@@ -9129,71 +9259,4 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   }
 }
 
-.tile-input-dropped {
-  position: absolute;
-  top: 8px;
-  left: 50%;
-  transform: translateX(-50%);
-  /* Above the reconnect/ended overlay (z-index 50) so it stays readable. */
-  z-index: 60;
-  max-width: calc(100% - 24px);
-  padding: 6px 12px;
-  border: 1px solid var(--accent-yellow, #d29922);
-  border-radius: 6px;
-  background: rgba(22, 27, 34, 0.95);
-  color: var(--text-primary);
-  font-size: 12px;
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.tile-input-dropped.visible {
-  opacity: 1;
-}
-
-.session-close-toast {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  cursor: default;
-}
-
-.session-close-toast.hidden {
-  display: none;
-}
-
-.session-close-toast-message {
-  flex: 1;
-  min-width: 0;
-  padding: 0;
-  border: 0;
-  background: none;
-  color: inherit;
-  font: inherit;
-  text-align: left;
-  cursor: pointer;
-}
-
-.session-close-toast-undo {
-  flex: 0 0 auto;
-  min-height: 28px;
-  padding: 4px 12px;
-  border: 1px solid var(--accent-blue);
-  border-radius: 6px;
-  background: transparent;
-  color: var(--accent-blue);
-  font: inherit;
-  font-weight: 600;
-  cursor: pointer;
-}
-
-.session-close-toast-undo:hover,
-.session-close-toast-undo:focus-visible {
-  background: rgba(88, 166, 255, 0.12);
-}
-
-.session-close-toast-undo[hidden] {
-  display: none;
-}
 /* ===== end TERMINAL RELIABILITY ===== */

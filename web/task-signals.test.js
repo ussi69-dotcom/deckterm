@@ -14,6 +14,9 @@ import {
   formatActivityAge,
   sessionActivityAt,
   orderSessionsForPanel,
+  describeTaskTransitionToast,
+  shouldToastAttention,
+  describeAttentionToast,
 } from "./task-signals";
 
 test("computeTaskSignals counts running and needs-attention tasks", () => {
@@ -209,4 +212,60 @@ test("orderSessionsForPanel puts needs-input first, then running, then the rest 
   ]);
   // Input array is not mutated.
   expect(sessions[0].id).toBe("idle1");
+});
+
+test("describeTaskTransitionToast maps each transition to a toast kind", () => {
+  expect(
+    describeTaskTransitionToast({ id: "t1", title: "Fix CI", to: "complete" }),
+  ).toEqual({
+    key: "task:t1",
+    kind: "success",
+    title: "Task completed",
+    body: "Fix CI",
+  });
+  expect(
+    describeTaskTransitionToast({ id: "t1", title: "Fix CI", to: "failed" }),
+  ).toMatchObject({ key: "task:t1", kind: "error", title: "Task failed" });
+  expect(
+    describeTaskTransitionToast({ id: "t2", title: "  ", to: "needs-user" }),
+  ).toMatchObject({
+    key: "task:t2",
+    kind: "warning",
+    title: "Task needs your input",
+    body: "Untitled task",
+  });
+});
+
+test("shouldToastAttention: visible page only; the active session toasts only for prompts", () => {
+  const prompt = { kind: "needs-input" };
+  const done = { kind: "done" };
+  expect(shouldToastAttention(prompt, { pageVisible: false })).toBe(false);
+  expect(
+    shouldToastAttention(prompt, { pageVisible: true, isActiveVisible: true }),
+  ).toBe(true);
+  expect(
+    shouldToastAttention(done, { pageVisible: true, isActiveVisible: true }),
+  ).toBe(false);
+  expect(
+    shouldToastAttention(done, { pageVisible: true, isActiveVisible: false }),
+  ).toBe(true);
+  expect(shouldToastAttention({ kind: "bogus" })).toBe(false);
+  expect(shouldToastAttention(null)).toBe(false);
+});
+
+test("describeAttentionToast names the session and keeps the agent text as the body", () => {
+  expect(
+    describeAttentionToast(
+      { kind: "needs-input", title: "Claude Code", body: "Allow edit?" },
+      { sessionId: "abc", label: "deckterm_dev" },
+    ),
+  ).toEqual({
+    key: "attention:abc",
+    kind: "warning",
+    title: "deckterm_dev: Needs your input",
+    body: "Claude Code — Allow edit?",
+  });
+  expect(
+    describeAttentionToast({ kind: "info", title: "", body: "hi" }, {}),
+  ).toEqual({ key: "attention:", kind: "info", title: "Notification", body: "hi" });
 });
