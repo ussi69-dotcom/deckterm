@@ -10516,14 +10516,14 @@ class TerminalManager {
       }
       if (!this.isPaletteBareQuery(query)) return [];
 
+      // One MRU snapshot per query: rankOf per candidate re-read and
+      // re-parsed localStorage for every one of up to 5000 files.
+      const fileRank = this.paletteMru?.rankLookup?.("files");
       const matches = window.PaletteProviders.filterQuickOpenFiles(
         query,
         files,
         50,
-        {
-          mruRank: (file) =>
-            this.paletteMru ? this.paletteMru.rankOf("files", file.path) : -1,
-        },
+        { mruRank: fileRank ? (file) => fileRank(file.path) : undefined },
       );
 
       return matches.map((file, index) =>

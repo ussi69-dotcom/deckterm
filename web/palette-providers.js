@@ -358,7 +358,20 @@ function createPaletteMruStore(storage, { limit = 50 } = {}) {
       return entries(read(), kind).map((entry) => entry.id);
     },
     rankOf(kind, id) {
-      return this.list(kind).indexOf(String(id || ""));
+      return this.rankLookup(kind)(id);
+    },
+    // Snapshot of `kind`'s ranks as a lookup function: one storage read and
+    // JSON parse up front, then O(1) per id. Use it for per-candidate ranking
+    // (quick open scores thousands of files per keystroke) instead of rankOf.
+    rankLookup(kind) {
+      const ranks = new Map();
+      this.list(kind).forEach((id, index) => {
+        if (!ranks.has(id)) ranks.set(id, index);
+      });
+      return (id) => {
+        const rank = ranks.get(String(id || ""));
+        return rank === undefined ? -1 : rank;
+      };
     },
   };
 }

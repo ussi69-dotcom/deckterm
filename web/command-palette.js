@@ -64,8 +64,11 @@ function formatResultDetail(title, meta) {
 
 // Default lucide renderer: swaps the <i data-lucide> placeholders inside
 // `root` for SVGs (scoped, so the rest of the document is not re-scanned).
-function renderLucideIcons(root) {
-  if (typeof window === "undefined" || !window.lucide?.createIcons) return;
+// Uniquely named: web modules are classic scripts sharing one global scope.
+function renderPaletteIcons(root) {
+  if (!root || typeof window === "undefined" || !window.lucide?.createIcons) {
+    return;
+  }
   try {
     window.lucide.createIcons({ root });
   } catch {
@@ -81,7 +84,7 @@ class CommandPaletteController {
     registry,
     onRun = null,
     rankOf = null,
-    renderIcons = renderLucideIcons,
+    renderIcons = renderPaletteIcons,
   }) {
     this.root = root;
     this.input = input;
