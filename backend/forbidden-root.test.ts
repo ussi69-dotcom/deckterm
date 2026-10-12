@@ -3,6 +3,8 @@ import {
   ALLOWED_ROOTS_SETTING,
   GRANTED_ROOTS_SETTING,
   forbiddenRootDetail,
+  isLexicallyWithinRoots,
+  rejectedPathMayBeMissing,
 } from "./forbidden-root";
 
 describe("forbiddenRootDetail", () => {
@@ -75,5 +77,62 @@ describe("forbiddenRootDetail", () => {
     const bounded = forbiddenRootDetail({ path: long, subject: "path" });
     expect(bounded.path!.length).toBeLessThanOrEqual(513);
     expect(bounded.path!.endsWith("…")).toBe(true);
+  });
+});
+
+describe("rejectedPathMayBeMissing", () => {
+  const roots = ["/home/u", "/srv/data"];
+
+  function statSpy(existing: string[]) {
+    const calls: string[] = [];
+    const stat = async (path: string) => {
+      calls.push(path);
+      if (!existing.includes(path)) throw new Error("ENOENT");
+    };
+    return { calls, stat };
+  }
+
+  test("lexical containment honours segment boundaries and normalises ..", () => {
+    expect(isLexicallyWithinRoots("/home/u", roots)).toBe(true);
+    expect(isLexicallyWithinRoots("/home/u/a/b", roots)).toBe(true);
+    expect(isLexicallyWithinRoots("/home/user2/x", roots)).toBe(false);
+    expect(isLexicallyWithinRoots("/home/u/../other/x", roots)).toBe(false);
+    expect(isLexicallyWithinRoots("/etc/passwd", roots)).toBe(false);
+    expect(isLexicallyWithinRoots("/x", ["/"])).toBe(true);
+  });
+
+  test("outside the roots it never stats, so existence is not an oracle", async () => {
+    const { calls, stat } = statSpy(["/etc/passwd"]);
+    // Missing and existing outside paths give the SAME answer.
+    expect(
+      await rejectedPathMayBeMissing("/home/other/.ssh/id_ed25519", roots, stat),
+    ).toBe(false);
+    expect(await rejectedPathMayBeMissing("/etc/passwd", roots, stat)).toBe(
+      false,
+    );
+    expect(
+      await rejectedPathMayBeMissing("/home/u/../other/nope", roots, stat),
+    ).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  test("inside a root, a missing path may be missing; an existing one (symlink escape) is not", async () => {
+    const { calls, stat } = statSpy(["/home/u/link-out"]);
+    expect(await rejectedPathMayBeMissing("/home/u/gone.txt", roots, stat)).toBe(
+      true,
+    );
+    expect(await rejectedPathMayBeMissing("/home/u/link-out", roots, stat)).toBe(
+      false,
+    );
+    expect(calls).toEqual(["/home/u/gone.txt", "/home/u/link-out"]);
+  });
+
+  test("an empty or non-string path is never reported as missing", async () => {
+    const { calls, stat } = statSpy([]);
+    expect(await rejectedPathMayBeMissing("", roots, stat)).toBe(false);
+    expect(
+      await rejectedPathMayBeMissing(undefined as unknown as string, roots, stat),
+    ).toBe(false);
+    expect(calls).toEqual([]);
   });
 });

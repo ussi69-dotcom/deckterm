@@ -220,11 +220,11 @@ async function restartServer(h: Harness): Promise<Harness> {
   return { ...h, child };
 }
 
-async function createTerminal(h: Harness): Promise<string> {
+async function createTerminal(h: Harness, cwd = h.workRoot): Promise<string> {
   const res = await fetch(`http://127.0.0.1:${h.port}/api/terminals`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ cols: 80, rows: 24, cwd: h.workRoot }),
+    body: JSON.stringify({ cols: 80, rows: 24, cwd }),
   });
   expect(res.status).toBe(200);
   const body = (await res.json()) as { id: string };
@@ -682,6 +682,101 @@ test.skipIf(!TMUX_AVAILABLE)(
     expect(await attachClientPids(h, id)).toHaveLength(1);
     await expectShellRoundTrip(ws);
     ws.ws.close();
+  },
+  60_000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "a live session whose recorded cwd was deleted still re-attaches, and never 500s the catalog",
+  async () => {
+    // A task worktree removed under a running terminal: the recorded
+    // creation cwd is gone, the tmux session lives on.
+    const h = await startHarness();
+    const doomed = join(h.workRoot, "worktree");
+    await mkdir(doomed, { recursive: true });
+    const id = await createTerminal(h, doomed);
+    const healthy = await createTerminal(h);
+    const panePid = await panePidOf(h, id);
+    const first = await attachWs(h, id);
+    await attachClientPid(h, id);
+
+    await rm(doomed, { recursive: true, force: true });
+    const detached = await tmux(h, [
+      "detach-client",
+      "-s",
+      `=${sessionName(h, id)}`,
+    ]);
+    expect(detached.code).toBe(0);
+    await waitFor(first.isClosed, "the server to close the socket");
+
+    // The catalog keeps answering and lists both rows as live.
+    for (let i = 0; i < 3; i++) {
+      const listed = await listTerminals(h);
+      expect(listed.find((t) => t.id === healthy)?.sessionStatus).toBe(
+        "active",
+      );
+      expect(listed.find((t) => t.id === id)?.sessionStatus).toBe("active");
+    }
+
+    // The same pane re-attaches although its creation directory is gone.
+    const again = await attachWs(h, id);
+    await pingPong(again);
+    await expectShellRoundTrip(again);
+    expect(await panePidOf(h, id)).toBe(panePid);
+    expect(dbStatus(h, id)).toBe("active");
+    again.ws.close();
+  },
+  60_000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "with no browser, a dead attach is re-attached server-side and output written in the gap is still processed",
+  async () => {
+    const h = await startHarness();
+    const id = await createTerminal(h);
+    const panePid = await panePidOf(h, id);
+    const oldClient = await attachClientPid(h, id);
+
+    // No WebSocket and no catalog poll from here on: only the server can
+    // bring the attach back.
+    process.kill(oldClient, "SIGKILL");
+    await waitFor(
+      () => h.output.join("").includes(`[lifecycle] attach client for ${id}`),
+      "the detach to be handled",
+    );
+    // A notification the pane prints while nothing is attached. Only the
+    // shell's output contains the evaluated marker, not the typed echo.
+    const typed = await tmux(h, [
+      "send-keys",
+      "-t",
+      `=${sessionName(h, id)}:`,
+      "printf '\\033]9;%s\\007' lc_gap_$((40+2))",
+      "Enter",
+    ]);
+    expect(typed.code).toBe(0);
+
+    // The server re-attaches on its own (first retry after about 1 s).
+    await waitFor(
+      async () => {
+        const pids = await attachClientPids(h, id);
+        return pids.length === 1 && pids[0] !== oldClient;
+      },
+      "a server-side re-attach",
+      8_000,
+    );
+    expect(await panePidOf(h, id)).toBe(panePid);
+    expect(dbStatus(h, id)).toBe("active");
+
+    // The gap's notification reached the re-attached handle (pump or poll).
+    await waitFor(
+      async () =>
+        JSON.stringify(
+          (await listTerminals(h)).find((terminal) => terminal.id === id),
+        ).includes("lc_gap_42"),
+      "the gap notification on the re-attached terminal",
+      8_000,
+    );
+    expect(await attachClientPids(h, id)).toHaveLength(1);
   },
   60_000,
 );

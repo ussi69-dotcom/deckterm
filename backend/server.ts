@@ -246,7 +246,15 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
-import { forbiddenRootDetail } from "./forbidden-root";
+import { hardenGitInvocation } from "./git-readonly";
+import {
+  TMUX_REATTACH_BACKOFF_MS,
+  planTmuxReattach,
+} from "./services/tmux-reattach-policy";
+import {
+  forbiddenRootDetail,
+  rejectedPathMayBeMissing,
+} from "./forbidden-root";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -1295,7 +1303,11 @@ async function attachRecordedTmuxSession(
 
   const restoredTerminal = await createManagedTerminal({
     id: recordedSession.id,
+    // The recorded cwd stays metadata (root mapping, labels). The attach
+    // client is spawned in the live pane cwd; the backend falls back to HOME
+    // or / when that is gone too (a removed task worktree).
     cwd: recordedSession.cwd || cwd,
+    attachCwd: cwd,
     cols,
     rows,
     ownerId,
@@ -1318,6 +1330,38 @@ async function attachRecordedTmuxSession(
 // restore: separate restores would each spawn a managed terminal (and a tmux
 // attach client), and all but the last would be orphaned.
 const tmuxRestoreFlights = new Map<string, Promise<Terminal | null>>();
+
+// A row whose restore throws (it never should, but one bad row must not take
+// the whole catalog or a reconnect down with it) is logged at most once a
+// minute per id and left active: the caller serializes it as detached / 404s
+// the upgrade, and the next ask retries.
+const TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS = 60_000;
+const tmuxRestoreFailureWarnedAt = new Map<string, number>();
+
+function restoreRecordedTmuxSessionSafely(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  return restoreRecordedTmuxSession(state, recordedSession).then(
+    (term) => {
+      tmuxRestoreFailureWarnedAt.delete(recordedSession.id);
+      return term;
+    },
+    (err) => {
+      const now = Date.now();
+      const last =
+        tmuxRestoreFailureWarnedAt.get(recordedSession.id) ?? -Infinity;
+      if (now - last >= TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS) {
+        tmuxRestoreFailureWarnedAt.set(recordedSession.id, now);
+        console.error(
+          `[tmux] Failed to restore session for ${recordedSession.id}; row stays active, will retry on the next request:`,
+          err,
+        );
+      }
+      return null;
+    },
+  );
+}
 
 function restoreRecordedTmuxSession(
   state: FoundationState,
@@ -1363,6 +1407,7 @@ async function restoreRecordedTmuxSessionNow(
   tmuxLivenessUnknownWarnedAt.delete(id);
   if (liveness === "missing") {
     markTerminalSessionEnded(state.db, id);
+    forgetTmuxReattach(id);
     return null;
   }
 
@@ -1373,6 +1418,98 @@ async function restoreRecordedTmuxSessionNow(
   if (getTerminalSession(state.db, id)?.status !== "active") return null;
 
   return attachRecordedTmuxSession(state, recordedSession, sessionName);
+}
+
+// Pipe-log hand-off across a detach. When an attach client dies while its
+// session lives, the dropped handle's last PROCESSED pipe offset (and the
+// parser carries for a sequence split at that offset) are kept here, and the
+// next attach of the same session resumes from there instead of from the
+// current end of the log. Notifications and shell-integration markers the
+// pane wrote while nothing was attached are then processed exactly once.
+type TmuxPipeResume = {
+  pipePath: string;
+  offset: number;
+  shellIntegrationCarry: string;
+  notificationParse: TerminalNotificationParseState;
+};
+const tmuxPipeResume = new Map<string, TmuxPipeResume>();
+
+function rememberTmuxPipeResume(term: Terminal) {
+  if (!term.tmuxPipePath) return;
+  tmuxPipeResume.set(term.id, {
+    pipePath: term.tmuxPipePath,
+    offset: term.tmuxPipeOffset,
+    shellIntegrationCarry: term.shellIntegrationCarry,
+    notificationParse: term.notificationParse,
+  });
+}
+
+// Server-side re-attach after detachDeadAttach (policy and rationale in
+// services/tmux-reattach-policy.ts). A browser reconnect or catalog poll
+// may restore the session first; restoreRecordedTmuxSession single-flights
+// them, so the timer then finds the id attached and does nothing.
+const tmuxReattachAttempts = new Map<string, number>();
+const tmuxReattachTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function forgetTmuxReattach(id: string) {
+  const timer = tmuxReattachTimers.get(id);
+  if (timer) clearTimeout(timer);
+  tmuxReattachTimers.delete(id);
+  tmuxReattachAttempts.delete(id);
+  tmuxPipeResume.delete(id);
+}
+
+function scheduleTmuxReattach(id: string, attachLivedMs: number) {
+  if (shutdownInProgress || tmuxReattachTimers.has(id)) return;
+  const plan = planTmuxReattach(
+    tmuxReattachAttempts.get(id) ?? 0,
+    attachLivedMs,
+  );
+  if (!plan) {
+    console.warn(
+      `[lifecycle] not re-attaching ${id} server-side again: its attach keeps dying (${TMUX_REATTACH_BACKOFF_MS.length} attempts); a client reconnect still restores it`,
+    );
+    return;
+  }
+  tmuxReattachAttempts.set(id, plan.attempt);
+  const timer = setTimeout(() => {
+    tmuxReattachTimers.delete(id);
+    void runTmuxReattach(id).catch((err) =>
+      console.error(`[lifecycle] server-side re-attach of ${id} failed:`, err),
+    );
+  }, plan.delayMs);
+  (timer as { unref?: () => void }).unref?.();
+  tmuxReattachTimers.set(id, timer);
+}
+
+async function runTmuxReattach(id: string): Promise<void> {
+  if (shutdownInProgress || terminals.has(id)) return;
+  const state = await getFoundationState();
+  const recordedSession = getTerminalSession(state.db, id);
+  if (!recordedSession || recordedSession.status !== "active") {
+    forgetTmuxReattach(id);
+    return;
+  }
+  let restored: Terminal | null = null;
+  try {
+    restored = await restoreRecordedTmuxSession(state, recordedSession);
+  } catch (err) {
+    console.error(`[lifecycle] server-side re-attach of ${id} failed:`, err);
+  }
+  if (restored) {
+    console.log(`[lifecycle] re-attached ${id} server-side`);
+    return;
+  }
+  // Nothing attached (tmux unreachable, or the restore threw): try again
+  // later while the row stays active. An ended row stops here.
+  if (
+    !terminals.has(id) &&
+    getTerminalSession(state.db, id)?.status === "active"
+  ) {
+    scheduleTmuxReattach(id, 0);
+  } else if (!terminals.has(id)) {
+    forgetTmuxReattach(id);
+  }
 }
 
 // Debug logger
@@ -2121,19 +2258,17 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   );
 }
 
-// Whether a path refused by resolveAllowedPath exists at all, so the denial
-// can say "outside the allowed roots" instead of "outside the allowed roots or
-// does not exist". Legacy (service-account) view only — never consulted under
-// OS isolation, where the service account must not traverse a user's tree.
-async function rejectedPathExists(inputPath: string): Promise<boolean> {
-  if (!inputPath) return false;
-  try {
-    const fs = await import("fs/promises");
-    await fs.stat(resolve(inputPath));
-    return true;
-  } catch {
-    return false;
-  }
+// "…outside the allowed roots or does not exist" wording for a path refused by
+// resolveAllowedPath. Stats only paths lexically inside an allowed root (see
+// rejectedPathMayBeMissing), so it is no existence oracle for host paths.
+async function rejectedPathMayBeMissingForRoots(
+  inputPath: string,
+): Promise<boolean> {
+  const roots = [
+    ...ALLOWED_FILESYSTEM_ROOTS.map((root) => resolve(root)),
+    ...(await getAllowedRealRoots()),
+  ];
+  return rejectedPathMayBeMissing(inputPath, roots);
 }
 
 async function resolveAllowedPath(
@@ -3920,7 +4055,7 @@ async function resolveScopedFsPath(
           ...forbiddenRootDetail({
             path: clientPath,
             subject: "path",
-            mayBeMissing: !(await rejectedPathExists(clientPath)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(clientPath),
           }),
         },
       };
@@ -5097,6 +5232,9 @@ async function readTmuxPipeDeltaOnce(term: Terminal): Promise<string> {
     term.tmuxPipePath,
     term.tmuxPipeOffset,
   );
+  // Detached while reading: leave the bytes (and the offset) for the handle
+  // that re-attaches, which resumes from this handle's offset.
+  if (terminals.get(term.id) !== term) return "";
   term.tmuxPipeOffset = delta.offset;
   return delta.chunk;
 }
@@ -5413,9 +5551,12 @@ async function createManagedTerminal({
   initialLastExitCode = null,
   initialScrollback = "",
   exec,
+  attachCwd,
 }: {
   id?: string;
   cwd: string;
+  /** Where to spawn the attach client, when it differs from `cwd`. */
+  attachCwd?: string;
   cols: number;
   rows: number;
   ownerId: string;
@@ -5477,12 +5618,16 @@ async function createManagedTerminal({
       .catch((err) => debug("Failed to mark terminal session ended:", err));
     notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
+    forgetTmuxReattach(id);
     terminal.close();
   };
 
   // The tmux session outlived its attach client: drop this attach only. A
   // plain close (no exit frame) makes ReconnectingWebSocket reconnect, and
-  // the upgrade lazily re-attaches through restoreRecordedTmuxSession.
+  // the upgrade lazily re-attaches through restoreRecordedTmuxSession. With
+  // no browser around, the server re-attaches by itself (backoff + cap), so
+  // the pipe pump and the reapers keep covering the session; the pipe offset
+  // is handed over so the gap's markers are processed once.
   const detachDeadAttach = (
     exitCode: number,
     signalCode: number | null | undefined,
@@ -5492,9 +5637,12 @@ async function createManagedTerminal({
     console.warn(
       `[lifecycle] attach client for ${id} exited (code=${exitCode}, signal=${signalCode ?? "none"}) but tmux session ${sessionName} is ${liveness}; detaching, row stays active`,
     );
-    if (terminals.get(id)?.terminal === terminal) {
+    const current = terminals.get(id);
+    if (current?.terminal === terminal) {
+      rememberTmuxPipeResume(current);
       closeTerminalSockets(id);
       removeTerminalState(id);
+      scheduleTmuxReattach(id, Date.now() - attachStartedAt);
     }
     terminal.close();
   };
@@ -5569,10 +5717,11 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
+  const attachStartedAt = Date.now();
   let attachResult: TerminalBackendAttachResult;
   try {
     attachResult = await backend.attach(attachSessionName, {
-      cwd,
+      cwd: attachCwd || cwd,
       cols,
       rows,
       terminal,
@@ -5593,6 +5742,16 @@ async function createManagedTerminal({
   const proc = attachResult.proc as Subprocess;
   tmuxPipePath = attachResult.pipePath ?? tmuxPipePath;
   tmuxPipeOffset = attachResult.pipeOffset ?? tmuxPipeOffset;
+  // Re-attach after a dead attach: resume where the dropped handle stopped
+  // (never past the current end of the log).
+  const pipeResume = tmuxPipeResume.get(id);
+  const resumePipe =
+    pipeResume && tmuxPipePath && pipeResume.pipePath === tmuxPipePath
+      ? pipeResume
+      : null;
+  if (resumePipe) {
+    tmuxPipeOffset = Math.min(resumePipe.offset, tmuxPipeOffset);
+  }
 
   const now = Date.now();
   const managedTerminal: Terminal = {
@@ -5623,9 +5782,10 @@ async function createManagedTerminal({
     agentRespondingTimer: null,
     recentTools: [],
     toolRate: { windowStart: 0, count: 0 },
-    notificationParse: createTerminalNotificationParseState(),
+    notificationParse:
+      resumePipe?.notificationParse ?? createTerminalNotificationParseState(),
     attention: createAttentionTracker(),
-    shellIntegrationCarry: "",
+    shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
     tmuxPipeOffset,
@@ -5635,6 +5795,7 @@ async function createManagedTerminal({
 
   terminals.set(id, managedTerminal);
   registered = true;
+  if (pipeResume) tmuxPipeResume.delete(id);
   getTerminalSockets(id);
   markHandleSettled();
   if (initialScrollback) {
@@ -7199,7 +7360,7 @@ export function createWebApp() {
             ...forbiddenRootDetail({
               path: requestedRoot,
               subject: "project",
-              mayBeMissing: !(await rejectedPathExists(requestedRoot)),
+              mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedRoot),
             }),
           },
           403,
@@ -8040,7 +8201,7 @@ export function createWebApp() {
         const restoredTerm =
           terminals.get(recordedSession.id) ||
           (recordedSession.status === "active"
-            ? await restoreRecordedTmuxSession(state, recordedSession)
+            ? await restoreRecordedTmuxSessionSafely(state, recordedSession)
             : null);
 
         if (restoredTerm) {
@@ -8563,7 +8724,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
           }),
           requestId,
         },
@@ -8665,7 +8826,7 @@ export function createWebApp() {
           ...forbiddenRootDetail({
             path: requestedCwd,
             subject: "search",
-            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
           }),
         },
         403,
@@ -9337,7 +9498,8 @@ export function createWebApp() {
   }
 
   // Shared runner for git child processes. Legacy: direct spawn with
-  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast. Brokered: the broker
+  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast, read-only calls
+  // hardened by hardenGitInvocation. Brokered: the broker
   // `git` profile (argv rebuilt from the fixed schema; cwd resolved fd-safely
   // beneath the granted root as the mapped user). `args` is the argv AFTER `git`.
   async function runGit(
@@ -9391,11 +9553,21 @@ export function createWebApp() {
       }
     }
     const cwd = git.reldir ? join(git.root, git.reldir) : git.root;
-    const proc = Bun.spawn(["git", ...args], {
+    // Read-only calls (status/diff/log/…) run in whatever directory a
+    // terminal enters: repo-local fsmonitor, hooks and diff drivers must not
+    // execute there. Writes keep the user's hooks. The broker git profile
+    // applies its own fixed hardening.
+    const hardened = hardenGitInvocation(args);
+    const proc = Bun.spawn(["git", ...hardened.argv], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0", ...extraEnv },
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        ...hardened.env,
+        ...extraEnv,
+      },
     });
     const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
     const [output, stderr, code] = await Promise.all([
@@ -11067,7 +11239,8 @@ async function startOwnedWebServer(
               actorId: ownerId,
               recordedOwnerId: recordedSession.actorUserId,
               requestUrl: req.url,
-              restore: () => restoreRecordedTmuxSession(state, recordedSession),
+              restore: () =>
+                restoreRecordedTmuxSessionSafely(state, recordedSession),
             });
             if (!restored.ok) {
               return new Response("Terminal not found", { status: 404 });

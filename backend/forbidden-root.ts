@@ -6,6 +6,9 @@
 // echoed: /api/onboarding/env hides them from actors without a filesystem
 // capability, so a denial must not leak them either.
 
+import { stat as fsStat } from "node:fs/promises";
+import { resolve } from "node:path";
+
 export const ALLOWED_ROOTS_SETTING = "ALLOWED_FILE_ROOTS";
 export const GRANTED_ROOTS_SETTING = "root_grants";
 
@@ -84,4 +87,44 @@ export function forbiddenRootDetail({
     message: `${lead} is outside the allowed roots (${ALLOWED_ROOTS_SETTING})${missing}. ${hint}`,
     hint,
   };
+}
+
+/** Whether `path` (normalised, no symlink resolution) lies inside a root. */
+export function isLexicallyWithinRoots(path: string, roots: string[]): boolean {
+  const candidate = resolve(path);
+  return roots.some((rawRoot) => {
+    const root = resolve(rawRoot);
+    if (root === "/") return true;
+    return candidate === root || candidate.startsWith(`${root}/`);
+  });
+}
+
+async function defaultStat(path: string): Promise<void> {
+  await fsStat(path);
+}
+
+/**
+ * Whether a path refused by allowed-roots resolution should be described as
+ * "outside the allowed roots or does not exist" (`mayBeMissing`).
+ *
+ * Only a path that lies lexically INSIDE an allowed root is stat'ed: there the
+ * refusal means realpath failed (missing) or a symlink escapes the root. A path
+ * outside every root is outside whether or not it exists, so it is never
+ * stat'ed — otherwise the wording would tell any caller (before any grant
+ * check) whether an arbitrary host path exists as the service account.
+ * Legacy (service-account) view only; OS isolation denies earlier.
+ */
+export async function rejectedPathMayBeMissing(
+  inputPath: string,
+  roots: string[],
+  statPath: (path: string) => Promise<unknown> = defaultStat,
+): Promise<boolean> {
+  if (typeof inputPath !== "string" || !inputPath) return false;
+  if (!isLexicallyWithinRoots(inputPath, roots)) return false;
+  try {
+    await statPath(resolve(inputPath));
+    return false;
+  } catch {
+    return true;
+  }
 }
