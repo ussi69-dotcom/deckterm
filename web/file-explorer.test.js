@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { FileExplorerController, breadcrumbSegments } from "./file-explorer";
+import {
+  FileExplorerController,
+  breadcrumbSegments,
+  compactBreadcrumbs,
+  fileIconName,
+} from "./file-explorer";
 import { FileTreeStore } from "./file-tree-store";
 import { isViewController } from "./view-host";
 
@@ -1515,4 +1520,92 @@ test("Trash opened before a pending file deletion commits receives the new item"
   expect(controller.trashDialog).toBe(dialog);
   expect(dialog.items.map((item) => item.id)).toEqual([trashFixtureItem.id]);
   expect(controller.fileNotice).toBeNull();
+});
+
+// --- icons, compact breadcrumbs, row layout ---
+
+test("fileIconName maps folders and common file types to lucide icons", () => {
+  expect(fileIconName({ name: "src", isDir: true })).toBe("folder");
+  expect(fileIconName({ name: "..", isDir: true, isParent: true })).toBe(
+    "folder-up",
+  );
+  expect(fileIconName({ name: "app.js" })).toBe("file-code");
+  expect(fileIconName({ name: "server.TS" })).toBe("file-code");
+  expect(fileIconName({ name: "package.json" })).toBe("file-json");
+  expect(fileIconName({ name: "config.yaml" })).toBe("file-json");
+  expect(fileIconName({ name: "README.md" })).toBe("file-text");
+  expect(fileIconName({ name: "logo.svg" })).toBe("image");
+  expect(fileIconName({ name: "release.tar.gz" })).toBe("archive");
+  expect(fileIconName({ name: "deploy.sh" })).toBe("terminal");
+  expect(fileIconName({ name: "Makefile" })).toBe("terminal");
+  expect(fileIconName({ name: "Dockerfile" })).toBe("file-code");
+  expect(fileIconName({ name: "LICENSE" })).toBe("file");
+  expect(fileIconName({ name: ".bashrc" })).toBe("terminal");
+  expect(fileIconName(null)).toBe("file");
+});
+
+test("compactBreadcrumbs keeps the root and the deepest crumbs", () => {
+  const crumbs = breadcrumbSegments("/r/a/b/c/d", "/r");
+  expect(compactBreadcrumbs(crumbs, 4).map((crumb) => crumb.label)).toEqual([
+    "r",
+    "…",
+    "c",
+    "d",
+  ]);
+  const hidden = compactBreadcrumbs(crumbs, 4)[1];
+  expect(hidden.ellipsis).toBe(true);
+  expect(hidden.path).toBe("/r/a/b");
+  expect(compactBreadcrumbs(crumbs.slice(0, 3), 4)).toEqual(crumbs.slice(0, 3));
+  expect(compactBreadcrumbs([], 4)).toEqual([]);
+});
+
+test("rows use a lucide icon and icon-only actions beside the filename", () => {
+  withFakeDocument(() => {
+    const controller = interactiveExplorer();
+    controller.onOpenFile = () => {};
+    controller.renderList();
+    const row = controller.listEl.querySelectorAll(".file-item")[0];
+    const icon = row.querySelectorAll(".file-icon")[0];
+    expect(icon.attrs["aria-hidden"]).toBe("true");
+    expect(icon.children[0].tagName).toBe("I");
+    expect(icon.children[0].attrs["data-lucide"]).toBe("file-text");
+    const name = row.querySelectorAll(".file-open")[0];
+    expect(name.textContent).toBe("alpha.txt");
+    const actions = row.querySelectorAll(".file-actions")[0];
+    expect(row.children.indexOf(actions)).toBeGreaterThan(
+      row.children.indexOf(name),
+    );
+    const buttons = actions.children;
+    expect(buttons.map((button) => button.dataset.explorerAction)).toEqual([
+      "edit",
+      "download",
+      "rename",
+      "delete",
+    ]);
+    for (const button of buttons) {
+      expect(button.textContent || "").toBe("");
+      expect(button.children[0].tagName).toBe("I");
+      expect(button.title).toBeTruthy();
+    }
+    expect(buttons[0].attrs["aria-label"]).toBe("Edit alpha.txt");
+    expect(buttons[3].attrs["aria-label"]).toBe("Delete alpha.txt");
+  });
+});
+
+test("deep breadcrumbs collapse their middle into one ellipsis", () => {
+  withFakeDocument(() => {
+    const controller = interactiveExplorer();
+    controller.setWorkspacePath("keyboard-workspace", "/workspace/a/b/c/d");
+    const buttons = controller.breadcrumbEl.querySelectorAll("button");
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "workspace",
+      "c",
+      "d",
+    ]);
+    const ellipsis = controller.breadcrumbEl.querySelectorAll(
+      ".file-breadcrumb-ellipsis",
+    );
+    expect(ellipsis).toHaveLength(1);
+    expect(ellipsis[0].title).toBe("/workspace/a/b");
+  });
 });

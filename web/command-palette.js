@@ -13,12 +13,86 @@ function getCommandPaletteGroupRank(group) {
   );
 }
 
+// Lucide icon per group when an action does not name its own.
+const COMMAND_PALETTE_GROUP_ICONS = {
+  Actions: "zap",
+  Files: "file",
+  Workspaces: "folder",
+  Views: "eye",
+  Contextual: "sparkles",
+  Sessions: "square-terminal",
+  Commands: "terminal",
+};
+
+function resolvePaletteProviders() {
+  if (typeof window !== "undefined" && window.PaletteProviders) {
+    return window.PaletteProviders;
+  }
+  if (typeof require !== "undefined") {
+    try {
+      return require("./palette-providers");
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+// The text a row should be highlighted against: prefix modes ("@" sessions,
+// "$" saved commands) match on the text after the prefix.
+function getHighlightQuery(query) {
+  return String(query || "")
+    .trim()
+    .replace(/^[@$]\s*/, "");
+}
+
+// Secondary text for a row: the meta entries minus blanks, repeats and
+// anything that only repeats the title, joined on one line.
+function formatResultDetail(title, meta) {
+  if (!Array.isArray(meta)) return "";
+  const seen = new Set([String(title || "").trim().toLowerCase()]);
+  const parts = [];
+  for (const entry of meta) {
+    const text = String(entry ?? "").trim();
+    const key = text.toLowerCase();
+    if (!text || seen.has(key)) continue;
+    seen.add(key);
+    parts.push(text);
+  }
+  return parts.join(" · ");
+}
+
+// Default lucide renderer: swaps the <i data-lucide> placeholders inside
+// `root` for SVGs (scoped, so the rest of the document is not re-scanned).
+function renderLucideIcons(root) {
+  if (typeof window === "undefined" || !window.lucide?.createIcons) return;
+  try {
+    window.lucide.createIcons({ root });
+  } catch {
+    // icons are decorative; a missing name must never break the palette
+  }
+}
+
 class CommandPaletteController {
-  constructor({ root, input, results, registry }) {
+  constructor({
+    root,
+    input,
+    results,
+    registry,
+    onRun = null,
+    rankOf = null,
+    renderIcons = renderLucideIcons,
+  }) {
     this.root = root;
     this.input = input;
     this.results = results;
     this.registry = registry;
+    // onRun(result): called before a result runs (MRU bookkeeping).
+    // rankOf(result): recency index (0 = most recent, -1 = never) used to
+    // order each group when the query is empty.
+    this.onRun = typeof onRun === "function" ? onRun : null;
+    this.rankOf = typeof rankOf === "function" ? rankOf : null;
+    this.renderIcons = typeof renderIcons === "function" ? renderIcons : null;
     this.context = {};
     this.selectedIndex = 0;
     this.visibleResults = [];
@@ -139,6 +213,11 @@ class CommandPaletteController {
   runSelected() {
     const selected = this.visibleResults[this.selectedIndex];
     if (!selected || typeof selected.run !== "function") return;
+    try {
+      this.onRun?.(selected);
+    } catch {
+      // bookkeeping must never block the command itself
+    }
     selected.run();
     // A command may focus another surface synchronously or after an await.
     // Restore the opener only while focus is still stranded in this palette;
@@ -153,15 +232,31 @@ class CommandPaletteController {
   refreshResults() {
     if (!this.registry || !this.results) return;
     const query = this.input?.value || "";
-    // Keep keyboard order identical to the grouped visual order.
+    const recencyOf = (result) => {
+      if (!this.rankOf || query.trim()) return Number.POSITIVE_INFINITY;
+      const rank = this.rankOf(result);
+      return Number.isInteger(rank) && rank >= 0
+        ? rank
+        : Number.POSITIVE_INFINITY;
+    };
+    // Keep keyboard order identical to the grouped visual order. With an
+    // empty query, recently used entries lead their group.
     this.visibleResults = this.registry
       .getResults(query, this.context)
       .slice()
+      .map((result, order) => ({ result, order, recency: recencyOf(result) }))
       .sort(
         (left, right) =>
-          getCommandPaletteGroupRank(left.group || "Other") -
-          getCommandPaletteGroupRank(right.group || "Other"),
-      );
+          getCommandPaletteGroupRank(left.result.group || "Other") -
+            getCommandPaletteGroupRank(right.result.group || "Other") ||
+          (left.recency === right.recency
+            ? 0
+            : left.recency < right.recency
+              ? -1
+              : 1) ||
+          left.order - right.order,
+      )
+      .map(({ result }) => result);
     if (this.selectedIndex >= this.visibleResults.length) {
       this.selectedIndex = Math.max(0, this.visibleResults.length - 1);
     }
@@ -182,6 +277,7 @@ class CommandPaletteController {
       return;
     }
 
+    const highlightQuery = getHighlightQuery(this.input?.value);
     const groupedResults = new Map();
     results.forEach((result, index) => {
       const group = result.group || "Other";
@@ -223,21 +319,47 @@ class CommandPaletteController {
         item.dataset.actionId = result.id;
         item.addEventListener("mousedown", (event) => event.preventDefault());
 
+        const iconName =
+          result.icon ||
+          COMMAND_PALETTE_GROUP_ICONS[result.group] ||
+          "chevron-right";
+        const icon = document.createElement("span");
+        icon.className = "command-palette-item-icon";
+        icon.setAttribute("aria-hidden", "true");
+        const glyph = document.createElement("i");
+        glyph.setAttribute("data-lucide", iconName);
+        icon.appendChild(glyph);
+        item.appendChild(icon);
+
+        const text = document.createElement("span");
+        text.className = "command-palette-item-text";
+        const detailText = formatResultDetail(result.title, result.meta);
+        const titlePositions = this.matchPositions(highlightQuery, result.title);
         const title = document.createElement("span");
         title.className = "command-palette-item-title";
-        title.textContent = result.title;
-        item.appendChild(title);
+        this.appendHighlighted(title, result.title, titlePositions);
+        text.appendChild(title);
 
-        if (Array.isArray(result.meta) && result.meta.length > 0) {
-          const meta = document.createElement("span");
-          meta.className = "command-palette-item-meta";
-          result.meta.forEach((entry) => {
-            const chip = document.createElement("span");
-            chip.className = "command-palette-chip";
-            chip.textContent = String(entry);
-            meta.appendChild(chip);
-          });
-          item.appendChild(meta);
+        if (detailText) {
+          const detail = document.createElement("span");
+          detail.className = "command-palette-item-detail";
+          // Highlight the detail only when the title itself did not match
+          // (e.g. a file found through its directory).
+          const detailPositions =
+            titlePositions && titlePositions.length > 0
+              ? null
+              : this.matchPositions(highlightQuery, detailText);
+          this.appendHighlighted(detail, detailText, detailPositions);
+          detail.title = detailText;
+          text.appendChild(detail);
+        }
+        item.appendChild(text);
+
+        if (result.keybinding) {
+          const key = document.createElement("kbd");
+          key.className = "command-palette-item-key";
+          key.textContent = result.keybinding;
+          item.appendChild(key);
         }
 
         item.addEventListener("click", () => {
@@ -250,6 +372,7 @@ class CommandPaletteController {
 
       this.results.appendChild(section);
     }
+    this.renderIcons?.(this.results);
     const selected = this.results.querySelector(
       ".command-palette-item.selected",
     );
@@ -258,10 +381,40 @@ class CommandPaletteController {
       selected.scrollIntoView?.({ block: "nearest" });
     }
   }
+
+  matchPositions(query, text) {
+    if (!query) return null;
+    const providers = resolvePaletteProviders();
+    return providers?.matchPositions
+      ? providers.matchPositions(query, text)
+      : null;
+  }
+
+  // Fill `element` with `text`, wrapping matched characters in <mark>.
+  appendHighlighted(element, text, positions) {
+    const value = String(text ?? "");
+    const providers = resolvePaletteProviders();
+    if (
+      !Array.isArray(positions) ||
+      positions.length === 0 ||
+      !providers?.highlightSegments
+    ) {
+      element.textContent = value;
+      return;
+    }
+    for (const segment of providers.highlightSegments(value, positions)) {
+      const part = document.createElement(segment.match ? "mark" : "span");
+      if (segment.match) part.className = "command-palette-match";
+      part.textContent = segment.text;
+      element.appendChild(part);
+    }
+  }
 }
 
 const CommandPaletteModule = {
   CommandPaletteController,
+  formatResultDetail,
+  getHighlightQuery,
 };
 
 if (typeof window !== "undefined") {
@@ -274,4 +427,6 @@ if (typeof module !== "undefined" && module.exports) {
 
 if (typeof exports !== "undefined") {
   exports.CommandPaletteController = CommandPaletteController;
+  exports.formatResultDetail = formatResultDetail;
+  exports.getHighlightQuery = getHighlightQuery;
 }

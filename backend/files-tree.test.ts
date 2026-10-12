@@ -28,6 +28,9 @@ import {
 let stateDir: string;
 let allowedRoot: string;
 let outsideDir: string; // a directory OUTSIDE every allowed root
+let repoRoot: string; // a git repository INSIDE the allowed root
+let outerRepo: string; // a git repository whose toplevel is OUTSIDE every root
+let innerRoot: string; // an allowed root that is a subdirectory of outerRepo
 let app: { fetch: (req: Request) => Response | Promise<Response> };
 
 beforeAll(async () => {
@@ -68,8 +71,37 @@ beforeAll(async () => {
     join(allowedRoot, "escape-file.txt"),
   );
 
+  // A git repository inside the root: quick-open from any directory inside it
+  // lists the repository's tracked + untracked-not-ignored files.
+  repoRoot = join(allowedRoot, "proj");
+  await mkdir(join(repoRoot, "src", "deep"), { recursive: true });
+  await writeFile(join(repoRoot, "README.md"), "readme\n");
+  await writeFile(join(repoRoot, "src", "app.js"), "app\n");
+  await writeFile(join(repoRoot, "src", "deep", "util.ts"), "util\n");
+  await writeFile(join(repoRoot, "gone.txt"), "deleted later\n");
+  await writeFile(join(repoRoot, ".gitignore"), "*.log\n");
+  await symlink(join(outsideDir, "leak.txt"), join(repoRoot, "tracked-link.txt"));
+  git(repoRoot, ["init", "-q"]);
+  git(repoRoot, ["add", "-A"]);
+  git(repoRoot, ["commit", "-q", "-m", "init"]);
+  await rm(join(repoRoot, "gone.txt"));
+  await writeFile(join(repoRoot, "notes.txt"), "untracked\n");
+  await writeFile(join(repoRoot, "debug.log"), "ignored\n");
+  await writeFile(join(repoRoot, ".env"), "SECRET=1\n");
+
+  // A repository whose toplevel is outside every allowed root: only the
+  // allowed subdirectory may be listed.
+  outerRepo = await mkdtemp(join(home, ".deckterm-tree-outer-"));
+  innerRoot = join(outerRepo, "inner");
+  await mkdir(innerRoot, { recursive: true });
+  await writeFile(join(outerRepo, "outer-only.txt"), "outer\n");
+  await writeFile(join(innerRoot, "inner.txt"), "inner\n");
+  git(outerRepo, ["init", "-q"]);
+  git(outerRepo, ["add", "-A"]);
+  git(outerRepo, ["commit", "-q", "-m", "init"]);
+
   process.env.DECKTERM_STATE_DIR = stateDir;
-  process.env.ALLOWED_FILE_ROOTS = allowedRoot;
+  process.env.ALLOWED_FILE_ROOTS = `${allowedRoot},${innerRoot}`;
   process.env.DECKTERM_RUNTIME_ENV = "development";
   delete process.env.DECKTERM_PUBLISH_MODE;
   delete process.env.DECKTERM_LEGACY_NO_BOOTSTRAP;
@@ -77,7 +109,7 @@ beforeAll(async () => {
 
   const state = await initializeFoundationState({
     stateDir,
-    allowedFileRoots: [allowedRoot],
+    allowedFileRoots: [allowedRoot, innerRoot],
     env: {},
   });
   const token = (
@@ -106,11 +138,30 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await Promise.all(
-    [stateDir, allowedRoot, outsideDir].map((d) =>
+    [stateDir, allowedRoot, outsideDir, outerRepo].map((d) =>
       rm(d, { recursive: true, force: true }),
     ),
   );
 });
+
+function git(cwd: string, args: string[]) {
+  const result = Bun.spawnSync(
+    [
+      "git",
+      "-c",
+      "user.email=tree@test.invalid",
+      "-c",
+      "user.name=tree",
+      "-c",
+      "commit.gpgsign=false",
+      ...args,
+    ],
+    { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } },
+  );
+  if (result.exitCode !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  }
+}
 
 function tree(cwd: string) {
   return app.fetch(
@@ -186,4 +237,64 @@ test("missing cwd query param is denied (403, not a crash)", async () => {
     new Request("http://deckterm.test/api/files/tree"),
   );
   expect(res.status).toBe(403);
+});
+
+test("git scope: a cwd inside a repository lists the whole repository", async () => {
+  const res = await tree(join(repoRoot, "src"));
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  expect(data.scope).toEqual({ kind: "git", root: repoRoot });
+  const relPaths = data.files.map((f: any) => f.relativePath).sort();
+  expect(relPaths).toEqual([
+    "README.md",
+    "notes.txt",
+    "src/app.js",
+    "src/deep/util.ts",
+  ]);
+  const app = data.files.find((f: any) => f.relativePath === "src/app.js");
+  expect(app.path).toBe(join(repoRoot, "src", "app.js"));
+});
+
+test("git scope: ignored, deleted, dot and symlinked entries are never listed", async () => {
+  const res = await tree(repoRoot);
+  const data = (await res.json()) as any;
+  const relPaths = data.files.map((f: any) => f.relativePath);
+  expect(relPaths).not.toContain("debug.log");
+  expect(relPaths).not.toContain("gone.txt");
+  expect(relPaths).not.toContain(".env");
+  expect(relPaths).not.toContain(".gitignore");
+  expect(relPaths).not.toContain("tracked-link.txt");
+  const paths = data.files.map((f: any) => f.path);
+  expect(paths.some((p: string) => p.includes("leak.txt"))).toBe(false);
+});
+
+test("git scope: a repository toplevel outside every root lists only the allowed subtree", async () => {
+  const res = await tree(innerRoot);
+  expect(res.status).toBe(200);
+  const data = (await res.json()) as any;
+  expect(data.scope).toEqual({ kind: "git", root: innerRoot });
+  const relPaths = data.files.map((f: any) => f.relativePath);
+  expect(relPaths).toEqual(["inner.txt"]);
+});
+
+test("dir scope: a cwd outside any repository walks its own subtree", async () => {
+  const res = await tree(join(allowedRoot, "sub"));
+  const data = (await res.json()) as any;
+  expect(data.scope).toEqual({ kind: "dir", root: join(allowedRoot, "sub") });
+  const relPaths = data.files.map((f: any) => f.relativePath).sort();
+  expect(relPaths).toEqual(["deeper/deepest.txt", "nested.txt"]);
+});
+
+test("home scope: the home directory itself lists only its top-level files", async () => {
+  const previousHome = process.env.HOME;
+  process.env.HOME = join(allowedRoot, "sub");
+  try {
+    const res = await tree(join(allowedRoot, "sub"));
+    const data = (await res.json()) as any;
+    expect(data.scope).toEqual({ kind: "home", root: join(allowedRoot, "sub") });
+    const relPaths = data.files.map((f: any) => f.relativePath);
+    expect(relPaths).toEqual(["nested.txt"]);
+  } finally {
+    process.env.HOME = previousHome;
+  }
 });

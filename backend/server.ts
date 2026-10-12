@@ -89,8 +89,14 @@ import {
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
-import { TmuxTerminalBackend } from "./services/tmux-terminal-backend";
-import type { TerminalBackend } from "./services/terminal-backend";
+import {
+  TmuxTerminalBackend,
+  type TmuxSessionLiveness,
+} from "./services/tmux-terminal-backend";
+import type {
+  TerminalBackend,
+  TerminalBackendAttachResult,
+} from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
   TaskRunnerError,
@@ -240,6 +246,7 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
+import { forbiddenRootDetail } from "./forbidden-root";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -1122,11 +1129,19 @@ export async function reconcileSessionsOnStartup(
         namespace: TMUX_SESSION_NAMESPACE,
         terminalId: session.id,
       });
-      if (!(await tmuxSessionExists(sessionName))) {
+      // Only proof of absence ends a row. An unreachable tmux server (EACCES,
+      // protocol mismatch after a tmux upgrade, a wedged server) used to read
+      // as "every session is missing" and ended live sessions wholesale.
+      const liveness = await tmuxSessionLiveness(sessionName);
+      if (liveness === "missing") {
         markTerminalSessionEnded(db, session.id);
         fixed++;
         console.log(
           `[reconciliation] Closed zombie session ${session.id} (DB was active, but tmux session was missing)`,
+        );
+      } else if (liveness === "unknown") {
+        console.warn(
+          `[reconciliation] tmux session ${sessionName} for ${session.id} is unknown (tmux server unreachable or not answering); leaving the row active`,
         );
       }
     }
@@ -1160,69 +1175,13 @@ async function recoverTmuxSessions(): Promise<number> {
     const state = await getFoundationState();
 
     for (const sessionName of sessions) {
-      const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
-      if (!parsed) continue;
-
-      const { terminalId: id } = parsed;
-      const recordedSession = getTerminalSession(state.db, id);
-      if (!recordedSession) {
-        console.warn(
-          `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
-        );
-        continue;
+      // One session that fails to attach must not strand every session
+      // listed after it.
+      try {
+        if (await recoverTmuxSession(state, sessionName)) recovered++;
+      } catch (err) {
+        console.error(`[tmux] Failed to recover session ${sessionName}:`, err);
       }
-      if (recordedSession.status !== "active") {
-        console.warn(
-          `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
-        );
-        continue;
-      }
-
-      const ownerId = recordedSession.actorUserId || "unknown";
-      const ownerEmail = resolveRecoveredOwnerEmail(
-        state,
-        recordedSession.actorUserId,
-      );
-
-      const { cwd, cols, rows, panePid, paneCurrentCommand } =
-        await getTmuxSessionInfo(sessionName);
-      const paneCapture = await captureTmuxPane(sessionName);
-      const processTree = panePid > 0 ? await getProcessTreeArgs(panePid) : [];
-      const recoveredRuntimeState = inferTmuxRuntimeState({
-        paneCurrentCommand,
-        processTree,
-        capture: paneCapture,
-        previousCapture: "",
-        previousState: {
-          running: false,
-          lastExitCode: null,
-          agentName: null,
-          agentState: null,
-        },
-        hasUserPrompted: true,
-      });
-      const recoveredTerminal = await createManagedTerminal({
-        id,
-        cwd: recordedSession.cwd || cwd,
-        cols,
-        rows,
-        ownerId,
-        ownerEmail,
-        sessionName,
-        initialRuntimeState: recoveredRuntimeState,
-        initialLastExitCode: recoveredRuntimeState.lastExitCode,
-        initialScrollback: paneCapture,
-      });
-      recoveredTerminal.hadSocketConnection = true;
-      recoveredTerminal.terminationScheduledAt =
-        recordedSession.terminationScheduledAt
-          ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
-          : undefined;
-
-      recovered++;
-      console.log(
-        `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
-      );
     }
 
     return recovered;
@@ -1231,6 +1190,36 @@ async function recoverTmuxSessions(): Promise<number> {
     console.log("[tmux] No existing sessions to recover");
     return 0;
   }
+}
+
+async function recoverTmuxSession(
+  state: FoundationState,
+  sessionName: string,
+): Promise<boolean> {
+  const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
+  if (!parsed) return false;
+
+  const { terminalId: id } = parsed;
+  const recordedSession = getTerminalSession(state.db, id);
+  if (!recordedSession) {
+    console.warn(
+      `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
+    );
+    return false;
+  }
+  if (recordedSession.status !== "active") {
+    console.warn(
+      `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
+    );
+    return false;
+  }
+  if (terminals.has(id)) return false;
+
+  await attachRecordedTmuxSession(state, recordedSession, sessionName);
+  console.log(
+    `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
+  );
+  return true;
 }
 
 function resolveRecoveredOwnerEmail(
@@ -1244,29 +1233,39 @@ function resolveRecoveredOwnerEmail(
   return row?.email || actorUserId;
 }
 
-async function tmuxSessionExists(sessionName: string): Promise<boolean> {
-  if (!TMUX_BACKEND || !tmuxTerminalBackend) return false;
-  return tmuxTerminalBackend.sessionExists(sessionName);
+async function tmuxSessionLiveness(
+  sessionName: string,
+): Promise<TmuxSessionLiveness> {
+  // Unreachable in tmux mode (the backend always exists there); "unknown"
+  // keeps a caller from ending a row it has no way to probe.
+  if (!TMUX_BACKEND || !tmuxTerminalBackend) return "unknown";
+  return tmuxTerminalBackend.sessionLiveness(sessionName);
 }
 
-async function restoreRecordedTmuxSession(
+// GET /api/terminals runs every few seconds per open tab; while the tmux
+// server stays unreachable, say so once a minute per session, not per poll.
+const TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS = 60_000;
+const tmuxLivenessUnknownWarnedAt = new Map<string, number>();
+
+function warnTmuxLivenessUnknown(id: string, sessionName: string) {
+  const now = Date.now();
+  const last = tmuxLivenessUnknownWarnedAt.get(id) ?? -Infinity;
+  if (now - last < TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS) return;
+  tmuxLivenessUnknownWarnedAt.set(id, now);
+  console.warn(
+    `[tmux] tmux session ${sessionName} for ${id} is unknown (tmux server unreachable or not answering); not restoring it now, row stays active`,
+  );
+}
+
+/**
+ * Builds the managed terminal for a recorded, still-active tmux session that
+ * nothing in this process is attached to (startup recovery, lazy restore).
+ */
+async function attachRecordedTmuxSession(
   state: FoundationState,
   recordedSession: RecordedTerminalSession,
-): Promise<Terminal | null> {
-  if (!TMUX_BACKEND || recordedSession.status !== "active") return null;
-
-  const existing = terminals.get(recordedSession.id);
-  if (existing) return existing;
-
-  const sessionName = buildTmuxSessionName({
-    namespace: TMUX_SESSION_NAMESPACE,
-    terminalId: recordedSession.id,
-  });
-  if (!(await tmuxSessionExists(sessionName))) {
-    markTerminalSessionEnded(state.db, recordedSession.id);
-    return null;
-  }
-
+  sessionName: string,
+): Promise<Terminal> {
   const ownerId = recordedSession.actorUserId || "unknown";
   const ownerEmail = resolveRecoveredOwnerEmail(
     state,
@@ -1290,6 +1289,10 @@ async function restoreRecordedTmuxSession(
     hasUserPrompted: true,
   });
 
+  // Another path may have attached this id while tmux was queried above.
+  const raced = terminals.get(recordedSession.id);
+  if (raced) return raced;
+
   const restoredTerminal = await createManagedTerminal({
     id: recordedSession.id,
     cwd: recordedSession.cwd || cwd,
@@ -1308,6 +1311,68 @@ async function restoreRecordedTmuxSession(
       ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
       : undefined;
   return restoredTerminal;
+}
+
+// Concurrent GET /api/terminals polls and a WebSocket upgrade can all find
+// the same active row with nothing attached in memory. They share ONE
+// restore: separate restores would each spawn a managed terminal (and a tmux
+// attach client), and all but the last would be orphaned.
+const tmuxRestoreFlights = new Map<string, Promise<Terminal | null>>();
+
+function restoreRecordedTmuxSession(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  if (!TMUX_BACKEND || recordedSession.status !== "active") {
+    return Promise.resolve(null);
+  }
+
+  const id = recordedSession.id;
+  const existing = terminals.get(id);
+  if (existing) return Promise.resolve(existing);
+
+  const inFlight = tmuxRestoreFlights.get(id);
+  if (inFlight) return inFlight;
+
+  // Every caller awaits the returned promise, so a rejection is handled.
+  const flight: Promise<Terminal | null> = restoreRecordedTmuxSessionNow(
+    state,
+    recordedSession,
+  ).finally(() => {
+    if (tmuxRestoreFlights.get(id) === flight) tmuxRestoreFlights.delete(id);
+  });
+  tmuxRestoreFlights.set(id, flight);
+  return flight;
+}
+
+async function restoreRecordedTmuxSessionNow(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  const id = recordedSession.id;
+  const sessionName = buildTmuxSessionName({
+    namespace: TMUX_SESSION_NAMESPACE,
+    terminalId: id,
+  });
+  const liveness = await tmuxSessionLiveness(sessionName);
+  if (liveness === "unknown") {
+    // Not proof the session ended: keep the row, try again on the next ask.
+    warnTmuxLivenessUnknown(id, sessionName);
+    return null;
+  }
+  tmuxLivenessUnknownWarnedAt.delete(id);
+  if (liveness === "missing") {
+    markTerminalSessionEnded(state.db, id);
+    return null;
+  }
+
+  // Re-check after the probe: another path may have attached the id or
+  // ended the row meanwhile.
+  const raced = terminals.get(id);
+  if (raced) return raced;
+  if (getTerminalSession(state.db, id)?.status !== "active") return null;
+
+  return attachRecordedTmuxSession(state, recordedSession, sessionName);
 }
 
 // Debug logger
@@ -2054,6 +2119,21 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   return roots.some(
     (root) => pathValue === root || pathValue.startsWith(`${root}/`),
   );
+}
+
+// Whether a path refused by resolveAllowedPath exists at all, so the denial
+// can say "outside the allowed roots" instead of "outside the allowed roots or
+// does not exist". Legacy (service-account) view only — never consulted under
+// OS isolation, where the service account must not traverse a user's tree.
+async function rejectedPathExists(inputPath: string): Promise<boolean> {
+  if (!inputPath) return false;
+  try {
+    const fs = await import("fs/promises");
+    await fs.stat(resolve(inputPath));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function resolveAllowedPath(
@@ -3389,6 +3469,7 @@ interface ScopedTreeFile {
 
 async function walkScopedFileTree(
   root: string,
+  { maxDepth = TREE_MAX_DEPTH }: { maxDepth?: number } = {},
 ): Promise<{ files: ScopedTreeFile[]; truncated: boolean }> {
   const files: ScopedTreeFile[] = [];
   let truncated = false;
@@ -3452,7 +3533,7 @@ async function walkScopedFileTree(
         if (entryStat.isSymbolicLink()) continue;
 
         if (entryStat.isDirectory()) {
-          if (depth + 1 > TREE_MAX_DEPTH) continue;
+          if (depth + 1 > maxDepth) continue;
           if (dirsVisited >= TREE_MAX_DIRS) {
             truncated = true;
             continue;
@@ -3509,6 +3590,159 @@ async function walkScopedFileTree(
   return { files: finalFiles, truncated };
 }
 
+// ── Quick-open scope (GET /api/files/tree) ───────────────────────────────────
+// Quick-open searches the active PROJECT, never all of $HOME:
+//   - "git":  the cwd is inside a git work tree → the repository's tracked +
+//             untracked-not-ignored files (`git ls-files -co --exclude-standard`).
+//             When the toplevel itself is not an allowed/granted path, git runs
+//             in the cwd instead, which limits the listing to that subtree.
+//   - "dir":  not a repository → the existing bounded walk of the cwd subtree.
+//   - "home": the cwd IS the home directory → its top-level files only.
+// A repository whose toplevel is the home directory (a dotfiles repo) does not
+// count as a project. Paths with a dot segment are skipped (parity with the
+// walk), and every returned path is lstat'ed (plain files only, never a
+// symlink) and realpath'd back inside the scope root.
+type QuickOpenScopeKind = "git" | "dir" | "home";
+const TREE_GIT_TIMEOUT_MS = 3000;
+const TREE_GIT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+
+async function runTreeGit(
+  cwd: string,
+  args: string[],
+): Promise<{ code: number | null; stdout: string; truncated: boolean }> {
+  let proc;
+  try {
+    proc = Bun.spawn(["git", "-c", "core.fsmonitor=false", ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
+    });
+  } catch {
+    return { code: null, stdout: "", truncated: false };
+  }
+  let truncated = false;
+  const timer = setTimeout(() => {
+    truncated = true;
+    proc.kill();
+  }, TREE_GIT_TIMEOUT_MS);
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    const reader = proc.stdout.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (bytes + value.byteLength > TREE_GIT_MAX_OUTPUT_BYTES) {
+        chunks.push(value.subarray(0, TREE_GIT_MAX_OUTPUT_BYTES - bytes));
+        bytes = TREE_GIT_MAX_OUTPUT_BYTES;
+        truncated = true;
+        proc.kill();
+        break;
+      }
+      chunks.push(value);
+      bytes += value.byteLength;
+    }
+  } catch {
+    truncated = true;
+  }
+  const code = await proc.exited;
+  clearTimeout(timer);
+  return {
+    code: truncated ? null : code,
+    stdout: Buffer.concat(chunks).toString("utf8"),
+    truncated,
+  };
+}
+
+async function resolveHomeRealPath(): Promise<string | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  try {
+    return await realpath(home);
+  } catch {
+    return null;
+  }
+}
+
+async function listGitScopedFiles(
+  base: string,
+): Promise<{ files: ScopedTreeFile[]; truncated: boolean }> {
+  const listing = await runTreeGit(base, [
+    "ls-files",
+    "-z",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+  ]);
+  let truncated = listing.truncated;
+  const entries = listing.stdout.split("\0");
+  // A cut-off listing ends mid-path: drop the partial last entry.
+  if (truncated) entries.pop();
+  const isInside = (p: string) => p === base || p.startsWith(`${base}/`);
+  const seen = new Set<string>();
+  const files: ScopedTreeFile[] = [];
+  for (const rel of entries) {
+    if (!rel || seen.has(rel)) continue;
+    seen.add(rel);
+    const segments = rel.split("/");
+    if (segments.some((segment) => !segment || segment.startsWith("."))) {
+      continue;
+    }
+    if (segments.some((segment) => SEARCH_EXCLUDE_DIRS.includes(segment))) {
+      continue;
+    }
+    if (files.length >= TREE_MAX_ENTRIES) {
+      truncated = true;
+      break;
+    }
+    const entryPath = join(base, rel);
+    try {
+      const entryStat = await lstat(entryPath);
+      if (!entryStat.isFile()) continue; // symlinks, gitlinks, deleted paths
+      const real = await realpath(entryPath);
+      if (!isInside(real)) continue;
+      files.push({ path: real, relativePath: rel });
+    } catch {
+      // tracked but deleted from the work tree, or vanished — dropped
+    }
+  }
+  return { files, truncated };
+}
+
+async function resolveQuickOpenScope(
+  c: any,
+  cwd: string,
+): Promise<{ kind: QuickOpenScopeKind; root: string }> {
+  const home = await resolveHomeRealPath();
+  const topLevel = await runTreeGit(cwd, ["rev-parse", "--show-toplevel"]);
+  if (topLevel.code === 0) {
+    const reported = topLevel.stdout.trim();
+    let gitRoot: string | null = null;
+    try {
+      gitRoot = reported ? await realpath(reported) : null;
+    } catch {
+      gitRoot = null;
+    }
+    if (gitRoot && gitRoot !== home) {
+      if (gitRoot === cwd) return { kind: "git", root: cwd };
+      const allowedTop = await resolveAllowedPath(gitRoot);
+      if (allowedTop === gitRoot) {
+        const access = await requireFileAccess(c, gitRoot);
+        if (access.ok) return { kind: "git", root: gitRoot };
+      }
+      return { kind: "git", root: cwd };
+    }
+  }
+  if (home && cwd === home) return { kind: "home", root: cwd };
+  return { kind: "dir", root: cwd };
+}
+
 function resolveFoundationRootIdForPath(
   state: FoundationState,
   pathValue: string,
@@ -3558,7 +3792,7 @@ async function requireFileAccess(
       body: {
         error: "Forbidden path (no matching registered root)",
         reason: "no_matching_root",
-        path: resolvedPath,
+        ...forbiddenRootDetail({ path: resolvedPath, subject: "path" }),
       },
     };
   }
@@ -3675,10 +3909,20 @@ async function resolveScopedFsPath(
   if (ctx.kind === "legacy") {
     const abs = await resolveAllowedPath(clientPath, opts);
     if (!abs) {
+      // resolveAllowedPath also returns null for a path that does not exist
+      // (realpath ENOENT), so the message must not claim it is out of bounds.
       return {
         ok: false,
         status: 403,
-        body: { error: "Forbidden path", reason: "no_matching_root" },
+        body: {
+          error: "Forbidden path",
+          reason: "no_matching_root",
+          ...forbiddenRootDetail({
+            path: clientPath,
+            subject: "path",
+            mayBeMissing: !(await rejectedPathExists(clientPath)),
+          }),
+        },
       };
     }
     const access = await requireFileAccess(c, abs);
@@ -3706,7 +3950,15 @@ async function resolveScopedFsPath(
     return {
       ok: false,
       status: 403,
-      body: { error: "Forbidden path", reason: "no_matching_root" },
+      body: {
+        error: "Forbidden path",
+        reason: "no_matching_root",
+        ...forbiddenRootDetail({
+          path: clientPath,
+          subject: "path",
+          scope: "granted",
+        }),
+      },
     };
   }
   const actor = getCurrentActor(c);
@@ -3734,6 +3986,11 @@ async function resolveScopedFsPath(
     body: lastDeny?.body ?? {
       error: "Forbidden path",
       reason: "no_matching_root",
+      ...forbiddenRootDetail({
+        path: clientPath,
+        subject: "path",
+        scope: "granted",
+      }),
     },
   };
 }
@@ -5183,13 +5440,34 @@ async function createManagedTerminal({
     ? backendForExec(exec)
     : terminalBackend;
 
-  const closeAndRemoveTerminal = (
+  // Identity guard. A re-attach after a detach registers a NEWER handle under
+  // the same id; this handle's exit must never end, close or remove that one.
+  const ownsTerminalSlot = () => {
+    const current = terminals.get(id);
+    return !current || current.terminal === terminal;
+  };
+
+  // `registered` flips when this call puts its handle into `terminals`;
+  // `handleSettled` resolves then, or when the attach fails before that. The
+  // tmux exit path waits for it, so an attach client that dies while the
+  // handle is still being built is not judged against an empty slot.
+  let registered = false;
+  let markHandleSettled!: () => void;
+  const handleSettled = new Promise<void>((resolve) => {
+    markHandleSettled = resolve;
+  });
+
+  const finalizeTerminalExit = (
     exitCode: number,
     signalCode?: number | null,
   ) => {
-    // Deploy detach, not a real terminal exit: the shutdown routine already
-    // closed the sockets and (raw mode only) persisted ended synchronously.
-    if (shutdownInProgress) return;
+    if (!ownsTerminalSlot()) {
+      debug(
+        `Stale attach for terminal ${id} exited; a newer attach owns it, leaving it alone`,
+      );
+      terminal.close();
+      return;
+    }
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -5200,6 +5478,75 @@ async function createManagedTerminal({
     notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
     terminal.close();
+  };
+
+  // The tmux session outlived its attach client: drop this attach only. A
+  // plain close (no exit frame) makes ReconnectingWebSocket reconnect, and
+  // the upgrade lazily re-attaches through restoreRecordedTmuxSession.
+  const detachDeadAttach = (
+    exitCode: number,
+    signalCode: number | null | undefined,
+    sessionName: string,
+    liveness: TmuxSessionLiveness,
+  ) => {
+    console.warn(
+      `[lifecycle] attach client for ${id} exited (code=${exitCode}, signal=${signalCode ?? "none"}) but tmux session ${sessionName} is ${liveness}; detaching, row stays active`,
+    );
+    if (terminals.get(id)?.terminal === terminal) {
+      closeTerminalSockets(id);
+      removeTerminalState(id);
+    }
+    terminal.close();
+  };
+
+  const closeAndRemoveTerminal = (
+    exitCode: number,
+    signalCode?: number | null,
+  ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
+    // Legacy tmux: the PTY is a `tmux attach-session` client, and its exit is
+    // not proof the session ended — detach-client, a stray or child-first
+    // kill, or the OOM killer all leave the pane running. Probe before any
+    // DB write; only a session proven missing is a terminal exit. Raw and
+    // brokered terminals, and linked views (a second client on another
+    // terminal's session, which restore cannot re-attach), keep the direct
+    // path.
+    const probedSessionName = activeSessionName;
+    const reattachable =
+      TMUX_BACKEND &&
+      !exec &&
+      probedSessionName !== undefined &&
+      probedSessionName ===
+        buildTmuxSessionName({
+          namespace: TMUX_SESSION_NAMESPACE,
+          terminalId: id,
+        });
+    if (!reattachable || !tmuxTerminalBackend) {
+      finalizeTerminalExit(exitCode, signalCode);
+      return;
+    }
+    const probe = tmuxTerminalBackend.sessionLiveness(probedSessionName);
+    void Promise.all([probe, handleSettled])
+      .then(([liveness]) => {
+        if (shutdownInProgress) return;
+        // DELETE, the reapers and revocation remove the handle BEFORE they
+        // kill: a registered handle that is gone now was torn down on
+        // purpose, which stays a terminal exit whatever tmux says.
+        const tornDown = registered && !terminals.has(id);
+        if (liveness === "missing" || tornDown) {
+          finalizeTerminalExit(exitCode, signalCode);
+        } else {
+          detachDeadAttach(exitCode, signalCode, probedSessionName, liveness);
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[lifecycle] attach exit handling failed for ${id}:`,
+          err,
+        );
+      });
   };
 
   let tmuxPipePath: string | null = null;
@@ -5222,21 +5569,27 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
-  const attachResult = await backend.attach(attachSessionName, {
-    cwd,
-    cols,
-    rows,
-    terminal,
-    waitForClient: TMUX_BACKEND,
-    exec,
-    onExit(
-      _proc: Subprocess,
-      exitCode: number | null,
-      signalCode?: number | null,
-    ) {
-      closeAndRemoveTerminal(exitCode ?? 0, signalCode);
-    },
-  });
+  let attachResult: TerminalBackendAttachResult;
+  try {
+    attachResult = await backend.attach(attachSessionName, {
+      cwd,
+      cols,
+      rows,
+      terminal,
+      waitForClient: TMUX_BACKEND,
+      exec,
+      onExit(
+        _proc: Subprocess,
+        exitCode: number | null,
+        signalCode?: number | null,
+      ) {
+        closeAndRemoveTerminal(exitCode ?? 0, signalCode);
+      },
+    });
+  } catch (err) {
+    markHandleSettled();
+    throw err;
+  }
   const proc = attachResult.proc as Subprocess;
   tmuxPipePath = attachResult.pipePath ?? tmuxPipePath;
   tmuxPipeOffset = attachResult.pipeOffset ?? tmuxPipeOffset;
@@ -5281,7 +5634,9 @@ async function createManagedTerminal({
   };
 
   terminals.set(id, managedTerminal);
+  registered = true;
   getTerminalSockets(id);
+  markHandleSettled();
   if (initialScrollback) {
     // Recovery keeps the raw snapshot above for runtime-state inference, but
     // the fallback is terminal-bound and therefore needs terminal newlines.
@@ -6837,7 +7192,18 @@ export function createWebApp() {
           reason: "forbidden_root",
           data: { projectRoot: requestedRoot },
         });
-        return c.json({ error: "Forbidden project root" }, 403);
+        return c.json(
+          {
+            error: "Forbidden project root",
+            reason: "forbidden_root",
+            ...forbiddenRootDetail({
+              path: requestedRoot,
+              subject: "project",
+              mayBeMissing: !(await rejectedPathExists(requestedRoot)),
+            }),
+          },
+          403,
+        );
       }
       const access = await requireFileAccess(c, resolvedRoot);
       if (!access.ok) {
@@ -7301,7 +7667,20 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden terminal root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden terminal root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: isOsIsolationEnabled(process.env)
+              ? (body.cwd ?? null)
+              : requestedCwd,
+            subject: "terminal",
+            scope: isOsIsolationEnabled(process.env) ? "granted" : "allowed",
+          }),
+        },
+        403,
+      );
     }
 
     // Lexical (no realpath) root match, same helper requireFileAccess uses.
@@ -7322,6 +7701,7 @@ export function createWebApp() {
         {
           error: "Forbidden path (no matching registered root)",
           reason: "no_matching_root",
+          ...forbiddenRootDetail({ path: resolvedCwd, subject: "terminal" }),
         },
         403,
       );
@@ -8176,7 +8556,19 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root", requestId }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+          }),
+          requestId,
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
@@ -8266,7 +8658,18 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: !(await rejectedPathExists(requestedCwd)),
+          }),
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
@@ -8283,21 +8686,27 @@ export function createWebApp() {
       return c.json(fileAccess.body, { status: fileAccess.status as any });
     }
 
-    const { files, truncated } = await walkScopedFileTree(resolvedRoot);
+    const scope = await resolveQuickOpenScope(c, resolvedRoot);
+    const { files, truncated } =
+      scope.kind === "git"
+        ? await listGitScopedFiles(scope.root)
+        : await walkScopedFileTree(scope.root, {
+            maxDepth: scope.kind === "home" ? 0 : TREE_MAX_DEPTH,
+          });
 
     const state = await getFoundationState();
-    const rootId = resolveFoundationRootIdForPath(state, resolvedRoot);
+    const rootId = resolveFoundationRootIdForPath(state, scope.root);
     writeAuditEvent(state.db, {
       actorUserId: ownerId,
       action: "files.tree",
       resourceType: "root",
-      resourceId: rootId || resolvedRoot,
+      resourceId: rootId || scope.root,
       decision: "allow",
       // DECISION (mirrors files.search): counts only, never the paths.
-      data: { fileCount: files.length, truncated },
+      data: { fileCount: files.length, truncated, scope: scope.kind },
     });
 
-    return c.json({ files, truncated });
+    return c.json({ files, truncated, scope });
   });
 
   // Downloads share a bounded per-actor/global budget with uploads.

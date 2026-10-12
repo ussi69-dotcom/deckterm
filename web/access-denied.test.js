@@ -21,6 +21,55 @@ test("no_matching_root without a path still explains", () => {
   expect(out.text.toLowerCase()).toContain("registered");
 });
 
+test("no_matching_root shows the server's detail naming the path and setting", () => {
+  const out = describeAccessDenied({
+    error: "Forbidden path",
+    reason: "no_matching_root",
+    path: "/srv/elsewhere",
+    setting: "ALLOWED_FILE_ROOTS",
+    message:
+      '"/srv/elsewhere" is outside the allowed roots (ALLOWED_FILE_ROOTS) or does not exist. Use a path inside an allowed root, or add the directory to ALLOWED_FILE_ROOTS in the DeckTerm service environment and restart DeckTerm.',
+  });
+  expect(out.showSetupCta).toBe(true);
+  expect(out.text).toContain("/srv/elsewhere");
+  expect(out.text).toContain("ALLOWED_FILE_ROOTS");
+  expect(out.text.toLowerCase()).toContain("restart");
+});
+
+test("forbidden_root (terminal/search/task) is explained like no_matching_root", () => {
+  const out = describeAccessDenied({
+    error: "Forbidden terminal root",
+    reason: "forbidden_root",
+    path: "/opt/x",
+    setting: "ALLOWED_FILE_ROOTS",
+    message:
+      'Cannot start a terminal in "/opt/x": it is outside the allowed roots (ALLOWED_FILE_ROOTS). Choose a directory inside an allowed root, or add the directory to ALLOWED_FILE_ROOTS in the DeckTerm service environment and restart DeckTerm.',
+  });
+  expect(out.showSetupCta).toBe(true);
+  expect(out.text).toContain('"/opt/x"');
+  expect(out.text).toContain("ALLOWED_FILE_ROOTS");
+
+  const bare = describeAccessDenied({
+    error: "Forbidden search root",
+    reason: "forbidden_root",
+  });
+  expect(bare.showSetupCta).toBe(true);
+  expect(bare.text.toLowerCase()).toContain("allowed root");
+});
+
+test("a server message without a setting is not trusted as the root explanation", () => {
+  // foundation capability denials also carry a generic `message`; only the
+  // root-detail payload (with `setting`) replaces the client wording.
+  const out = describeAccessDenied({
+    error: "Forbidden path",
+    reason: "no_matching_root",
+    path: "/srv/elsewhere",
+    message: "something unrelated",
+  });
+  expect(out.text).not.toContain("something unrelated");
+  expect(out.text).toContain("/srv/elsewhere");
+});
+
 test("bootstrap_required points at finishing setup", () => {
   const out = describeAccessDenied({
     error: "DeckTerm bootstrap required",

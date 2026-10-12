@@ -356,7 +356,7 @@ test("pinLayoutAction inserts available actions into the pinned list", () => {
   );
 
   expect(next.desktopPinned).toEqual(["files", "clipboard", "git", "palette"]);
-  expect(next.mobilePinned).toEqual(["files", "git", "paste"]);
+  expect(next.mobilePinned).toEqual(["files", "git", "paste", "compose"]);
 });
 
 test("unpinLayoutAction removes an action from the pinned list", () => {
@@ -375,7 +375,7 @@ test("unpinLayoutAction removes an action from the pinned list", () => {
   );
 
   expect(next.desktopPinned).toEqual(desktopDefaults);
-  expect(next.mobilePinned).toEqual(["files", "git", "paste"]);
+  expect(next.mobilePinned).toEqual(["files", "git", "paste", "compose"]);
 });
 
 test("reorderLayoutAction moves a pinned action within the same surface", () => {
@@ -395,7 +395,7 @@ test("reorderLayoutAction moves a pinned action within the same surface", () => 
   );
 
   expect(next.desktopPinned).toEqual(["files", "git", "palette", "clipboard"]);
-  expect(next.mobilePinned).toEqual(["files", "git", "paste"]);
+  expect(next.mobilePinned).toEqual(["files", "git", "paste", "compose"]);
   expect(next.desktopPinned).not.toEqual(desktopDefaults);
 });
 
@@ -601,8 +601,9 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(11);
+  expect(overflow).toHaveLength(12);
   expect(overflow).toContain("palette");
+  expect(overflow).toContain("compose");
   expect(overflow).toContain("setup");
   expect(overflow).toContain("settings");
   expect(overflow).toContain("dock-sessions");
@@ -615,4 +616,15 @@ test("overflow actions contain the secondary utilities", () => {
   expect(overflow).not.toContain("font-increase");
   expect(overflow).toContain("help");
   expect(overflow).toContain("linked-view");
+});
+
+test("phones get Compose in the default action bar", () => {
+  expect(getMobilePrimaryActionIds()).toEqual([
+    "files",
+    "git",
+    "paste",
+    "compose",
+    "more",
+  ]);
+  expect(getDesktopPrimaryActionIds()).not.toContain("compose");
 });

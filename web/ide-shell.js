@@ -250,6 +250,17 @@ function reduceActivityClick(state, clickedView, viewIds) {
   return { activeView: clicked, collapsed: false };
 }
 
+// Tooltip for an activity-bar icon: the view title (plus its keyboard
+// shortcut when the view declares one) and, for the active view, what a click
+// does (VS Code: clicking the active view toggles the sidebar). Pure.
+function activityItemTooltip(view, { active = false, collapsed = false } = {}) {
+  if (!view) return "";
+  const title = String(view.title || view.id || "");
+  const label = view.shortcut ? `${title} (${view.shortcut})` : title;
+  if (!active) return label;
+  return `${label}\nClick to ${collapsed ? "show" : "hide"} the sidebar`;
+}
+
 // ── Pure focus-target resolution (DOM-free, unit-tested) ─────────────────────
 
 // Snapshot the focus target before a mode switch into a serializable descriptor,
@@ -420,6 +431,10 @@ class IdeShellController {
       typeof options.resetSidebarSash === "function"
         ? options.resetSidebarSash
         : null;
+    // Notified after the active view / collapsed state is applied, so the app
+    // can keep its toolbar Files/Git active states in step with the sidebar.
+    this.onViewChangeFn =
+      typeof options.onViewChange === "function" ? options.onViewChange : null;
 
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
@@ -631,7 +646,18 @@ class IdeShellController {
           const sel = btn.dataset.view === activeId;
           btn.classList.toggle("active", sel);
           btn.setAttribute("aria-selected", sel ? "true" : "false");
+          btn.dataset.tooltip = activityItemTooltip(
+            this.viewById.get(btn.dataset.view),
+            { active: sel, collapsed },
+          );
         });
+    }
+    if (this.onViewChangeFn) {
+      try {
+        this.onViewChangeFn({ activeView: activeId, collapsed });
+      } catch {
+        // cosmetic sync only
+      }
     }
 
     // Don't (re)mount view bodies while the sidebar is collapsed — they're not
@@ -714,7 +740,12 @@ class IdeShellController {
       btn.className = "ide-activity-item";
       if (view.id === activeId) btn.classList.add("active");
       btn.dataset.view = view.id;
-      btn.title = view.title || view.id;
+      // Styled tooltip (CSS ::after on data-tooltip) instead of the slow,
+      // unstyled native title; aria-label carries the accessible name.
+      btn.dataset.tooltip = activityItemTooltip(view, {
+        active: view.id === activeId,
+        collapsed: this.isSidebarCollapsed(),
+      });
       btn.setAttribute("role", "tab");
       btn.setAttribute("aria-label", view.title || view.id);
       btn.setAttribute(
@@ -1271,6 +1302,7 @@ const IdeShell = {
   normalizeActiveView,
   loadActiveView,
   reduceActivityClick,
+  activityItemTooltip,
   captureFocusTarget,
   resolveFocusTarget,
   captureExplorerState,
@@ -1314,6 +1346,7 @@ if (typeof exports !== "undefined") {
   exports.normalizeActiveView = normalizeActiveView;
   exports.loadActiveView = loadActiveView;
   exports.reduceActivityClick = reduceActivityClick;
+  exports.activityItemTooltip = activityItemTooltip;
   exports.captureFocusTarget = captureFocusTarget;
   exports.resolveFocusTarget = resolveFocusTarget;
   exports.captureExplorerState = captureExplorerState;

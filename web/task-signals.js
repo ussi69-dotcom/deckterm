@@ -219,6 +219,67 @@ function orderSessionsForPanel(sessions, seenMap) {
     .map((entry) => entry.session);
 }
 
+// --- Toast descriptions (rendered by web/toast-service.js) ------------------
+
+const TASK_TOAST_COPY = {
+  complete: { kind: "success", verb: "completed" },
+  failed: { kind: "error", verb: "failed" },
+  "needs-user": { kind: "warning", verb: "needs your input" },
+};
+
+/** Toast model for a task status transition (see diffTaskTransitions). */
+function describeTaskTransitionToast(transition) {
+  const copy = TASK_TOAST_COPY[transition?.to] || TASK_TOAST_COPY["needs-user"];
+  const title =
+    typeof transition?.title === "string" && transition.title.trim()
+      ? transition.title.trim()
+      : "Untitled task";
+  return {
+    key: `task:${transition?.id || title}`,
+    kind: copy.kind,
+    title: `Task ${copy.verb}`,
+    body: title,
+  };
+}
+
+const ATTENTION_TOAST_COPY = {
+  "needs-input": { kind: "warning", title: "Needs your input" },
+  error: { kind: "error", title: "Agent reported an error" },
+  done: { kind: "success", title: "Agent finished" },
+  info: { kind: "info", title: "Notification" },
+};
+
+/**
+ * Whether a fresh agent notification deserves an in-page toast. Hidden tabs
+ * use the system notification path instead; the session you are looking at
+ * already shows its own output, so only a prompt waiting for you toasts there.
+ */
+function shouldToastAttention(attention, { pageVisible = true, isActiveVisible = false } = {}) {
+  const kind = attention?.kind;
+  if (!Object.prototype.hasOwnProperty.call(ATTENTION_TOAST_COPY, kind)) {
+    return false;
+  }
+  if (!pageVisible) return false;
+  if (kind === "needs-input") return true;
+  return !isActiveVisible;
+}
+
+/** Toast model for an agent notification on session `sessionId`. */
+function describeAttentionToast(attention, { sessionId = "", label = "" } = {}) {
+  const copy = ATTENTION_TOAST_COPY[attention?.kind] || ATTENTION_TOAST_COPY.info;
+  const detail = [attention?.title, attention?.body]
+    .map((part) => (typeof part === "string" ? part.trim() : ""))
+    .filter(Boolean)
+    .join(" — ");
+  const where = typeof label === "string" ? label.trim() : "";
+  return {
+    key: `attention:${sessionId}`,
+    kind: copy.kind,
+    title: where ? `${where}: ${copy.title}` : copy.title,
+    body: detail,
+  };
+}
+
 const TaskSignals = {
   computeTaskSignals,
   diffTaskTransitions,
@@ -235,6 +296,9 @@ const TaskSignals = {
   formatActivityAge,
   sessionActivityAt,
   orderSessionsForPanel,
+  describeTaskTransitionToast,
+  shouldToastAttention,
+  describeAttentionToast,
 };
 
 if (typeof window !== "undefined") {
@@ -261,4 +325,7 @@ if (typeof exports !== "undefined") {
   exports.formatActivityAge = formatActivityAge;
   exports.sessionActivityAt = sessionActivityAt;
   exports.orderSessionsForPanel = orderSessionsForPanel;
+  exports.describeTaskTransitionToast = describeTaskTransitionToast;
+  exports.shouldToastAttention = shouldToastAttention;
+  exports.describeAttentionToast = describeAttentionToast;
 }

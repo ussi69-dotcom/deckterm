@@ -1,10 +1,15 @@
 import { test, expect } from "bun:test";
+
 import {
   scmSections,
   scmTotalCount,
   scmDiffModeForSection,
   GitScmViewController,
 } from "./git-scm-view.js";
+
+// Tests below stub global.fetch; restore the real one (never delete it — later
+// test files in the same `bun test` process need it).
+const ORIGINAL_FETCH = global.fetch;
 
 test("scmSections leads with Merge Changes, then the three existing groups, in render order", () => {
   const groups = {
@@ -590,7 +595,7 @@ test("renderMergeFileHtml shows the hint (not buttons) for a UU file before elig
     );
     expect(html).toContain("resolve in terminal");
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
 });
 
@@ -607,7 +612,7 @@ test("fetchConflictEligibility caches eligible:true when the fetched content par
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   const cached = ctl._conflictEligibility.get("u.txt");
   expect(cached.eligible).toBe(true);
@@ -626,7 +631,7 @@ test("fetchConflictEligibility caches eligible:false when the content has no con
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
 });
@@ -642,7 +647,7 @@ test("fetchConflictEligibility caches eligible:false on a fetch failure (never t
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
 });
@@ -659,7 +664,7 @@ test("getConflictEligibility only kicks off ONE in-flight fetch per path+generat
     ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
     ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(fetchCalls).toBe(1);
 });
@@ -678,7 +683,7 @@ test("a cached eligibility from a stale generation is ignored (re-checked, not r
     expect(result).toBe(false); // unresolved-for-this-generation → hint, not buttons
     expect(fetchCalls).toBe(1); // re-checked rather than trusting the stale cache
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
 });
 

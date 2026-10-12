@@ -104,11 +104,14 @@ const TERMINAL_FONT_FAMILY =
 const TERMINAL_LINE_HEIGHT = 1.2;
 // Scrollback-search match highlighting (GitHub-dark yellows; the overview
 // ruler colors are required fields of the SearchAddon decorations API).
-const TERMINAL_SEARCH_DECORATIONS = {
-  matchBackground: "#5a4a00",
-  matchOverviewRuler: "#d29922",
-  activeMatchBackground: "#9e6a03",
-  activeMatchColorOverviewRuler: "#f0c674",
+// Colours live in web/search-overlay.js; this fallback only covers a stale
+// cached copy of that file.
+const TERMINAL_SEARCH_DECORATIONS = window.SearchOverlay
+  ?.SEARCH_DECORATIONS || {
+  matchBackground: "#3d3214",
+  matchOverviewRuler: "#9e6a03",
+  activeMatchBackground: "#b35c00",
+  activeMatchColorOverviewRuler: "#ffd33d",
 };
 const TERMINAL_PADDING_X = 16;
 const TERMINAL_PADDING_Y = 16;
@@ -477,6 +480,15 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     toolsId: "tools-sheet-paste",
     desktopTone: "secondary",
   }),
+  compose: Object.freeze({
+    label: "Compose",
+    icon: "message-square-text",
+    action: "compose",
+    mobileId: "mobile-compose-btn",
+    toolsId: "tools-sheet-compose",
+    desktopTone: "secondary",
+    description: "Write a message in a text box and send it to the terminal",
+  }),
   copy: Object.freeze({
     label: "Copy",
     icon: "copy",
@@ -792,6 +804,14 @@ class ReconnectingWebSocket {
       return true;
     }
     return false;
+  }
+
+  // True when input would go straight out: socket open, nothing queued.
+  isReadyForInput() {
+    return (
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(this.inputQueue && this.inputQueue.length > 0)
+    );
   }
 
   // Send terminal input, queueing it while the transport is not ready. Input
@@ -2423,7 +2443,9 @@ class ExtraKeysManager {
       sequence = sequence.toUpperCase();
     }
 
-    active.ws.send(JSON.stringify({ type: "input", data: sequence }));
+    // Queued send (ReconnectingWebSocket.sendInput): a key tapped while the
+    // socket reconnects is held and flushed in order instead of dropped.
+    active.ws.sendInput(sequence);
     this.resetModifiers();
     // Snap the view back to the prompt on synthetic key input, except for
     // scrollback-navigation keys (PgUp/PgDn). Single source of truth lives in
@@ -2618,6 +2640,7 @@ class ExtraKeysManager {
     const visible = helpers.shouldShowQuickReplies({
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
+      attention: active?.attention ?? null,
     });
     root.dataset.state = helpers.getQuickReplyState({
       agentState: active?.agentState ?? null,
@@ -2693,24 +2716,46 @@ class StatsManager {
   }
 
   updateUI(stats) {
-    if (this.cpuEl) {
-      this.cpuEl.textContent = `${stats.cpu.usage}%`;
-      this.cpuEl.title = `CPU: ${stats.cpu.usage}%`;
-      this.updateClass(this.cpuEl, stats.cpu.usage);
+    // Labelled chips ("CPU 4%") with exact numbers in the tooltip; the pure
+    // formatting lives in web/server-stats-format.js.
+    const describe = window.ServerStatsFormat?.describeServerStats;
+    if (!describe) {
+      this.updateUILegacy(stats);
+      return;
     }
-    if (this.ramEl) {
-      this.ramEl.textContent = `${stats.memory.percent}%`;
-      this.ramEl.title = `RAM: ${stats.memory.percent}%`;
-      this.updateClass(this.ramEl, stats.memory.percent);
-    }
-    if (this.diskEl) {
-      this.diskEl.textContent = `${stats.disk.percent}%`;
-      this.diskEl.title = `Disk: ${stats.disk.percent}%`;
-      this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+    const elements = { cpu: this.cpuEl, ram: this.ramEl, disk: this.diskEl };
+    for (const chip of describe(stats)) {
+      const el = elements[chip.id];
+      if (!el) continue;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = chip.value;
+      else el.textContent = chip.value;
+      el.title = chip.title;
+      el.setAttribute("aria-label", chip.title);
+      el.classList.toggle("warning", chip.level === "warning");
+      el.classList.toggle("danger", chip.level === "danger");
     }
   }
 
+  // Fallback for a stale cached index.html without server-stats-format.js.
+  updateUILegacy(stats) {
+    const set = (el, value, label) => {
+      if (!el) return;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = `${value}%`;
+      else el.textContent = `${value}%`;
+      el.title = `${label}: ${value}%`;
+    };
+    set(this.cpuEl, stats.cpu.usage, "CPU");
+    this.updateClass(this.cpuEl, stats.cpu.usage);
+    set(this.ramEl, stats.memory.percent, "RAM");
+    this.updateClass(this.ramEl, stats.memory.percent);
+    set(this.diskEl, stats.disk.percent, "Disk");
+    this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+  }
+
   updateClass(el, value, warn = 70, danger = 90) {
+    if (!el) return;
     el.classList.remove("warning", "danger");
     if (value >= danger) el.classList.add("danger");
     else if (value >= warn) el.classList.add("warning");
@@ -2728,7 +2773,6 @@ class ClipboardManager {
     this.maxHistory = 20;
     this.maxItemSize = 200 * 1024; // 200KB
     this.panel = null;
-    this.toast = null;
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
@@ -2746,7 +2790,6 @@ class ClipboardManager {
 
   init() {
     this.createPanel();
-    this.createToast();
   }
 
   createPanel() {
@@ -2799,22 +2842,6 @@ class ClipboardManager {
     document.getElementById("app").appendChild(this.panel);
   }
 
-  createToast() {
-    this.toast = document.createElement("div");
-    this.toast.className = "clipboard-toast hidden";
-    this.toast.innerHTML = `
-      <span class="toast-message"></span>
-      <button class="toast-copy">Copy</button>
-    `;
-    document.getElementById("app").appendChild(this.toast);
-
-    this.toast.querySelector(".toast-copy").addEventListener("click", () => {
-      if (this.pendingCopy) {
-        this.copyWithGesture(this.pendingCopy);
-      }
-    });
-  }
-
   // Handle OSC52 from terminal
   handleOsc52(data) {
     // Parse: c;<base64>
@@ -2830,11 +2857,7 @@ class ClipboardManager {
 
       // Size limit check
       if (text.length > this.maxItemSize) {
-        this.showToast(
-          "Content too large. Click to download.",
-          "download",
-          text,
-        );
+        this.showToast("Too large for the clipboard", "download", text);
         return;
       }
 
@@ -2932,7 +2955,12 @@ class ClipboardManager {
     });
   }
 
-  showToast(message, type, data = null) {
+  // Clipboard notices go through the shared toast service under one key, so
+  // a new clipboard notice replaces the previous one instead of stacking.
+  // `type` keeps the historical vocabulary: success | error | pending |
+  // download. "pending" with data offers a Copy action (the async clipboard
+  // needs a user gesture); "download" offers the oversized text as a file.
+  showToast(message, type, data = null, { timeoutMs } = {}) {
     const now = Date.now();
 
     // Debounce success toasts (2 second cooldown)
@@ -2944,23 +2972,68 @@ class ClipboardManager {
       this.lastToastTime = now;
     }
 
-    const toast = this.toast;
-    const msgEl = toast.querySelector(".toast-message");
-    const copyBtn = toast.querySelector(".toast-copy");
-
-    msgEl.textContent = message;
-    toast.className = `clipboard-toast ${type}`;
-    copyBtn.style.display = type === "pending" ? "inline-block" : "none";
-
-    toast.classList.remove("hidden");
-
-    if (type === "success" || type === "error") {
-      setTimeout(() => toast.classList.add("hidden"), 2000);
+    const actions = [];
+    let kind = "info";
+    if (type === "success") kind = "success";
+    else if (type === "error") kind = "error";
+    else if (type === "download") {
+      kind = "warning";
+      if (typeof data === "string") {
+        actions.push({
+          label: "Download",
+          primary: true,
+          run: () => this.downloadText(data),
+        });
+      }
+    } else if (type === "pending") {
+      kind = data ? "info" : "warning";
+      if (data && this.pendingCopy) {
+        actions.push({
+          label: "Copy",
+          primary: true,
+          // copyWithGesture's result replaces this toast via the same key.
+          dismiss: false,
+          run: () => {
+            if (this.pendingCopy) this.copyWithGesture(this.pendingCopy);
+          },
+        });
+      }
     }
+
+    window.ToastService?.show({
+      key: "clipboard",
+      className: "clipboard-toast",
+      kind,
+      title: message,
+      actions,
+      timeoutMs:
+        timeoutMs !== undefined
+          ? timeoutMs
+          : type === "success"
+            ? 2500
+            : undefined,
+    });
   }
 
   hideToast() {
-    this.toast.classList.add("hidden");
+    window.ToastService?.dismiss("clipboard");
+  }
+
+  downloadText(text) {
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `deckterm-clipboard-${Date.now()}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error("Clipboard download failed:", err);
+      this.showToast("Download failed", "error");
+    }
   }
 
   showPanel() {
@@ -3164,7 +3237,7 @@ class ClipboardManager {
   }
 
   async handleImagePaste(blob, terminalWs, terminal = null, inputState = null) {
-    this.showToast("Uploading image...", "pending");
+    this.showToast("Uploading image…", "info", null, { timeoutMs: null });
 
     try {
       const formData = new FormData();
@@ -3256,9 +3329,9 @@ class ClipboardManager {
       }
       return;
     }
-    if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
-      terminalWs.send(JSON.stringify({ type: "input", data: text }));
-    }
+    // No xterm instance to paste through: send the raw text through the
+    // queued input path so a paste during a reconnect is not lost.
+    terminalWs?.sendInput?.(text);
   }
 
   escapeHtml(text) {
@@ -6067,8 +6140,10 @@ class TerminalManager {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
       // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
-      this.fileExplorer.onOpenFile = (path, intent) =>
+      this.fileExplorer.onOpenFile = (path, intent) => {
+        this.recordPaletteFileOpen(path);
         this.handleExplorerOpenFile(path, intent);
+      };
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -6246,6 +6321,106 @@ class TerminalManager {
     document.body.dataset.bootstrapState = isPending ? "pending" : "ready";
     const newButton = document.getElementById("new-terminal");
     if (newButton) newButton.disabled = isPending;
+    // Bootstrap may end with zero terminals (nothing to restore and the
+    // create failed): show the launcher instead of a blank canvas.
+    if (!isPending) this.syncWorkspaceLauncher();
+  }
+
+  // --- Zero-terminal launcher -------------------------------------------------
+  // Shown in #terminal-container whenever no terminal is open (after
+  // bootstrap): New terminal, restorable/recent sessions, recent directories
+  // and key shortcuts. Planning/DOM: web/workspace-launcher.js.
+
+  syncWorkspaceLauncher({ refresh = false } = {}) {
+    if (!window.WorkspaceLauncher || !this.container) return;
+    const show = !this.bootstrapPending && this.terminals.size === 0;
+    let root = document.getElementById("workspace-launcher");
+    if (!show) {
+      if (root) root.hidden = true;
+      this.workspaceLauncherVisible = false;
+      return;
+    }
+    if (!root) {
+      root = document.createElement("div");
+      root.id = "workspace-launcher";
+      root.className = "workspace-launcher";
+      this.container.appendChild(root);
+    }
+    const wasVisible = Boolean(this.workspaceLauncherVisible);
+    root.hidden = false;
+    this.workspaceLauncherVisible = true;
+    if (!wasVisible || refresh) {
+      void this.refreshWorkspaceLauncher({ focus: !wasVisible });
+    }
+  }
+
+  async refreshWorkspaceLauncher({ focus = false } = {}) {
+    const root = document.getElementById("workspace-launcher");
+    if (!root || root.hidden) return;
+    const token = (this.workspaceLauncherToken =
+      (this.workspaceLauncherToken || 0) + 1);
+    // Re-rendering replaces the buttons: remember whether focus was inside so
+    // it can come back (otherwise a refresh drops focus to <body>).
+    const focusNewButton = () =>
+      root
+        .querySelector("#launcher-new-terminal")
+        ?.focus({ preventScroll: true });
+    let keepFocus = focus || root.contains(document.activeElement);
+    // Paint at once from the cached catalog, then again with fresh data.
+    this.renderWorkspaceLauncher(root, { loading: !this._sessionCatalog });
+    if (keepFocus) focusNewButton();
+    try {
+      const res = await fetch("/api/terminals", {
+        headers: { "x-deckterm-client-id": this.clientInstanceId },
+      });
+      if (res.ok) {
+        this._sessionCatalog = await res.json();
+        this.updateSessionsAvailableBadge(this._sessionCatalog);
+      }
+    } catch {
+      // Keep the cached catalog; the launcher still offers New terminal.
+    }
+    if (token !== this.workspaceLauncherToken || root.hidden) return;
+    keepFocus = keepFocus || root.contains(document.activeElement);
+    this.renderWorkspaceLauncher(root, { loading: false });
+    if (keepFocus) focusNewButton();
+  }
+
+  renderWorkspaceLauncher(root, { loading = false } = {}) {
+    const api = window.WorkspaceLauncher;
+    if (!api || !root) return;
+    const catalog = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    const standalone = Boolean(
+      window.matchMedia?.("(display-mode: standalone)")?.matches,
+    );
+    api.renderWorkspaceLauncher(
+      root,
+      document,
+      {
+        loading,
+        sessions: api.planLauncherSessions(catalog, {
+          openIds: [...this.terminals.keys()],
+          titleOf: window.TaskSignals?.sessionDisplayTitle,
+        }),
+        directories: api.planRecentDirectories({
+          currentCwd: this.getCurrentDirectoryValue(),
+          catalog,
+          registry: this.sessionRegistry?.sessions,
+        }),
+        shortcuts: api.planLauncherShortcuts(
+          window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+        ),
+        newHint: api.newTerminalHint({ standalone }),
+      },
+      {
+        onNewTerminal: () => void this.createTerminal(),
+        onSession: (id) => void this.handleSessionRowActivate(id),
+        onDirectory: (cwd) => void this.createTerminal(false, { cwd }),
+      },
+    );
+    initLucideIcons();
   }
 
   setupViewportResizeHandling() {
@@ -6517,11 +6692,19 @@ class TerminalManager {
     }
 
     const tabCount = tabs.querySelectorAll(".tab").length;
-    const preferredTabWidth =
+    const availableWidth = Math.floor(tabs.getBoundingClientRect().width || 0);
+    const baseTabWidth =
       tabCount <= 1 ? 280 : tabCount <= 2 ? 240 : tabCount <= 3 ? 200 : 160;
+    // Wide screens: let tabs grow into the free strip (up to 360px, sharing
+    // it as if there were one more tab, so a lone tab stays wider than each
+    // of two) instead of leaving a dead gap before the directory field.
+    const preferredTabWidth = Math.max(
+      baseTabWidth,
+      Math.min(360, Math.floor(availableWidth / (tabCount + 1)) - 4),
+    );
     return (
       this.navigationSurface.getDesktopTabLayoutByWidth?.({
-        availableWidth: Math.floor(tabs.getBoundingClientRect().width || 0),
+        availableWidth,
         tabCount,
         preferredTabWidth,
         minTabWidth: 96,
@@ -6974,15 +7157,28 @@ class TerminalManager {
     // Windowed surfaces can be open simultaneously; the exclusive
     // right-surface notion only applies to the mobile sheets.
     const windowed = this.isWindowedSurfaces();
-    const filesOpen = windowed
+    let filesOpen = windowed
       ? Boolean(this.fileExplorer?.isOpen)
       : surface === "files";
-    const gitOpen = windowed
+    let gitOpen = windowed
       ? Boolean(
           window.gitManager &&
           !window.gitManager.panel?.classList.contains("hidden"),
         )
       : surface === "git";
+    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
+    // permanently "open" there, so its isOpen flag would keep Files lit).
+    const ideMode = this.isIdeModeActive();
+    if (ideMode && this.ideShell) {
+      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
+      const view = this.ideShell.activeView?.();
+      filesOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
+      gitOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
+    }
 
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
@@ -7005,6 +7201,19 @@ class TerminalManager {
         button.classList.toggle("active", paletteOpen);
       } else if (actionId === "dock-sessions") {
         button.classList.toggle("active", Boolean(this.dockState?.enabled));
+      } else if (actionId === "ide") {
+        button.classList.toggle("active", ideMode);
+        button.setAttribute("aria-pressed", ideMode ? "true" : "false");
+      }
+      // Files/Git toolbar buttons are toggles: announce the state too.
+      if (
+        button.classList.contains("toolbar-action-btn") &&
+        (actionId === "files" || actionId === "git")
+      ) {
+        button.setAttribute(
+          "aria-pressed",
+          button.classList.contains("active") ? "true" : "false",
+        );
       }
     });
   }
@@ -7021,6 +7230,7 @@ class TerminalManager {
     else if (action === "clipboard") this.clipboardManager.togglePanel();
     else if (action === "copy") this.copySelection();
     else if (action === "paste") await this.pasteClipboard();
+    else if (action === "compose") this.openComposeSheet();
     else if (action === "font-decrease") this.changeFontSize(-1);
     else if (action === "font-increase") this.changeFontSize(1);
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
@@ -7221,6 +7431,10 @@ class TerminalManager {
     panel
       .querySelector("#sessions-refresh-btn")
       ?.addEventListener("click", () => this.refreshSessionsPanel());
+    panel.querySelector("#sessions-new-btn")?.addEventListener("click", () => {
+      this.closeSessionsPanel({ restoreFocus: false });
+      void this.createTerminal();
+    });
     panel.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -8712,28 +8926,21 @@ class TerminalManager {
     this.taskSignalLast = Array.isArray(tasks) ? tasks : [];
   }
 
+  // Shared toast entry point (web/toast-service.js). Returns the toast handle,
+  // or null when the service is unavailable (e.g. a stale cached script).
+  notify(options) {
+    return window.ToastService?.show?.(options) ?? null;
+  }
+
   showTaskToast(transition) {
-    let toast = document.getElementById("task-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "task-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        void this.openTaskPanel();
-      });
-      document.getElementById("app")?.appendChild(toast);
-    }
-    const verb =
-      transition.to === "complete"
-        ? "completed ✅"
-        : transition.to === "failed"
-          ? "failed ❌"
-          : "needs your input ⏸";
-    toast.textContent = `Task "${transition.title}" ${verb}`;
-    toast.classList.remove("hidden");
-    clearTimeout(this.taskToastTimer);
-    this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
+    const describe = window.TaskSignals?.describeTaskTransitionToast;
+    if (typeof describe !== "function") return;
+    this.notify({
+      ...describe(transition),
+      actions: [
+        { label: "Open", run: () => void this.openTaskPanel() },
+      ],
+    });
   }
 
   getTaskViewMode() {
@@ -8768,14 +8975,55 @@ class TerminalManager {
     const toggle = document.getElementById("task-view-toggle");
     if (!toggle) return;
     const mode = this.getTaskViewMode();
-    toggle.textContent = mode === "board" ? "☰ List" : "▦ Board";
-    toggle.title =
-      mode === "board" ? "Switch to list view" : "Switch to board view";
+    const content = window.TaskBoard?.taskViewToggleContent?.({ mode }) || {
+      icon: mode === "board" ? "list" : "layout-grid",
+      label: mode === "board" ? "List" : "Board",
+      title: mode === "board" ? "Switch to list view" : "Switch to board view",
+    };
+    toggle.title = content.title;
+    if (toggle.dataset.label === content.label) return;
+    toggle.dataset.label = content.label;
+    const icon = document.createElement("i");
+    icon.dataset.lucide = content.icon;
+    const label = document.createElement("span");
+    label.textContent = content.label;
+    toggle.replaceChildren(icon, label);
+    initLucideIcons();
+  }
+
+  // Calm "no tasks" state for the floating panel (shared copy: task-board.js).
+  renderTaskEmptyState(list) {
+    const state = window.TaskBoard?.taskEmptyState?.({ surface: "panel" }) || {
+      icon: "list-checks",
+      title: "No tasks yet",
+      hint: "",
+    };
+    const empty = document.createElement("div");
+    empty.className = "task-empty-state";
+    const icon = document.createElement("i");
+    icon.dataset.lucide = state.icon;
+    const title = document.createElement("p");
+    title.className = "task-empty-title";
+    title.textContent = state.title;
+    empty.append(icon, title);
+    if (state.hint) {
+      const hint = document.createElement("p");
+      hint.className = "task-empty-hint";
+      hint.textContent = state.hint;
+      empty.appendChild(hint);
+    }
+    list.appendChild(empty);
+    initLucideIcons();
   }
 
   renderTasks() {
     this.syncTaskViewToggle();
-    if (this.getTaskViewMode() === "board") {
+    // Zero tasks: one calm empty state in either view (five empty "(0)"
+    // board columns say nothing useful).
+    if (
+      this.getTaskViewMode() === "board" &&
+      this.taskState.items.length > 0
+    ) {
       this.renderTaskBoard();
       return;
     }
@@ -8785,10 +9033,7 @@ class TerminalManager {
     list.replaceChildren();
 
     if (this.taskState.items.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "task-item-meta";
-      empty.textContent = "No tasks";
-      list.appendChild(empty);
+      this.renderTaskEmptyState(list);
       this.renderTaskDetail(null);
       return;
     }
@@ -9760,11 +10005,16 @@ class TerminalManager {
     }
 
     this.commandPaletteRegistry = new ActionRegistryCtor();
+    this.paletteMru =
+      window.PaletteProviders?.createPaletteMruStore?.(window.localStorage) ||
+      null;
     this.commandPalette = new CommandPaletteCtor({
       root,
       input,
       results,
       registry: this.commandPaletteRegistry,
+      onRun: (result) => this.recordPaletteUse(result),
+      rankOf: (result) => this.getPaletteUseRank(result),
     });
 
     root.addEventListener("click", (event) => {
@@ -9868,6 +10118,63 @@ class TerminalManager {
 
   getCommandPaletteQuery() {
     return String(this.commandPalette?.input?.value || "").trim();
+  }
+
+  // Palette MRU: files opened (absolute paths) and commands run (action ids).
+  recordPaletteUse(result) {
+    const id = String(result?.id || "");
+    if (!id || !this.paletteMru) return;
+    if (id.startsWith("quick-open:") || id.startsWith("recent-file:")) {
+      return; // recorded by the file open itself (recordPaletteFileOpen)
+    }
+    this.paletteMru.touch("commands", id);
+  }
+
+  recordPaletteFileOpen(path) {
+    if (path) this.paletteMru?.touch("files", String(path));
+  }
+
+  getPaletteUseRank(result) {
+    const id = String(result?.id || "");
+    if (!this.paletteMru || !id) return -1;
+    if (id.startsWith("recent-file:")) {
+      return this.paletteMru.rankOf("files", id.slice("recent-file:".length));
+    }
+    return this.paletteMru.rankOf("commands", id);
+  }
+
+  openFileFromPalette(path) {
+    this.recordPaletteFileOpen(path);
+    this.handleExplorerOpenFile(path, { pinned: true });
+  }
+
+  paletteFileIcon(name) {
+    return (
+      window.FileExplorerController?.fileIconName?.({ name, isDir: false }) ||
+      "file"
+    );
+  }
+
+  // Quick-open file row: basename as the title, its directory (relative to
+  // the searched project) as the dim detail.
+  buildPaletteFileAction(file, { id, keywords, priority, detailPrefix = "" }) {
+    const split = window.PaletteProviders.splitFilePath(
+      file.relativePath || file.path,
+    );
+    const truncate = window.PaletteProviders.truncatePathMiddle;
+    const detail = [detailPrefix, split.dir ? truncate(split.dir, 56) : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return {
+      id,
+      title: split.base || file.path,
+      group: "Files",
+      icon: this.paletteFileIcon(split.base),
+      keywords,
+      meta: detail ? [detail] : null,
+      priority,
+      run: () => this.openFileFromPalette(file.path),
+    };
   }
 
   isPaletteDirectoryQuery(query) {
@@ -9983,6 +10290,8 @@ class TerminalManager {
         id: "new-terminal",
         title: "New Terminal",
         group: "Actions",
+        icon: "square-terminal",
+        keybinding: "Ctrl+N",
         keywords: ["workspace", "shell", "tab"],
         priority: 50,
         run: () => this.createTerminal(),
@@ -9991,6 +10300,8 @@ class TerminalManager {
         id: "split-workspace",
         title: "Split Workspace",
         group: "Actions",
+        icon: "columns-2",
+        keybinding: "Ctrl+Shift+D",
         keywords: ["split", "pane", "terminal"],
         priority: 45,
         run: () => this.splitWorkspace(),
@@ -9999,6 +10310,7 @@ class TerminalManager {
         id: "detach-terminal-pane",
         title: "Move Pane to New Tab",
         group: "Actions",
+        icon: "square-arrow-out-up-right",
         keywords: ["detach", "unmerge", "ungroup", "pane", "tab"],
         priority: 45,
         run: () => this.detachTerminalToWorkspace(),
@@ -10007,6 +10319,7 @@ class TerminalManager {
         id: "new-task-workspace",
         title: "New Task Workspace",
         group: "Actions",
+        icon: "bot",
         keywords: ["agent", "worker", "judge", "task"],
         priority: 44,
         run: () => this.openTaskPanel({ focusTitle: true }),
@@ -10015,6 +10328,7 @@ class TerminalManager {
         id: "open-tasks",
         title: "Open Tasks",
         group: "Actions",
+        icon: "list-todo",
         keywords: ["agent", "runner", "worker", "judge"],
         priority: 43,
         run: () => this.openTaskPanel(),
@@ -10023,6 +10337,7 @@ class TerminalManager {
         id: "open-git",
         title: "Open Git",
         group: "Actions",
+        icon: "git-branch",
         keywords: ["repo", "branch", "diff"],
         priority: 40,
         run: () => this.openGitPanel(),
@@ -10031,14 +10346,24 @@ class TerminalManager {
         id: "open-file-manager",
         title: "Open File Manager",
         group: "Actions",
+        icon: "folder-open",
         keywords: ["files", "explorer", "browse"],
         priority: 40,
         run: () => this.openFileExplorer(),
       },
       {
+        id: "compose-message",
+        title: "Compose message…",
+        group: "Actions",
+        keywords: ["compose", "write", "message", "prompt", "send", "dictate"],
+        priority: 35,
+        run: () => this.openComposeSheet(),
+      },
+      {
         id: "open-clipboard",
         title: "Open Clipboard",
         group: "Actions",
+        icon: "clipboard",
         keywords: ["paste", "copy", "history"],
         priority: 30,
         run: () => this.clipboardManager.togglePanel(),
@@ -10047,6 +10372,7 @@ class TerminalManager {
         id: "open-settings",
         title: "Open Settings",
         group: "Actions",
+        icon: "settings",
         keywords: ["settings", "preferences", "config", "options"],
         priority: 35,
         run: () => this.openSettings(),
@@ -10055,6 +10381,8 @@ class TerminalManager {
         id: "search-terminal",
         title: "Search in Terminal",
         group: "Views",
+        icon: "search",
+        keybinding: "Ctrl+F",
         keywords: ["find", "search", "terminal"],
         run: () => this.openTerminalSearch(),
       },
@@ -10062,6 +10390,7 @@ class TerminalManager {
         id: "toggle-line-wrap",
         title: "Toggle Line Wrap",
         group: "Views",
+        icon: "wrap-text",
         keywords: ["wrap", "lines", "overflow"],
         run: () => this.toggleWrapLines(),
       },
@@ -10069,6 +10398,7 @@ class TerminalManager {
         id: "toggle-sessions-dock",
         title: "Dock Sessions to Bottom",
         group: "Views",
+        icon: "panel-bottom",
         keywords: ["dock", "panel", "bottom", "sessions", "terminal"],
         run: () => this.toggleSessionsDock(),
       },
@@ -10076,6 +10406,8 @@ class TerminalManager {
         id: "toggle-fullscreen",
         title: "Toggle Fullscreen",
         group: "Views",
+        icon: "maximize",
+        keybinding: "F11",
         keywords: ["fullscreen", "focus", "zen"],
         run: () => this.toggleFullscreen(),
       },
@@ -10083,6 +10415,8 @@ class TerminalManager {
         id: "font-increase",
         title: "Increase Font Size",
         group: "Views",
+        icon: "zoom-in",
+        keybinding: "Ctrl+=",
         keywords: ["zoom", "font", "larger"],
         run: () => this.changeFontSize(1),
       },
@@ -10090,6 +10424,8 @@ class TerminalManager {
         id: "font-decrease",
         title: "Decrease Font Size",
         group: "Views",
+        icon: "zoom-out",
+        keybinding: "Ctrl+-",
         keywords: ["zoom", "font", "smaller"],
         run: () => this.changeFontSize(-1),
       },
@@ -10097,6 +10433,8 @@ class TerminalManager {
         id: "open-help",
         title: "Open Help",
         group: "Views",
+        icon: "circle-help",
+        keybinding: "F1",
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
@@ -10104,6 +10442,7 @@ class TerminalManager {
         id: "toggle-ide-mode",
         title: "Toggle IDE Mode",
         group: "Views",
+        icon: "layout-panel-left",
         keywords: ["ide", "editor", "mode", "workspace"],
         run: () => this.toggleIdeMode(),
       },
@@ -10122,6 +10461,7 @@ class TerminalManager {
           id: `go-to-directory:${query}`,
           title: "Go to Directory...",
           group: "Actions",
+          icon: "folder-input",
           keywords: [query, "directory", "cwd", "jump", "open path"],
           meta: [query],
           priority: 48,
@@ -10138,26 +10478,45 @@ class TerminalManager {
     // comes from this provider via descending priority.
     this.commandPaletteRegistry.registerProvider((context = {}) => {
       const query = this.getCommandPaletteQuery();
-      if (!this.isPaletteBareQuery(query)) return [];
-
       const files = Array.isArray(context.quickOpenFiles)
         ? context.quickOpenFiles
         : [];
+
+      // Empty query: the few most recently opened files of this project.
+      if (!query) {
+        const byPath = new Map(files.map((file) => [file.path, file]));
+        return (this.paletteMru?.list("files") || [])
+          .map((path) => byPath.get(path))
+          .filter(Boolean)
+          .slice(0, 5)
+          .map((file, index) =>
+            this.buildPaletteFileAction(file, {
+              id: `recent-file:${file.path}`,
+              keywords: [],
+              priority: 30 - index,
+              detailPrefix: "recent",
+            }),
+          );
+      }
+      if (!this.isPaletteBareQuery(query)) return [];
+
       const matches = window.PaletteProviders.filterQuickOpenFiles(
         query,
         files,
         50,
+        {
+          mruRank: (file) =>
+            this.paletteMru ? this.paletteMru.rankOf("files", file.path) : -1,
+        },
       );
 
-      return matches.map((file, index) => ({
-        id: `quick-open:${file.path}`,
-        title: file.relativePath || file.path,
-        group: "Files",
-        keywords: [query],
-        meta: [file.path],
-        priority: 50 - index,
-        run: () => this.handleExplorerOpenFile(file.path, { pinned: true }),
-      }));
+      return matches.map((file, index) =>
+        this.buildPaletteFileAction(file, {
+          id: `quick-open:${file.path}`,
+          keywords: [query],
+          priority: 50 - index,
+        }),
+      );
     });
 
     this.commandPaletteRegistry.registerProvider((context = {}) => {
@@ -10167,7 +10526,7 @@ class TerminalManager {
       });
 
       if (newFolderAction) {
-        contextualActions.push(newFolderAction);
+        contextualActions.push({ icon: "folder-plus", ...newFolderAction });
       }
 
       if (context.canCreateLinkedView) {
@@ -10175,6 +10534,7 @@ class TerminalManager {
           id: "open-linked-view",
           title: "Open Linked View",
           group: "Contextual",
+          icon: "link",
           keywords: ["tmux", "linked", "shared"],
           run: () => this.createLinkedView(),
         });
@@ -10185,6 +10545,7 @@ class TerminalManager {
           id: "toggle-extra-keys",
           title: "Toggle Extra Keys",
           group: "Contextual",
+          icon: "keyboard",
           keywords: ["keyboard", "modifiers", "mobile"],
           meta: context.extraKeysVisible ? ["Visible"] : ["Hidden"],
           run: () => this.extraKeys?.toggle(),
@@ -10196,8 +10557,9 @@ class TerminalManager {
           id: `reveal-cwd:${context.cwd}`,
           title: "Reveal Current CWD in Files",
           group: "Contextual",
+          icon: "folder-search",
           keywords: ["files", "explorer", "cwd", "reveal", context.cwd],
-          meta: [context.cwd],
+          meta: [window.PaletteProviders.truncatePathMiddle(context.cwd, 56)],
           priority: 38,
           run: () => this.revealCurrentCwdInFilesFromPalette(context.cwd),
         });
@@ -10208,6 +10570,7 @@ class TerminalManager {
           id: `checkout-git-branch:${context.cwd}`,
           title: "Checkout Git Branch",
           group: "Contextual",
+          icon: "git-branch",
           keywords: ["checkout", "branch", "git", context.cwd],
           meta: context.currentGitBranch
             ? [`Current: ${context.currentGitBranch}`]
@@ -10221,14 +10584,14 @@ class TerminalManager {
         openGitBranches: (cwd) => this.openGitBranchesFromPalette(cwd),
       });
       if (openGitBranchesAction) {
-        contextualActions.push(openGitBranchesAction);
+        contextualActions.push({ icon: "git-branch", ...openGitBranchesAction });
       }
 
       contextualActions.push(
         ...buildGitBranchActions(context, {
           switchBranch: (cwd, branch) =>
             this.switchGitBranchFromPalette(cwd, branch),
-        }),
+        }).map((action) => ({ icon: "git-branch", ...action })),
       );
 
       if (context.paneCount > 1) {
@@ -10237,6 +10600,8 @@ class TerminalManager {
             id: "focus-next-pane",
             title: "Focus Next Pane",
             group: "Contextual",
+            icon: "arrow-down",
+            keybinding: "Alt+Shift+↓",
             keywords: ["pane", "terminal", "next", "down"],
             run: () => this.switchToAdjacentPane(1),
           },
@@ -10244,6 +10609,8 @@ class TerminalManager {
             id: "focus-previous-pane",
             title: "Focus Previous Pane",
             group: "Contextual",
+            icon: "arrow-up",
+            keybinding: "Alt+Shift+↑",
             keywords: ["pane", "terminal", "previous", "up"],
             run: () => this.switchToAdjacentPane(-1),
           },
@@ -10257,6 +10624,7 @@ class TerminalManager {
           id: "close-editor-tab",
           title: "Close Editor Tab",
           group: "Contextual",
+          icon: "x",
           keywords: ["editor", "tab", "close"],
           run: () => this.closeActiveEditorTabFromPalette(),
         });
@@ -10264,6 +10632,7 @@ class TerminalManager {
           id: "next-editor-tab",
           title: "Next Editor Tab",
           group: "Contextual",
+          icon: "chevron-right",
           keywords: ["editor", "tab", "next"],
           run: () => this.stepActiveEditorTab(1),
         });
@@ -10271,6 +10640,7 @@ class TerminalManager {
           id: "previous-editor-tab",
           title: "Previous Editor Tab",
           group: "Contextual",
+          icon: "chevron-left",
           keywords: ["editor", "tab", "previous", "prev"],
           run: () => this.stepActiveEditorTab(-1),
         });
@@ -10281,6 +10651,7 @@ class TerminalManager {
           id: "open-task-board-tab",
           title: "Open Task Board",
           group: "Contextual",
+          icon: "square-kanban",
           keywords: ["tasks", "board", "kanban", "agent"],
           run: () => this.openTaskBoardTab(),
         });
@@ -10290,37 +10661,27 @@ class TerminalManager {
     });
 
     this.commandPaletteRegistry.registerProvider(() => {
+      const truncate = window.PaletteProviders.truncatePathMiddle;
       return this.loadRecentWorkspaceEntries()
         .map((entry) => {
           const cwd = this.normalizeWorkspaceCwd(entry.cwd);
           if (!cwd) return null;
-
-          const existingWorkspaceId = this.findWorkspaceIdByCwd(cwd);
-          const activeWorkspaceId = this.terminals.get(
-            this.activeId,
-          )?.workspaceId;
-          const metadata = [entry.label];
-
-          if (entry.label !== cwd) {
-            metadata.push(cwd);
-          }
-          if (existingWorkspaceId === activeWorkspaceId) {
-            metadata.push("Active");
-          } else if (existingWorkspaceId) {
-            metadata.push("Open");
-          }
+          // An open workspace in this cwd already has its own row below;
+          // listing it again as "recent" would only duplicate it.
+          if (this.findWorkspaceIdByCwd(cwd)) return null;
 
           return {
             id: `recent-workspace:${cwd}`,
-            title: "Recent Workspace",
+            title: entry.label || this.formatCwdLabel(cwd),
             group: "Workspaces",
+            icon: "history",
             keywords: [
               entry.label,
               cwd,
               `recent ${entry.label}`,
               "recent workspace",
             ],
-            meta: metadata,
+            meta: ["Recent workspace", truncate(cwd, 56)],
             priority: 42,
             run: () => this.switchOrCreateWorkspaceForCwd(cwd),
           };
@@ -10348,7 +10709,9 @@ class TerminalManager {
             metadata.push("Active");
           }
           if (snapshot.cwd) {
-            metadata.push(snapshot.cwd);
+            metadata.push(
+              window.PaletteProviders.truncatePathMiddle(snapshot.cwd, 56),
+            );
           }
           if (snapshot.count > 1) {
             metadata.push(`${snapshot.count} terminals`);
@@ -10361,6 +10724,7 @@ class TerminalManager {
             id: `workspace:${workspaceId}`,
             title: label,
             group: "Workspaces",
+            icon: "square-terminal",
             keywords: [
               workspaceId,
               index,
@@ -10396,19 +10760,22 @@ class TerminalManager {
           window.SessionActions.planSessionRowAction(session, options),
       });
 
-      return entries.map((entry, index) => ({
-        id: `palette-session:${entry.session.id}`,
-        title: this.formatCwdLabel(entry.session.cwd) || entry.session.id,
-        group: "Sessions",
-        keywords: [query],
-        meta: [
-          entry.plan.label,
-          entry.plan.statusClass === "active" ? "● live" : "○ ended",
-          entry.session.id,
-        ],
-        priority: 100 - index,
-        run: () => void this.handleSessionRowActivate(entry.session.id),
-      }));
+      return entries.map((entry, index) => {
+        const described = window.PaletteProviders.describePaletteSession(
+          entry.session,
+          entry.plan,
+        );
+        return {
+          id: `palette-session:${entry.session.id}`,
+          title: described.title,
+          group: "Sessions",
+          icon: entry.session.agentName ? "bot" : "square-terminal",
+          keywords: [query],
+          meta: [described.hint, described.detail],
+          priority: 100 - index,
+          run: () => void this.handleSessionRowActivate(entry.session.id),
+        };
+      });
     });
 
     // "$" mode — saved commands (localStorage), run in the active terminal.
@@ -10429,6 +10796,7 @@ class TerminalManager {
         id: `palette-command:${entry.name}`,
         title: entry.name,
         group: "Commands",
+        icon: "terminal",
         keywords: [query],
         meta: [entry.command],
         priority: 100 - index,
@@ -10439,6 +10807,7 @@ class TerminalManager {
         id: "palette-command-save",
         title: "Save command…",
         group: "Commands",
+        icon: "bookmark",
         keywords: [query],
         meta: ["new $ shortcut"],
         priority: 1,
@@ -10449,6 +10818,7 @@ class TerminalManager {
           id: "palette-command-remove",
           title: "Remove command…",
           group: "Commands",
+          icon: "trash-2",
           keywords: [query],
           meta: ["delete a $ shortcut"],
           priority: 0,
@@ -10462,7 +10832,9 @@ class TerminalManager {
   runSavedCommand(command) {
     const active = this.getActiveTerminal();
     if (!active?.ws) return;
-    active.ws.send(JSON.stringify({ type: "input", data: `${command}\r` }));
+    // Queued send: a saved command run while the socket reconnects is held
+    // (bounded 8 KB / 15 s) and flushed in order, not silently dropped.
+    active.ws.sendInput(`${command}\r`);
     active.terminal?.focus();
   }
 
@@ -10987,7 +11359,7 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
-          this.applyTerminalAttention(terminal, next);
+          this.applyTerminalAttention(terminal, next, id);
           // Under tmux the server reads the pane's live cwd on every poll, so
           // it is authoritative (bash emits no OSC 7 and tmux would not
           // forward it). The raw backend only knows the spawn cwd, so there
@@ -11377,7 +11749,7 @@ class TerminalManager {
   // it has shown per session (localStorage) so tabs and the app badge mark
   // only unseen events. Alerts reuse the completion sound/notification path.
 
-  applyTerminalAttention(terminal, next) {
+  applyTerminalAttention(terminal, next, id = terminal?.id) {
     const signals = window.TaskSignals;
     // A stale cached task-signals.js (older than this app.js) lacks the
     // attention helpers: skip attention rather than break telemetry refresh.
@@ -11388,7 +11760,47 @@ class TerminalManager {
     terminal.attention = next?.attention || null;
     terminal.progress = signals.normalizeProgress(next?.progress);
     terminal.lastActivityAt = Number(next?.lastActivityAt) || null;
-    if (fresh) this.maybeNotifyAttention(terminal, fresh);
+    if (fresh) {
+      this.maybeNotifyAttention(terminal, fresh);
+      this.maybeToastAttention(id, terminal, fresh);
+    }
+  }
+
+  // In-page toast for a fresh agent notification while the page is visible
+  // (hidden tabs get the system notification above). Open jumps to it.
+  maybeToastAttention(id, terminal, attention) {
+    const signals = window.TaskSignals;
+    if (
+      !id ||
+      typeof signals?.shouldToastAttention !== "function" ||
+      typeof signals?.describeAttentionToast !== "function"
+    ) {
+      return;
+    }
+    const show = signals.shouldToastAttention(attention, {
+      pageVisible: document.visibilityState === "visible",
+      isActiveVisible: id === this.getActiveVisibleTerminalId(),
+    });
+    if (!show) return;
+    const actions =
+      id === this.activeId
+        ? []
+        : [
+            {
+              label: "Open",
+              primary: true,
+              run: () => {
+                if (this.terminals.has(id)) this.switchTo(id);
+              },
+            },
+          ];
+    this.notify({
+      ...signals.describeAttentionToast(attention, {
+        sessionId: id,
+        label: this.formatCwdLabel(terminal.cwd || "") || "Terminal",
+      }),
+      actions,
+    });
   }
 
   maybeNotifyAttention(terminal, attention) {
@@ -11774,17 +12186,39 @@ class TerminalManager {
       helpModal.addEventListener("click", (e) => {
         if (e.target === helpModal) this.closeHelp();
       });
+      helpModal.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeHelp({ refocus: true });
+      });
     }
+  }
+
+  // Rows come from web/keyboard-shortcuts.js (one list, no hand-kept table).
+  renderHelpShortcuts() {
+    const shortcuts = window.KeyboardShortcuts;
+    const container = document.getElementById("help-shortcuts");
+    if (!shortcuts || !container || container.childElementCount) return;
+    shortcuts.renderHelpShortcuts(container, document);
+    const footnote = document.getElementById("help-footnote");
+    if (footnote) footnote.textContent = shortcuts.SHORTCUT_FOOTNOTE || "";
   }
 
   openHelp() {
     this.closeToolsSheet();
-    document.getElementById("help-modal")?.classList.remove("hidden");
+    this.renderHelpShortcuts();
+    const modal = document.getElementById("help-modal");
+    modal?.classList.remove("hidden");
+    document.getElementById("help-close")?.focus({ preventScroll: true });
     this.syncSurfaceButtonState();
   }
 
-  closeHelp() {
-    document.getElementById("help-modal")?.classList.add("hidden");
+  closeHelp({ refocus = false } = {}) {
+    const modal = document.getElementById("help-modal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    modal.classList.add("hidden");
+    if (refocus) this.getActiveTerminal()?.terminal?.focus();
   }
 
   getActiveWorkspaceContext() {
@@ -11944,6 +12378,19 @@ class TerminalManager {
     return this.surfaceWindowManager;
   }
 
+  // The Sessions/Setup sheets and the More sheet stack above the floating
+  // windows (styles.css) with a backdrop that dims them. A window opened while
+  // one of those sheets is up (palette action, shortcut) would land under that
+  // backdrop, so opening a window dismisses the sheets first.
+  closeOverlaySheetsForWindow() {
+    const isOpen = (el) => Boolean(el && !el.classList.contains("hidden"));
+    if (isOpen(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (isOpen(this.getSetupPanel())) this.closeSetupPanel();
+    if (isOpen(this.toolsSheet)) this.closeToolsSheet();
+  }
+
   async openSurfaceWindow(id, config) {
     const manager = await this.ensureSurfaceWindowManager();
     if (!manager) return null;
@@ -11958,6 +12405,7 @@ class TerminalManager {
     ) {
       win.bodyEl.appendChild(config.contentEl);
     }
+    this.closeOverlaySheetsForWindow();
     manager.open(id);
     return win;
   }
@@ -12160,6 +12608,7 @@ class TerminalManager {
       beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
+      onViewChange: () => this.syncSurfaceButtonState(),
       // Refit terminals + re-render the explorer after the container resizes.
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));
@@ -12408,12 +12857,21 @@ class TerminalManager {
     // Wrap save() with a minimal success toast (failures already surface their
     // own alert from mountInto's save). The Mod-s keymap inside the editor view
     // routes through this wrapped handle, so a successful Ctrl/Cmd+S flashes
-    // "Saved ✓" — keeping feedback cheap without a status bar.
+    // "Saved" — keeping feedback cheap without a status bar. Autosave also
+    // goes through this wrapper; it stays quiet while autosave is on.
     const innerSave = handle.save;
     if (typeof innerSave === "function") {
       handle.save = async () => {
         const ok = await innerSave();
-        if (ok) this.showToast?.("Saved ✓", "success");
+        if (ok && !this.editorAutosaveMs) {
+          this.notify({
+            key: "editor-save",
+            kind: "success",
+            title: "Saved",
+            body: String(tab.ref || "").split("/").pop(),
+            timeoutMs: 2000,
+          });
+        }
         return ok;
       };
     }
@@ -13242,7 +13700,10 @@ class TerminalManager {
         e.preventDefault();
         return;
       }
-      if (e.ctrlKey && e.key === "f") {
+      // Ctrl+Shift+F is the documented scrollback search everywhere (inside a
+      // terminal it is caught by the xterm key handler first). Plain Ctrl+F
+      // only reaches here outside a terminal; it keeps working as before.
+      if (e.ctrlKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         this.openTerminalSearch();
       }
@@ -13265,10 +13726,20 @@ class TerminalManager {
         e.preventDefault();
         this.changeFontSize(-1);
       }
-      // `?` is a literal character in task/commit/search inputs — only treat it
-      // as the help shortcut when focus is not inside an editable field. F1 is a
-      // function key (never typed as text) so it opens help anywhere.
-      if (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target))) {
+      // Help: Ctrl+Shift+? works everywhere (it never produces terminal
+      // input). F1 and a bare `?` only count outside the terminal — TUIs such
+      // as htop use F1 — and `?` not inside an editable field.
+      const helpShortcut = window.KeyboardShortcuts?.isHelpShortcut;
+      const inTerminal = Boolean(e.target?.closest?.(".xterm"));
+      if (
+        helpShortcut
+          ? helpShortcut(e, {
+              inTerminal,
+              editable: isEditableTarget(e.target),
+            })
+          : !inTerminal &&
+            (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target)))
+      ) {
         e.preventDefault();
         this.openHelp();
       }
@@ -13616,6 +14087,7 @@ class TerminalManager {
       awaitingReconnectReady: false,
       connectionStatus: "connecting",
     });
+    this.syncWorkspaceLauncher();
 
     dbg(`[reconnect] Terminal ${id} stored in Map with isReconnection=true`);
 
@@ -14222,6 +14694,9 @@ class TerminalManager {
         (event.key === "F" || event.key === "f")
       ) {
         event.preventDefault();
+        // The event still bubbles to the document shortcut handler, which
+        // also maps Ctrl+Shift+F: mark it handled so search opens once.
+        this.handledPaneShortcutEvents.add(event);
         this.openTerminalSearch();
         return false;
       }
@@ -14347,12 +14822,15 @@ class TerminalManager {
     if (this.searchBar) return this.searchBar;
     const bar = document.createElement("div");
     bar.className = "terminal-search-bar hidden";
+    bar.dataset.placement = "bottom";
+    bar.setAttribute("role", "search");
     bar.innerHTML = `
-      <input type="text" class="search-input" placeholder="Search scrollback" spellcheck="false" autocomplete="off" />
+      <i class="search-bar-icon" data-lucide="search" aria-hidden="true"></i>
+      <input type="text" class="search-input" placeholder="Search scrollback" aria-label="Search terminal scrollback" spellcheck="false" autocomplete="off" />
       <span class="search-count" aria-live="polite"></span>
-      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)">↑</button>
-      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)">↓</button>
-      <button type="button" class="search-btn" data-search-act="close" title="Close (Esc)">✕</button>
+      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)" aria-label="Previous match"><i data-lucide="chevron-up"></i></button>
+      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)" aria-label="Next match"><i data-lucide="chevron-down"></i></button>
+      <button type="button" class="search-btn search-btn-close" data-search-act="close" title="Close (Esc)" aria-label="Close search"><i data-lucide="x"></i></button>
     `;
     const input = bar.querySelector(".search-input");
     input.addEventListener("input", () => {
@@ -14369,13 +14847,64 @@ class TerminalManager {
       }
     });
     bar.addEventListener("click", (e) => {
-      const act = e.target?.dataset?.searchAct;
+      // Buttons hold lucide SVGs: resolve the button, not the clicked icon.
+      const act = e.target?.closest?.("[data-search-act]")?.dataset?.searchAct;
       if (act === "prev") this.searchController?.prev();
       else if (act === "next") this.searchController?.next();
       else if (act === "close") this.closeTerminalSearch({ refocus: true });
     });
     this.searchBar = bar;
     return bar;
+  }
+
+  // Keep the floating bar off the active match: it sits at the tile's bottom
+  // edge and dodges to the top only when the active match is under it (pure
+  // rule: SearchOverlay.searchBarPlacement).
+  syncSearchBarPlacement(terminal, { reset = false } = {}) {
+    const bar = this.searchBar;
+    if (!bar) return;
+    if (reset) bar.dataset.placement = "bottom";
+    const placementFn = window.SearchOverlay?.searchBarPlacement;
+    if (!placementFn || !terminal) return;
+    const rows = terminal.rows || 0;
+    const screen = terminal.element?.querySelector(".xterm-screen");
+    const cellHeight =
+      rows && screen ? screen.getBoundingClientRect().height / rows : 0;
+    const barHeight = bar.getBoundingClientRect().height || 40;
+    // The bar's height plus its 8px inset from the tile edge.
+    const coveredRows = cellHeight
+      ? Math.ceil((barHeight + 8) / cellHeight)
+      : 2;
+    const selection = terminal.getSelectionPosition?.();
+    const viewportY = terminal.buffer?.active?.viewportY ?? 0;
+    const activeRow = selection ? selection.start.y - viewportY : null;
+    // Columns the bar overlaps (it is right-aligned over the screen).
+    let barCols = null;
+    let activeCols = null;
+    if (screen && terminal.cols && selection) {
+      const screenRect = screen.getBoundingClientRect();
+      const barRect = bar.getBoundingClientRect();
+      const cellWidth = screenRect.width / terminal.cols;
+      if (cellWidth > 0 && barRect.width > 0) {
+        barCols = [
+          Math.floor((barRect.left - screenRect.left) / cellWidth),
+          Math.ceil((barRect.right - screenRect.left) / cellWidth),
+        ];
+        // A single-line match; a wrapped one spans to the row end.
+        activeCols =
+          selection.end.y === selection.start.y
+            ? [selection.start.x, selection.end.x]
+            : [selection.start.x, terminal.cols];
+      }
+    }
+    bar.dataset.placement = placementFn({
+      activeRow,
+      rows,
+      coveredRows,
+      current: bar.dataset.placement,
+      activeCols,
+      barCols,
+    });
   }
 
   openTerminalSearch() {
@@ -14386,6 +14915,8 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     const host = active.element?.parentElement || active.element;
     if (bar.parentElement !== host) host.appendChild(bar);
+    // lucide only swaps <i data-lucide> placeholders that are in the document.
+    if (bar.querySelector("i[data-lucide]")) initLucideIcons();
 
     this.searchResultsDisposable?.dispose?.();
     this.searchController = window.SearchOverlay.createSearchController({
@@ -14404,11 +14935,13 @@ class TerminalManager {
       },
       onState: (state) => this.renderSearchState(state),
     });
-    this.searchResultsDisposable = addon.onDidChangeResults?.((r) =>
+    this.searchResultsDisposable = addon.onDidChangeResults?.((r) => {
       this.searchController?.handleResults(
         r || { resultIndex: -1, resultCount: 0 },
-      ),
-    );
+      );
+      this.syncSearchBarPlacement(active.terminal);
+    });
+    this.syncSearchBarPlacement(active.terminal, { reset: true });
 
     // Prefill: short single-line selection wins, then the last search.
     const selection = active.terminal.getSelection?.()?.trim() || "";
@@ -14439,13 +14972,16 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     bar.classList.toggle("hidden", !state.open);
     const count = bar.querySelector(".search-count");
-    if (!state.query || state.resultCount === null) {
-      count.textContent = "";
-    } else if (state.resultCount === 0) {
-      count.textContent = "0/0";
-    } else {
-      count.textContent = `${state.resultIndex + 1}/${state.resultCount}`;
-    }
+    const format = window.SearchOverlay?.formatSearchCount;
+    count.textContent = format
+      ? format(state)
+      : !state.query || state.resultCount === null
+        ? ""
+        : `${state.resultIndex + 1}/${state.resultCount}`;
+    bar.classList.toggle(
+      "no-results",
+      Boolean(state.query) && state.resultCount === 0,
+    );
   }
 
   createDimensionOverlay(container) {
@@ -14650,28 +15186,22 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
-  // Brief per-tile notice when input typed during a connect/reconnect could
-  // not be delivered (queue bound hit, input too old, or the terminal ended
-  // before the connection came back).
+  // Notice when input typed during a connect/reconnect could not be delivered
+  // (queue bound hit, input too old, or the terminal ended before the
+  // connection came back). One toast per terminal; repeats replace it.
   showInputDroppedNotice(id) {
     const t = this.terminals.get(id);
-    const host = t?.element?.parentElement;
-    if (!t || t.disposed || !host) return;
-    let notice = t.inputDroppedNotice;
-    if (!notice || !notice.isConnected) {
-      notice = document.createElement("div");
-      notice.className = "tile-input-dropped";
-      notice.setAttribute("role", "status");
-      notice.setAttribute("aria-live", "polite");
-      notice.textContent = "Input not sent — connection was down";
-      host.appendChild(notice);
-      t.inputDroppedNotice = notice;
-    }
-    notice.classList.add("visible");
-    clearTimeout(t.inputDroppedTimer);
-    t.inputDroppedTimer = setTimeout(() => {
-      notice.classList.remove("visible");
-    }, 4000);
+    if (!t || t.disposed) return;
+    const label = this.formatCwdLabel?.(t.cwd || "") || "";
+    this.notify({
+      key: `input-dropped:${id}`,
+      kind: "warning",
+      title: "Input not sent — connection was down",
+      body: label
+        ? `${label}: retype it once the terminal is connected.`
+        : "Retype it once the terminal is connected.",
+      timeoutMs: 6000,
+    });
   }
 
   performReconnectLayoutSync(
@@ -15131,6 +15661,7 @@ class TerminalManager {
         awaitingReconnectReady: false,
         connectionStatus: "connecting",
       });
+      this.syncWorkspaceLauncher();
 
       // Register with session registry for reconnection persistence
       this.sessionRegistry.register(id, {
@@ -15670,8 +16201,8 @@ class TerminalManager {
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
-    if (t.inputDroppedTimer) clearTimeout(t.inputDroppedTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.composeSubmit?.cancel();
     t.resizeObserver = null;
     t.resizeTimer = null;
     t.fitFrame = 0;
@@ -15696,6 +16227,7 @@ class TerminalManager {
     this.tileManager.removeTile(id);
     this.terminals.delete(id);
     this.sessionRegistry.remove(id);
+    this.syncWorkspaceLauncher();
 
     const workspaceFallback =
       this.resolveWorkspaceTerminalId(closingWorkspaceId);
@@ -15738,6 +16270,8 @@ class TerminalManager {
         { canUndo: Boolean(undoEntry) },
       );
       this.queueTelemetryRefresh(0);
+      // The closed session is now restorable: list it in the launcher.
+      this.syncWorkspaceLauncher({ refresh: true });
     } catch (err) {
       console.warn("Could not schedule terminal close:", err);
       // No termination was scheduled, so the session (if it still exists)
@@ -15803,8 +16337,7 @@ class TerminalManager {
   async undoRecentSessionClose() {
     const batch = this.closeUndoBatch;
     this.closeUndoBatch = null;
-    document.getElementById("session-close-toast")?.classList.add("hidden");
-    clearTimeout(this.sessionCloseToastTimer);
+    window.ToastService?.dismiss?.("session-close");
     if (!batch?.entries?.length) return;
     let focusId = null;
     for (const entry of batch.entries) {
@@ -15821,55 +16354,44 @@ class TerminalManager {
     this.queueTelemetryRefresh(0);
   }
 
+  // The close toast keeps id="session-close-toast" (e2e) and offers Undo
+  // (reattach the batch just closed) plus a shortcut into Sessions.
   showSessionCloseToast(
     label,
     terminationScheduledAt,
     preservedByOtherClient = false,
     { canUndo = false } = {},
   ) {
-    let toast = document.getElementById("session-close-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "session-close-toast";
-      toast.className = "task-toast session-close-toast hidden";
-      toast.setAttribute("role", "status");
-      const message = document.createElement("button");
-      message.type = "button";
-      message.className = "session-close-toast-message";
-      message.title = "Open Sessions";
-      message.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        this.openSessionsPanel();
-      });
-      const undo = document.createElement("button");
-      undo.type = "button";
-      undo.className = "session-close-toast-undo";
-      undo.textContent = "Undo";
-      undo.addEventListener("click", (event) => {
-        event.stopPropagation();
-        void this.undoRecentSessionClose();
-      });
-      toast.append(message, undo);
-      document.getElementById("app")?.appendChild(toast);
-    }
-    const message = toast.querySelector(".session-close-toast-message");
-    const undo = toast.querySelector(".session-close-toast-undo");
     const batchSize = this.closeUndoBatch?.entries?.length || 0;
     const plural = batchSize > 1;
     const subject = plural ? `${batchSize} terminals` : label;
     const it = plural ? "them" : "it";
-    message.textContent = preservedByOtherClient
-      ? `${subject} closed here and ${plural ? "remain" : "remains"} active in another client. You can restore ${it} from Sessions.`
-      : terminationScheduledAt
-        ? `${subject} closed. Restore ${it} from Sessions within 15 minutes.`
-        : `${subject} closed, but automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
-    undo.hidden = !(canUndo && batchSize > 0);
-    toast.classList.remove("hidden");
-    clearTimeout(this.sessionCloseToastTimer);
-    this.sessionCloseToastTimer = setTimeout(
-      () => toast.classList.add("hidden"),
-      9000,
-    );
+    const scheduled = Boolean(terminationScheduledAt);
+    const body = preservedByOtherClient
+      ? `${plural ? "They remain" : "It remains"} active in another client. You can restore ${it} from Sessions.`
+      : scheduled
+        ? `Restore ${it} from Sessions within 15 minutes.`
+        : `Automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
+    const actions = [];
+    if (canUndo && batchSize > 0) {
+      actions.push({
+        label: "Undo",
+        primary: true,
+        ariaLabel: plural ? `Reopen ${batchSize} terminals` : `Reopen ${label}`,
+        run: () => this.undoRecentSessionClose(),
+      });
+    }
+    actions.push({ label: "Sessions", run: () => this.openSessionsPanel() });
+    this.notify({
+      key: "session-close",
+      id: "session-close-toast",
+      className: "session-close-toast",
+      kind: preservedByOtherClient || scheduled ? "info" : "warning",
+      title: `${subject} closed`,
+      body,
+      actions,
+      timeoutMs: 15000,
+    });
   }
 
   sendResize(id, colsOverride = null, rowsOverride = null, options = {}) {
@@ -16059,6 +16581,100 @@ class TerminalManager {
     const selection = active.terminal.getSelection();
     if (selection)
       navigator.clipboard.writeText(selection).catch(console.error);
+  }
+
+  // --- Compose sheet (web/compose-sheet.js) ---------------------------------
+  // A real text box for writing a message to the active terminal (phones
+  // first; desktop through the palette). It targets the terminal that was
+  // active when it opened.
+  openComposeSheet() {
+    const helpers = window.ComposeSheet;
+    const targetId = this.activeId;
+    const target = this.terminals.get(targetId);
+    if (!helpers?.ComposeSheet || !target) {
+      if (!target) {
+        this.notify({
+          key: "compose",
+          kind: "warning",
+          title: "No terminal to write to",
+          body: "Open a terminal first.",
+        });
+      }
+      return;
+    }
+    this.closeToolsSheet?.();
+    if (!this.composeSheet) {
+      let storage = null;
+      try {
+        storage = window.localStorage;
+      } catch {
+        storage = null;
+      }
+      this.composeSheet = new helpers.ComposeSheet({
+        document,
+        storage,
+        onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
+        onClose: ({ restoreFocus }) => {
+          // On touch, refocusing xterm would pop the keyboard back up.
+          if (restoreFocus && !this.isTouchLayout() && this.activeId) {
+            this.focusTerminal(this.activeId);
+          }
+        },
+      });
+    }
+    this.composeTargetId = targetId;
+    this.composeSheet.open({
+      targetLabel: this.formatCwdLabel(target.cwd || "") || "terminal",
+    });
+  }
+
+  // Paste through xterm (bracketed-paste markers when the program asked for
+  // them) into the queued input path, then — for Send — a separate deferred
+  // Enter once that input has settled (see scheduleDeferredSubmit).
+  sendComposedText(id, plan) {
+    const helpers = window.ComposeSheet;
+    const t = this.terminals.get(id);
+    if (!plan || !t || t.disposed || !t.ws || !helpers) {
+      this.notify({
+        key: "compose",
+        kind: "error",
+        title: "Message not sent",
+        body: "That terminal is no longer open.",
+      });
+      return false;
+    }
+    const readyAtStart = Boolean(t.ws.isReadyForInput?.());
+    this.clipboardManager.executePaste(
+      plan.text,
+      t.ws,
+      t.terminal,
+      t.inputState,
+    );
+    if (!plan.submit) return true;
+    t.composeSubmit?.cancel();
+    t.composeSubmit = helpers.scheduleDeferredSubmit({
+      readyAtStart,
+      delayMs: plan.submitDelayMs,
+      isReady: () =>
+        this.terminals.get(id) === t &&
+        !t.disposed &&
+        Boolean(t.ws?.isReadyForInput?.()),
+      send: () => {
+        t.composeSubmit = null;
+        t.ws.sendInput("\r");
+      },
+      onGiveUp: () => {
+        t.composeSubmit = null;
+        if (this.terminals.get(id) !== t || t.disposed) return;
+        this.notify({
+          key: `compose-submit:${id}`,
+          kind: "warning",
+          title: "Message inserted but not submitted",
+          body: "The terminal was not connected. Press Enter once it is.",
+        });
+      },
+    });
+    return true;
   }
 
   async pasteClipboard() {

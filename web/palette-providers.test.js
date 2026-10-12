@@ -6,6 +6,12 @@ import {
   filterSavedCommands,
   fuzzyScoreFilePath,
   filterQuickOpenFiles,
+  matchPositions,
+  highlightSegments,
+  truncatePathMiddle,
+  splitFilePath,
+  describePaletteSession,
+  createPaletteMruStore,
 } from "./palette-providers";
 
 // --- parsePrefixQuery -------------------------------------------------------
@@ -233,4 +239,145 @@ test("filterQuickOpenFiles respects the limit and ranks a tighter/basename match
 test("filterQuickOpenFiles tolerates a non-array input", () => {
   expect(filterQuickOpenFiles("app", null)).toEqual([]);
   expect(filterQuickOpenFiles("app", undefined)).toEqual([]);
+});
+
+test("filterSessions also matches the session name", () => {
+  const out = filterSessions({
+    sessions: [
+      { id: "t-1", name: "api server", cwd: "/srv/a", status: "active" },
+      { id: "t-2", cwd: "/srv/b", status: "active" },
+    ],
+    text: "api",
+    isLocallyOpen: () => false,
+    planAction,
+  });
+  expect(out.map((e) => e.session.id)).toEqual(["t-1"]);
+});
+
+// --- match highlighting -----------------------------------------------------
+
+test("matchPositions prefers a contiguous match at a word start", () => {
+  expect(matchPositions("git", "Open Git")).toEqual([5, 6, 7]);
+  expect(matchPositions("GIT", "digit git")).toEqual([6, 7, 8]);
+  expect(matchPositions("it", "digit")).toEqual([3, 4]);
+});
+
+test("matchPositions falls back to a subsequence and returns null on no match", () => {
+  expect(matchPositions("ogt", "Open Git")).toEqual([0, 5, 7]);
+  expect(matchPositions("xyz", "Open Git")).toBe(null);
+  expect(matchPositions("", "Open Git")).toEqual([]);
+  expect(matchPositions("  ", "Open Git")).toEqual([]);
+});
+
+test("highlightSegments merges consecutive matched characters", () => {
+  expect(highlightSegments("Open Git", [5, 6, 7])).toEqual([
+    { text: "Open ", match: false },
+    { text: "Git", match: true },
+  ]);
+  expect(highlightSegments("abc", [0, 2])).toEqual([
+    { text: "a", match: true },
+    { text: "b", match: false },
+    { text: "c", match: true },
+  ]);
+  expect(highlightSegments("abc", null)).toEqual([
+    { text: "abc", match: false },
+  ]);
+});
+
+// --- path presentation ------------------------------------------------------
+
+test("truncatePathMiddle keeps short paths and the tail of long ones", () => {
+  expect(truncatePathMiddle("/home/deploy/app", 40)).toBe("/home/deploy/app");
+  expect(
+    truncatePathMiddle("/home/deploy/llama.cpp/models/templates/x.jinja", 32),
+  ).toBe("/home/…/models/templates/x.jinja");
+  const long = truncatePathMiddle(`/${"a".repeat(80)}`, 20);
+  expect(long.length).toBe(20);
+  expect(long).toContain("…");
+  expect(truncatePathMiddle("", 20)).toBe("");
+});
+
+test("splitFilePath separates the basename from its directory", () => {
+  expect(splitFilePath("web/app.js")).toEqual({ dir: "web", base: "app.js" });
+  expect(splitFilePath("README.md")).toEqual({ dir: "", base: "README.md" });
+});
+
+test("describePaletteSession never shows the raw session id", () => {
+  const id = "b540c3ae-6a12-4210-9ba8-dd4d2559128d";
+  const described = describePaletteSession(
+    {
+      id,
+      cwd: "/home/deploy/deckterm_dev",
+      agentName: "claude",
+      agentState: "thinking",
+    },
+    { kind: "focus", label: "Focus", statusClass: "active" },
+  );
+  expect(described.title).toBe("deckterm_dev");
+  expect(described.detail).toBe("claude · thinking · /home/deploy/deckterm_dev");
+  expect(described.hint).toBe("Focus");
+  expect(JSON.stringify(described)).not.toContain(id);
+
+  const named = describePaletteSession(
+    { id, name: "api", cwd: "/srv/api", running: true },
+    { kind: "attach", label: "Attach", statusClass: "active" },
+  );
+  expect(named.title).toBe("api");
+  expect(named.detail).toBe("running · /srv/api");
+
+  const ended = describePaletteSession(
+    { id, cwd: "" },
+    { kind: "open-here", label: "Open here", statusClass: "ended" },
+  );
+  expect(ended.title).toBe("Terminal");
+  expect(ended.detail).toBe("ended");
+});
+
+// --- MRU --------------------------------------------------------------------
+
+test("MRU store keeps most recent first, dedupes and caps each kind", () => {
+  const storage = makeStorage();
+  const mru = createPaletteMruStore(storage, { limit: 3 });
+  mru.touch("files", "/a", 1);
+  mru.touch("files", "/b", 2);
+  mru.touch("files", "/a", 3);
+  mru.touch("files", "/c", 4);
+  mru.touch("files", "/d", 5);
+  mru.touch("commands", "open-git", 6);
+  expect(mru.list("files")).toEqual(["/d", "/c", "/a"]);
+  expect(mru.rankOf("files", "/d")).toBe(0);
+  expect(mru.rankOf("files", "/b")).toBe(-1);
+  expect(createPaletteMruStore(storage).list("commands")).toEqual(["open-git"]);
+});
+
+test("MRU store survives corrupt storage and ignores blank ids", () => {
+  const storage = makeStorage({ "deckterm-palette-mru": "{not json" });
+  const mru = createPaletteMruStore(storage);
+  expect(mru.list("files")).toEqual([]);
+  mru.touch("files", "", 1);
+  expect(mru.list("files")).toEqual([]);
+  const throwing = {
+    getItem() {
+      throw new Error("denied");
+    },
+    setItem() {
+      throw new Error("denied");
+    },
+  };
+  const safe = createPaletteMruStore(throwing);
+  safe.touch("files", "/a", 1);
+  expect(safe.list("files")).toEqual([]);
+});
+
+test("filterQuickOpenFiles ranks recently opened files above equal matches", () => {
+  const files = [
+    { path: "/r/src/alpha.js", relativePath: "src/alpha.js" },
+    { path: "/r/lib/alpha.js", relativePath: "lib/alpha.js" },
+  ];
+  const plain = filterQuickOpenFiles("alpha", files, 10);
+  expect(plain[0].relativePath).toBe("lib/alpha.js");
+  const boosted = filterQuickOpenFiles("alpha", files, 10, {
+    mruRank: (file) => (file.path === "/r/src/alpha.js" ? 0 : -1),
+  });
+  expect(boosted[0].relativePath).toBe("src/alpha.js");
 });

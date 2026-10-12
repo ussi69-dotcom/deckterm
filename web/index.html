@@ -111,7 +111,8 @@
 
           <button
             id="ide-toggle-btn"
-            class="btn btn-secondary"
+            class="toolbar-action-btn toolbar-ide-btn"
+            type="button"
             data-action="toggle-ide"
             data-action-id="ide"
             title="Toggle IDE layout"
@@ -122,10 +123,24 @@
             <span class="btn-label">IDE</span>
           </button>
 
-          <div id="server-stats" class="server-stats">
-            <span class="stat" id="stat-cpu" title="CPU">--%</span>
-            <span class="stat" id="stat-ram" title="RAM">--%</span>
-            <span class="stat" id="stat-disk" title="Disk">--%</span>
+          <div
+            id="server-stats"
+            class="server-stats"
+            role="group"
+            aria-label="Server load"
+          >
+            <span class="stat" id="stat-cpu" title="CPU"
+              ><span class="stat-label">CPU</span
+              ><span class="stat-value">--%</span></span
+            >
+            <span class="stat" id="stat-ram" title="Memory"
+              ><span class="stat-label">RAM</span
+              ><span class="stat-value">--%</span></span
+            >
+            <span class="stat" id="stat-disk" title="Disk"
+              ><span class="stat-label">Disk</span
+              ><span class="stat-value">--%</span></span
+            >
           </div>
         </div>
       </header>
@@ -271,7 +286,7 @@
                 type="button"
                 title="Switch to board view"
               >
-                ▦ Board
+                <i data-lucide="layout-grid"></i><span>Board</span>
               </button>
               <button
                 id="task-panel-close"
@@ -409,42 +424,45 @@
       <div id="sessions-panel" class="task-panel hidden" aria-hidden="true">
         <div class="task-panel-backdrop"></div>
         <section
-          class="task-panel-shell"
+          class="task-panel-shell sessions-panel-shell"
           role="dialog"
           aria-modal="true"
           aria-labelledby="sessions-panel-title"
         >
-          <div class="task-panel-header">
-            <div>
-              <div class="task-panel-kicker">Session Manager</div>
-              <h3 id="sessions-panel-title">Sessions</h3>
+          <div class="task-panel-header sessions-panel-header">
+            <h3 id="sessions-panel-title">Sessions</h3>
+            <div class="task-panel-header-actions">
+              <button
+                id="sessions-new-btn"
+                class="btn btn-primary sessions-new-btn"
+                type="button"
+                title="Open a new terminal session"
+              >
+                <i data-lucide="plus"></i>
+                <span>New session</span>
+              </button>
+              <button
+                id="sessions-refresh-btn"
+                class="btn-icon"
+                type="button"
+                title="Refresh the session list"
+                aria-label="Refresh the session list"
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+              <button
+                id="sessions-panel-close"
+                class="btn-icon"
+                type="button"
+                title="Close sessions panel"
+                aria-label="Close"
+              >
+                <i data-lucide="x"></i>
+              </button>
             </div>
-            <button
-              id="sessions-panel-close"
-              class="btn-icon"
-              title="Close sessions panel"
-              aria-label="Close"
-            >
-              <i data-lucide="x"></i>
-            </button>
           </div>
-          <div
-            style="
-              padding: 15px;
-              display: flex;
-              flex-direction: column;
-              gap: 12px;
-              height: calc(100% - 70px);
-              overflow-y: auto;
-            "
-          >
-            <button
-              id="sessions-refresh-btn"
-              class="btn btn-secondary btn-block"
-            >
-              Refresh Catalog
-            </button>
-            <div id="sessions-list" class="task-list" style="margin-top: 10px">
+          <div class="sessions-panel-body">
+            <div id="sessions-list" class="task-list">
               <!-- Dynamically loaded sessions -->
             </div>
           </div>
@@ -465,56 +483,73 @@
           aria-labelledby="file-explorer-title"
         >
           <div class="file-explorer-header">
-            <div>
-              <div class="file-explorer-kicker">Workspace Surface</div>
-              <h3 id="file-explorer-title">Files</h3>
-            </div>
-            <div class="file-explorer-header-actions">
-              <span class="file-explorer-path-hint">Active workspace</span>
-              <button
-                id="file-explorer-close"
-                class="btn-icon"
-                title="Close file explorer"
-                aria-label="Close file explorer"
-              >
-                <i data-lucide="x"></i>
-              </button>
-            </div>
-          </div>
-
-          <div
-            id="file-explorer-breadcrumb"
-            class="breadcrumb file-explorer-breadcrumb"
-          >
-            <span>Open Files to browse the current workspace.</span>
-          </div>
-
-          <div class="file-toolbar file-explorer-toolbar">
-            <button id="file-explorer-upload-btn" class="btn btn-secondary">
-              <i data-lucide="upload"></i>
-              <span>Upload</span>
-            </button>
-            <button id="file-explorer-mkdir-btn" class="btn btn-secondary">
-              <i data-lucide="folder-plus"></i>
-              <span>New Folder</span>
-            </button>
-            <button id="file-explorer-newfile-btn" class="btn">
-              <i data-lucide="file-plus"></i>
-              <span>New File</span>
-            </button>
+            <h3 id="file-explorer-title">Files</h3>
             <button
-              id="file-explorer-refresh-btn"
+              id="file-explorer-close"
               class="btn-icon"
-              title="Refresh explorer"
+              type="button"
+              title="Close file explorer"
+              aria-label="Close file explorer"
             >
-              <i data-lucide="refresh-cw"></i>
+              <i data-lucide="x"></i>
             </button>
-            <input
-              type="file"
-              id="file-explorer-upload-input"
-              multiple
-              hidden
-            />
+          </div>
+
+          <div class="file-explorer-bar">
+            <nav
+              id="file-explorer-breadcrumb"
+              class="breadcrumb file-explorer-breadcrumb"
+            >
+              <span>Open Files to browse the current workspace.</span>
+            </nav>
+            <div
+              class="file-toolbar file-explorer-toolbar"
+              role="toolbar"
+              aria-label="File actions"
+            >
+              <button
+                id="file-explorer-newfile-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="New File"
+                aria-label="New File"
+              >
+                <i data-lucide="file-plus"></i>
+              </button>
+              <button
+                id="file-explorer-mkdir-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="New Folder"
+                aria-label="New Folder"
+              >
+                <i data-lucide="folder-plus"></i>
+              </button>
+              <button
+                id="file-explorer-upload-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="Upload"
+                aria-label="Upload"
+              >
+                <i data-lucide="upload"></i>
+              </button>
+              <button
+                id="file-explorer-refresh-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="Refresh"
+                aria-label="Refresh explorer"
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+              <input
+                type="file"
+                id="file-explorer-upload-input"
+                multiple
+                hidden
+              />
+            </div>
           </div>
 
           <div id="file-explorer-list" class="file-list file-explorer-list">
@@ -532,16 +567,6 @@
             class="file-drop-zone file-explorer-drop-zone hidden"
           >
             <span>Drop files here to upload</span>
-          </div>
-
-          <div class="file-explorer-footer">
-            <button
-              id="file-explorer-mobile-close"
-              class="btn btn-secondary"
-              type="button"
-            >
-              Close
-            </button>
           </div>
         </section>
       </div>
@@ -674,37 +699,41 @@
       >
         <div class="command-palette-panel">
           <div class="command-palette-header">
-            <div class="command-palette-title-row">
-              <span id="command-palette-title" class="command-palette-kicker"
-                >Command palette</span
-              >
-              <span class="command-palette-shortcut">Ctrl+Shift+P</span>
+            <span id="command-palette-title" class="command-palette-title"
+              >Command palette</span
+            >
+            <div class="command-palette-search">
+              <i
+                data-lucide="search"
+                class="command-palette-search-icon"
+                aria-hidden="true"
+              ></i>
+              <input
+                id="command-palette-input"
+                aria-label="Search commands, files, and workspaces"
+                type="text"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                enterkeyhint="go"
+                placeholder="Search commands and files"
+              />
             </div>
-            <input
-              id="command-palette-input"
-              aria-label="Search commands, files, and workspaces"
-              type="text"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="Search actions, workspaces, and views..."
-            />
           </div>
           <div
             id="command-palette-results"
             class="command-palette-results"
             role="listbox"
             aria-label="Command palette results"
-          >
-            <div class="command-palette-section">
-              <div class="command-palette-section-label">Actions</div>
-              <div class="command-palette-empty">
-                Start typing to filter actions, workspaces, and view toggles.
-              </div>
-            </div>
-          </div>
-          <div class="command-palette-footer">
-            <span>Enter to run</span>
-            <span>Esc to close</span>
+          ></div>
+          <div class="command-palette-footer" aria-hidden="true">
+            <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+            <span><kbd>Enter</kbd> run</span>
+            <span><kbd>Esc</kbd> close</span>
+            <span class="command-palette-modes"
+              ><kbd>@</kbd> sessions <kbd>$</kbd> commands <kbd>/</kbd>
+              folders</span
+            >
           </div>
         </div>
       </div>
@@ -757,135 +786,25 @@
       </div>
     </div>
 
-    <!-- Help Modal -->
+    <!-- Help Modal: rows are generated from web/keyboard-shortcuts.js -->
     <div id="help-modal" class="modal hidden">
-      <div class="modal-content modal-large">
+      <div
+        class="modal-content modal-large help-modal-content"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="help-modal-title"
+      >
         <div class="modal-header">
-          <h3>Help - Keyboard Shortcuts</h3>
-          <button class="modal-close" id="help-close">&times;</button>
+          <h3 id="help-modal-title">Keyboard shortcuts</h3>
+          <button class="modal-close" id="help-close" aria-label="Close">
+            &times;
+          </button>
         </div>
         <div class="help-content">
-          <div class="help-grid">
-            <div class="help-column">
-              <h4>Workspaces & Tabs</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>N</kbd></td>
-                  <td>New workspace tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>W</kbd></td>
-                  <td>Close current pane</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Tab</kbd></td>
-                  <td>Next tab</td>
-                </tr>
-                <tr>
-                  <td>
-                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>←</kbd>/<kbd
-                      >→</kbd
-                    >
-                  </td>
-                  <td>Previous/next tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>1-9</kbd></td>
-                  <td>Switch to tab number</td>
-                </tr>
-                <tr>
-                  <td>Drag tab → tab</td>
-                  <td>Merge workspaces</td>
-                </tr>
-              </table>
-
-              <h4>Terminals</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd></td>
-                  <td>Split workspace (add terminal)</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
-                  <td>Move current pane to a new tab</td>
-                </tr>
-                <tr>
-                  <td>
-                    <kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>↑</kbd>/<kbd
-                      >↓</kbd
-                    >
-                  </td>
-                  <td>Previous/next pane in this tab</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Z</kbd></td>
-                  <td>Undo layout change</td>
-                </tr>
-                <tr>
-                  <td>Drag tile edge</td>
-                  <td>Resize terminals</td>
-                </tr>
-              </table>
-            </div>
-
-            <div class="help-column">
-              <h4>Visual Groups</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>G</kbd></td>
-                  <td>Color-group with previous</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>G</kbd></td>
-                  <td>Ungroup when pane is already alone</td>
-                </tr>
-              </table>
-
-              <h4>General</h4>
-              <table class="help-table">
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>Shift</kbd> + <kbd>P</kbd></td>
-                  <td>Open actions palette</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>F</kbd></td>
-                  <td>Search</td>
-                </tr>
-                <tr>
-                  <td><kbd>F11</kbd></td>
-                  <td>Toggle fullscreen</td>
-                </tr>
-                <tr>
-                  <td><kbd>Ctrl</kbd> + <kbd>+</kbd>/<kbd>-</kbd></td>
-                  <td>Font size</td>
-                </tr>
-                <tr>
-                  <td><kbd>F1</kbd> or <kbd>?</kbd></td>
-                  <td>Show this help</td>
-                </tr>
-              </table>
-
-              <h4>Surfaces</h4>
-              <table class="help-table">
-                <tr>
-                  <td>Desktop</td>
-                  <td>
-                    Use the top-bar actions to open Files, Git, Palette, and
-                    More
-                  </td>
-                </tr>
-                <tr>
-                  <td>Mobile</td>
-                  <td>
-                    Use the bottom action bar for Files, Git, Paste, and More
-                  </td>
-                </tr>
-              </table>
-            </div>
-          </div>
-
+          <div id="help-shortcuts" class="help-shortcuts"></div>
+          <p id="help-footnote" class="help-footnote"></p>
           <div class="help-legend">
-            <h4>Tab Colors</h4>
+            <h4>Tab colors</h4>
             <p>
               <span class="legend-dot" style="background: #58a6ff"></span>
               <strong>Single color dot</strong> = 1 terminal
@@ -913,6 +832,7 @@
     <script src="/debug-bootstrap.js?v=20260905a"></script>
     <script src="/html-escape.js?v=20260617a"></script>
     <script src="/format-bytes.js?v=20260829a"></script>
+    <script src="/server-stats-format.js?v=20261012a"></script>
     <script src="/access-denied.js?v=20260611a"></script>
     <script src="/git-error.js?v=20260611a"></script>
     <script src="/git-scm.js?v=20260705e"></script>
@@ -924,10 +844,13 @@
     <script src="/git-history-view.js?v=20260620b"></script>
     <script src="/session-actions.js?v=20260718a"></script>
     <script src="/reconnect-classify.js?v=20260601a"></script>
+    <script src="/toast-service.js?v=20261012a"></script>
     <script src="/release-watch.js?v=20261012a"></script>
     <script src="/input-queue.js?v=20261012a"></script>
     <script src="/live-cwd.js?v=20261012a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
+    <script src="/keyboard-shortcuts.js?v=20261012a"></script>
+    <script src="/workspace-launcher.js?v=20261012a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
     <script src="/notification-sounds.js?v=20260719a"></script>
     <script src="/push-notifications.js?v=20260719a"></script>
@@ -961,6 +884,7 @@
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
     <script src="/mobile-layout.js?v=20261012a"></script>
     <script src="/quick-replies.js?v=20261012a"></script>
+    <script src="/compose-sheet.js?v=20261012a"></script>
     <script src="/terminal-selection.js?v=20260819b"></script>
     <script src="/assets/diff2html-3.4.56.min.js"></script>
     <script src="/app.js?v=20260829a"></script>
