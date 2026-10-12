@@ -3222,11 +3222,9 @@ body.touch-input-mode .xterm .composition-view.active {
   min-width: 320px;
   height: calc(100vh - var(--toolbar-height) - 28px);
   pointer-events: auto;
-  border: 1px solid rgba(48, 54, 61, 0.92);
-  border-radius: 24px;
-  background:
-    linear-gradient(180deg, rgba(88, 166, 255, 0.06), rgba(13, 17, 23, 0) 18%),
-    linear-gradient(180deg, rgba(22, 27, 34, 0.98), rgba(13, 17, 23, 0.98));
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-secondary);
   box-shadow:
     0 24px 60px rgba(0, 0, 0, 0.45),
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
@@ -3235,74 +3233,101 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .file-explorer-header {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.file-explorer-kicker {
-  color: var(--accent-blue);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  margin-bottom: 6px;
+  gap: 8px;
+  padding: 8px 8px 8px 14px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
 .file-explorer-header h3 {
   margin: 0;
-  font-size: 22px;
-  line-height: 1.1;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
 }
 
-.file-explorer-header-actions {
+/* Breadcrumb + compact icon actions share one row. */
+.file-explorer-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 4px;
+  min-height: 34px;
+  padding: 3px 4px 3px 8px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
-.file-explorer-path-hint {
-  display: inline-flex;
+.file-explorer-breadcrumb.breadcrumb {
+  display: flex;
+  flex: 1 1 auto;
   align-items: center;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text-secondary);
-  font-size: 11px;
-  font-weight: 600;
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  background: none;
+  border-bottom: none;
+  font-size: 12px;
   white-space: nowrap;
 }
 
-.file-explorer-breadcrumb {
-  background: rgba(255, 255, 255, 0.03);
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.file-explorer-breadcrumb span {
+.file-explorer-breadcrumb > span {
   color: var(--text-secondary);
 }
 
-.file-explorer-toolbar {
-  padding: 12px 16px;
-  gap: 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+.file-explorer-breadcrumb .file-breadcrumb-button {
+  flex: 0 1 auto;
+  min-width: 2ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.file-explorer-toolbar .btn {
-  flex: 1 1 auto;
-  min-width: 0;
+/* The current folder keeps its name readable; ancestors give way first. */
+.file-explorer-breadcrumb .file-breadcrumb-button[aria-current="location"] {
+  flex-shrink: 0;
+  max-width: 70%;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.file-breadcrumb-separator,
+.file-breadcrumb-ellipsis {
+  flex: 0 0 auto;
+  padding: 0 2px;
+  color: var(--text-muted);
+}
+
+.file-explorer-toolbar.file-toolbar {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  gap: 0;
+  padding: 0;
+  border-bottom: none;
+}
+
+.file-explorer-action.btn-icon {
+  width: 26px;
+  height: 26px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.file-explorer-action.btn-icon:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.file-explorer-action.btn-icon svg {
+  width: 16px;
+  height: 16px;
 }
 
 .file-explorer-list {
   flex: 1;
   min-height: 0;
   max-height: none;
-  padding: 16px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.015), rgba(255, 255, 255, 0)),
-    transparent;
+  padding: 4px;
 }
 
 /* #file-explorer-list also carries the shared `.file-list` class (used by a
@@ -3319,38 +3344,27 @@ body.touch-input-mode .xterm .composition-view.active {
 .file-explorer-empty {
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 16px;
+  gap: 6px;
+  margin: 8px 6px;
+  padding: 12px;
   border: 1px dashed rgba(139, 148, 158, 0.28);
-  border-radius: 16px;
-  background: rgba(22, 27, 34, 0.62);
+  border-radius: 8px;
   color: var(--text-secondary);
   line-height: 1.5;
 }
 
 .file-explorer-empty strong {
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .file-explorer-empty span {
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .file-explorer-drop-zone {
   inset: 16px;
-  border-radius: 20px;
-}
-
-.file-explorer-footer {
-  display: none;
-  padding: 14px 16px calc(18px + env(safe-area-inset-bottom, 0px));
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  background: rgba(13, 17, 23, 0.82);
-}
-
-.file-explorer-footer .btn {
-  width: 100%;
+  border-radius: 12px;
 }
 
 /* =============================================================================
@@ -3695,9 +3709,9 @@ body.touch-input-mode .xterm .composition-view.active {
   display: flex;
   align-items: flex-start;
   justify-content: center;
-  padding: clamp(28px, 8vh, 84px) 16px 24px;
-  background: rgba(3, 7, 12, 0.58);
-  backdrop-filter: blur(12px);
+  padding: clamp(24px, 8vh, 80px) 16px 24px;
+  background: rgba(3, 7, 12, 0.5);
+  backdrop-filter: blur(6px);
 }
 
 .command-palette.hidden {
@@ -3705,123 +3719,134 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .command-palette-panel {
-  width: min(720px, 100%);
+  width: min(680px, 100%);
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  max-height: 100%;
   overflow: hidden;
-  border: 1px solid rgba(88, 166, 255, 0.16);
-  border-radius: 18px;
-  background:
-    linear-gradient(
-      180deg,
-      rgba(88, 166, 255, 0.08) 0%,
-      rgba(13, 17, 23, 0) 20%
-    ),
-    rgba(13, 17, 23, 0.96);
+  border: 1px solid var(--border-primary);
+  border-radius: 10px;
+  background: var(--bg-secondary);
   box-shadow:
-    0 24px 60px rgba(0, 0, 0, 0.46),
+    0 18px 48px rgba(0, 0, 0, 0.5),
     0 0 0 1px rgba(255, 255, 255, 0.03) inset;
 }
 
 .command-palette-header {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  padding: 18px 18px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 8px;
+  border-bottom: 1px solid var(--border-primary);
 }
 
-.command-palette-title-row {
+/* Names the dialog for assistive tech; the input carries its own label. */
+.command-palette-title {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.command-palette-search {
+  position: relative;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
 }
 
-.command-palette-kicker {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--accent-blue);
-}
-
-.command-palette-shortcut {
-  font-family: "JetBrains Mono", monospace;
-  font-size: 11px;
+.command-palette-search-icon {
+  position: absolute;
+  left: 10px;
+  width: 16px;
+  height: 16px;
   color: var(--text-muted);
+  pointer-events: none;
 }
 
 #command-palette-input {
   width: 100%;
-  padding: 14px 16px;
-  border: 1px solid rgba(88, 166, 255, 0.18);
-  border-radius: 12px;
-  background: rgba(22, 27, 34, 0.88);
+  height: 34px;
+  padding: 0 10px 0 34px;
+  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-radius: 6px;
+  background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: "JetBrains Mono", monospace;
-  font-size: 15px;
+  font: inherit;
+  font-size: 14px;
+}
+
+#command-palette-input::placeholder {
+  color: var(--text-muted);
 }
 
 #command-palette-input:focus {
   outline: none;
-  border-color: rgba(88, 166, 255, 0.72);
-  box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.12);
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.18);
 }
 
 #command-palette-input:focus-visible {
   box-shadow:
-    0 0 0 3px rgba(88, 166, 255, 0.12),
-    0 0 0 2px var(--focus-ring);
+    0 0 0 2px rgba(88, 166, 255, 0.18),
+    0 0 0 1px var(--focus-ring);
 }
 
 .command-palette-results {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  max-height: min(52vh, 440px);
-  padding: 16px 18px;
+  min-height: 0;
+  max-height: min(62vh, 520px);
+  padding: 4px;
   overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .command-palette-section {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+}
+
+.command-palette-section + .command-palette-section {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .command-palette-section-label {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  padding: 4px 8px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  line-height: 16px;
   text-transform: uppercase;
   color: var(--text-muted);
 }
 
 .command-palette-empty {
-  padding: 16px 18px;
-  border: 1px dashed rgba(139, 148, 158, 0.28);
-  border-radius: 14px;
-  background: rgba(22, 27, 34, 0.66);
+  padding: 14px 10px;
   color: var(--text-secondary);
   font-size: 13px;
-  line-height: 1.5;
+  text-align: center;
 }
 
 .command-palette-item {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid transparent;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.03);
+  gap: 8px;
+  min-height: 30px;
+  padding: 0 8px;
+  border-radius: 5px;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.command-palette-item:hover {
+  background: rgba(255, 255, 255, 0.04);
 }
 
 .command-palette-item.selected {
-  border-color: rgba(88, 166, 255, 0.4);
-  background: rgba(88, 166, 255, 0.12);
+  background: rgba(56, 139, 253, 0.2);
+  box-shadow: inset 2px 0 0 var(--accent-blue);
 }
 
 .command-palette-item:focus-visible {
@@ -3829,36 +3854,119 @@ body.touch-input-mode .xterm .composition-view.active {
   outline-offset: -2px;
 }
 
-.command-palette-item-title {
-  font-size: 14px;
+.command-palette-item-icon {
+  display: inline-flex;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.command-palette-item-icon svg,
+.command-palette-item-icon i {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+}
+
+.command-palette-item.selected .command-palette-item-icon {
   color: var(--text-primary);
 }
 
-.command-palette-item-meta {
-  display: inline-flex;
-  flex-wrap: wrap;
-  justify-content: flex-end;
-  gap: 6px;
+/* Title and detail share one line; the detail yields first. */
+.command-palette-item-text {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 
-.command-palette-chip {
-  padding: 3px 8px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
+.command-palette-item-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.command-palette-item-detail {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.command-palette-match {
+  background: none;
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.command-palette-item-key {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 6px;
+  border: 1px solid var(--border-primary);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-primary);
   color: var(--text-secondary);
+  font-family: inherit;
   font-size: 11px;
-  line-height: 1.2;
+  line-height: 16px;
+  white-space: nowrap;
 }
 
 .command-palette-footer {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 12px 18px 16px;
-  border-top: 1px solid rgba(255, 255, 255, 0.06);
-  font-size: 12px;
+  gap: 4px 14px;
+  padding: 6px 12px;
+  border-top: 1px solid var(--border-primary);
+  font-size: 11px;
   color: var(--text-muted);
+}
+
+.command-palette-footer kbd {
+  display: inline-block;
+  min-width: 16px;
+  margin-right: 2px;
+  padding: 0 4px;
+  border: 1px solid var(--border-primary);
+  border-radius: 3px;
+  font-family: inherit;
+  font-size: 10.5px;
+  line-height: 15px;
+  text-align: center;
+}
+
+.command-palette-modes {
+  margin-left: auto;
+}
+
+/* Touch: 44px targets, no keyboard hints, and the sheet sits at the TOP of
+   the visual viewport so the on-screen keyboard never covers the results. */
+@media (pointer: coarse) {
+  .command-palette-item {
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .command-palette-item-detail {
+    font-size: 13px;
+  }
+
+  .command-palette-item-key,
+  .command-palette-footer {
+    display: none;
+  }
 }
 
 /* =============================================================================
@@ -4041,11 +4149,13 @@ body.touch-input-mode .xterm .composition-view.active {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  border-radius: 6px;
+  gap: 6px;
+  min-height: 26px;
+  padding: 0 4px 0 8px;
+  border: 1px solid transparent;
+  border-radius: 4px;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 13px;
 }
 
 .file-item:hover {
@@ -4054,17 +4164,32 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .file-item.selected {
   background: rgba(88, 166, 255, 0.14);
-  border: 1px solid rgba(88, 166, 255, 0.35);
+  border-color: rgba(88, 166, 255, 0.35);
 }
 
 .file-item .file-icon {
-  font-size: 18px;
-  width: 24px;
-  text-align: center;
+  display: inline-flex;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.file-item .file-icon svg {
+  width: 16px;
+  height: 16px;
+  stroke-width: 1.75;
+}
+
+.file-item.is-dir .file-icon {
+  color: #d9a441;
 }
 
 .file-item .file-name {
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 3ch;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4075,24 +4200,17 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 .file-item .file-size {
-  font-size: 12px;
+  flex: 0 0 auto;
+  font-size: 11px;
   color: var(--text-muted);
 }
 
+/* Row actions sit in the row's flow AFTER the filename (never on top of
+   it): the name only ellipsizes to make room while they are shown. */
 .file-item .file-actions {
   display: none;
-  gap: 4px;
-  /* Overlay, not flex flow: 4 non-shrinking buttons in the row's flex flow
-     forced .file-name (flex:1, basis 0%) down to a sliver ("o.") once the
-     row got narrow. Positioning them out-of-flow means the name keeps the
-     row's full width and only visually cedes space on hover/focus. */
-  position: absolute;
-  right: 6px;
-  top: 50%;
-  transform: translateY(-50%);
-  background: var(--bg-tertiary);
-  padding: 2px 4px;
-  border-radius: 4px;
+  flex: 0 0 auto;
+  gap: 1px;
 }
 
 .file-item:hover .file-actions,
@@ -4100,21 +4218,28 @@ body.touch-input-mode .xterm .composition-view.active {
   display: flex;
 }
 
-/* Actions overlay the size column too, so hide it out of the way rather than
-   let it collide with the buttons. */
 .file-item:hover .file-size,
 .file-item:focus-within .file-size {
   display: none;
 }
 
 .file-item .file-actions button {
-  padding: 4px 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   background: transparent;
-  border: 1px solid var(--border-primary);
+  border: 1px solid transparent;
   border-radius: 4px;
-  color: var(--text-muted);
-  font-size: 12px;
+  color: var(--text-secondary);
   cursor: pointer;
+}
+
+.file-item .file-actions button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .file-item .file-actions button:hover {
@@ -4126,6 +4251,27 @@ body.touch-input-mode .xterm .composition-view.active {
   background: rgba(248, 81, 73, 0.2);
   border-color: var(--accent-red);
   color: var(--accent-red);
+}
+
+/* Touch: 44px rows and targets. */
+@media (pointer: coarse) {
+  .file-item {
+    min-height: 44px;
+    font-size: 15px;
+  }
+
+  .file-item .file-actions button,
+  .file-explorer-action.btn-icon {
+    width: 40px;
+    height: 40px;
+  }
+
+  .file-item .file-icon,
+  .file-item .file-icon svg {
+    width: 18px;
+    height: 18px;
+    flex-basis: 18px;
+  }
 }
 
 .file-drop-zone {
@@ -4716,19 +4862,19 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   .file-explorer-header {
-    padding: 18px 16px 14px;
+    padding: calc(6px + env(safe-area-inset-top, 0px)) 6px 6px 16px;
   }
 
   .file-explorer-header h3 {
-    font-size: 24px;
+    font-size: 17px;
   }
 
-  .file-explorer-path-hint {
-    display: none;
+  .file-explorer-bar {
+    padding-left: 12px;
   }
 
-  .file-explorer-footer {
-    display: block;
+  .file-explorer-list {
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
   }
 
   .tools-sheet-panel {
@@ -4822,36 +4968,41 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   }
 
   .command-palette {
-    align-items: flex-end;
+    top: var(--app-vv-top, 0px);
+    bottom: auto;
+    height: var(--app-vvh, 100dvh);
+    align-items: flex-start;
     padding: 0;
     background: rgba(3, 7, 12, 0.7);
   }
 
   .command-palette-panel {
     width: 100%;
-    max-height: min(82dvh, 680px);
+    max-height: 100%;
+    border-top: none;
     border-right: none;
-    border-bottom: none;
     border-left: none;
-    border-radius: 20px 20px 0 0;
+    border-radius: 0 0 14px 14px;
   }
 
   .command-palette-header {
-    padding: 18px 16px 14px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 10px 8px;
+  }
+
+  #command-palette-input {
+    height: 44px;
+    /* 16px keeps iOS from zooming the page on focus. */
+    font-size: 16px;
   }
 
   .command-palette-results {
-    max-height: min(50dvh, 380px);
-    padding: 14px 16px;
-  }
-
-  .command-palette-empty,
-  .command-palette-item {
-    min-height: 52px;
+    flex: 1 1 auto;
+    max-height: none;
+    padding: 4px 6px 8px;
   }
 
   .command-palette-footer {
-    padding: 12px 16px calc(16px + env(safe-area-inset-bottom));
+    display: none;
   }
 
   .tab {

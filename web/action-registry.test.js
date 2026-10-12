@@ -107,3 +107,24 @@ test("sorts exact prefix matches before looser matches and groups results by sec
     "Workspaces",
   ]);
 });
+
+test("passes icon and keybinding display metadata through to results", () => {
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "new-terminal",
+    title: "New Terminal",
+    group: "Actions",
+    icon: "square-terminal",
+    keybinding: "Ctrl+N",
+    run: () => {},
+  });
+  registry.registerProvider(() => [
+    { id: "plain", title: "Plain", group: "Actions", run: () => {} },
+  ]);
+
+  const [first, second] = registry.getResults("");
+  expect(first.icon).toBe("square-terminal");
+  expect(first.keybinding).toBe("Ctrl+N");
+  expect(second.icon).toBeNull();
+  expect(second.keybinding).toBeNull();
+});

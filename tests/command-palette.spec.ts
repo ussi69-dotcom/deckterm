@@ -128,8 +128,10 @@ test.describe("Command palette navigation layer", () => {
     await openCommandPalette(page);
     await page.locator("#command-palette-input").fill(workspaceALabel);
 
+    // Workspace A is still open as a tab, so the palette lists it once (as
+    // the open workspace) instead of repeating it as a recent workspace.
     const recentWorkspaceEntry = page
-      .getByRole("option", { name: /Recent Workspace/i })
+      .getByRole("option", { name: new RegExp(workspaceALabel) })
       .first();
     await expect(recentWorkspaceEntry).toBeVisible();
 
@@ -259,16 +261,26 @@ test.describe("Command palette navigation layer on mobile", () => {
     await waitForTerminal(page);
   });
 
-  test("renders as a mobile sheet and still runs actions", async ({ page }) => {
+  test("renders as a top-anchored mobile sheet and still runs actions", async ({
+    page,
+  }) => {
     await openCommandPalette(page);
 
     const panel = page.locator(".command-palette-panel");
     await expect(panel).toBeVisible();
 
+    // Anchored at the top so the on-screen keyboard never covers results:
+    // the input comes first, the results below it, and no keyboard hints.
     const box = await panel.boundingBox();
     expect(box).toBeTruthy();
     expect(box?.width || 0).toBeGreaterThan(360);
-    expect(box?.y || 0).toBeGreaterThan(140);
+    expect(box?.y ?? 999).toBeLessThan(24);
+    const inputBox = await page.locator("#command-palette-input").boundingBox();
+    const resultsBox = await page
+      .locator("#command-palette-results")
+      .boundingBox();
+    expect(inputBox!.y).toBeLessThan(resultsBox!.y);
+    await expect(page.locator(".command-palette-footer")).toBeHidden();
 
     await page.locator("#command-palette-input").fill("Open File Manager");
     await page.keyboard.press("Enter");

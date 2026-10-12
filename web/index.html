@@ -483,56 +483,73 @@
           aria-labelledby="file-explorer-title"
         >
           <div class="file-explorer-header">
-            <div>
-              <div class="file-explorer-kicker">Workspace Surface</div>
-              <h3 id="file-explorer-title">Files</h3>
-            </div>
-            <div class="file-explorer-header-actions">
-              <span class="file-explorer-path-hint">Active workspace</span>
-              <button
-                id="file-explorer-close"
-                class="btn-icon"
-                title="Close file explorer"
-                aria-label="Close file explorer"
-              >
-                <i data-lucide="x"></i>
-              </button>
-            </div>
-          </div>
-
-          <div
-            id="file-explorer-breadcrumb"
-            class="breadcrumb file-explorer-breadcrumb"
-          >
-            <span>Open Files to browse the current workspace.</span>
-          </div>
-
-          <div class="file-toolbar file-explorer-toolbar">
-            <button id="file-explorer-upload-btn" class="btn btn-secondary">
-              <i data-lucide="upload"></i>
-              <span>Upload</span>
-            </button>
-            <button id="file-explorer-mkdir-btn" class="btn btn-secondary">
-              <i data-lucide="folder-plus"></i>
-              <span>New Folder</span>
-            </button>
-            <button id="file-explorer-newfile-btn" class="btn">
-              <i data-lucide="file-plus"></i>
-              <span>New File</span>
-            </button>
+            <h3 id="file-explorer-title">Files</h3>
             <button
-              id="file-explorer-refresh-btn"
+              id="file-explorer-close"
               class="btn-icon"
-              title="Refresh explorer"
+              type="button"
+              title="Close file explorer"
+              aria-label="Close file explorer"
             >
-              <i data-lucide="refresh-cw"></i>
+              <i data-lucide="x"></i>
             </button>
-            <input
-              type="file"
-              id="file-explorer-upload-input"
-              multiple
-              hidden
-            />
+          </div>
+
+          <div class="file-explorer-bar">
+            <nav
+              id="file-explorer-breadcrumb"
+              class="breadcrumb file-explorer-breadcrumb"
+            >
+              <span>Open Files to browse the current workspace.</span>
+            </nav>
+            <div
+              class="file-toolbar file-explorer-toolbar"
+              role="toolbar"
+              aria-label="File actions"
+            >
+              <button
+                id="file-explorer-newfile-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="New File"
+                aria-label="New File"
+              >
+                <i data-lucide="file-plus"></i>
+              </button>
+              <button
+                id="file-explorer-mkdir-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="New Folder"
+                aria-label="New Folder"
+              >
+                <i data-lucide="folder-plus"></i>
+              </button>
+              <button
+                id="file-explorer-upload-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="Upload"
+                aria-label="Upload"
+              >
+                <i data-lucide="upload"></i>
+              </button>
+              <button
+                id="file-explorer-refresh-btn"
+                class="btn-icon file-explorer-action"
+                type="button"
+                title="Refresh"
+                aria-label="Refresh explorer"
+              >
+                <i data-lucide="refresh-cw"></i>
+              </button>
+              <input
+                type="file"
+                id="file-explorer-upload-input"
+                multiple
+                hidden
+              />
+            </div>
           </div>
 
           <div id="file-explorer-list" class="file-list file-explorer-list">
@@ -550,16 +567,6 @@
             class="file-drop-zone file-explorer-drop-zone hidden"
           >
             <span>Drop files here to upload</span>
-          </div>
-
-          <div class="file-explorer-footer">
-            <button
-              id="file-explorer-mobile-close"
-              class="btn btn-secondary"
-              type="button"
-            >
-              Close
-            </button>
           </div>
         </section>
       </div>
@@ -692,37 +699,41 @@
       >
         <div class="command-palette-panel">
           <div class="command-palette-header">
-            <div class="command-palette-title-row">
-              <span id="command-palette-title" class="command-palette-kicker"
-                >Command palette</span
-              >
-              <span class="command-palette-shortcut">Ctrl+Shift+P</span>
+            <span id="command-palette-title" class="command-palette-title"
+              >Command palette</span
+            >
+            <div class="command-palette-search">
+              <i
+                data-lucide="search"
+                class="command-palette-search-icon"
+                aria-hidden="true"
+              ></i>
+              <input
+                id="command-palette-input"
+                aria-label="Search commands, files, and workspaces"
+                type="text"
+                autocomplete="off"
+                autocapitalize="off"
+                spellcheck="false"
+                enterkeyhint="go"
+                placeholder="Search commands and files"
+              />
             </div>
-            <input
-              id="command-palette-input"
-              aria-label="Search commands, files, and workspaces"
-              type="text"
-              autocomplete="off"
-              spellcheck="false"
-              placeholder="Search actions, workspaces, and views..."
-            />
           </div>
           <div
             id="command-palette-results"
             class="command-palette-results"
             role="listbox"
             aria-label="Command palette results"
-          >
-            <div class="command-palette-section">
-              <div class="command-palette-section-label">Actions</div>
-              <div class="command-palette-empty">
-                Start typing to filter actions, workspaces, and view toggles.
-              </div>
-            </div>
-          </div>
-          <div class="command-palette-footer">
-            <span>Enter to run</span>
-            <span>Esc to close</span>
+          ></div>
+          <div class="command-palette-footer" aria-hidden="true">
+            <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+            <span><kbd>Enter</kbd> run</span>
+            <span><kbd>Esc</kbd> close</span>
+            <span class="command-palette-modes"
+              ><kbd>@</kbd> sessions <kbd>$</kbd> commands <kbd>/</kbd>
+              folders</span
+            >
           </div>
         </div>
       </div>

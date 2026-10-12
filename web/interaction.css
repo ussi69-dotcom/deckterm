@@ -14,6 +14,8 @@
 
 .file-item .file-open {
   padding: 3px 0;
+  /* Fill the row so the filename keeps every pixel the actions do not use. */
+  align-self: stretch;
 }
 
 .file-breadcrumb-button {
@@ -230,10 +232,6 @@
   .file-operation-notice button {
     min-height: 44px;
   }
-
-  .file-explorer-toolbar {
-    flex-wrap: wrap;
-  }
 }
 /* Keep frequent workspace actions above terminal utilities and preferences. */
 .tools-sheet-group-title {
@@ -249,12 +247,6 @@
 
 .tools-sheet-grid + .tools-sheet-edit-layout {
   margin-top: 20px;
-}
-.file-explorer-toolbar {
-  flex-wrap: wrap;
-}
-.file-explorer-toolbar .btn {
-  white-space: nowrap;
 }
 @media (max-width: 767px) {
   .tools-sheet-grid {

@@ -213,13 +213,18 @@ test.describe("Mobile Files modal keyboard contract", () => {
       name: "Close file explorer",
       exact: true,
     });
-    const last = explorer.getByRole("button", { name: "Close", exact: true });
+    // The sheet has exactly one close control (the header ×).
     await opener.tap();
     await expect(dialog).toBeVisible();
     await expect(dialog).toHaveAttribute("aria-modal", "true");
+    await expect(
+      explorer.getByRole("button", { name: "Close", exact: true }),
+    ).toHaveCount(0);
     await expect(first).toBeFocused();
+    // Shift+Tab from the first control wraps to the last one inside the sheet.
     await page.keyboard.press("Shift+Tab");
-    await expect(last).toBeFocused();
+    await expect(first).not.toBeFocused();
+    await expect(dialog.locator(":focus")).toHaveCount(1);
     await page.keyboard.press("Tab");
     await expect(first).toBeFocused();
     await page.keyboard.press("Escape");
@@ -227,7 +232,6 @@ test.describe("Mobile Files modal keyboard contract", () => {
     await expect(opener).toBeFocused();
     await opener.tap();
     await expect(first).toBeFocused();
-    await page.keyboard.press("Shift+Tab");
     await page.keyboard.press("Enter");
     await expect(explorer).toBeHidden();
     await expect(opener).toBeFocused();
