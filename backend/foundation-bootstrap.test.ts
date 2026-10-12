@@ -189,6 +189,9 @@ test("foundation C0 bootstraps first admin with one-time token and allows termin
   expect(forbiddenRootRes.status).toBe(403);
   await expect(forbiddenRootRes.json()).resolves.toMatchObject({
     error: "Forbidden terminal root",
+    reason: "forbidden_root",
+    path: outsideRoot,
+    setting: "ALLOWED_FILE_ROOTS",
   });
 
   const createRes = await app.fetch(
