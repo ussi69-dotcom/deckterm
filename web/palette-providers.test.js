@@ -369,6 +369,36 @@ test("MRU store survives corrupt storage and ignores blank ids", () => {
   expect(safe.list("files")).toEqual([]);
 });
 
+test("MRU rankLookup reads storage once and answers ranks from a snapshot", () => {
+  const storage = makeStorage();
+  const mru = createPaletteMruStore(storage);
+  mru.touch("files", "/a", 1);
+  mru.touch("files", "/b", 2);
+  let reads = 0;
+  const getItem = storage.getItem.bind(storage);
+  storage.getItem = (key) => {
+    reads += 1;
+    return getItem(key);
+  };
+
+  const rankOf = mru.rankLookup("files");
+  const files = Array.from({ length: 2000 }, (_, i) => ({
+    path: `/r/file-${i}.js`,
+    relativePath: `file-${i}.js`,
+  }));
+  files.push({ path: "/a", relativePath: "a-file.js" });
+  const ranked = filterQuickOpenFiles("file", files, 5, {
+    mruRank: (file) => rankOf(file.path),
+  });
+
+  expect(reads).toBe(1);
+  expect(ranked[0].path).toBe("/a");
+  expect(rankOf("/b")).toBe(0);
+  expect(rankOf("/a")).toBe(1);
+  expect(rankOf("/missing")).toBe(-1);
+  expect(rankOf(undefined)).toBe(-1);
+});
+
 test("filterQuickOpenFiles ranks recently opened files above equal matches", () => {
   const files = [
     { path: "/r/src/alpha.js", relativePath: "src/alpha.js" },
