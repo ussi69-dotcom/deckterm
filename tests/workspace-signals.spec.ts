@@ -280,7 +280,9 @@ test.describe("Workspace telemetry contract", () => {
     expect(workspaceContext.workspaceId).toBeTruthy();
     expect(workspaceContext.activeId).toBeTruthy();
 
-    await page.keyboard.type("printf 'listening on port 4174\\n'; sleep 1");
+    // Running state is sampled about every 2 s (tmux pipe pump and the
+    // shared runtime-sync TTL), so the command must outlast one sample.
+    await page.keyboard.type("printf 'listening on port 4174\\n'; sleep 4");
     await page.keyboard.press("Enter");
 
     await expect
@@ -392,7 +394,9 @@ test.describe("Workspace telemetry contract", () => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
 
-    await page.keyboard.type("sleep 1");
+    // Must outlast one ~2 s running-state sample (tmux pipe pump / runtime
+    // sync TTL); a shorter command can start and finish between samples.
+    await page.keyboard.type("sleep 3");
     await page.keyboard.press("Enter");
 
     await expect
