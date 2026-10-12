@@ -263,6 +263,16 @@
     return match ? formatCombo(match.keys[0]) : "";
   }
 
+  // Command-palette actions with their hint taken from this registry, so the
+  // palette and the Help modal never disagree. Actions the registry does not
+  // bind keep their own keybinding (or none).
+  function withShortcutHints(actions, shortcuts = KEYBOARD_SHORTCUTS) {
+    return (Array.isArray(actions) ? actions : []).map((action) => {
+      const keybinding = shortcutForAction(action?.id, shortcuts);
+      return keybinding ? { ...action, keybinding } : action;
+    });
+  }
+
   // The help shortcut test used by the global keydown handler. Ctrl+Shift+? (the
   // "/" key with Shift) never produces terminal input, so it works with a
   // focused terminal; F1 and a bare "?" only count outside the terminal and
@@ -377,6 +387,7 @@
     buildHelpSections,
     listedCombos,
     shortcutForAction,
+    withShortcutHints,
     isHelpShortcut,
     renderHelpShortcuts,
   };

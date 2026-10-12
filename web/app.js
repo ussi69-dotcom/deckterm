@@ -10398,7 +10398,6 @@ class TerminalManager {
         title: "Search in Terminal",
         group: "Views",
         icon: "search",
-        keybinding: "Ctrl+F",
         keywords: ["find", "search", "terminal"],
         run: () => this.openTerminalSearch(),
       },
@@ -10450,7 +10449,6 @@ class TerminalManager {
         title: "Open Help",
         group: "Views",
         icon: "circle-help",
-        keybinding: "F1",
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
@@ -10464,7 +10462,13 @@ class TerminalManager {
       },
     ];
 
-    actions.forEach((action) => this.commandPaletteRegistry.register(action));
+    // Hints come from the shortcut registry (the Help modal's source), so a
+    // palette row never advertises a key the app does not handle.
+    const hintedActions =
+      window.KeyboardShortcuts?.withShortcutHints?.(actions) || actions;
+    hintedActions.forEach((action) =>
+      this.commandPaletteRegistry.register(action),
+    );
 
     this.commandPaletteRegistry.registerProvider(() => {
       const query = this.getCommandPaletteQuery();
