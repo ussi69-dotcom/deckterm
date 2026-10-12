@@ -116,17 +116,24 @@ async function fetchServedBuild() {
   return body?.build ?? null;
 }
 
-// Reuses the existing bottom-centre toast look (.clipboard-toast); a later
-// pass unifies the toast systems.
+// Reuses the existing toast look (.clipboard-toast), placed at the top; a
+// later pass unifies the toast systems.
 function createUpdateToast(doc, { onReload, onDismiss }) {
   const toast = doc.createElement("div");
   toast.className = "clipboard-toast release-watch-toast hidden";
   toast.setAttribute("role", "status");
   toast.setAttribute("aria-live", "polite");
+  // Below the toolbar rather than the clipboard toast's bottom slot, which
+  // on phones sits on top of the extra-keys row.
+  Object.assign(toast.style, {
+    top: "calc(env(safe-area-inset-top, 0px) + 72px)",
+    bottom: "auto",
+  });
 
   const message = doc.createElement("span");
   message.className = "toast-message";
   message.textContent = "DeckTerm was updated";
+  message.style.whiteSpace = "nowrap";
 
   const reload = doc.createElement("button");
   reload.type = "button";
