@@ -27,6 +27,23 @@ function isDesktopSurfaceWidth(width) {
   return Number(width) >= SURFACE_WINDOW_DESKTOP_MIN_WIDTH_PX;
 }
 
+// Touch tablets keep the phone's bottom chrome (extra keys, action bar)
+// while Files/Git float above the terminal. The inset is how much of the
+// viewport bottom that chrome covers, so a floating surface can stop above
+// it. rects: bounding rects of the bottom bars (hidden ones have height 0).
+function computeBottomChromeInset(viewportBottom, rects) {
+  const bottom = Number(viewportBottom);
+  if (!Number.isFinite(bottom)) return 0;
+  let top = bottom;
+  for (const rect of Array.isArray(rects) ? rects : []) {
+    const height = Number(rect?.height);
+    const rectTop = Number(rect?.top);
+    if (!(height > 0) || !Number.isFinite(rectTop)) continue;
+    top = Math.min(top, rectTop);
+  }
+  return Math.max(0, Math.round(bottom - top));
+}
+
 const SNAP_ZONE_BOUNDS = Object.freeze({
   left: Object.freeze({ x: 0, y: 0, width: 50, height: 100 }),
   right: Object.freeze({ x: 50, y: 0, width: 50, height: 100 }),
@@ -609,6 +626,7 @@ const SurfaceWindows = {
   clampDockHeight,
   dockStateFromSettings,
   isDesktopSurfaceWidth,
+  computeBottomChromeInset,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,

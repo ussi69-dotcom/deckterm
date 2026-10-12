@@ -6473,7 +6473,43 @@ class TerminalManager {
         viewport.addEventListener("scrollend", scheduleViewportSync);
       }
     }
+    // The bottom bars change height on their own (chips row, extra-keys
+    // toggle, function keys); floating surfaces must follow them.
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(() => this.syncBottomChromeInset());
+      for (const id of ["extra-keys", "mobile-action-bar"]) {
+        const el = document.getElementById(id);
+        if (el) observer.observe(el);
+      }
+    }
     this.handleViewportResize({ fromViewportEvent: true });
+  }
+
+  // --bottom-chrome-inset: how much of the viewport bottom the touch chrome
+  // (extra keys + action bar) covers. Touch tablets float Files/Git above the
+  // terminal; styles.css stops them above this inset so they never cover the
+  // keys and buttons. 0 on desktop.
+  syncBottomChromeInset() {
+    const compute = window.SurfaceWindows?.computeBottomChromeInset;
+    if (typeof compute !== "function") return;
+    let inset = 0;
+    if (this.isTouchLayout()) {
+      const rects = ["extra-keys", "mobile-action-bar"].map((id) => {
+        const el = document.getElementById(id);
+        return el && el.getClientRects().length
+          ? el.getBoundingClientRect()
+          : null;
+      });
+      const viewport = window.visualViewport;
+      const viewportBottom = viewport
+        ? viewport.offsetTop + viewport.height
+        : window.innerHeight;
+      inset = compute(viewportBottom, rects);
+    }
+    const value = `${inset}px`;
+    if (this.bottomChromeInset === value) return;
+    this.bottomChromeInset = value;
+    document.documentElement.style.setProperty("--bottom-chrome-inset", value);
   }
 
   // Touch-first layouts: phones (mobile chrome) and coarse-pointer tablets.
@@ -16682,6 +16718,7 @@ class TerminalManager {
     body.classList.toggle("virtual-keyboard-open", layout.keyboardOpen);
     body.classList.toggle("phone-landscape", layout.phoneLandscape);
     this.extraKeys?.syncQuickReplies?.({ relayout: false });
+    this.syncBottomChromeInset();
 
     const layoutKey = [
       layout.appHeight,

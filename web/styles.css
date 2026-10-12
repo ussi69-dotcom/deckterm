@@ -4649,6 +4649,26 @@ body.chrome-mobile .file-explorer-shell {
   background: linear-gradient(180deg, var(--bg-secondary), var(--bg-primary));
 }
 
+/* Touch tablets (wider than the phone sheet breakpoint) float Files and Git
+   over the terminal but keep the extra keys and action bar: stop both above
+   that chrome (--bottom-chrome-inset, measured in app.js) so the keys and
+   buttons stay reachable. */
+@media (min-width: 769px) {
+  body.chrome-mobile .file-explorer-shell {
+    height: calc(
+      var(--app-vvh, 100vh) - var(--toolbar-height) - 24px -
+        var(--bottom-chrome-inset, 0px)
+    );
+  }
+
+  body.chrome-mobile .side-panel {
+    height: calc(
+      var(--app-vvh, 100vh) - var(--toolbar-height) -
+        var(--bottom-chrome-inset, 0px)
+    );
+  }
+}
+
 /* A lone pane on a touch layout: its floating close (x) only covers terminal
    text — the tab already has a close button. Multi-pane workspaces keep it
    (it closes one pane), and an open close-confirmation stays reachable. */
