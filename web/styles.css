@@ -7017,8 +7017,40 @@ body.ide-mode #workspace-area {
   border-radius: 0;
 }
 
+.ide-activity-item {
+  position: relative;
+}
+
 .ide-activity-item:hover {
   color: var(--text-primary, #fff);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.ide-activity-item:hover svg {
+  stroke-width: 2.1;
+}
+
+/* Styled tooltip from data-tooltip (title + shortcut + what a click does). */
+.ide-activity-item[data-tooltip]:hover::after,
+.ide-activity-item[data-tooltip]:focus-visible::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: calc(100% + 8px);
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 5px 9px;
+  border: 1px solid var(--border-hover, #484f58);
+  border-radius: 6px;
+  background: var(--bg-secondary, #161b22);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.45);
+  color: var(--text-primary, #e6edf3);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  white-space: pre;
+  text-align: left;
+  pointer-events: none;
 }
 
 .ide-activity-item.active {

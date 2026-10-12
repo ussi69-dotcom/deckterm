@@ -923,3 +923,28 @@ test("enter/exit fire the app dock hooks and never recreate the terminal node", 
   // contract is "move the node", not "rebuild the terminal area".
   expect(h.doc.getElementById("terminal-container")).toBe(tc);
 });
+
+test("activityItemTooltip: view title, its shortcut, and what a click does", () => {
+  const { activityItemTooltip } = require("./ide-shell");
+  // Inactive view: the click opens it.
+  expect(
+    activityItemTooltip({ title: "Source Control" }, { active: false }),
+  ).toBe("Source Control");
+  // With a shortcut the label carries it.
+  expect(
+    activityItemTooltip(
+      { title: "Explorer", shortcut: "Ctrl+Shift+E" },
+      { active: false },
+    ),
+  ).toBe("Explorer (Ctrl+Shift+E)");
+  // Active + open: a click hides the sidebar; active + collapsed: shows it.
+  expect(
+    activityItemTooltip({ title: "Explorer" }, { active: true, collapsed: false }),
+  ).toBe("Explorer\nClick to hide the sidebar");
+  expect(
+    activityItemTooltip({ title: "Explorer" }, { active: true, collapsed: true }),
+  ).toBe("Explorer\nClick to show the sidebar");
+  // Junk-tolerant.
+  expect(activityItemTooltip(null)).toBe("");
+  expect(activityItemTooltip({ id: "tasks" })).toBe("tasks");
+});
