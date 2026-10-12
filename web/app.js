@@ -7647,7 +7647,21 @@ class TerminalManager {
           const attentionText = attentionKind
             ? [s.attention.title, s.attention.body].filter(Boolean).join(" — ")
             : "";
-          const agentState = String(s.agentState || "").toLowerCase();
+          // A needs-input notification the agent is still waiting on beats
+          // agentState ("thinking" is only "no new output"). It is fresh while
+          // the agent is not streaming and nothing (typing, agent output) has
+          // happened since it arrived; the slack covers the prompt render.
+          const attentionAt = Number(s.attention?.at) || 0;
+          const freshNeedsInput =
+            s.attention?.kind === "needs-input" &&
+            attentionAt > 0 &&
+            String(s.agentState || "").toLowerCase() !== "responding" &&
+            (Number(s.lastActivityAt) || 0) <= attentionAt + 15_000;
+          const agentState = !freshNeedsInput
+            ? String(s.agentState || "").toLowerCase()
+            : attentionKind === "needs-input"
+              ? "" // the attention chip already says "Needs your input"
+              : "needs input";
           const agentChip = s.agentName
             ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
             : s.running

@@ -75,6 +75,7 @@ import {
   createTerminalNotificationParseState,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
+  nextAgentMarkerActive,
   parseShellIntegrationChunk,
   parseTerminalNotifications,
   resolveAgentOutputState,
@@ -314,6 +315,12 @@ type Terminal = {
   agentName: "codex" | "claude" | null;
   agentState: "thinking" | "responding" | null;
   agentHasUserPrompt: boolean;
+  // An explicit agent;start marker is open: the agent stays until agent;done
+  // or a returned prompt, whatever the process tree shows.
+  agentMarkerActive: boolean;
+  // Consecutive tmux samples without the process-detected agent (see
+  // inferTmuxRuntimeState); the agent is cleared at two.
+  agentMissedSamples: number;
   agentTurnCompletedAt: number | null;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
   // S11: display-only ring of recent tool-used marker events (untrusted,
@@ -757,6 +764,10 @@ function applyParsedShellIntegrationState(
   const wasRunning = term.running;
   let completedAgentTurn = false;
   term.shellIntegrationCarry = parsed.state.carry;
+  term.agentMarkerActive = nextAgentMarkerActive(
+    term.agentMarkerActive,
+    parsed.events,
+  );
   let stateChanged = false;
   if (term.running !== parsed.state.running) {
     term.running = parsed.state.running;
@@ -5501,7 +5512,12 @@ async function syncTmuxRuntimeState(
   const [capture, processTree] = await Promise.all([
     captureTmuxPane(term.sessionName).catch(() => ""),
     panePid > 0
-      ? getProcessTreeArgs(panePid, getProcessSnapshot()).catch(() => [])
+      ? getProcessTreeArgs(panePid, getProcessSnapshot()).then(
+          // The tree always contains the pane process itself; an empty one
+          // means the ps snapshot failed, so the sample is inconclusive.
+          (args) => (args.length > 0 ? args : null),
+          () => null,
+        )
       : Promise.resolve([]),
   ]);
   const nextRuntimeState = inferTmuxRuntimeState({
@@ -5514,8 +5530,10 @@ async function syncTmuxRuntimeState(
       lastExitCode: term.lastExitCode,
       agentName: term.agentName,
       agentState: term.agentState,
+      agentMissedSamples: term.agentMissedSamples,
     },
     hasUserPrompted: term.agentHasUserPrompt,
+    agentMarkerActive: term.agentMarkerActive,
   });
 
   if (term.agentName && term.agentName !== nextRuntimeState.agentName) {
@@ -5526,8 +5544,10 @@ async function syncTmuxRuntimeState(
   term.lastExitCode = nextRuntimeState.lastExitCode;
   term.agentName = nextRuntimeState.agentName;
   term.agentState = nextRuntimeState.agentState;
+  term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
   if (!nextRuntimeState.agentName) {
     term.agentHasUserPrompt = false;
+    term.agentMarkerActive = false;
   }
   term.lastTmuxCapture = capture;
 
@@ -5778,6 +5798,8 @@ async function createManagedTerminal({
     agentName: initialRuntimeState?.agentName || null,
     agentState: initialRuntimeState?.agentState || null,
     agentHasUserPrompt: Boolean(initialRuntimeState?.agentName),
+    agentMarkerActive: false,
+    agentMissedSamples: 0,
     agentTurnCompletedAt: null,
     agentRespondingTimer: null,
     recentTools: [],
