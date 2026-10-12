@@ -50,6 +50,16 @@ Merge order planned: perf-cache → git-ux → agent-attention → terminal-reli
 
 Wave 2 (after wave 1 merges): desktop polish (z-order P1, empty-state launcher, toolbar, help, search overlay), palette + explorer, unified toasts with Undo, phone compose sheet, smalls (error names rejected value, e2e `.xterm-rows` migration, leaked `palette-folder-*` cleanup).
 
+## Progress
+
+- Wave 1 merged into `dev` (merge commits after `b001e23`; conflicts in server.ts pump/single-flight and app.js attention/live-cwd resolved keeping both), tests wired in `cc327b8`, pushed to `origin/dev`. Gate: unit 1432/0, push 14/0, tsc 0, smoke e2e 32/32. Dev restarted 20:55 UTC: tmux session preserved + recovered, health shows `build`.
+- Lifecycle investigation: root cause of the 07-19 P1 reproduced (old deploy candidate sharing prod state + namespace; closed by the 09-06 ownership lock). Latent mechanism still in code: `closeAndRemoveTerminal` ends the row on ANY attach-client exit (3/3 repro), boolean tmux probe treats unreachable as missing. Fix = wave 2 slice `lifecycle-fix`. KB backlog item must be re-scoped at sync.
+- Prod drop-in `deckterm.service.d/idle-timeout.conf` still sets 24h/72h reapers on prod (contradicts the 08-30 "only explicit close ends a session" decision) → owner question (prod config).
+- Wave 2 running: workflow `deckterm-qol-wave2` run `wf_3a7d8243-b5d` (task wnvlfx7iq), worktrees from `cc327b8`, ports 4292-4296, state dirs `/tmp/claude-1001/w2*`.
+- Full e2e on dev (wave 1 state): 174 pass / 9 fail → e2e-fix agent (background, main checkout, commits on `dev`: 3164a6e, ef8e4f4, 58d43b9, 2cecd94 …) fixing git-panel spec repo fixture, tab copy vs close, extra-keys selector scope, Settings focus/keyboard heuristic, cwd-contract specs.
+- Wave 2 done (5 slices). Merged in integration worktree `/home/deploy/deckterm-qol/integration` (branch `qol/integration`, from dev incl. early e2e-fix commits) — all auto-merged; tests wired `921d1a7`. Running there: unit+push gate (bx9pqbguw), Codex review `--base=b001e23` → `codex-review-w2.md` (bnyzhp0ci), adversarial review workflow `deckterm-qol-review` run `wf_55c0a587-055` (w0j67iuzf).
+- After the e2e-fix agent finishes: merge `qol/integration` into `dev` in the main checkout, restart dev, full e2e, fix review findings, after-screenshots.
+
 ## Next triggers
 
 1. Wave 1 completes → read each result, inspect diffs, merge in order into `dev`, add new test files to `test:unit`, run full gate.
@@ -60,3 +70,7 @@ Wave 2 (after wave 1 merges): desktop polish (z-order P1, empty-state launcher, 
 - Workflow `isolation: 'worktree'` branched from stale commits here before → operator creates worktrees by hand from `dev` and verifies the base sha.
 - Operator env carries prod values (`DECKTERM_PUBLISH_MODE=cloudflare-access`, `TMUX_SESSION_NAMESPACE=deckterm`) → every private instance must start with `env -i` and explicit values.
 - e2e run cookie works only on port 4174.
+- `tmux kill-server` is blocked by the permission system → stop private tmux servers by killing the server PID whose args contain the private socket path.
+- Unix socket path limit (108 bytes): private state dirs must be short (`/tmp/claude-1001/<x>`), not under the scratchpad.
+- `web/git-scm-view.test.js` used `delete global.fetch` → later files in the same bun process lost fetch (fixed `de0feb5` on qol/integration).
+- Codex bridge auth expired 2026-10-12 21:36 UTC (401 token_expired) → Codex review unavailable until the owner runs `codex login`.
