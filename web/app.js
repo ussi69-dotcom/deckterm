@@ -5603,6 +5603,15 @@ class SettingsManager {
     this.searchInputEl?.focus?.({ preventScroll: true });
   }
 
+  // Touch layouts: focusing the search field would pop the on-screen
+  // keyboard over the panel, so focus lands on the active category tab.
+  focusActiveCategory() {
+    const tab =
+      this.sidebarEl?.querySelector?.('[aria-selected="true"]') ||
+      this.sidebarEl?.querySelector?.(".settings-category-btn");
+    tab?.focus?.({ preventScroll: true });
+  }
+
   renderControlRow(descriptor) {
     const row = document.createElement("div");
     row.className = "settings-row";
@@ -8225,7 +8234,12 @@ class TerminalManager {
       this.openSettingsSheet();
     }
     await this.settingsManager.render();
-    requestAnimationFrame(() => this.settingsManager?.focusSearch?.());
+    const touch = this.isTouchLayout();
+    requestAnimationFrame(() =>
+      touch
+        ? this.settingsManager?.focusActiveCategory?.()
+        : this.settingsManager?.focusSearch?.(),
+    );
     this.syncSurfaceButtonState();
   }
 
@@ -16480,7 +16494,11 @@ class TerminalManager {
       supportsLinkedView: Boolean(t.supportsLinkedView),
       wasActive: id === this.activeId,
     };
-    if (batch && now - batch.startedAt < 1000) {
+    // A close while the previous close toast is still up joins its batch:
+    // that toast is replaced, so it must say "N terminals closed" and its
+    // Undo must reopen all of them, not only the latest.
+    const toastStillShown = Boolean(window.ToastService?.has?.("session-close"));
+    if (batch && (now - batch.startedAt < 1000 || toastStillShown)) {
       batch.entries.push(entry);
     } else {
       this.closeUndoBatch = { startedAt: now, entries: [entry] };

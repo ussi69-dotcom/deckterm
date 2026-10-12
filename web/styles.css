@@ -7956,6 +7956,11 @@ body.ide-mode #workspace-area {
   pointer-events: none;
 }
 
+/* Hidden from pointerdown until the pointer leaves (ide-shell.js). */
+.ide-activity-item.tooltip-dismissed[data-tooltip]::after {
+  display: none;
+}
+
 .ide-activity-item.active {
   color: var(--text-primary, #fff);
   border-left-color: var(--accent-blue);
