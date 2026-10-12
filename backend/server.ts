@@ -93,7 +93,10 @@ import {
   TmuxTerminalBackend,
   type TmuxSessionLiveness,
 } from "./services/tmux-terminal-backend";
-import type { TerminalBackend } from "./services/terminal-backend";
+import type {
+  TerminalBackend,
+  TerminalBackendAttachResult,
+} from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
   TaskRunnerError,
@@ -5244,13 +5247,34 @@ async function createManagedTerminal({
     ? backendForExec(exec)
     : terminalBackend;
 
-  const closeAndRemoveTerminal = (
+  // Identity guard. A re-attach after a detach registers a NEWER handle under
+  // the same id; this handle's exit must never end, close or remove that one.
+  const ownsTerminalSlot = () => {
+    const current = terminals.get(id);
+    return !current || current.terminal === terminal;
+  };
+
+  // `registered` flips when this call puts its handle into `terminals`;
+  // `handleSettled` resolves then, or when the attach fails before that. The
+  // tmux exit path waits for it, so an attach client that dies while the
+  // handle is still being built is not judged against an empty slot.
+  let registered = false;
+  let markHandleSettled!: () => void;
+  const handleSettled = new Promise<void>((resolve) => {
+    markHandleSettled = resolve;
+  });
+
+  const finalizeTerminalExit = (
     exitCode: number,
     signalCode?: number | null,
   ) => {
-    // Deploy detach, not a real terminal exit: the shutdown routine already
-    // closed the sockets and (raw mode only) persisted ended synchronously.
-    if (shutdownInProgress) return;
+    if (!ownsTerminalSlot()) {
+      debug(
+        `Stale attach for terminal ${id} exited; a newer attach owns it, leaving it alone`,
+      );
+      terminal.close();
+      return;
+    }
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -5261,6 +5285,75 @@ async function createManagedTerminal({
     notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
     terminal.close();
+  };
+
+  // The tmux session outlived its attach client: drop this attach only. A
+  // plain close (no exit frame) makes ReconnectingWebSocket reconnect, and
+  // the upgrade lazily re-attaches through restoreRecordedTmuxSession.
+  const detachDeadAttach = (
+    exitCode: number,
+    signalCode: number | null | undefined,
+    sessionName: string,
+    liveness: TmuxSessionLiveness,
+  ) => {
+    console.warn(
+      `[lifecycle] attach client for ${id} exited (code=${exitCode}, signal=${signalCode ?? "none"}) but tmux session ${sessionName} is ${liveness}; detaching, row stays active`,
+    );
+    if (terminals.get(id)?.terminal === terminal) {
+      closeTerminalSockets(id);
+      removeTerminalState(id);
+    }
+    terminal.close();
+  };
+
+  const closeAndRemoveTerminal = (
+    exitCode: number,
+    signalCode?: number | null,
+  ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
+    // Legacy tmux: the PTY is a `tmux attach-session` client, and its exit is
+    // not proof the session ended — detach-client, a stray or child-first
+    // kill, or the OOM killer all leave the pane running. Probe before any
+    // DB write; only a session proven missing is a terminal exit. Raw and
+    // brokered terminals, and linked views (a second client on another
+    // terminal's session, which restore cannot re-attach), keep the direct
+    // path.
+    const probedSessionName = activeSessionName;
+    const reattachable =
+      TMUX_BACKEND &&
+      !exec &&
+      probedSessionName !== undefined &&
+      probedSessionName ===
+        buildTmuxSessionName({
+          namespace: TMUX_SESSION_NAMESPACE,
+          terminalId: id,
+        });
+    if (!reattachable || !tmuxTerminalBackend) {
+      finalizeTerminalExit(exitCode, signalCode);
+      return;
+    }
+    const probe = tmuxTerminalBackend.sessionLiveness(probedSessionName);
+    void Promise.all([probe, handleSettled])
+      .then(([liveness]) => {
+        if (shutdownInProgress) return;
+        // DELETE, the reapers and revocation remove the handle BEFORE they
+        // kill: a registered handle that is gone now was torn down on
+        // purpose, which stays a terminal exit whatever tmux says.
+        const tornDown = registered && !terminals.has(id);
+        if (liveness === "missing" || tornDown) {
+          finalizeTerminalExit(exitCode, signalCode);
+        } else {
+          detachDeadAttach(exitCode, signalCode, probedSessionName, liveness);
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[lifecycle] attach exit handling failed for ${id}:`,
+          err,
+        );
+      });
   };
 
   let tmuxPipePath: string | null = null;
@@ -5283,21 +5376,27 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
-  const attachResult = await backend.attach(attachSessionName, {
-    cwd,
-    cols,
-    rows,
-    terminal,
-    waitForClient: TMUX_BACKEND,
-    exec,
-    onExit(
-      _proc: Subprocess,
-      exitCode: number | null,
-      signalCode?: number | null,
-    ) {
-      closeAndRemoveTerminal(exitCode ?? 0, signalCode);
-    },
-  });
+  let attachResult: TerminalBackendAttachResult;
+  try {
+    attachResult = await backend.attach(attachSessionName, {
+      cwd,
+      cols,
+      rows,
+      terminal,
+      waitForClient: TMUX_BACKEND,
+      exec,
+      onExit(
+        _proc: Subprocess,
+        exitCode: number | null,
+        signalCode?: number | null,
+      ) {
+        closeAndRemoveTerminal(exitCode ?? 0, signalCode);
+      },
+    });
+  } catch (err) {
+    markHandleSettled();
+    throw err;
+  }
   const proc = attachResult.proc as Subprocess;
   tmuxPipePath = attachResult.pipePath ?? tmuxPipePath;
   tmuxPipeOffset = attachResult.pipeOffset ?? tmuxPipeOffset;
@@ -5342,7 +5441,9 @@ async function createManagedTerminal({
   };
 
   terminals.set(id, managedTerminal);
+  registered = true;
   getTerminalSockets(id);
+  markHandleSettled();
   if (initialScrollback) {
     // Recovery keeps the raw snapshot above for runtime-state inference, but
     // the fallback is terminal-bound and therefore needs terminal newlines.
