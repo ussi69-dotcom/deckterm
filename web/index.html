@@ -111,7 +111,8 @@
 
           <button
             id="ide-toggle-btn"
-            class="btn btn-secondary"
+            class="toolbar-action-btn toolbar-ide-btn"
+            type="button"
             data-action="toggle-ide"
             data-action-id="ide"
             title="Toggle IDE layout"
@@ -122,10 +123,24 @@
             <span class="btn-label">IDE</span>
           </button>
 
-          <div id="server-stats" class="server-stats">
-            <span class="stat" id="stat-cpu" title="CPU">--%</span>
-            <span class="stat" id="stat-ram" title="RAM">--%</span>
-            <span class="stat" id="stat-disk" title="Disk">--%</span>
+          <div
+            id="server-stats"
+            class="server-stats"
+            role="group"
+            aria-label="Server load"
+          >
+            <span class="stat" id="stat-cpu" title="CPU"
+              ><span class="stat-label">CPU</span
+              ><span class="stat-value">--%</span></span
+            >
+            <span class="stat" id="stat-ram" title="Memory"
+              ><span class="stat-label">RAM</span
+              ><span class="stat-value">--%</span></span
+            >
+            <span class="stat" id="stat-disk" title="Disk"
+              ><span class="stat-label">Disk</span
+              ><span class="stat-value">--%</span></span
+            >
           </div>
         </div>
       </header>
@@ -806,6 +821,7 @@
     <script src="/debug-bootstrap.js?v=20260905a"></script>
     <script src="/html-escape.js?v=20260617a"></script>
     <script src="/format-bytes.js?v=20260829a"></script>
+    <script src="/server-stats-format.js?v=20261012a"></script>
     <script src="/access-denied.js?v=20260611a"></script>
     <script src="/git-error.js?v=20260611a"></script>
     <script src="/git-scm.js?v=20260705e"></script>

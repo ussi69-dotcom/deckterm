@@ -431,6 +431,10 @@ class IdeShellController {
       typeof options.resetSidebarSash === "function"
         ? options.resetSidebarSash
         : null;
+    // Notified after the active view / collapsed state is applied, so the app
+    // can keep its toolbar Files/Git active states in step with the sidebar.
+    this.onViewChangeFn =
+      typeof options.onViewChange === "function" ? options.onViewChange : null;
 
     // Captured across an enter→exit round-trip (null when not in IDE mode).
     this.priorExplorerState = null;
@@ -647,6 +651,13 @@ class IdeShellController {
             { active: sel, collapsed },
           );
         });
+    }
+    if (this.onViewChangeFn) {
+      try {
+        this.onViewChangeFn({ activeView: activeId, collapsed });
+      } catch {
+        // cosmetic sync only
+      }
     }
 
     // Don't (re)mount view bodies while the sidebar is collapsed — they're not

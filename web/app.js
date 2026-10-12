@@ -2696,24 +2696,46 @@ class StatsManager {
   }
 
   updateUI(stats) {
-    if (this.cpuEl) {
-      this.cpuEl.textContent = `${stats.cpu.usage}%`;
-      this.cpuEl.title = `CPU: ${stats.cpu.usage}%`;
-      this.updateClass(this.cpuEl, stats.cpu.usage);
+    // Labelled chips ("CPU 4%") with exact numbers in the tooltip; the pure
+    // formatting lives in web/server-stats-format.js.
+    const describe = window.ServerStatsFormat?.describeServerStats;
+    if (!describe) {
+      this.updateUILegacy(stats);
+      return;
     }
-    if (this.ramEl) {
-      this.ramEl.textContent = `${stats.memory.percent}%`;
-      this.ramEl.title = `RAM: ${stats.memory.percent}%`;
-      this.updateClass(this.ramEl, stats.memory.percent);
-    }
-    if (this.diskEl) {
-      this.diskEl.textContent = `${stats.disk.percent}%`;
-      this.diskEl.title = `Disk: ${stats.disk.percent}%`;
-      this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+    const elements = { cpu: this.cpuEl, ram: this.ramEl, disk: this.diskEl };
+    for (const chip of describe(stats)) {
+      const el = elements[chip.id];
+      if (!el) continue;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = chip.value;
+      else el.textContent = chip.value;
+      el.title = chip.title;
+      el.setAttribute("aria-label", chip.title);
+      el.classList.toggle("warning", chip.level === "warning");
+      el.classList.toggle("danger", chip.level === "danger");
     }
   }
 
+  // Fallback for a stale cached index.html without server-stats-format.js.
+  updateUILegacy(stats) {
+    const set = (el, value, label) => {
+      if (!el) return;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = `${value}%`;
+      else el.textContent = `${value}%`;
+      el.title = `${label}: ${value}%`;
+    };
+    set(this.cpuEl, stats.cpu.usage, "CPU");
+    this.updateClass(this.cpuEl, stats.cpu.usage);
+    set(this.ramEl, stats.memory.percent, "RAM");
+    this.updateClass(this.ramEl, stats.memory.percent);
+    set(this.diskEl, stats.disk.percent, "Disk");
+    this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+  }
+
   updateClass(el, value, warn = 70, danger = 90) {
+    if (!el) return;
     el.classList.remove("warning", "danger");
     if (value >= danger) el.classList.add("danger");
     else if (value >= warn) el.classList.add("warning");
@@ -6520,11 +6542,19 @@ class TerminalManager {
     }
 
     const tabCount = tabs.querySelectorAll(".tab").length;
-    const preferredTabWidth =
+    const availableWidth = Math.floor(tabs.getBoundingClientRect().width || 0);
+    const baseTabWidth =
       tabCount <= 1 ? 280 : tabCount <= 2 ? 240 : tabCount <= 3 ? 200 : 160;
+    // Wide screens: let tabs grow into the free strip (up to 360px, never
+    // more than half of it for a lone tab) instead of leaving a dead gap
+    // between the tabs and the directory field.
+    const preferredTabWidth = Math.max(
+      baseTabWidth,
+      Math.min(360, Math.floor(availableWidth / Math.max(tabCount, 2)) - 4),
+    );
     return (
       this.navigationSurface.getDesktopTabLayoutByWidth?.({
-        availableWidth: Math.floor(tabs.getBoundingClientRect().width || 0),
+        availableWidth,
         tabCount,
         preferredTabWidth,
         minTabWidth: 96,
@@ -6977,15 +7007,28 @@ class TerminalManager {
     // Windowed surfaces can be open simultaneously; the exclusive
     // right-surface notion only applies to the mobile sheets.
     const windowed = this.isWindowedSurfaces();
-    const filesOpen = windowed
+    let filesOpen = windowed
       ? Boolean(this.fileExplorer?.isOpen)
       : surface === "files";
-    const gitOpen = windowed
+    let gitOpen = windowed
       ? Boolean(
           window.gitManager &&
           !window.gitManager.panel?.classList.contains("hidden"),
         )
       : surface === "git";
+    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
+    // permanently "open" there, so its isOpen flag would keep Files lit).
+    const ideMode = this.isIdeModeActive();
+    if (ideMode && this.ideShell) {
+      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
+      const view = this.ideShell.activeView?.();
+      filesOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
+      gitOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
+    }
 
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
@@ -7008,6 +7051,19 @@ class TerminalManager {
         button.classList.toggle("active", paletteOpen);
       } else if (actionId === "dock-sessions") {
         button.classList.toggle("active", Boolean(this.dockState?.enabled));
+      } else if (actionId === "ide") {
+        button.classList.toggle("active", ideMode);
+        button.setAttribute("aria-pressed", ideMode ? "true" : "false");
+      }
+      // Files/Git toolbar buttons are toggles: announce the state too.
+      if (
+        button.classList.contains("toolbar-action-btn") &&
+        (actionId === "files" || actionId === "git")
+      ) {
+        button.setAttribute(
+          "aria-pressed",
+          button.classList.contains("active") ? "true" : "false",
+        );
       }
     });
   }
@@ -12236,6 +12292,7 @@ class TerminalManager {
       beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
+      onViewChange: () => this.syncSurfaceButtonState(),
       // Refit terminals + re-render the explorer after the container resizes.
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));

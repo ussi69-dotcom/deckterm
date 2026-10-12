@@ -154,8 +154,9 @@ body {
   border-radius: 8px;
 }
 
-.notification-sound-toggle[data-mode="always"],
-.notification-sound-toggle[data-mode="unfocused"] {
+/* The default mode ("unfocused") looks like any other icon button; only the
+   non-default "always" mode is tinted, and "off" is struck through below. */
+.notification-sound-toggle[data-mode="always"] {
   border-color: rgba(88, 166, 255, 0.34);
   background: rgba(88, 166, 255, 0.08);
   color: var(--accent-blue);
@@ -350,6 +351,12 @@ body {
 .tabs[data-layout] .tab {
   min-height: 52px;
   box-sizing: border-box;
+}
+
+/* With zero tabs the strip still reserves the tab height, so the toolbar
+   does not jump from 64px to 54px when the last terminal closes. */
+.tabs[data-layout] {
+  min-height: 52px;
 }
 
 .tab:hover {
@@ -1338,30 +1345,38 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
+/* One ghost style for every desktop toolbar action (Files, Git, Palette,
+   More, IDE and any pinned extra): no fill or border at rest, a soft fill on
+   hover, and the accent fill ONLY while that surface is open (.active, kept
+   in sync by syncSurfaceButtonState / the IDE view hook). */
 .toolbar-action-btn {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 7px;
   height: 36px;
-  padding: 0 14px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--text-primary);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
   transition:
-    transform 0.2s ease,
-    border-color 0.2s ease,
-    background 0.2s ease,
-    color 0.2s ease;
+    border-color 0.15s ease,
+    background 0.15s ease,
+    color 0.15s ease;
   flex-shrink: 0;
   white-space: nowrap;
 }
 
 .toolbar-action-btn:hover {
-  transform: translateY(-1px);
-  border-color: rgba(88, 166, 255, 0.35);
-  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.toolbar-action-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 .toolbar-action-btn svg {
@@ -1416,28 +1431,44 @@ body.touch-input-mode .xterm .composition-view.active {
   display: none;
 }
 
-.toolbar-action-btn-primary {
-  border-color: rgba(63, 185, 80, 0.26);
-  background: rgba(63, 185, 80, 0.1);
-}
-
-.toolbar-action-btn-primary:hover {
-  border-color: rgba(63, 185, 80, 0.45);
-  background: rgba(63, 185, 80, 0.16);
-}
-
-.toolbar-action-btn-secondary {
-  color: var(--text-secondary);
-}
-
-.toolbar-action-btn-secondary:hover {
+/* Primary/secondary tones used to tint Files/Git green; the toolbar now uses
+   the single ghost style above for every action. */
+.toolbar-action-btn.active,
+.toolbar-action-btn.active:hover {
+  border-color: rgba(88, 166, 255, 0.45);
+  background: rgba(88, 166, 255, 0.14);
   color: var(--text-primary);
 }
 
-.toolbar-action-btn.active {
-  border-color: rgba(88, 166, 255, 0.55);
-  background: rgba(88, 166, 255, 0.15);
-  color: var(--text-primary);
+.toolbar-action-btn.active svg {
+  color: var(--accent-blue);
+}
+
+#ide-toggle-btn[hidden] {
+  display: none;
+}
+
+/* The IDE toggle sits outside .desktop-primary-actions; follow the same
+   density tiers so it shrinks with its neighbours. */
+.toolbar[data-tab-density="compact"] .toolbar-ide-btn {
+  height: 34px;
+  padding: 0 10px;
+}
+
+.toolbar[data-tab-density="tight"] .toolbar-ide-btn,
+.toolbar[data-tab-density="icon-only"] .toolbar-ide-btn {
+  height: 32px;
+  padding: 0 9px;
+}
+
+.toolbar[data-tab-density="icon-only"] .toolbar-ide-btn .btn-label {
+  display: none;
+}
+
+.toolbar-ide-btn .btn-label {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .dir-input {
@@ -1448,10 +1479,12 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .dir-input input {
   width: 140px;
+  height: 36px;
+  box-sizing: border-box;
   padding: 6px 10px;
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
-  border-radius: 6px;
+  border-radius: 8px;
   color: var(--text-primary);
   font-size: 12px;
   text-overflow: ellipsis;
@@ -3108,19 +3141,42 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .server-stats {
   display: flex;
-  gap: 8px;
+  gap: 6px;
   font-size: 11px;
-  font-family: "JetBrains Mono", monospace;
   color: var(--text-secondary);
-  margin-right: 8px;
+  margin-right: 4px;
   flex-shrink: 0;
 }
 
 .server-stats .stat {
-  padding: 2px 6px;
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 3px 7px;
   background: rgba(255, 255, 255, 0.03);
-  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 6px;
   cursor: default;
+}
+
+.server-stats .stat-label {
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.server-stats .stat-value {
+  min-width: 3ch;
+  font-family: "JetBrains Mono", monospace;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.server-stats .stat.warning .stat-label,
+.server-stats .stat.danger .stat-label {
+  color: inherit;
 }
 
 .server-stats .stat.warning {
