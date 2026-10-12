@@ -9585,10 +9585,10 @@ export function createWebApp() {
   app.get("/api/notifications/push", async (c) => {
     const gate = await requirePushNotificationUser(c);
     if (!gate.ok) {
-      return c.json(
-        { error: "Push notifications unavailable", reason: gate.reason },
-        gate.status,
-      );
+      // The settings UI probes this on every page load. An actor without
+      // push rights gets a quiet "not available" answer instead of a 403 in
+      // the console; the key is withheld and every write stays denied.
+      return c.json({ configured: false, publicKey: null, available: false });
     }
     const config = resolveWebPushConfig(process.env);
     return c.json({

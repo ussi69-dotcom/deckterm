@@ -13,7 +13,7 @@ function response(body, ok = true) {
   };
 }
 
-function createHarness({ postOk = true } = {}) {
+function createHarness({ postOk = true, config = null } = {}) {
   const calls = [];
   let permissionRequests = 0;
   let subscribeCalls = 0;
@@ -60,7 +60,7 @@ function createHarness({ postOk = true } = {}) {
       return response(postOk ? { ok: true } : { error: "save failed" }, postOk);
     }
     if (options.method === "DELETE") return response({ ok: true });
-    return response({ configured: true, publicKey });
+    return response(config || { configured: true, publicKey });
   };
   const manager = new PushNotificationManager({
     windowRef: { Notification: MockNotification, PushManager: class {} },
@@ -130,6 +130,20 @@ describe("PushNotificationManager", () => {
     expect(harness.unsubscribeCalls).toBe(1);
     expect(harness.manager.hasActiveSubscription()).toBe(false);
     expect(harness.manager.getStatus().state).toBe("error");
+  });
+
+  test("an account without push rights is unavailable without touching the service worker", async () => {
+    const harness = createHarness({
+      config: { configured: false, publicKey: null, available: false },
+    });
+    const status = await harness.manager.initialize();
+    expect(status.state).toBe("unavailable");
+    expect(status.description).toBe(
+      "Push notifications are not available for this account.",
+    );
+    expect(harness.calls.map((call) => call[0])).toEqual([
+      "/api/notifications/push",
+    ]);
   });
 
   test("suppresses page-level fallback when this device has a push subscription", async () => {

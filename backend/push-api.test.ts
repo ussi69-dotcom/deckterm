@@ -109,5 +109,26 @@ test("push API stores only the canonical caller subscription and never echoes se
     .get() as { data_json: string };
   expect(audit.data_json).toBe("{}");
   expect(audit.data_json).not.toContain(subscription.endpoint);
+
+  // An actor without push rights gets a quiet "not available" probe (no 403
+  // in every page load's console), while writes stay strictly denied.
+  check.db.query(`UPDATE users SET disabled = 1 WHERE id = 'anonymous'`).run();
   check.db.close();
+  const deniedProbe = await app.fetch(
+    new Request("http://localhost/api/notifications/push"),
+  );
+  expect(deniedProbe.status).toBe(200);
+  expect(await deniedProbe.json()).toEqual({
+    configured: false,
+    publicKey: null,
+    available: false,
+  });
+  const deniedWrite = await app.fetch(
+    new Request("http://localhost/api/notifications/push", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ subscription }),
+    }),
+  );
+  expect(deniedWrite.status).toBe(403);
 });
