@@ -3847,8 +3847,12 @@ body.touch-input-mode .xterm .composition-view.active {
   font-size: 13px;
 }
 
-.command-palette-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+/* Hover only where a real pointer hovers: a tap would otherwise leave a
+   second highlighted row next to the selected one. */
+@media (hover: hover) {
+  .command-palette-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
 }
 
 .command-palette-item.selected {
@@ -5326,6 +5330,16 @@ body.chrome-mobile .toast-region {
   width: auto;
   align-items: stretch;
   flex-direction: column-reverse;
+}
+
+/* Tablets (and wide phones in landscape) keep the top placement but cap the
+   stack at a readable width in the right corner instead of a full-width bar. */
+@media (min-width: 600px) {
+  body.chrome-mobile .toast-region {
+    left: auto;
+    right: 12px;
+    width: min(420px, calc(100vw - 24px));
+  }
 }
 
 .toast {
