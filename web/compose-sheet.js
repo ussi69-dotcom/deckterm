@@ -14,9 +14,10 @@
 //   task-message delivery uses on the server (POINTER_SUBMIT_DELAY_MS).
 // - Insert without Enter: the paste only, for editing before submitting.
 //
-// Both go through the terminal's queued input path, so a message sent while
-// the socket reconnects is held and flushed in order, and the Enter waits
-// until that flush has settled.
+// Both need a connected terminal: while it reconnects the message stays in
+// the sheet (never parked in the small, short-lived reconnect queue, where it
+// could be dropped after the sheet was cleared), and the Enter follows only a
+// paste that actually went out.
 //
 // The last 20 sent messages are kept in localStorage; tapping one puts it
 // back into the text box. Pure parts are exported for Bun unit tests; app.js
@@ -138,18 +139,22 @@ function scheduleDeferredSubmit({
   delayMs = COMPOSE_SUBMIT_DELAY_MS,
   maxWaitMs = COMPOSE_SUBMIT_MAX_WAIT_MS,
   onGiveUp = null,
+  now = () => Date.now(),
   setTimer = (fn, ms) => setTimeout(fn, ms),
   clearTimer = (handle) => clearTimeout(handle),
 }) {
   let previousReady = Boolean(readyAtStart);
-  let waited = 0;
+  let ticked = 0;
+  const startedAt = now();
   let handle = null;
   let finished = false;
 
   const tick = () => {
     handle = null;
     if (finished) return;
-    waited += delayMs;
+    ticked += delayMs;
+    // Background tabs throttle timers, so count real elapsed time too.
+    const waited = Math.max(ticked, now() - startedAt);
     let ready = false;
     try {
       ready = Boolean(isReady());
@@ -178,6 +183,34 @@ function scheduleDeferredSubmit({
       handle = null;
     },
   };
+}
+
+/**
+ * Hand a Send / Insert plan to the terminal without ever losing the text.
+ * Only input that goes straight out is accepted (socket open, nothing
+ * queued): the reconnect queue is small (8 KB) and short-lived (15 s), so a
+ * message parked there could be dropped after the sheet already cleared it,
+ * and its deferred Enter would then submit an empty line. When not accepted,
+ * nothing is pasted or submitted and the caller keeps the text in the sheet.
+ * The deferred Enter is scheduled only after an accepted paste.
+ *
+ * `paste(text)` may return false when the transport refused it.
+ * Returns { accepted: true } or { accepted: false, reason }.
+ */
+function deliverComposePlan({ plan, isReady, paste, scheduleSubmit = null }) {
+  if (!plan || typeof plan.text !== "string" || !plan.text) {
+    return { accepted: false, reason: "empty" };
+  }
+  let ready = false;
+  try {
+    ready = Boolean(isReady?.());
+  } catch {
+    ready = false;
+  }
+  if (!ready) return { accepted: false, reason: "not-connected" };
+  if (paste(plan.text) === false) return { accepted: false, reason: "refused" };
+  if (plan.submit) scheduleSubmit?.();
+  return { accepted: true };
 }
 
 // --- DOM (browser only) -------------------------------------------------------
@@ -408,6 +441,7 @@ const ComposeSheetApi = {
   loadComposeHistory,
   saveComposeHistory,
   composeHistoryPreview,
+  deliverComposePlan,
   scheduleDeferredSubmit,
   ComposeSheet,
 };

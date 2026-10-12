@@ -16758,8 +16758,9 @@ class TerminalManager {
   }
 
   // Paste through xterm (bracketed-paste markers when the program asked for
-  // them) into the queued input path, then — for Send — a separate deferred
-  // Enter once that input has settled (see scheduleDeferredSubmit).
+  // them), then — for Send — a separate deferred Enter once that input has
+  // settled (see scheduleDeferredSubmit). Only a connected terminal accepts
+  // the text (deliverComposePlan); otherwise it stays in the sheet.
   sendComposedText(id, plan) {
     const helpers = window.ComposeSheet;
     const t = this.terminals.get(id);
@@ -16772,17 +16773,37 @@ class TerminalManager {
       });
       return false;
     }
-    const readyAtStart = Boolean(t.ws.isReadyForInput?.());
-    this.clipboardManager.executePaste(
-      plan.text,
-      t.ws,
-      t.terminal,
-      t.inputState,
-    );
-    if (!plan.submit) return true;
+    const result = helpers.deliverComposePlan({
+      plan,
+      isReady: () => t.ws.isReadyForInput?.(),
+      paste: (text) =>
+        this.clipboardManager.executePaste(
+          text,
+          t.ws,
+          t.terminal,
+          t.inputState,
+        ),
+      scheduleSubmit: () => this.scheduleComposeSubmit(id, t, plan),
+    });
+    if (!result.accepted) {
+      this.notify({
+        key: `compose-kept:${id}`,
+        kind: "warning",
+        title: "Not connected — message kept",
+        body: "Your message is still in the compose box. Send it again once the terminal reconnects.",
+      });
+      return false;
+    }
+    return true;
+  }
+
+  scheduleComposeSubmit(id, t, plan) {
+    const helpers = window.ComposeSheet;
     t.composeSubmit?.cancel();
     t.composeSubmit = helpers.scheduleDeferredSubmit({
-      readyAtStart,
+      // The paste went straight out (deliverComposePlan only accepts ready
+      // input).
+      readyAtStart: true,
       delayMs: plan.submitDelayMs,
       isReady: () =>
         this.terminals.get(id) === t &&
@@ -16803,7 +16824,6 @@ class TerminalManager {
         });
       },
     });
-    return true;
   }
 
   async pasteClipboard() {

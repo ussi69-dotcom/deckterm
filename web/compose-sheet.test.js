@@ -7,6 +7,7 @@ import {
   COMPOSE_SUBMIT_MAX_WAIT_MS,
   addToComposeHistory,
   composeHistoryPreview,
+  deliverComposePlan,
   loadComposeHistory,
   parseComposeHistory,
   planComposeSend,
@@ -229,6 +230,112 @@ describe("scheduleDeferredSubmit", () => {
     });
     handle.cancel();
     timers.advance(5000);
+    expect(sent).toEqual([]);
+  });
+});
+
+describe("deliverComposePlan", () => {
+  function setup({ ready = true, pasteResult } = {}) {
+    const calls = [];
+    return {
+      calls,
+      args: {
+        isReady: () => ready,
+        paste: (text) => {
+          calls.push(["paste", text]);
+          return pasteResult;
+        },
+        scheduleSubmit: () => calls.push(["submit"]),
+      },
+    };
+  }
+
+  test("ready: pastes, then schedules the deferred Enter for Send", () => {
+    const { calls, args } = setup();
+    const result = deliverComposePlan({
+      plan: planComposeSend("hello"),
+      ...args,
+    });
+    expect(result).toEqual({ accepted: true });
+    expect(calls).toEqual([["paste", "hello"], ["submit"]]);
+  });
+
+  test("Insert without Enter schedules no Enter", () => {
+    const { calls, args } = setup();
+    deliverComposePlan({
+      plan: planComposeSend("hello", { submit: false }),
+      ...args,
+    });
+    expect(calls).toEqual([["paste", "hello"]]);
+  });
+
+  test("not connected: nothing is pasted or submitted, the text is kept", () => {
+    const { calls, args } = setup({ ready: false });
+    // Larger than the 8 KB reconnect queue: queueing it would lose it.
+    const big = "ž".repeat(5000);
+    const result = deliverComposePlan({ plan: planComposeSend(big), ...args });
+    expect(result).toEqual({ accepted: false, reason: "not-connected" });
+    expect(calls).toEqual([]);
+  });
+
+  test("a paste the transport refused schedules no lone Enter", () => {
+    const { calls, args } = setup({ pasteResult: false });
+    const result = deliverComposePlan({
+      plan: planComposeSend("hello"),
+      ...args,
+    });
+    expect(result).toEqual({ accepted: false, reason: "refused" });
+    expect(calls).toEqual([["paste", "hello"]]);
+  });
+
+  test("an empty plan is not accepted", () => {
+    const { calls, args } = setup();
+    expect(deliverComposePlan({ plan: null, ...args })).toEqual({
+      accepted: false,
+      reason: "empty",
+    });
+    expect(calls).toEqual([]);
+  });
+
+  test("a readiness probe that throws counts as not connected", () => {
+    const { calls, args } = setup();
+    const result = deliverComposePlan({
+      plan: planComposeSend("hello"),
+      ...args,
+      isReady: () => {
+        throw new Error("gone");
+      },
+    });
+    expect(result).toEqual({ accepted: false, reason: "not-connected" });
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("scheduleDeferredSubmit wall clock", () => {
+  test("gives up by elapsed time even when throttled timers fire rarely", () => {
+    let clock = 0;
+    const pending = [];
+    let gaveUp = false;
+    const sent = [];
+    scheduleDeferredSubmit({
+      readyAtStart: false,
+      isReady: () => false,
+      send: () => sent.push(clock),
+      onGiveUp: () => {
+        gaveUp = true;
+      },
+      now: () => clock,
+      setTimer: (fn) => {
+        pending.push(fn);
+        return pending.length;
+      },
+      clearTimer: () => {},
+    });
+    // A background tab: the first tick only runs 20 s later.
+    clock = 20000;
+    pending.shift()();
+    expect(gaveUp).toBe(true);
+    expect(pending.length).toBe(0);
     expect(sent).toEqual([]);
   });
 });
