@@ -220,11 +220,11 @@ async function restartServer(h: Harness): Promise<Harness> {
   return { ...h, child };
 }
 
-async function createTerminal(h: Harness): Promise<string> {
+async function createTerminal(h: Harness, cwd = h.workRoot): Promise<string> {
   const res = await fetch(`http://127.0.0.1:${h.port}/api/terminals`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ cols: 80, rows: 24, cwd: h.workRoot }),
+    body: JSON.stringify({ cols: 80, rows: 24, cwd }),
   });
   expect(res.status).toBe(200);
   const body = (await res.json()) as { id: string };
@@ -682,6 +682,49 @@ test.skipIf(!TMUX_AVAILABLE)(
     expect(await attachClientPids(h, id)).toHaveLength(1);
     await expectShellRoundTrip(ws);
     ws.ws.close();
+  },
+  60_000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "a live session whose recorded cwd was deleted still re-attaches, and never 500s the catalog",
+  async () => {
+    // A task worktree removed under a running terminal: the recorded
+    // creation cwd is gone, the tmux session lives on.
+    const h = await startHarness();
+    const doomed = join(h.workRoot, "worktree");
+    await mkdir(doomed, { recursive: true });
+    const id = await createTerminal(h, doomed);
+    const healthy = await createTerminal(h);
+    const panePid = await panePidOf(h, id);
+    const first = await attachWs(h, id);
+    await attachClientPid(h, id);
+
+    await rm(doomed, { recursive: true, force: true });
+    const detached = await tmux(h, [
+      "detach-client",
+      "-s",
+      `=${sessionName(h, id)}`,
+    ]);
+    expect(detached.code).toBe(0);
+    await waitFor(first.isClosed, "the server to close the socket");
+
+    // The catalog keeps answering and lists both rows as live.
+    for (let i = 0; i < 3; i++) {
+      const listed = await listTerminals(h);
+      expect(listed.find((t) => t.id === healthy)?.sessionStatus).toBe(
+        "active",
+      );
+      expect(listed.find((t) => t.id === id)?.sessionStatus).toBe("active");
+    }
+
+    // The same pane re-attaches although its creation directory is gone.
+    const again = await attachWs(h, id);
+    await pingPong(again);
+    await expectShellRoundTrip(again);
+    expect(await panePidOf(h, id)).toBe(panePid);
+    expect(dbStatus(h, id)).toBe("active");
+    again.ws.close();
   },
   60_000,
 );

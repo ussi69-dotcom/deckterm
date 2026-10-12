@@ -65,6 +65,28 @@ export function classifyTmuxHasSession({
   return "unknown";
 }
 
+/**
+ * The directory to spawn a `tmux attach-session` client in: the first
+ * candidate that is an existing directory, else "/". The client's own cwd
+ * does not matter to the tmux session it attaches to, but posix_spawn fails
+ * with ENOENT for a missing cwd — and a terminal's recorded creation
+ * directory (e.g. a removed task worktree) can vanish while its session
+ * lives on, which would make the session impossible to re-attach.
+ */
+export async function resolveAttachSpawnCwd(
+  candidates: Array<string | null | undefined>,
+): Promise<string> {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      if ((await stat(candidate)).isDirectory()) return candidate;
+    } catch {
+      // Missing or unreadable: try the next one.
+    }
+  }
+  return "/";
+}
+
 export type TmuxTerminalBackendOptions = {
   namespace: string;
   socketPath: string;
@@ -203,8 +225,13 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await this.resize(sessionName, options.cols, options.rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
+    const spawnCwd = await resolveAttachSpawnCwd([
+      options.cwd,
+      this.baseEnv.HOME,
+      process.env.HOME,
+    ]);
     const proc = await this.spawnTmux(["attach-session", "-t", sessionName], {
-      cwd: options.cwd,
+      cwd: spawnCwd,
       env: {
         ...this.baseEnv,
         ...options.env,

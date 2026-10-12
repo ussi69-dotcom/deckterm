@@ -1299,7 +1299,11 @@ async function attachRecordedTmuxSession(
 
   const restoredTerminal = await createManagedTerminal({
     id: recordedSession.id,
+    // The recorded cwd stays metadata (root mapping, labels). The attach
+    // client is spawned in the live pane cwd; the backend falls back to HOME
+    // or / when that is gone too (a removed task worktree).
     cwd: recordedSession.cwd || cwd,
+    attachCwd: cwd,
     cols,
     rows,
     ownerId,
@@ -1322,6 +1326,38 @@ async function attachRecordedTmuxSession(
 // restore: separate restores would each spawn a managed terminal (and a tmux
 // attach client), and all but the last would be orphaned.
 const tmuxRestoreFlights = new Map<string, Promise<Terminal | null>>();
+
+// A row whose restore throws (it never should, but one bad row must not take
+// the whole catalog or a reconnect down with it) is logged at most once a
+// minute per id and left active: the caller serializes it as detached / 404s
+// the upgrade, and the next ask retries.
+const TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS = 60_000;
+const tmuxRestoreFailureWarnedAt = new Map<string, number>();
+
+function restoreRecordedTmuxSessionSafely(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  return restoreRecordedTmuxSession(state, recordedSession).then(
+    (term) => {
+      tmuxRestoreFailureWarnedAt.delete(recordedSession.id);
+      return term;
+    },
+    (err) => {
+      const now = Date.now();
+      const last =
+        tmuxRestoreFailureWarnedAt.get(recordedSession.id) ?? -Infinity;
+      if (now - last >= TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS) {
+        tmuxRestoreFailureWarnedAt.set(recordedSession.id, now);
+        console.error(
+          `[tmux] Failed to restore session for ${recordedSession.id}; row stays active, will retry on the next request:`,
+          err,
+        );
+      }
+      return null;
+    },
+  );
+}
 
 function restoreRecordedTmuxSession(
   state: FoundationState,
@@ -5415,9 +5451,12 @@ async function createManagedTerminal({
   initialLastExitCode = null,
   initialScrollback = "",
   exec,
+  attachCwd,
 }: {
   id?: string;
   cwd: string;
+  /** Where to spawn the attach client, when it differs from `cwd`. */
+  attachCwd?: string;
   cols: number;
   rows: number;
   ownerId: string;
@@ -5574,7 +5613,7 @@ async function createManagedTerminal({
   let attachResult: TerminalBackendAttachResult;
   try {
     attachResult = await backend.attach(attachSessionName, {
-      cwd,
+      cwd: attachCwd || cwd,
       cols,
       rows,
       terminal,
@@ -8042,7 +8081,7 @@ export function createWebApp() {
         const restoredTerm =
           terminals.get(recordedSession.id) ||
           (recordedSession.status === "active"
-            ? await restoreRecordedTmuxSession(state, recordedSession)
+            ? await restoreRecordedTmuxSessionSafely(state, recordedSession)
             : null);
 
         if (restoredTerm) {
@@ -11080,7 +11119,8 @@ async function startOwnedWebServer(
               actorId: ownerId,
               recordedOwnerId: recordedSession.actorUserId,
               requestUrl: req.url,
-              restore: () => restoreRecordedTmuxSession(state, recordedSession),
+              restore: () =>
+                restoreRecordedTmuxSessionSafely(state, recordedSession),
             });
             if (!restored.ok) {
               return new Response("Terminal not found", { status: 404 });
