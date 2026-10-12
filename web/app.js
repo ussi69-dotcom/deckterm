@@ -8763,14 +8763,55 @@ class TerminalManager {
     const toggle = document.getElementById("task-view-toggle");
     if (!toggle) return;
     const mode = this.getTaskViewMode();
-    toggle.textContent = mode === "board" ? "☰ List" : "▦ Board";
-    toggle.title =
-      mode === "board" ? "Switch to list view" : "Switch to board view";
+    const content = window.TaskBoard?.taskViewToggleContent?.({ mode }) || {
+      icon: mode === "board" ? "list" : "layout-grid",
+      label: mode === "board" ? "List" : "Board",
+      title: mode === "board" ? "Switch to list view" : "Switch to board view",
+    };
+    toggle.title = content.title;
+    if (toggle.dataset.label === content.label) return;
+    toggle.dataset.label = content.label;
+    const icon = document.createElement("i");
+    icon.dataset.lucide = content.icon;
+    const label = document.createElement("span");
+    label.textContent = content.label;
+    toggle.replaceChildren(icon, label);
+    initLucideIcons();
+  }
+
+  // Calm "no tasks" state for the floating panel (shared copy: task-board.js).
+  renderTaskEmptyState(list) {
+    const state = window.TaskBoard?.taskEmptyState?.({ surface: "panel" }) || {
+      icon: "list-checks",
+      title: "No tasks yet",
+      hint: "",
+    };
+    const empty = document.createElement("div");
+    empty.className = "task-empty-state";
+    const icon = document.createElement("i");
+    icon.dataset.lucide = state.icon;
+    const title = document.createElement("p");
+    title.className = "task-empty-title";
+    title.textContent = state.title;
+    empty.append(icon, title);
+    if (state.hint) {
+      const hint = document.createElement("p");
+      hint.className = "task-empty-hint";
+      hint.textContent = state.hint;
+      empty.appendChild(hint);
+    }
+    list.appendChild(empty);
+    initLucideIcons();
   }
 
   renderTasks() {
     this.syncTaskViewToggle();
-    if (this.getTaskViewMode() === "board") {
+    // Zero tasks: one calm empty state in either view (five empty "(0)"
+    // board columns say nothing useful).
+    if (
+      this.getTaskViewMode() === "board" &&
+      this.taskState.items.length > 0
+    ) {
       this.renderTaskBoard();
       return;
     }
@@ -8780,10 +8821,7 @@ class TerminalManager {
     list.replaceChildren();
 
     if (this.taskState.items.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "task-item-meta";
-      empty.textContent = "No tasks";
-      list.appendChild(empty);
+      this.renderTaskEmptyState(list);
       this.renderTaskDetail(null);
       return;
     }

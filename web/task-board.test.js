@@ -46,3 +46,47 @@ test("unknown statuses fall into Ready rather than disappearing", () => {
     "x",
   ]);
 });
+
+import { taskEmptyState, taskViewToggleContent } from "./task-board";
+
+test("taskEmptyState: the floating panel points at its own Create form, no extra button", () => {
+  const state = taskEmptyState({ surface: "panel" });
+  expect(state.icon).toBe("list-checks");
+  expect(state.title).toBe("No tasks yet");
+  expect(state.hint).toMatch(/Create Task/);
+  expect(state.action).toBeNull();
+});
+
+test("taskEmptyState: the IDE sidebar and board tab offer one primary New task action", () => {
+  for (const surface of ["sidebar", "board"]) {
+    const state = taskEmptyState({ surface });
+    expect(state.title).toBe("No tasks yet");
+    expect(state.action).toEqual({ id: "new", label: "New task" });
+  }
+  // Unknown / missing surface falls back to the action-bearing variant.
+  expect(taskEmptyState().action).toEqual({ id: "new", label: "New task" });
+});
+
+test("taskViewToggleContent: lucide icons instead of text glyphs", () => {
+  expect(taskViewToggleContent({ mode: "list" })).toEqual({
+    icon: "layout-grid",
+    label: "Board",
+    title: "Switch to board view",
+  });
+  expect(taskViewToggleContent({ mode: "board" })).toEqual({
+    icon: "list",
+    label: "List",
+    title: "Switch to list view",
+  });
+  // With a Task Board editor tab available the button always OPENS the board.
+  expect(
+    taskViewToggleContent({ mode: "board", hasBoardTab: true }),
+  ).toEqual({
+    icon: "layout-grid",
+    label: "Board",
+    title: "Open board in the editor area",
+  });
+  for (const value of Object.values(taskViewToggleContent({ mode: "list" }))) {
+    expect(value).not.toMatch(/[▦☰]/);
+  }
+});

@@ -2277,6 +2277,59 @@ body.touch-input-mode .xterm .composition-view.active {
   padding: 12px;
 }
 
+/* No selected task: no empty bordered box. The status line keeps its live
+   region but stops reserving a blank row. */
+.task-detail:empty {
+  display: none;
+}
+
+.task-status:empty {
+  min-height: 0;
+}
+
+#task-view-toggle {
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+#task-view-toggle svg {
+  width: 14px;
+  height: 14px;
+}
+
+.task-empty-state {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 22px 16px;
+  border: 1px dashed rgba(255, 255, 255, 0.08);
+  border-radius: 10px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.task-empty-state svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.6;
+  color: var(--text-muted);
+}
+
+.task-empty-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.task-empty-hint {
+  margin: 0;
+  max-width: 340px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .task-actions {
   flex-wrap: wrap;
 }
@@ -6717,6 +6770,19 @@ body.chrome-mobile .mobile-action-bar[hidden] {
   box-shadow: none;
 }
 
+/* Inside a window the titlebar already says "Tasks" and carries the close
+   button: drop the sheet's own eyebrow, title and close, keep the list/board
+   toggle as a slim right-aligned action. */
+.surface-window-body > .task-panel .task-panel-header > div:first-child,
+.surface-window-body > .task-panel #task-panel-close {
+  display: none;
+}
+
+.surface-window-body > .task-panel .task-panel-header {
+  justify-content: flex-end;
+  margin-bottom: -6px;
+}
+
 .surface-window-body > .file-editor-modal {
   position: static;
   inset: auto;
@@ -7493,9 +7559,65 @@ body.ide-mode #workspace-area {
 }
 
 .ide-tasks-empty {
-  padding: 8px 12px;
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 28px 16px;
+  text-align: center;
   font-size: 12px;
   color: var(--text-secondary, #999);
+}
+
+.ide-tasks-empty-icon,
+.ide-tasks-empty > svg {
+  width: 22px;
+  height: 22px;
+  stroke-width: 1.6;
+  color: var(--text-muted, #6e7681);
+}
+
+.ide-tasks-empty-title {
+  margin: 0;
+  color: var(--text-primary, #ddd);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.ide-tasks-empty-hint {
+  margin: 0;
+  max-width: 260px;
+  line-height: 1.45;
+}
+
+.ide-tasks-empty-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 6px 12px;
+  border: 1px solid rgba(63, 185, 80, 0.4);
+  border-radius: 6px;
+  background: var(--btn-green, #238636);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.ide-tasks-empty-action:hover {
+  filter: brightness(1.1);
+}
+
+.ide-tasks-empty-action svg,
+.ide-tasks-action svg {
+  width: 14px;
+  height: 14px;
+}
+
+.ide-tasks-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 
 .ide-tasks-item {
