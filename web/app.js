@@ -350,6 +350,17 @@ const normalizeWorkspacePorts = (ports) => {
   ].sort((left, right) => left - right);
 };
 
+// Agent attention (OSC notifications): tab-dot labels and the window inside
+// which an agent's own "done" notification is folded into DeckTerm's
+// completion alert for the same moment.
+const ATTENTION_KIND_LABELS = Object.freeze({
+  "needs-input": "Needs your input",
+  done: "Finished",
+  error: "Error",
+  info: "Notification",
+});
+const ATTENTION_ALERT_DEDUPE_MS = 8000;
+
 const ACTION_BUTTON_CONFIG = Object.freeze({
   files: Object.freeze({
     label: "Files",
@@ -5653,6 +5664,10 @@ class TerminalManager {
     this.setupMobileSwipe();
     this.setupTerminalRenderRecovery();
     this.startTelemetryRefreshLoop();
+    document.addEventListener("visibilitychange", () => {
+      // Coming back to the page clears the active session's attention.
+      if (document.visibilityState === "visible") this.updateTabGroups();
+    });
 
     // Check for existing terminals
     this.startBootstrap();
@@ -10479,6 +10494,7 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
+          this.applyTerminalAttention(terminal, next);
           const hasClientCwd =
             typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
           if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
@@ -10487,6 +10503,7 @@ class TerminalManager {
           }
         });
 
+        this.pruneAttentionSeen(this._sessionCatalog);
         this.updateTabGroups();
         this.updateLinkedViewButton();
       } catch (err) {
@@ -10595,6 +10612,22 @@ class TerminalManager {
     const isWorktree = terminals.some((terminal) =>
       Boolean(terminal.isWorktree),
     );
+    const workspaceAttention = this.getWorkspaceAttention(terminals);
+    const progressTerminal = activeTerminal?.progress
+      ? activeTerminal
+      : terminals.find((terminal) => terminal.progress) || null;
+    // Red is reserved for failures: the last command in some pane exited
+    // non-zero (Ctrl+C's 130 is a user choice, not an error).
+    const exitStatus =
+      !running &&
+      terminals.some(
+        (terminal) =>
+          typeof terminal.lastExitCode === "number" &&
+          terminal.lastExitCode !== 0 &&
+          terminal.lastExitCode !== 130,
+      )
+        ? "error"
+        : "";
     const descriptors = TerminalColors.getWorkspaceSignalDescriptors({
       running,
       agentName,
@@ -10636,6 +10669,10 @@ class TerminalManager {
       recentTools,
       ports,
       isWorktree,
+      attentionKind: workspaceAttention.kind,
+      attentionText: workspaceAttention.text,
+      progress: progressTerminal?.progress || null,
+      exitStatus,
       descriptors,
       statusLabels,
       statusSummary: this.summarizeWorkspaceValues(statusLabels, 2),
@@ -10672,6 +10709,22 @@ class TerminalManager {
     } else {
       lines.push("Signals: none");
     }
+    if (snapshot.attentionKind) {
+      const kindLabel =
+        ATTENTION_KIND_LABELS[snapshot.attentionKind] || "Attention";
+      lines.push(
+        snapshot.attentionText
+          ? `${kindLabel}: ${snapshot.attentionText}`
+          : kindLabel,
+      );
+    }
+    if (snapshot.progress) {
+      lines.push(
+        snapshot.progress.percent !== null
+          ? `Progress: ${snapshot.progress.percent}%`
+          : "Progress: working…",
+      );
+    }
     let tooltip = lines.join("\n");
     const toolsTooltip = window.TerminalColors?.formatRecentToolsTooltip?.(
       snapshot.recentTools,
@@ -10692,7 +10745,32 @@ class TerminalManager {
     tab.dataset.agentState = snapshot.agentState || "none";
     tab.dataset.ports = snapshot.ports.join(",");
     tab.dataset.isWorktree = snapshot.isWorktree ? "true" : "false";
+    tab.dataset.exitStatus = snapshot.exitStatus || "";
     tab.title = this.composeWorkspaceTooltip(snapshot);
+
+    const attentionDot = tab.querySelector(".tab-attention");
+    tab.dataset.attention = snapshot.attentionKind || "";
+    if (attentionDot) {
+      attentionDot.hidden = !snapshot.attentionKind;
+      attentionDot.dataset.kind = snapshot.attentionKind || "";
+      attentionDot.setAttribute(
+        "aria-label",
+        snapshot.attentionKind
+          ? ATTENTION_KIND_LABELS[snapshot.attentionKind] || "Attention"
+          : "",
+      );
+    }
+    const progressEl = tab.querySelector(".tab-progress");
+    const progress = snapshot.progress;
+    tab.dataset.progress = progress ? progress.state : "";
+    if (progressEl) {
+      progressEl.hidden = !progress;
+      progressEl.style.setProperty(
+        "--tab-progress",
+        progress && progress.percent !== null ? `${progress.percent}%` : "0%",
+      );
+      progressEl.dataset.state = progress ? progress.state : "";
+    }
 
     if (signalBadge) {
       signalBadge.textContent = snapshot.showSignalBadge
@@ -10765,6 +10843,7 @@ class TerminalManager {
   }
 
   maybeNotifyCommandFinished(terminal) {
+    terminal.lastCompletionAlertAt = Date.now();
     this.playCompletionSound();
     if (typeof Notification === "undefined") return;
     if (Notification.permission !== "granted") return;
@@ -10791,6 +10870,190 @@ class TerminalManager {
     } catch (err) {
       console.warn("Command completion notification failed:", err);
     }
+  }
+
+  // --- Agent attention (OSC 9/777/99 notifications, OSC 9;4 progress) -------
+  // The server keeps each session's last agent notification as
+  // `attention: {kind,title,body,at,seq}`; this browser remembers the last seq
+  // it has shown per session (localStorage) so tabs and the app badge mark
+  // only unseen events. Alerts reuse the completion sound/notification path.
+
+  applyTerminalAttention(terminal, next) {
+    const signals = window.TaskSignals;
+    if (!signals || !terminal) return;
+    const baseline = terminal.attentionSeqBaseline;
+    const fresh = signals.newAttentionSince(baseline, next);
+    terminal.attentionSeqBaseline = signals.attentionSeq(next);
+    terminal.attention = next?.attention || null;
+    terminal.progress = signals.normalizeProgress(next?.progress);
+    terminal.lastActivityAt = Number(next?.lastActivityAt) || null;
+    if (fresh) this.maybeNotifyAttention(terminal, fresh);
+  }
+
+  maybeNotifyAttention(terminal, attention) {
+    if (attention.kind !== "needs-input" && attention.kind !== "done") return;
+    const now = Date.now();
+    // An agent's own "done" notification usually lands next to DeckTerm's
+    // turn/command completion detection — one alert per burst.
+    if (
+      attention.kind === "done" &&
+      now - (Number(terminal.lastCompletionAlertAt) || 0) <
+        ATTENTION_ALERT_DEDUPE_MS
+    ) {
+      return;
+    }
+    terminal.lastCompletionAlertAt = now;
+    this.playCompletionSound();
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    if (!document.hidden) return;
+    if (this.pushNotifications?.hasActiveSubscription?.()) return;
+
+    const title =
+      attention.kind === "needs-input"
+        ? "Agent needs your input"
+        : "Agent finished";
+    const label = this.formatCwdLabel(terminal.cwd || "Terminal");
+    const detail = [attention.title, attention.body]
+      .filter(Boolean)
+      .join(" — ");
+    const body = detail ? `${label}: ${detail}` : label;
+    if (this.pushNotifications?.showLocalFallback) {
+      void this.pushNotifications.showLocalFallback(title, {
+        body,
+        tag: `deckterm-local-${terminal.id}`,
+      });
+      return;
+    }
+    try {
+      new Notification(title, { body });
+    } catch (err) {
+      console.warn("Agent attention notification failed:", err);
+    }
+  }
+
+  getAttentionSeenMap() {
+    if (!this._attentionSeen) {
+      let raw = null;
+      try {
+        raw = localStorage.getItem(
+          window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+            "deckterm.attention.seen.v1",
+        );
+      } catch {
+        raw = null;
+      }
+      this._attentionSeen = window.TaskSignals?.parseSeenMap?.(raw) || {};
+    }
+    return this._attentionSeen;
+  }
+
+  saveAttentionSeenMap() {
+    try {
+      localStorage.setItem(
+        window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+          "deckterm.attention.seen.v1",
+        JSON.stringify(this._attentionSeen || {}),
+      );
+    } catch {
+      // Private mode / quota: unseen state just stays in memory.
+    }
+  }
+
+  pruneAttentionSeen(catalog) {
+    if (!Array.isArray(catalog) || catalog.length === 0) return;
+    const seen = this.getAttentionSeenMap();
+    const pruned = window.TaskSignals?.pruneSeenMap?.(
+      seen,
+      catalog.map((session) => session?.id).filter(Boolean),
+    );
+    if (pruned && Object.keys(pruned).length !== Object.keys(seen).length) {
+      this._attentionSeen = pruned;
+      this.saveAttentionSeenMap();
+    }
+  }
+
+  getActiveVisibleTerminalId() {
+    return document.visibilityState === "visible" ? this.activeId : null;
+  }
+
+  markAttentionSeen(id) {
+    const seq = window.TaskSignals?.attentionSeq?.(this.terminals.get(id));
+    if (!seq) return false;
+    const seen = this.getAttentionSeenMap();
+    if ((seen[id] || 0) >= seq) return false;
+    seen[id] = seq;
+    this.saveAttentionSeenMap();
+    return true;
+  }
+
+  isTerminalAttentionUnseen(id, terminal = this.terminals.get(id)) {
+    return Boolean(
+      window.TaskSignals?.hasUnseenAttention?.(
+        terminal,
+        this.getAttentionSeenMap()[id],
+        { isActiveVisible: id === this.getActiveVisibleTerminalId() },
+      ),
+    );
+  }
+
+  // Marks the active, visible session as seen and refreshes the app badge.
+  syncAttentionIndicators() {
+    const activeVisibleId = this.getActiveVisibleTerminalId();
+    if (activeVisibleId) this.markAttentionSeen(activeVisibleId);
+    const signals = window.TaskSignals;
+    if (!signals) return;
+    const sessions = new Map();
+    for (const session of this._sessionCatalog || []) {
+      if (session?.id && session.active !== false) {
+        sessions.set(session.id, session);
+      }
+    }
+    this.terminals.forEach((terminal, id) => {
+      sessions.set(id, { id, attention: terminal.attention });
+    });
+    this.updateAppBadge(
+      signals.countUnseenAttention(
+        Array.from(sessions.values()),
+        this.getAttentionSeenMap(),
+        { activeVisibleId },
+      ),
+    );
+  }
+
+  updateAppBadge(count) {
+    if (this._appBadgeCount === count) return;
+    this._appBadgeCount = count;
+    try {
+      if (count > 0 && typeof navigator.setAppBadge === "function") {
+        void navigator.setAppBadge(count).catch(() => {});
+      } else if (count === 0 && typeof navigator.clearAppBadge === "function") {
+        void navigator.clearAppBadge().catch(() => {});
+      }
+    } catch {
+      // Badging API unsupported or blocked: the tab dots still show it.
+    }
+  }
+
+  getWorkspaceAttention(terminals = []) {
+    const signals = window.TaskSignals;
+    const unseen = terminals.filter((terminal) =>
+      this.isTerminalAttentionUnseen(terminal.id, terminal),
+    );
+    const kind = signals?.topAttentionKind?.(
+      unseen.map((terminal) => terminal.attention?.kind),
+    );
+    const source = kind
+      ? unseen.find((terminal) => terminal.attention?.kind === kind)
+      : null;
+    return {
+      kind: kind || null,
+      text: source
+        ? [source.attention.title, source.attention.body]
+            .filter(Boolean)
+            .join(" — ")
+        : "",
+    };
   }
 
   renderWorkspaceTab(tab, preferredCwd = null) {
@@ -14370,15 +14633,20 @@ class TerminalManager {
     const label = this.formatCwdLabel(cwd);
     tab.innerHTML = `
       <span class="tab-dot"></span>
-      <span class="tab-index">${tabNum}</span>
+      <span class="tab-index"></span>
       <span class="tab-count"></span>
       <span class="tab-copy">
-        <span class="tab-label">${label}</span>
+        <span class="tab-label"></span>
         <span class="tab-meta" hidden></span>
         <span class="tab-signal-badge" hidden aria-hidden="true"></span>
       </span>
       <button class="tab-close" title="Close workspace" aria-label="Close workspace">&times;</button>
+      <span class="tab-attention" role="img" hidden></span>
+      <span class="tab-progress" hidden aria-hidden="true"></span>
     `;
+    // textContent: a cwd basename is user data, never markup.
+    tab.querySelector(".tab-index").textContent = String(tabNum);
+    tab.querySelector(".tab-label").textContent = label;
 
     tab.querySelector(".tab-close").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -14446,6 +14714,7 @@ class TerminalManager {
     });
 
     this.tabs.appendChild(tab);
+    this.renumberTabs();
     this.updateTabGroups();
     return tab;
   }
@@ -14456,7 +14725,23 @@ class TerminalManager {
       .forEach((t) => t.classList.remove("drop-target", "dragging"));
   }
 
+  // Tab numbers (and the Ctrl+1..9 targets) follow the visual order on every
+  // render; creation-time numbers drifted after closes/merges ("1", "3").
+  renumberTabs() {
+    Array.from(this.tabs.querySelectorAll(".tab")).forEach((tab, index) => {
+      const number = String(index + 1);
+      if (index < 9) tab.dataset.index = number;
+      else delete tab.dataset.index;
+      const indexEl = tab.querySelector(".tab-index");
+      if (indexEl && indexEl.textContent !== number) {
+        indexEl.textContent = number;
+      }
+    });
+  }
+
   updateTabGroups() {
+    this.syncAttentionIndicators();
+    this.renumberTabs();
     this.tabs.querySelectorAll(".tab").forEach((tab) => {
       this.renderWorkspaceTab(tab);
     });
@@ -14732,6 +15017,7 @@ class TerminalManager {
       tab.classList.toggle("active", isActive);
       tab.setAttribute("aria-selected", isActive ? "true" : "false");
     });
+    if (this.markAttentionSeen(id)) this.updateTabGroups();
 
     this.updateConnectionStatus(this.getTerminalConnectionStatus(t));
     this.updateLinkedViewButton();
