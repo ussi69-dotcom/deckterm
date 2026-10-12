@@ -197,18 +197,18 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
     test("extra keys contain expected buttons", async ({ page }) => {
       await toggleExtraKeysFromMore(page);
 
+      // Agent quick-reply chips (.ek-chip) reuse data-key to share the
+      // extra-keys send path, so scope to the key rows themselves.
+      const keyRows = page.locator("#extra-keys .extra-keys-rows");
+
       const essentialKeys = ["ESC", "TAB", "CTRL", "ALT", "SHIFT"];
       for (const key of essentialKeys) {
-        await expect(
-          page.locator(`#extra-keys [data-key="${key}"]`),
-        ).toBeVisible();
+        await expect(keyRows.locator(`[data-key="${key}"]`)).toBeVisible();
       }
 
       const arrowKeys = ["UP", "DOWN", "LEFT", "RIGHT"];
       for (const key of arrowKeys) {
-        await expect(
-          page.locator(`#extra-keys [data-key="${key}"]`),
-        ).toBeVisible();
+        await expect(keyRows.locator(`[data-key="${key}"]`)).toBeVisible();
       }
     });
   });
