@@ -11939,6 +11939,19 @@ class TerminalManager {
     return this.surfaceWindowManager;
   }
 
+  // The Sessions/Setup sheets and the More sheet stack above the floating
+  // windows (styles.css) with a backdrop that dims them. A window opened while
+  // one of those sheets is up (palette action, shortcut) would land under that
+  // backdrop, so opening a window dismisses the sheets first.
+  closeOverlaySheetsForWindow() {
+    const isOpen = (el) => Boolean(el && !el.classList.contains("hidden"));
+    if (isOpen(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (isOpen(this.getSetupPanel())) this.closeSetupPanel();
+    if (isOpen(this.toolsSheet)) this.closeToolsSheet();
+  }
+
   async openSurfaceWindow(id, config) {
     const manager = await this.ensureSurfaceWindowManager();
     if (!manager) return null;
@@ -11953,6 +11966,7 @@ class TerminalManager {
     ) {
       win.bodyEl.appendChild(config.contentEl);
     }
+    this.closeOverlaySheetsForWindow();
     manager.open(id);
     return win;
   }

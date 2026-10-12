@@ -1431,10 +1431,14 @@ body.touch-input-mode .xterm .composition-view.active {
   border-color: var(--accent-blue);
 }
 
+/* Explicitly opened sheets (More, Tasks/Sessions, Setup) stack ABOVE the
+   floating surface-windows layer (#surface-windows-layer, z-index 640) and the
+   sessions-dock sash (660): their backdrop must dim open windows too, not
+   slide underneath them. The layout-editor drag ghost (720) stays on top. */
 .tools-sheet {
   position: fixed;
   inset: 0;
-  z-index: 620;
+  z-index: 684;
   pointer-events: none;
 }
 
@@ -1921,7 +1925,7 @@ body.touch-input-mode .xterm .composition-view.active {
 .task-panel {
   position: fixed;
   inset: 0;
-  z-index: 610;
+  z-index: 680;
   pointer-events: none;
 }
 
@@ -2339,7 +2343,7 @@ body.touch-input-mode .xterm .composition-view.active {
 .setup-panel {
   position: fixed;
   inset: 0;
-  z-index: 612;
+  z-index: 682;
   pointer-events: none;
 }
 
