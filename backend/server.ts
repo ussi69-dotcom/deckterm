@@ -25,8 +25,20 @@ import {
   configuredBrowserBoundary,
   SECURITY_HEADERS,
 } from "./services/browser-boundary";
+import {
+  collectProcessTreeArgs,
+  createLazyOnce,
+  createSingleFlightCache,
+  parseProcessTable,
+  type ProcessSnapshot,
+} from "./services/runtime-sync-cache";
+import { createCpuUsageMeter } from "./services/cpu-usage";
+import {
+  NO_STORE_CACHE_CONTROL,
+  createBuildFingerprint,
+  createStaticAssetServer,
+} from "./services/static-assets";
 import { Hono } from "hono";
-import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import type { ServerWebSocket, Subprocess } from "bun";
 import { Database } from "bun:sqlite";
@@ -53,6 +65,7 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { assertPortAvailable } from "./port-probe";
+import { cpus } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   classifyAgentOutputPhase,
@@ -273,6 +286,7 @@ type Terminal = {
   sessionName?: string; // tmux session name (when TMUX_BACKEND=1)
   scrollback: string[]; // ring buffer of recent terminal output chunks
   scrollbackBytes: number; // current bytes in ring buffer
+  scrollbackChunkBytes: number[]; // byte length of each scrollback chunk (parallel array)
   hadSocketConnection: boolean; // tracks whether a websocket was ever connected
   running: boolean;
   lastExitCode: number | null;
@@ -428,6 +442,23 @@ const DECKTERM_RELEASE = ((): string => {
   }
   return "dev";
 })();
+// Served web files: ETag/304 + gzip for static assets, and a short build
+// fingerprint (/api/health `build`) so open tabs notice a new version. Both
+// resolve ./web against the working directory, as serveStatic did.
+const WEB_ROOT = "./web";
+const staticAssets = createStaticAssetServer({ root: WEB_ROOT });
+const webBuildFingerprint = createBuildFingerprint({
+  root: WEB_ROOT,
+  ttlMs: 5000,
+});
+const hostCpuUsage = createCpuUsageMeter({ readCpus: () => cpus() });
+declare module "hono" {
+  interface ContextVariableMap {
+    // Set when the static handler already chose this response's
+    // Cache-Control, so the global no-store middleware leaves it alone.
+    staticCacheManaged: boolean;
+  }
+}
 const DECKTERM_TASK_MAX_ROUNDS = parseInt(
   process.env.DECKTERM_TASK_MAX_ROUNDS || "5",
   10,
@@ -3937,8 +3968,10 @@ function appendScrollback(terminalId: string, data: string) {
   const chunks = data.split(/(?<=\n)/g);
   for (const chunk of chunks) {
     if (!chunk) continue;
+    const bytes = Buffer.byteLength(chunk);
     term.scrollback.push(chunk);
-    term.scrollbackBytes += Buffer.byteLength(chunk);
+    term.scrollbackChunkBytes.push(bytes);
+    term.scrollbackBytes += bytes;
   }
 
   while (
@@ -3946,8 +3979,9 @@ function appendScrollback(terminalId: string, data: string) {
     term.scrollbackBytes > SCROLLBACK_MAX_BYTES
   ) {
     const removed = term.scrollback.shift();
+    const removedBytes = term.scrollbackChunkBytes.shift();
     if (!removed) break;
-    term.scrollbackBytes -= Buffer.byteLength(removed);
+    term.scrollbackBytes -= removedBytes ?? Buffer.byteLength(removed);
   }
 }
 
@@ -4329,7 +4363,9 @@ function handoffTmuxSession(
 function broadcastTerminalOutput(id: string, data: string) {
   const sockets = terminalSockets.get(id);
   if (!sockets || sockets.size === 0) return;
-  debug(`PTY ${id} data (${data.length} bytes)`);
+  if (DEBUG) debug(`PTY ${id} data (${data.length} bytes)`);
+  // Hot path: serialise the v2 envelope at most once per chunk, not per socket.
+  let v2Frame: string | null = null;
   for (const ws of sockets) {
     const reconnectState = socketReconnectState.get(ws);
     if (reconnectState?.pendingReady || reconnectState?.replaying) {
@@ -4337,13 +4373,12 @@ function broadcastTerminalOutput(id: string, data: string) {
     }
     try {
       if (ws.data.type === "terminal" && ws.data.protocol === "v2") {
-        ws.send(
-          JSON.stringify({
-            type: "terminal_event",
-            kind: "output",
-            data,
-          }),
-        );
+        v2Frame ??= JSON.stringify({
+          type: "terminal_event",
+          kind: "output",
+          data,
+        });
+        ws.send(v2Frame);
       } else {
         ws.send(data);
       }
@@ -4886,52 +4921,49 @@ async function completeTmuxReconnectReplay(
   }
 }
 
-async function getProcessTreeArgs(rootPid: number): Promise<string[]> {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
-
+async function readProcessSnapshot(): Promise<ProcessSnapshot> {
   const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], {
     stdout: "pipe",
     stderr: "pipe",
   });
   const output = await new Response(proc.stdout).text();
   await proc.exited;
-
-  const childrenByParent = new Map<number, number[]>();
-  const argsByPid = new Map<number, string>();
-
-  for (const line of output.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (!match) continue;
-    const pid = Number.parseInt(match[1] || "", 10);
-    const ppid = Number.parseInt(match[2] || "", 10);
-    const args = (match[3] || "").trim();
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !args) continue;
-    argsByPid.set(pid, args);
-    const siblings = childrenByParent.get(ppid) || [];
-    siblings.push(pid);
-    childrenByParent.set(ppid, siblings);
-  }
-
-  const processTree: string[] = [];
-  const stack = [rootPid];
-  const visited = new Set<number>();
-
-  while (stack.length > 0) {
-    const pid = stack.pop();
-    if (!pid || visited.has(pid)) continue;
-    visited.add(pid);
-    const args = argsByPid.get(pid);
-    if (args) processTree.push(args);
-    const children = childrenByParent.get(pid) || [];
-    for (let index = children.length - 1; index >= 0; index--) {
-      stack.push(children[index]);
-    }
-  }
-
-  return processTree;
+  return parseProcessTable(output);
 }
 
-async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
+// Pass a snapshot to share one `ps` run across many sessions (GET
+// /api/terminals); without one a fresh snapshot is taken.
+async function getProcessTreeArgs(
+  rootPid: number,
+  snapshot?: ProcessSnapshot | Promise<ProcessSnapshot>,
+): Promise<string[]> {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  return collectProcessTreeArgs(
+    await (snapshot ?? readProcessSnapshot()),
+    rootPid,
+  );
+}
+
+// Concurrent and back-to-back /api/terminals polls (every open tab polls)
+// share one tmux runtime sync per terminal for this long.
+const TMUX_RUNTIME_SYNC_TTL_MS = 2000;
+const tmuxRuntimeSyncFlights = createSingleFlightCache<Terminal, void>({
+  ttlMs: TMUX_RUNTIME_SYNC_TTL_MS,
+});
+
+function syncTmuxRuntimeStateShared(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot>,
+): Promise<void> {
+  return tmuxRuntimeSyncFlights.run(term, () =>
+    syncTmuxRuntimeState(term, getProcessSnapshot),
+  );
+}
+
+async function syncTmuxRuntimeState(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot> = readProcessSnapshot,
+): Promise<void> {
   if (!TMUX_BACKEND || !term.sessionName) return;
 
   const pipeDelta = await readTmuxPipeDelta(term);
@@ -4949,7 +4981,7 @@ async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
   const [capture, processTree] = await Promise.all([
     captureTmuxPane(term.sessionName).catch(() => ""),
     panePid > 0
-      ? getProcessTreeArgs(panePid).catch(() => [])
+      ? getProcessTreeArgs(panePid, getProcessSnapshot()).catch(() => [])
       : Promise.resolve([]),
   ]);
   const nextRuntimeState = inferTmuxRuntimeState({
@@ -5101,6 +5133,7 @@ async function createManagedTerminal({
     sessionName,
     scrollback: [],
     scrollbackBytes: 0,
+    scrollbackChunkBytes: [],
     hadSocketConnection: false,
     running: initialRuntimeState?.running || false,
     lastExitCode:
@@ -5528,21 +5561,27 @@ export function createWebApp() {
     await next();
   });
 
-  // No-cache headers - bypass CF cache
+  // No-cache headers - bypass CF cache. API, WebSocket and HTML responses stay
+  // no-store. Static web files set their own `private` browser-cache policy
+  // (ETag revalidation or immutable for versioned /assets/); `private` keeps
+  // Cloudflare from storing them, and the CDN headers below forbid it outright.
   app.use("/*", async (c, next) => {
     await next();
-    c.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    c.header("Pragma", "no-cache");
-    c.header("Expires", "0");
+    if (!c.get("staticCacheManaged")) {
+      c.header("Cache-Control", NO_STORE_CACHE_CONTROL);
+      c.header("Pragma", "no-cache");
+      c.header("Expires", "0");
+    }
     c.header("CDN-Cache-Control", "no-store");
     c.header("Cloudflare-CDN-Cache-Control", "no-store");
   });
 
   // Health endpoint
-  app.get("/api/health", (c) => {
+  app.get("/api/health", async (c) => {
     return c.json({
       status: "ok",
       release: DECKTERM_RELEASE,
+      build: await webBuildFingerprint.get().catch(() => null),
       terminals: terminals.size,
       maxTerminals: MAX_TERMINALS,
       uptime: process.uptime(),
@@ -6516,13 +6555,8 @@ export function createWebApp() {
     const os = await import("os");
     const fs = await import("fs/promises");
 
-    const cpus = os.cpus();
-    const cpuUsage =
-      cpus.reduce((acc, cpu) => {
-        const total = Object.values(cpu.times).reduce((a, b) => a + b, 0);
-        const idle = cpu.times.idle;
-        return acc + ((total - idle) / total) * 100;
-      }, 0) / cpus.length;
+    // Busy share since the previous /api/stats read (not since boot).
+    const cpuUsage = await hostCpuUsage.read();
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
@@ -7490,6 +7524,9 @@ export function createWebApp() {
       endedLimit: TERMINAL_LIST_ENDED_LIMIT,
     });
     const seenIds = new Set<string>();
+    // One `ps` snapshot per request, taken only if some session needs a
+    // fresh runtime sync (cached syncs reuse their earlier result).
+    const getProcessSnapshot = createLazyOnce(readProcessSnapshot);
 
     const list = await Promise.all(
       recordedSessions.map(async (recordedSession) => {
@@ -7502,7 +7539,10 @@ export function createWebApp() {
         if (restoredTerm) {
           seenIds.add(restoredTerm.id);
           if (TMUX_BACKEND && restoredTerm.sessionName) {
-            await syncTmuxRuntimeState(restoredTerm).catch((err) => {
+            await syncTmuxRuntimeStateShared(
+              restoredTerm,
+              getProcessSnapshot,
+            ).catch((err) => {
               debug(`[tmux] runtime sync failed for ${restoredTerm.id}:`, err);
             });
           }
@@ -7557,9 +7597,11 @@ export function createWebApp() {
         .map(async (t) => {
           ensureTerminalSessionRecorded(state, t);
           if (TMUX_BACKEND && t.sessionName) {
-            await syncTmuxRuntimeState(t).catch((err) => {
-              debug(`[tmux] runtime sync failed for ${t.id}:`, err);
-            });
+            await syncTmuxRuntimeStateShared(t, getProcessSnapshot).catch(
+              (err) => {
+                debug(`[tmux] runtime sync failed for ${t.id}:`, err);
+              },
+            );
           }
           return {
             ...serializeTerminal(t, requestingClientId),
@@ -10086,14 +10128,13 @@ export function createWebApp() {
     }
   });
 
-  // Serve static files
-  app.use(
-    "/*",
-    serveStatic({
-      root: "./web",
-      rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
-    }),
-  );
+  // Serve static files (see services/static-assets.ts for the cache policy)
+  app.use("/*", async (c, next) => {
+    const response = await staticAssets.handle(c.req.raw);
+    if (!response) return next();
+    c.set("staticCacheManaged", true);
+    return c.newResponse(response.body, response);
+  });
 
   return app;
 }

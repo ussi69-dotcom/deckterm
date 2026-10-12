@@ -2480,7 +2480,14 @@ class StatsManager {
 
   init() {
     this.fetchStats();
-    setInterval(() => this.fetchStats(), 5000);
+    // Every 10 s while the tab is visible; a hidden tab skips the poll and
+    // refreshes as soon as it becomes visible again.
+    setInterval(() => {
+      if (!document.hidden) this.fetchStats();
+    }, 10000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.fetchStats();
+    });
   }
 
   async fetchStats() {
@@ -10430,10 +10437,21 @@ class TerminalManager {
     if (this.telemetryRefreshInterval) {
       clearInterval(this.telemetryRefreshInterval);
     }
-    this.telemetryRefreshInterval = setInterval(
-      () => this.queueTelemetryRefresh(0),
-      5000,
-    );
+    // Hidden tabs skip the 5 s poll (each one costs tmux queries on the
+    // server) and catch up immediately when they become visible again; live
+    // state changes still arrive over the terminal WebSockets meanwhile.
+    this.telemetryRefreshInterval = setInterval(() => {
+      if (!document.hidden) this.queueTelemetryRefresh(0);
+    }, 5000);
+    if (!this.telemetryVisibilityHandler) {
+      this.telemetryVisibilityHandler = () => {
+        if (!document.hidden) this.queueTelemetryRefresh(0);
+      };
+      document.addEventListener(
+        "visibilitychange",
+        this.telemetryVisibilityHandler,
+      );
+    }
   }
 
   queueTelemetryRefresh(delay = 150) {
