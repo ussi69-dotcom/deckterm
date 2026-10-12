@@ -514,6 +514,12 @@ class ReconnectingWebSocket {
     this.reconnectGeneration = 0;
     this.openedOnce = false;
     this.awaitingReconnectReady = false;
+    // Input typed while the transport is connecting/reconnecting is held here
+    // (bounded: 8 KB / 15 s) and flushed in order once the connection is
+    // ready, instead of being silently dropped. Never replayed after an
+    // intentional close or after the terminal ended.
+    this.inputQueue = window.InputQueue ? new window.InputQueue() : null;
+    this.inputQueueTimer = null;
     this.connect();
   }
 
@@ -548,6 +554,11 @@ class ReconnectingWebSocket {
       if (!isReconnectTransport && this.isCurrentSocket(socket)) {
         this.markConnectionReady(false, socket);
       }
+      // Deliver input queued while connecting right after open. On a
+      // reconnect this lands during the server's replay window, exactly
+      // like input typed there always has, and never waits on a `ready`
+      // that might not come.
+      this.flushQueuedInput(socket);
     };
     socket.onmessage = (e) => {
       if (!this.isCurrentSocket(socket)) return;
@@ -587,6 +598,7 @@ class ReconnectingWebSocket {
         if (data.type === "exit") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("exited", data.code);
           return;
@@ -594,6 +606,7 @@ class ReconnectingWebSocket {
         if (data.type === "terminal_dead") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("dead");
           return;
@@ -601,6 +614,7 @@ class ReconnectingWebSocket {
         if (data.type === "session_handoff") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("taken_over", data);
           socket.close();
@@ -639,6 +653,7 @@ class ReconnectingWebSocket {
     }
     if (this.retryCount >= this.maxRetries) {
       this.awaitingReconnectReady = false;
+      this.discardQueuedInput({ notify: true });
       this.callbacks.onStatusChange("failed");
       return;
     }
@@ -677,12 +692,14 @@ class ReconnectingWebSocket {
         if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("dead");
           return;
         }
         if (outcome === "blocked") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("setup_required");
           return;
         }
@@ -773,8 +790,71 @@ class ReconnectingWebSocket {
     return false;
   }
 
+  // Send terminal input, queueing it while the transport is not ready. Input
+  // already queued keeps its place: new input goes behind it until the flush,
+  // so keystrokes never reorder. Returns true when the input was sent or
+  // queued, false when it was refused (closed or ended terminal).
+  sendInput(data) {
+    if (typeof data !== "string" || !data) return false;
+    const queue = this.inputQueue;
+    const canSendNow =
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(queue && queue.length > 0);
+    if (canSendNow || !queue) {
+      return this.send(JSON.stringify({ type: "input", data }));
+    }
+    if (this.intentionallyClosed) return false;
+    const dropped = queue.push(data);
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    this.scheduleQueuedInputExpiry();
+    return true;
+  }
+
+  flushQueuedInput(socket = this.ws) {
+    const queue = this.inputQueue;
+    if (!queue || queue.length === 0) return;
+    if (
+      !this.isCurrentSocket(socket) ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    this.clearQueuedInputExpiry();
+    const { items, dropped } = queue.drain();
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    for (const data of items) {
+      socket.send(JSON.stringify({ type: "input", data }));
+    }
+  }
+
+  discardQueuedInput({ notify = false } = {}) {
+    this.clearQueuedInputExpiry();
+    const discarded = this.inputQueue?.clear() || 0;
+    if (notify && discarded > 0) this.callbacks.onInputDropped?.(discarded);
+    return discarded;
+  }
+
+  scheduleQueuedInputExpiry() {
+    if (this.inputQueueTimer) return;
+    const waitMs = this.inputQueue?.msUntilNextExpiry();
+    if (waitMs === null || waitMs === undefined) return;
+    this.inputQueueTimer = setTimeout(() => {
+      this.inputQueueTimer = null;
+      const dropped = this.inputQueue?.prune() || 0;
+      if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+      this.scheduleQueuedInputExpiry();
+    }, waitMs + 50);
+  }
+
+  clearQueuedInputExpiry() {
+    clearTimeout(this.inputQueueTimer);
+    this.inputQueueTimer = null;
+  }
+
   close() {
     this.intentionallyClosed = true;
+    // The user closed this terminal: never replay what was typed into it.
+    this.discardQueuedInput();
     this.stopHeartbeat();
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
@@ -6044,6 +6124,9 @@ class TerminalManager {
 
   fitTerminalState(terminalState) {
     if (!terminalState?.fitAddon || !terminalState?.terminal) return null;
+    // Deferred callers (rAF/timers) can outlive a closed terminal; fitting a
+    // disposed xterm throws inside its render service.
+    if (terminalState.disposed) return null;
     terminalState.fitAddon.fit();
     return this.normalizeTerminalGeometry(terminalState);
   }
@@ -10742,6 +10825,9 @@ class TerminalManager {
     if (this.telemetryRefreshPromise) return this.telemetryRefreshPromise;
     this.telemetryRefreshPromise = (async () => {
       try {
+        // Lets a cwd learned while this poll is in flight (OSC 7) win over
+        // the older server snapshot.
+        const requestStartedAt = Date.now();
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
@@ -10774,12 +10860,18 @@ class TerminalManager {
             ? next.recentTools
             : [];
           this.applyTerminalAttention(terminal, next);
-          const hasClientCwd =
-            typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
-          if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
-            terminal.cwd = next.cwd;
-            this.sessionRegistry.update(id, { cwd: next.cwd });
-          }
+          // Under tmux the server reads the pane's live cwd on every poll, so
+          // it is authoritative (bash emits no OSC 7 and tmux would not
+          // forward it). The raw backend only knows the spawn cwd, so there
+          // it just fills a missing client cwd.
+          const liveCwd = window.LiveCwd?.resolveServerLiveCwd?.({
+            clientCwd: terminal.cwd,
+            serverCwd: next.cwd,
+            backendMode: next.backendMode || terminal.backendMode,
+            clientCwdUpdatedAt: terminal.cwdUpdatedAt || 0,
+            requestStartedAt,
+          });
+          if (liveCwd) this.applyLiveCwd(id, liveCwd);
         });
 
         this.pruneAttentionSeen(this._sessionCatalog);
@@ -11439,19 +11531,62 @@ class TerminalManager {
     return terminal.parser.registerOscHandler(7, (data) => {
       const cwd = this.parseOsc7Cwd(data);
       if (!cwd) return false;
-      const t = this.terminals.get(id);
-      if (!t) return true;
-      t.cwd = cwd;
-      if (t.workspaceId && this.activeId === id) {
-        this.setDirectoryValue(cwd);
-        this.updateWorkspaceLabel(t.workspaceId, cwd);
-        this.rememberWorkspaceById(t.workspaceId, cwd);
-      }
-      this.updateTabGroups();
-      // Update session registry with new cwd
-      this.sessionRegistry.update(id, { cwd });
+      this.applyLiveCwd(id, cwd);
       if (DEBUG) dbg("osc7 cwd", { id, cwd });
       return true;
+    });
+  }
+
+  // One path for every live cwd change (OSC 7 from the shell, or the server's
+  // tmux pane cwd from the telemetry poll): tab/workspace label, session
+  // registry and — for the active terminal — the working-directory field and
+  // the Files/Git surfaces that follow it. The field keeps a draft the user
+  // is editing (setDirectoryValue's draft lock).
+  applyLiveCwd(id, cwd) {
+    const t = this.terminals.get(id);
+    if (!t || t.disposed || typeof cwd !== "string" || !cwd) return false;
+    const previousCwd = t.cwd;
+    t.cwdUpdatedAt = Date.now();
+    if (previousCwd === cwd) return false;
+    t.cwd = cwd;
+    if (t.workspaceId && this.activeId === id) {
+      this.setDirectoryValue(cwd);
+      this.updateWorkspaceLabel(t.workspaceId, cwd);
+      this.rememberWorkspaceById(t.workspaceId, cwd);
+      this.followLiveCwdInSurfaces(t.workspaceId, previousCwd, cwd);
+    }
+    this.updateTabGroups();
+    this.sessionRegistry.update(id, { cwd });
+    return true;
+  }
+
+  // Move the Files explorer (and with it the Git panel, which resolves its
+  // cwd from the explorer first) to the new cwd — but only while it still
+  // shows the terminal's previous cwd. A user who navigated the explorer
+  // elsewhere keeps their place.
+  followLiveCwdInSurfaces(workspaceId, previousCwd, cwd) {
+    const explorer = this.fileExplorer;
+    const explorerPath =
+      explorer && explorer.currentWorkspaceId === workspaceId
+        ? explorer.currentPath
+        : null;
+    if (
+      !window.LiveCwd?.shouldSurfaceFollowCwd?.({
+        surfacePath: explorerPath,
+        previousCwd,
+      })
+    ) {
+      return;
+    }
+    if (explorerPath) {
+      // loadDir records the new path synchronously, so the git refresh
+      // below already resolves the new cwd through getGitCwd().
+      Promise.resolve(explorer.loadDir(cwd, workspaceId)).catch((err) => {
+        if (DEBUG) dbg("live cwd explorer follow failed", err);
+      });
+    }
+    Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
+      if (DEBUG) dbg("live cwd git refresh failed", err);
     });
   }
 
@@ -13256,6 +13391,7 @@ class TerminalManager {
       onTerminalState: (message) => {
         this.applyTerminalRuntimeState(id, message);
       },
+      onInputDropped: () => this.showInputDroppedNotice(id),
       getReconnectBehavior: () => this.reconnectBehavior,
     });
 
@@ -13269,7 +13405,7 @@ class TerminalManager {
       if (inputState.pasteDepth > 0) {
         inputState.lastOnDataAt = performance.now();
         inputState.lastOnDataValue = data;
-        ws.send(JSON.stringify({ type: "input", data }));
+        ws.sendInput(data);
         return;
       }
 
@@ -13282,7 +13418,7 @@ class TerminalManager {
       inputState.lastOnDataAt = performance.now();
       inputState.lastOnDataValue = dedupedData;
       const finalData = this.applyExtraKeyModifiers(dedupedData);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
     });
 
     const inputFallbackCleanup = this.attachMobileInputFallback(
@@ -13575,7 +13711,7 @@ class TerminalManager {
       this.rememberFallbackEcho(inputState, data);
 
       const finalData = this.applyExtraKeyModifiers(data);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
 
       if (DEBUG) {
         dbg("[ExtraKeys] mobile input fallback:", {
@@ -14386,6 +14522,30 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
+  // Brief per-tile notice when input typed during a connect/reconnect could
+  // not be delivered (queue bound hit, input too old, or the terminal ended
+  // before the connection came back).
+  showInputDroppedNotice(id) {
+    const t = this.terminals.get(id);
+    const host = t?.element?.parentElement;
+    if (!t || t.disposed || !host) return;
+    let notice = t.inputDroppedNotice;
+    if (!notice || !notice.isConnected) {
+      notice = document.createElement("div");
+      notice.className = "tile-input-dropped";
+      notice.setAttribute("role", "status");
+      notice.setAttribute("aria-live", "polite");
+      notice.textContent = "Input not sent — connection was down";
+      host.appendChild(notice);
+      t.inputDroppedNotice = notice;
+    }
+    notice.classList.add("visible");
+    clearTimeout(t.inputDroppedTimer);
+    t.inputDroppedTimer = setTimeout(() => {
+      notice.classList.remove("visible");
+    }, 4000);
+  }
+
   performReconnectLayoutSync(
     id,
     { forceResize = false, scrollToPrompt = false } = {},
@@ -14394,6 +14554,7 @@ class TerminalManager {
     if (!t?.fitAddon || !t?.terminal) return;
 
     requestAnimationFrame(() => {
+      if (t.disposed) return;
       try {
         this.fitTerminalState(t);
         this.sendResize(id, t.terminal.cols, t.terminal.rows, {
@@ -14551,10 +14712,12 @@ class TerminalManager {
     }
 
     const observer = new ResizeObserver(() => {
+      if (t.disposed) return;
       if (!t.element || t.element.offsetParent === null) return;
       if (t.fitFrame) return;
       t.fitFrame = requestAnimationFrame(() => {
         t.fitFrame = 0;
+        if (t.disposed) return;
         try {
           const prevCols = t.terminal?.cols;
           const prevRows = t.terminal?.rows;
@@ -14735,6 +14898,7 @@ class TerminalManager {
           onLifecycle: (message) => this.handleReconnectLifecycle(id, message),
           onTerminalState: (message) =>
             this.applyTerminalRuntimeState(id, message),
+          onInputDropped: () => this.showInputDroppedNotice(id),
           getReconnectBehavior: () => this.reconnectBehavior,
         },
       );
@@ -14750,7 +14914,7 @@ class TerminalManager {
         if (inputState.pasteDepth > 0) {
           inputState.lastOnDataAt = performance.now();
           inputState.lastOnDataValue = data;
-          ws.send(JSON.stringify({ type: "input", data }));
+          ws.sendInput(data);
           return;
         }
 
@@ -14769,7 +14933,7 @@ class TerminalManager {
         const finalData = this.applyExtraKeyModifiers(dedupedData, {
           log: true,
         });
-        ws.send(JSON.stringify({ type: "input", data: finalData }));
+        ws.sendInput(finalData);
       });
 
       const inputFallbackCleanup = this.attachMobileInputFallback(
@@ -15352,9 +15516,18 @@ class TerminalManager {
     const terminalLabel = this.formatCwdLabel(t.cwd || "Terminal");
     const closingWorkspaceId = t.workspaceId;
     const wasActive = id === this.activeId;
+    // Snapshot what Undo needs before the registry entry goes away. A
+    // terminal whose process already ended has nothing to restore.
+    const terminalEnded = ["exited", "dead"].includes(t.connectionStatus);
+    const undoEntry = terminalEnded
+      ? null
+      : this.rememberClosedSessionForUndo(id, t);
 
     if (wasActive) this.closeTerminalSearch();
 
+    // Everything deferred (rAF fits, resize timers, layout syncs) checks this
+    // before touching the xterm instance.
+    t.disposed = true;
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
@@ -15365,7 +15538,11 @@ class TerminalManager {
     if (t.resizeTimer) clearTimeout(t.resizeTimer);
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
+    if (t.inputDroppedTimer) clearTimeout(t.inputDroppedTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.resizeObserver = null;
+    t.resizeTimer = null;
+    t.fitFrame = 0;
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
     // The webgl addon must be disposed BEFORE terminal.dispose() — disposing
@@ -15378,6 +15555,7 @@ class TerminalManager {
       }
       t.webglAddon = null;
     }
+    this.quiesceXtermForDispose(t.terminal);
     try {
       t.terminal?.dispose?.();
     } catch (err) {
@@ -15425,36 +15603,135 @@ class TerminalManager {
         terminalLabel,
         result.terminationScheduledAt,
         Boolean(result.preservedByOtherClient),
+        { canUndo: Boolean(undoEntry) },
       );
       this.queueTelemetryRefresh(0);
     } catch (err) {
       console.warn("Could not schedule terminal close:", err);
-      this.showSessionCloseToast(terminalLabel, null);
+      // No termination was scheduled, so the session (if it still exists)
+      // stays in Sessions — but a failed request can also mean it is gone,
+      // so do not promise a one-click Undo here.
+      this.showSessionCloseToast(terminalLabel, null, false, {
+        canUndo: false,
+      });
     }
+  }
+
+  // xterm 5.3 leaves two deferred callbacks un-cancelled on dispose: the
+  // render service's paused-resize idle task (queued when a hidden terminal
+  // is resized) and the viewport's refresh animation frame. Either firing
+  // after dispose throws "Cannot read properties of undefined (reading
+  // 'handleResize' / 'dimensions')". Neutralize both before disposing.
+  quiesceXtermForDispose(terminal) {
+    const core = terminal?._core;
+    if (!core) return;
+    try {
+      // set() replaces whatever resize is queued with a no-op.
+      core._renderService?._pausedResizeTask?.set?.(() => {});
+    } catch {}
+    const viewport = core.viewport;
+    if (!viewport) return;
+    try {
+      if (viewport._refreshAnimationFrame != null) {
+        cancelAnimationFrame(viewport._refreshAnimationFrame);
+        viewport._refreshAnimationFrame = null;
+      }
+      // The viewport also schedules syncScrollArea from timers we cannot
+      // reach; make any late call a no-op on this dead instance.
+      viewport.syncScrollArea = () => {};
+      viewport._innerRefresh = () => {};
+    } catch {}
+  }
+
+  // Closes that happen together (closing a multi-pane tab closes every pane
+  // synchronously) share one Undo batch.
+  rememberClosedSessionForUndo(id, t) {
+    const now = Date.now();
+    const batch = this.closeUndoBatch;
+    const entry = {
+      id,
+      cwd: t.cwd || "",
+      savedSession: this.sessionRegistry.get(id) || null,
+      backendMode: t.backendMode || null,
+      supportsLinkedView: Boolean(t.supportsLinkedView),
+      wasActive: id === this.activeId,
+    };
+    if (batch && now - batch.startedAt < 1000) {
+      batch.entries.push(entry);
+    } else {
+      this.closeUndoBatch = { startedAt: now, entries: [entry] };
+    }
+    return entry;
+  }
+
+  // Undo for the close toast: reattach every session closed in the last
+  // batch through the same path the Sessions panel's "Restore" uses
+  // (cancel the scheduled termination, then reconnect into the saved
+  // workspace slot).
+  async undoRecentSessionClose() {
+    const batch = this.closeUndoBatch;
+    this.closeUndoBatch = null;
+    document.getElementById("session-close-toast")?.classList.add("hidden");
+    clearTimeout(this.sessionCloseToastTimer);
+    if (!batch?.entries?.length) return;
+    let focusId = null;
+    for (const entry of batch.entries) {
+      if (this.terminals.has(entry.id)) continue;
+      await this.cancelScheduledTerminalClose(entry.id);
+      await this.reconnectToTerminal(entry.id, entry.cwd, entry.savedSession, {
+        backendMode: entry.backendMode,
+        supportsLinkedView: entry.supportsLinkedView,
+      });
+      if (entry.wasActive || !focusId) focusId = entry.id;
+    }
+    if (focusId && this.terminals.has(focusId)) this.switchTo(focusId);
+    this.updateSessionsAvailableBadge();
+    this.queueTelemetryRefresh(0);
   }
 
   showSessionCloseToast(
     label,
     terminationScheduledAt,
     preservedByOtherClient = false,
+    { canUndo = false } = {},
   ) {
     let toast = document.getElementById("session-close-toast");
     if (!toast) {
-      toast = document.createElement("button");
-      toast.type = "button";
+      toast = document.createElement("div");
       toast.id = "session-close-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
+      toast.className = "task-toast session-close-toast hidden";
+      toast.setAttribute("role", "status");
+      const message = document.createElement("button");
+      message.type = "button";
+      message.className = "session-close-toast-message";
+      message.title = "Open Sessions";
+      message.addEventListener("click", () => {
         toast.classList.add("hidden");
         this.openSessionsPanel();
       });
+      const undo = document.createElement("button");
+      undo.type = "button";
+      undo.className = "session-close-toast-undo";
+      undo.textContent = "Undo";
+      undo.addEventListener("click", (event) => {
+        event.stopPropagation();
+        void this.undoRecentSessionClose();
+      });
+      toast.append(message, undo);
       document.getElementById("app")?.appendChild(toast);
     }
-    toast.textContent = preservedByOtherClient
-      ? `${label} closed here and remains active in another client. You can restore it from Sessions.`
+    const message = toast.querySelector(".session-close-toast-message");
+    const undo = toast.querySelector(".session-close-toast-undo");
+    const batchSize = this.closeUndoBatch?.entries?.length || 0;
+    const plural = batchSize > 1;
+    const subject = plural ? `${batchSize} terminals` : label;
+    const it = plural ? "them" : "it";
+    message.textContent = preservedByOtherClient
+      ? `${subject} closed here and ${plural ? "remain" : "remains"} active in another client. You can restore ${it} from Sessions.`
       : terminationScheduledAt
-        ? `${label} closed. Restore it from Sessions within 15 minutes.`
-        : `${label} closed, but automatic termination could not be scheduled. It remains in Sessions.`;
+        ? `${subject} closed. Restore ${it} from Sessions within 15 minutes.`
+        : `${subject} closed, but automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
+    undo.hidden = !(canUndo && batchSize > 0);
     toast.classList.remove("hidden");
     clearTimeout(this.sessionCloseToastTimer);
     this.sessionCloseToastTimer = setTimeout(
