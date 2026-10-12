@@ -6,12 +6,14 @@ import {
   COMPOSE_SUBMIT_DELAY_MS,
   COMPOSE_SUBMIT_MAX_WAIT_MS,
   addToComposeHistory,
+  clearComposeHistory,
   composeHistoryPreview,
   deliverComposePlan,
   loadComposeHistory,
   parseComposeHistory,
   planComposeSend,
   prepareComposeText,
+  purgeLegacyComposeHistory,
   saveComposeHistory,
   scheduleDeferredSubmit,
 } from "./compose-sheet.js";
@@ -337,5 +339,47 @@ describe("scheduleDeferredSubmit wall clock", () => {
     expect(gaveUp).toBe(true);
     expect(pending.length).toBe(0);
     expect(sent).toEqual([]);
+  });
+});
+
+describe("compose history privacy", () => {
+  function memoryStorage(initial = {}) {
+    const store = new Map(Object.entries(initial));
+    return {
+      store,
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, String(value)),
+      removeItem: (key) => store.delete(key),
+    };
+  }
+
+  test("Clear removes every saved message", () => {
+    const storage = memoryStorage();
+    saveComposeHistory(storage, ["sudo password", "b"]);
+    expect(clearComposeHistory(storage)).toBe(true);
+    expect(storage.store.has(COMPOSE_HISTORY_STORAGE_KEY)).toBe(false);
+    expect(loadComposeHistory(storage)).toEqual([]);
+  });
+
+  test("the old persistent localStorage copy is deleted, not carried over", () => {
+    const legacy = memoryStorage({
+      [COMPOSE_HISTORY_STORAGE_KEY]: JSON.stringify(["api-key-123"]),
+      other: "kept",
+    });
+    expect(purgeLegacyComposeHistory(legacy)).toBe(true);
+    expect(legacy.store.has(COMPOSE_HISTORY_STORAGE_KEY)).toBe(false);
+    expect(legacy.store.get("other")).toBe("kept");
+  });
+
+  test("clear/purge survive missing or throwing storage", () => {
+    const broken = {
+      removeItem: () => {
+        throw new Error("denied");
+      },
+    };
+    expect(clearComposeHistory(broken)).toBe(false);
+    expect(purgeLegacyComposeHistory(broken)).toBe(false);
+    expect(clearComposeHistory(null)).toBe(false);
+    expect(purgeLegacyComposeHistory(undefined)).toBe(false);
   });
 });

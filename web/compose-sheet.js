@@ -19,9 +19,11 @@
 // could be dropped after the sheet was cleared), and the Enter follows only a
 // paste that actually went out.
 //
-// The last 20 sent messages are kept in localStorage; tapping one puts it
-// back into the text box. Pure parts are exported for Bun unit tests; app.js
-// owns the glue (window.ComposeSheet).
+// The last 20 sent messages are kept for this browser tab only
+// (sessionStorage — sends can include passwords or tokens typed on a phone);
+// tapping one puts it back into the text box, and "Clear" forgets them. An
+// older persistent localStorage copy is deleted on first use. Pure parts are
+// exported for Bun unit tests; app.js owns the glue (window.ComposeSheet).
 
 const COMPOSE_HISTORY_STORAGE_KEY = "deckterm.compose.history.v1";
 const COMPOSE_HISTORY_MAX = 20;
@@ -111,6 +113,29 @@ function saveComposeHistory(storage, history) {
   } catch {
     return false;
   }
+}
+
+function removeStorageKey(storage) {
+  try {
+    if (typeof storage?.removeItem !== "function") return false;
+    storage.removeItem(COMPOSE_HISTORY_STORAGE_KEY);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Forget every saved message ("Clear" in the sheet). */
+function clearComposeHistory(storage) {
+  return removeStorageKey(storage);
+}
+
+/**
+ * Delete the history an earlier version kept in persistent localStorage
+ * (deliberately not carried over: it may hold secrets).
+ */
+function purgeLegacyComposeHistory(legacyStorage) {
+  return removeStorageKey(legacyStorage);
 }
 
 /** One-line preview of a history entry. */
@@ -219,6 +244,7 @@ class ComposeSheet {
   constructor({
     document: doc,
     storage = null,
+    legacyStorage = null,
     onSend,
     onClose = null,
     mount = null,
@@ -229,6 +255,9 @@ class ComposeSheet {
     this.onClose = onClose;
     this.mount = mount;
     this.root = null;
+    if (legacyStorage && legacyStorage !== storage) {
+      purgeLegacyComposeHistory(legacyStorage);
+    }
     this.history = loadComposeHistory(storage);
   }
 
@@ -306,9 +335,22 @@ class ComposeSheet {
     const historySection = doc.createElement("section");
     historySection.className = "compose-sheet-history";
     historySection.setAttribute("aria-labelledby", "compose-sheet-history-title");
+    const historyHeader = doc.createElement("div");
+    historyHeader.className = "compose-sheet-history-header";
     const historyTitle = doc.createElement("h3");
     historyTitle.id = "compose-sheet-history-title";
     historyTitle.textContent = "Recent";
+    const clearHistory = doc.createElement("button");
+    clearHistory.type = "button";
+    clearHistory.className = "compose-sheet-history-clear";
+    clearHistory.textContent = "Clear";
+    clearHistory.title = "Forget recent messages";
+    clearHistory.setAttribute("aria-label", "Clear recent messages");
+    clearHistory.addEventListener("click", () => {
+      this.clearHistory();
+      input.focus();
+    });
+    historyHeader.append(historyTitle, clearHistory);
     const list = doc.createElement("ul");
     list.className = "compose-sheet-history-list";
     list.addEventListener("click", (event) => {
@@ -322,7 +364,7 @@ class ComposeSheet {
       const end = input.value.length;
       input.setSelectionRange?.(end, end);
     });
-    historySection.append(historyTitle, list);
+    historySection.append(historyHeader, list);
 
     panel.append(header, input, actions, historySection);
     root.append(backdrop, panel);
@@ -408,6 +450,12 @@ class ComposeSheet {
     );
   }
 
+  clearHistory() {
+    this.history = [];
+    clearComposeHistory(this.storage);
+    if (this.els) this.renderHistory();
+  }
+
   async submit({ submit }) {
     const plan = planComposeSend(this.els?.input?.value, { submit });
     if (!plan) return false;
@@ -440,7 +488,9 @@ const ComposeSheetApi = {
   addToComposeHistory,
   loadComposeHistory,
   saveComposeHistory,
+  clearComposeHistory,
   composeHistoryPreview,
+  purgeLegacyComposeHistory,
   deliverComposePlan,
   scheduleDeferredSubmit,
   ComposeSheet,

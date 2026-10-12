@@ -16733,15 +16733,24 @@ class TerminalManager {
     }
     this.closeToolsSheet?.();
     if (!this.composeSheet) {
+      // Recent messages live for this tab only (they can hold secrets);
+      // the old persistent localStorage copy is deleted.
       let storage = null;
+      let legacyStorage = null;
       try {
-        storage = window.localStorage;
+        storage = window.sessionStorage;
       } catch {
         storage = null;
+      }
+      try {
+        legacyStorage = window.localStorage;
+      } catch {
+        legacyStorage = null;
       }
       this.composeSheet = new helpers.ComposeSheet({
         document,
         storage,
+        legacyStorage,
         onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
         onClose: ({ restoreFocus }) => {
           // On touch, refocusing xterm would pop the keyboard back up.
