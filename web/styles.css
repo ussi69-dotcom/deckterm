@@ -2268,6 +2268,20 @@ body.touch-input-mode .xterm .composition-view.active {
   height: 16px;
 }
 
+/* Touch: 44px targets for New session, Refresh and Close. */
+@media (pointer: coarse) {
+  .sessions-new-btn {
+    height: 44px;
+    padding: 0 14px;
+    font-size: 14px;
+  }
+
+  .sessions-panel-header .btn-icon {
+    width: 44px;
+    height: 44px;
+  }
+}
+
 .sessions-panel-body {
   min-height: 0;
   overflow-y: auto;
@@ -3682,7 +3696,7 @@ body.touch-input-mode .xterm .composition-view.active {
 
 .ek-btn.ek-chip {
   min-width: 44px;
-  height: 40px;
+  height: 44px;
   padding: 0 14px;
   border-radius: 999px;
   font-weight: 600;
@@ -3791,6 +3805,8 @@ body.touch-input-mode .xterm .composition-view.active {
 }
 
 #command-palette-input {
+  flex: 1 1 auto;
+  min-width: 0;
   width: 100%;
   height: 34px;
   padding: 0 10px 0 34px;
@@ -3816,6 +3832,11 @@ body.touch-input-mode .xterm .composition-view.active {
   box-shadow:
     0 0 0 2px rgba(88, 166, 255, 0.18),
     0 0 0 1px var(--focus-ring);
+}
+
+/* Touch-only way out (no Esc key on phones); shown under pointer: coarse. */
+.command-palette-cancel {
+  display: none;
 }
 
 .command-palette-results {
@@ -3867,8 +3888,12 @@ body.touch-input-mode .xterm .composition-view.active {
   font-size: 13px;
 }
 
-.command-palette-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+/* Hover only where a real pointer hovers: a tap would otherwise leave a
+   second highlighted row next to the selected one. */
+@media (hover: hover) {
+  .command-palette-item:hover {
+    background: rgba(255, 255, 255, 0.04);
+  }
 }
 
 .command-palette-item.selected {
@@ -3993,6 +4018,32 @@ body.touch-input-mode .xterm .composition-view.active {
   .command-palette-item-key,
   .command-palette-footer {
     display: none;
+  }
+
+  .command-palette-search {
+    gap: 6px;
+  }
+
+  .command-palette-cancel {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    min-width: 44px;
+    height: 44px;
+    padding: 0 12px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--accent-blue);
+    font: inherit;
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  .command-palette-cancel:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
   }
 }
 
@@ -4625,6 +4676,26 @@ body.chrome-mobile .file-explorer-shell {
   background: linear-gradient(180deg, var(--bg-secondary), var(--bg-primary));
 }
 
+/* Touch tablets (wider than the phone sheet breakpoint) float Files and Git
+   over the terminal but keep the extra keys and action bar: stop both above
+   that chrome (--bottom-chrome-inset, measured in app.js) so the keys and
+   buttons stay reachable. */
+@media (min-width: 769px) {
+  body.chrome-mobile .file-explorer-shell {
+    height: calc(
+      var(--app-vvh, 100vh) - var(--toolbar-height) - 24px -
+        var(--bottom-chrome-inset, 0px)
+    );
+  }
+
+  body.chrome-mobile .side-panel {
+    height: calc(
+      var(--app-vvh, 100vh) - var(--toolbar-height) -
+        var(--bottom-chrome-inset, 0px)
+    );
+  }
+}
+
 /* A lone pane on a touch layout: its floating close (x) only covers terminal
    text — the tab already has a close button. Multi-pane workspaces keep it
    (it closes one pane), and an open close-confirmation stays reachable. */
@@ -5135,7 +5206,8 @@ body.phone-landscape .landscape-primary-actions:not(:empty) {
 
   .command-palette-panel {
     width: 100%;
-    max-height: 100%;
+    /* Leave a strip of backdrop below the sheet to tap away. */
+    max-height: calc(100% - 64px);
     border-top: none;
     border-right: none;
     border-left: none;
@@ -5451,6 +5523,16 @@ body.chrome-mobile .toast-region {
   flex-direction: column-reverse;
 }
 
+/* Tablets (and wide phones in landscape) keep the top placement but cap the
+   stack at a readable width in the right corner instead of a full-width bar. */
+@media (min-width: 600px) {
+  body.chrome-mobile .toast-region {
+    left: auto;
+    right: 12px;
+    width: min(420px, calc(100vw - 24px));
+  }
+}
+
 .toast {
   --toast-accent: var(--accent-blue);
   position: relative;
@@ -5737,6 +5819,14 @@ body.chrome-mobile .toast-dismiss {
   color: var(--text-primary);
 }
 
+@media (pointer: coarse) {
+  .compose-sheet-close {
+    width: 44px;
+    height: 44px;
+    margin: -10px -10px 0 0;
+  }
+}
+
 .compose-sheet-input {
   width: 100%;
   min-height: 96px;
@@ -6000,15 +6090,17 @@ body.chrome-mobile .compose-sheet-history-item {
   padding: 8px;
 }
 
+/* Compact list rows (same density as the IDE SCM view): name plus dimmed
+   directory, no card background; actions appear on hover/selection. */
 .git-file {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px;
-  background: var(--bg-tertiary);
-  border-radius: 6px;
-  margin-bottom: 6px;
-  transition: background 0.2s;
+  gap: 6px;
+  min-height: 24px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: background 0.15s;
 }
 
 .git-file:hover {
@@ -6820,7 +6912,8 @@ body.chrome-mobile .compose-sheet-history-item {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 8px;
+  min-height: 24px;
+  padding: 2px 8px;
   padding-left: calc(8px + (var(--tree-depth, 0) * 14px));
   border-radius: 4px;
   color: var(--text-secondary);
@@ -6847,7 +6940,6 @@ body.chrome-mobile .compose-sheet-history-item {
 .git-tree-folder-name {
   min-width: 0;
   overflow: hidden;
-  font-family: "JetBrains Mono", monospace;
   color: var(--text-primary);
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -6867,6 +6959,8 @@ body.chrome-mobile .compose-sheet-history-item {
 .git-file-label .git-file-path {
   flex: 0 1 auto;
   min-width: 3em;
+  font-family: inherit;
+  font-size: 13px;
 }
 
 .git-file-dir {
@@ -7925,6 +8019,19 @@ body.chrome-mobile .compose-sheet-history-item {
   max-width: none;
 }
 
+/* Inside a window the titlebar already says "Git" and carries the close
+   button: drop the panel's own title and close, keep branch, sync label and
+   the Pull/Push/Fetch/Stash/Refresh actions as a slim toolbar. */
+.surface-window-body > #git-panel .git-panel-header > h3,
+.surface-window-body > #git-panel .git-panel-header > .panel-close {
+  display: none;
+}
+
+.surface-window-body > #git-panel .git-panel-header {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+
 /* The window titlebar replaces the explorer's own header on desktop */
 .surface-window-body > .file-explorer .file-explorer-header {
   display: none;
@@ -8025,6 +8132,92 @@ body.sessions-docked .dock-sash.dragging {
   background: var(--accent-blue);
 }
 
+/* The main area above the docked terminals (app.js syncDockPlaceholder):
+   what opens there and the way back, instead of an empty black block.
+   Surface windows (z-index 640) cover it. */
+.dock-placeholder {
+  display: none;
+}
+
+body.sessions-docked:not(.ide-mode) .dock-placeholder:not([hidden]) {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: var(--dock-height, 35%);
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 24px;
+  overflow: auto;
+  color: var(--text-secondary);
+  text-align: center;
+}
+
+.dock-placeholder-title {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dock-placeholder-hint {
+  margin: 0 0 10px;
+  font-size: 13px;
+}
+
+.dock-placeholder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: 640px;
+}
+
+.dock-placeholder-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--border-primary);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.dock-placeholder-action:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-tertiary);
+}
+
+.dock-placeholder-action:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.dock-placeholder-action svg {
+  width: 16px;
+  height: 16px;
+  color: var(--text-secondary);
+}
+
+.dock-placeholder-action kbd {
+  padding: 0 5px;
+  border: 1px solid var(--border-primary);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 16px;
+}
+
 /* =============================================================================
    IDE SHELL (Phase 5, slice 2) — VS Code layout: activity bar + sidebar +
    editor-area placeholder, with terminals docked to the bottom panel.
@@ -8111,6 +8304,11 @@ body.ide-mode #workspace-area {
   white-space: pre;
   text-align: left;
   pointer-events: none;
+}
+
+/* Hidden from pointerdown until the pointer leaves (ide-shell.js). */
+.ide-activity-item.tooltip-dismissed[data-tooltip]::after {
+  display: none;
 }
 
 .ide-activity-item.active {
@@ -9695,29 +9893,44 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   background: var(--bg-hover, rgba(255, 255, 255, 0.1));
 }
 
-/* Row hover actions (VS Code style: hidden until hover/selected) */
+/* Row hover actions (VS Code style: hidden until hover/selected). Hidden
+   actions take no width, so file names are not cut short. Touch layouts show
+   them on every row (see the pointer: coarse block). */
 .git-file .git-file-actions {
-  display: flex;
+  display: none;
+  align-items: center;
   gap: 2px;
-  visibility: hidden;
+  opacity: 1;
 }
 .git-file:hover .git-file-actions,
 .git-file.selected .git-file-actions,
 .git-file:focus-within .git-file-actions {
-  visibility: visible;
+  display: flex;
 }
 .git-file-open,
-.git-file-discard {
-  padding: 2px 6px;
+.git-file-discard,
+.git-file .git-file-stage {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   background: transparent;
   border: none;
   border-radius: 4px;
   color: var(--text-secondary);
-  font-size: 12px;
   cursor: pointer;
 }
+.git-file-actions svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.9;
+  pointer-events: none;
+}
 .git-file-open:hover,
-.git-file-discard:hover {
+.git-file-discard:hover,
+.git-file .git-file-stage:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
 }
@@ -9730,15 +9943,30 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 /* Group header action (stage all / unstage all). The header itself is
    position: sticky (see "File groups" above); do not reset it here. */
 .git-group-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   visibility: hidden;
   margin-left: auto;
-  padding: 0 6px;
+  padding: 1px 6px;
   background: transparent;
   border: none;
   border-radius: 4px;
   color: var(--text-secondary);
-  font-size: 13px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-transform: none;
   cursor: pointer;
+}
+.git-group-action svg {
+  width: 13px;
+  height: 13px;
+  pointer-events: none;
+}
+/* Desktop: icon only (the tooltip names it); touch shows the label. */
+.git-group-action-label {
+  display: none;
 }
 .git-file-group-header:hover .git-group-action,
 .git-file-group-header:focus-within .git-group-action {
@@ -9751,6 +9979,42 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 .git-group-action:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 1px;
+}
+
+/* Touch: placed after the base row/group rules so it wins the cascade. */
+@media (pointer: coarse) {
+  /* No hover on touch: row actions and Stage all are always shown, as
+     44px targets. */
+  .git-file .git-file-actions {
+    display: flex;
+  }
+
+  .git-file-open,
+  .git-file-discard,
+  .git-file .git-file-stage {
+    width: 44px;
+    height: 44px;
+  }
+
+  .git-file-actions svg {
+    width: 18px;
+    height: 18px;
+  }
+
+  .git-group-action {
+    visibility: visible;
+    min-height: 44px;
+    padding: 0 12px;
+    font-size: 13px;
+  }
+
+  .git-group-action-label {
+    display: inline;
+  }
+
+  .git-file-label .git-file-path {
+    font-size: 14px;
+  }
 }
 
 /* Sync (ahead/behind) label in the panel header */
@@ -9821,6 +10085,13 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 .settings-category-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
+}
+
+@media (pointer: coarse) {
+  .settings-category-btn {
+    min-height: 44px;
+    font-size: 14px;
+  }
 }
 
 .settings-main {

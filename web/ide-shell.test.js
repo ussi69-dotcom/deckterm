@@ -463,8 +463,14 @@ function makeFakeEl(id = null) {
         ? el._attrs[key]
         : null;
     },
-    addEventListener() {},
+    _listeners: {},
+    addEventListener(type, handler) {
+      (el._listeners[type] ||= []).push(handler);
+    },
     removeEventListener() {},
+    dispatch(type, event = {}) {
+      for (const handler of el._listeners[type] || []) handler(event);
+    },
     appendChild(child) {
       if (child.parentElement && child.parentElement !== el) {
         const sibs = child.parentElement.children;
@@ -953,4 +959,15 @@ test("activityItemTooltip: view title, its shortcut, and what a click does", () 
   // Junk-tolerant.
   expect(activityItemTooltip(null)).toBe("");
   expect(activityItemTooltip({ id: "tasks" })).toBe("tasks");
+});
+
+test("activity-bar tooltip hides on pointerdown until the pointer leaves", () => {
+  const h = makeController();
+  h.controller.applyMode(); // enter IDE → activity bar renders
+  const btn = h.controller.activityBarEl.children[0];
+  expect(btn.dataset.tooltip).toBeTruthy();
+  btn.dispatch("pointerdown");
+  expect(btn.classList.contains("tooltip-dismissed")).toBe(true);
+  btn.dispatch("pointerleave");
+  expect(btn.classList.contains("tooltip-dismissed")).toBe(false);
 });

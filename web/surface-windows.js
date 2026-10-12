@@ -27,6 +27,23 @@ function isDesktopSurfaceWidth(width) {
   return Number(width) >= SURFACE_WINDOW_DESKTOP_MIN_WIDTH_PX;
 }
 
+// Touch tablets keep the phone's bottom chrome (extra keys, action bar)
+// while Files/Git float above the terminal. The inset is how much of the
+// viewport bottom that chrome covers, so a floating surface can stop above
+// it. rects: bounding rects of the bottom bars (hidden ones have height 0).
+function computeBottomChromeInset(viewportBottom, rects) {
+  const bottom = Number(viewportBottom);
+  if (!Number.isFinite(bottom)) return 0;
+  let top = bottom;
+  for (const rect of Array.isArray(rects) ? rects : []) {
+    const height = Number(rect?.height);
+    const rectTop = Number(rect?.top);
+    if (!(height > 0) || !Number.isFinite(rectTop)) continue;
+    top = Math.min(top, rectTop);
+  }
+  return Math.max(0, Math.round(bottom - top));
+}
+
 const SNAP_ZONE_BOUNDS = Object.freeze({
   left: Object.freeze({ x: 0, y: 0, width: 50, height: 100 }),
   right: Object.freeze({ x: 50, y: 0, width: 50, height: 100 }),
@@ -153,6 +170,27 @@ function dockStateFromSettings(value) {
   return {
     enabled: Boolean(value.enabled),
     heightPct: clampDockHeight(value.heightPct),
+  };
+}
+
+// What the main area shows while the terminals are docked to the bottom and
+// no window covers it (it used to be ~545 px of empty black): the surfaces
+// that open there, plus the way back. keysFor(id) may supply a key hint.
+function planDockPlaceholder({ keysFor = () => "" } = {}) {
+  const actions = [
+    { id: "files", label: "Files", icon: "folder-open" },
+    { id: "git", label: "Git", icon: "git-branch" },
+    { id: "tasks", label: "Tasks", icon: "list-todo" },
+    { id: "palette", label: "Command palette", icon: "search" },
+    { id: "undock", label: "Undock terminals", icon: "panel-bottom-close" },
+  ];
+  return {
+    title: "Terminals are docked below",
+    hint: "Files, Git, Tasks and the editor open here as windows.",
+    actions: actions.map((action) => ({
+      ...action,
+      keys: String((typeof keysFor === "function" && keysFor(action.id)) || ""),
+    })),
   };
 }
 
@@ -609,6 +647,8 @@ const SurfaceWindows = {
   clampDockHeight,
   dockStateFromSettings,
   isDesktopSurfaceWidth,
+  computeBottomChromeInset,
+  planDockPlaceholder,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,

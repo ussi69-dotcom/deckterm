@@ -754,6 +754,15 @@ class IdeShellController {
       );
       btn.innerHTML = `<i data-lucide="${view.icon || "circle"}"></i>`;
       btn.addEventListener("click", () => this.onActivityClick(view.id));
+      // A click means the user knows the target: drop the hover tooltip so
+      // it does not linger over the sidebar it just opened. It comes back on
+      // the next hover.
+      btn.addEventListener("pointerdown", () =>
+        btn.classList.add("tooltip-dismissed"),
+      );
+      btn.addEventListener("pointerleave", () =>
+        btn.classList.remove("tooltip-dismissed"),
+      );
       this.activityBarEl.appendChild(btn);
     }
     if (typeof window !== "undefined" && window.lucide?.createIcons) {

@@ -46,7 +46,9 @@ class PushNotificationManager {
       loading: "Checking this device…",
       unsupported: "This browser does not support Web Push.",
       unavailable:
-        "The DeckTerm server has not been configured with push keys yet.",
+        this.config?.available === false
+          ? "Push notifications are not available for this account."
+          : "The DeckTerm server has not been configured with push keys yet.",
       blocked:
         "Notifications are blocked in browser or system settings for DeckTerm.",
       ready:
@@ -71,6 +73,8 @@ class PushNotificationManager {
     if (!response.ok) throw new Error("Push configuration is unavailable.");
     const body = await response.json();
     this.config = {
+      // false: the server answered for an actor without push rights.
+      available: body?.available !== false,
       configured: Boolean(body?.configured),
       publicKey:
         typeof body?.publicKey === "string" && body.publicKey

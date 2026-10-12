@@ -5,6 +5,7 @@ import {
   buildHelpSections,
   listedCombos,
   shortcutForAction,
+  withShortcutHints,
   isHelpShortcut,
   formatCombo,
   compactCombos,
@@ -87,6 +88,26 @@ test("shortcutForAction maps palette action ids to their first combo", () => {
   expect(shortcutForAction("split-workspace")).toBe("Ctrl+Shift+D");
   expect(shortcutForAction("open-help")).toBe("Ctrl+Shift+?");
   expect(shortcutForAction("no-such-action")).toBe("");
+});
+
+test("withShortcutHints takes palette hints from the registry, keeping others", () => {
+  const actions = [
+    { id: "search-terminal", title: "Search", keybinding: "Ctrl+F" },
+    { id: "detach-terminal-pane", title: "Move Pane to New Tab" },
+    { id: "font-increase", title: "Bigger", keybinding: "Ctrl+=" },
+    { id: "open-git", title: "Open Git" },
+  ];
+  const hinted = withShortcutHints(actions);
+  expect(hinted.map((action) => action.keybinding)).toEqual([
+    "Ctrl+Shift+F",
+    "Ctrl+Shift+G",
+    "Ctrl+=",
+    undefined,
+  ]);
+  // Inputs are not mutated; other fields pass through.
+  expect(actions[0].keybinding).toBe("Ctrl+F");
+  expect(hinted[1].title).toBe("Move Pane to New Tab");
+  expect(withShortcutHints(null)).toEqual([]);
 });
 
 test("isHelpShortcut: Ctrl+Shift+? anywhere, F1 and ? only outside the terminal", () => {

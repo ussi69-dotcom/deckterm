@@ -4222,7 +4222,7 @@ class GitManager {
         hideWhenEmpty: true,
         files: this.state.files.merge || [],
         groupAction: null,
-        groupActionGlyph: "",
+        groupActionIcon: "",
         groupActionTitle: "",
       },
       {
@@ -4231,7 +4231,7 @@ class GitManager {
         icon: "\u2713",
         files: this.state.files.staged,
         groupAction: "unstage-all",
-        groupActionGlyph: "\u2212",
+        groupActionIcon: "minus",
         groupActionTitle: "Unstage all",
       },
       {
@@ -4240,7 +4240,7 @@ class GitManager {
         icon: "\u2022",
         files: this.state.files.changes,
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
       {
@@ -4249,7 +4249,7 @@ class GitManager {
         icon: "\u25cb",
         files: this.state.files.untracked || [],
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
     ];
@@ -4288,7 +4288,7 @@ class GitManager {
             <span class="git-file-group-count" aria-label="${countLabel}">${files.length}</span>
             ${
               section.groupAction
-                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+                ? `<button type="button" class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}"><i data-lucide="${section.groupActionIcon}" aria-hidden="true"></i><span class="git-group-action-label" aria-hidden="true">${section.groupActionTitle}</span></button>`
                 : ""
             }
           </div>
@@ -4304,6 +4304,12 @@ class GitManager {
     }
 
     container.innerHTML = html;
+    // Row and group actions are lucide placeholders; hydrate just this list.
+    try {
+      window.lucide?.createIcons?.({ root: container });
+    } catch {
+      // icons are decorative; buttons keep their aria-labels
+    }
 
     // Keep the selection when its file is still listed; otherwise fall back
     // to the first rendered row (highlightSelectedFile picks it by index).
@@ -4343,12 +4349,16 @@ class GitManager {
       el.addEventListener("click", (e) => {
         const file = this.findFile(el.dataset.path);
 
-        if (e.target.classList.contains("git-file-stage")) {
+        // Action buttons hold lucide SVGs: match the button, not the target.
+        const action = e.target.closest?.(
+          ".git-file-stage, .git-file-open, .git-file-discard",
+        );
+        if (action?.classList.contains("git-file-stage")) {
           this.toggleStage(el.dataset.path, file?.staged);
           return;
         }
 
-        if (e.target.classList.contains("git-file-open")) {
+        if (action?.classList.contains("git-file-open")) {
           const cwd = (this.state.cwd || this.currentCwd || "").replace(
             /\/$/,
             "",
@@ -4359,7 +4369,7 @@ class GitManager {
           return;
         }
 
-        if (e.target.classList.contains("git-file-discard")) {
+        if (action?.classList.contains("git-file-discard")) {
           this.discardFile(file || { path: el.dataset.path });
           return;
         }
@@ -4759,6 +4769,7 @@ class GitManager {
       const colorClass = statusClass(letter);
       const discardTitle =
         letter === "U" ? "Delete untracked file" : "Discard changes";
+      const stageTitle = file.staged ? "Unstage" : "Stage";
       const pathAttr = this.escapeHtml(file.path);
       html += `
         <div class="git-file ${isSelected ? "selected" : ""}" role="listitem" tabindex="0" aria-label="${this.escapeHtml(fileName)}, ${statusWord(letter)}${dir ? `, in ${this.escapeHtml(dir)}` : ""}" data-path="${pathAttr}" data-index="${index}" style="--tree-depth:${depth}">
@@ -4767,9 +4778,9 @@ class GitManager {
             ${dir ? `<span class="git-file-dir">${this.escapeHtml(dir)}</span>` : ""}
           </span>
           <div class="git-file-actions">
-            <button class="git-file-open" title="Open file">⤢</button>
-            <button class="git-file-discard" title="${discardTitle}">⟲</button>
-            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "−" : "+"}</button>
+            <button type="button" class="git-file-open" title="Open file" aria-label="Open ${this.escapeHtml(fileName)}"><i data-lucide="file-symlink" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-discard" title="${discardTitle}" aria-label="${discardTitle}: ${this.escapeHtml(fileName)}"><i data-lucide="undo-2" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-stage" title="${stageTitle}" aria-label="${stageTitle} ${this.escapeHtml(fileName)}"><i data-lucide="${file.staged ? "minus" : "plus"}" aria-hidden="true"></i></button>
           </div>
           <span class="git-file-status ${colorClass}">${this.escapeHtml(letter)}</span>
         </div>
@@ -5601,6 +5612,15 @@ class SettingsManager {
 
   focusSearch() {
     this.searchInputEl?.focus?.({ preventScroll: true });
+  }
+
+  // Touch layouts: focusing the search field would pop the on-screen
+  // keyboard over the panel, so focus lands on the active category tab.
+  focusActiveCategory() {
+    const tab =
+      this.sidebarEl?.querySelector?.('[aria-selected="true"]') ||
+      this.sidebarEl?.querySelector?.(".settings-category-btn");
+    tab?.focus?.({ preventScroll: true });
   }
 
   renderControlRow(descriptor) {
@@ -6462,7 +6482,43 @@ class TerminalManager {
         viewport.addEventListener("scrollend", scheduleViewportSync);
       }
     }
+    // The bottom bars change height on their own (chips row, extra-keys
+    // toggle, function keys); floating surfaces must follow them.
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(() => this.syncBottomChromeInset());
+      for (const id of ["extra-keys", "mobile-action-bar"]) {
+        const el = document.getElementById(id);
+        if (el) observer.observe(el);
+      }
+    }
     this.handleViewportResize({ fromViewportEvent: true });
+  }
+
+  // --bottom-chrome-inset: how much of the viewport bottom the touch chrome
+  // (extra keys + action bar) covers. Touch tablets float Files/Git above the
+  // terminal; styles.css stops them above this inset so they never cover the
+  // keys and buttons. 0 on desktop.
+  syncBottomChromeInset() {
+    const compute = window.SurfaceWindows?.computeBottomChromeInset;
+    if (typeof compute !== "function") return;
+    let inset = 0;
+    if (this.isTouchLayout()) {
+      const rects = ["extra-keys", "mobile-action-bar"].map((id) => {
+        const el = document.getElementById(id);
+        return el && el.getClientRects().length
+          ? el.getBoundingClientRect()
+          : null;
+      });
+      const viewport = window.visualViewport;
+      const viewportBottom = viewport
+        ? viewport.offsetTop + viewport.height
+        : window.innerHeight;
+      inset = compute(viewportBottom, rects);
+    }
+    const value = `${inset}px`;
+    if (this.bottomChromeInset === value) return;
+    this.bottomChromeInset = value;
+    document.documentElement.style.setProperty("--bottom-chrome-inset", value);
   }
 
   // Touch-first layouts: phones (mobile chrome) and coarse-pointer tablets.
@@ -8368,7 +8424,12 @@ class TerminalManager {
       this.openSettingsSheet();
     }
     await this.settingsManager.render();
-    requestAnimationFrame(() => this.settingsManager?.focusSearch?.());
+    const touch = this.isTouchLayout();
+    requestAnimationFrame(() =>
+      touch
+        ? this.settingsManager?.focusActiveCategory?.()
+        : this.settingsManager?.focusSearch?.(),
+    );
     this.syncSurfaceButtonState();
   }
 
@@ -10209,6 +10270,11 @@ class TerminalManager {
         this.closeCommandPalette();
       }
     });
+    // Touch screens have no Esc key: a visible Cancel (coarse pointers only,
+    // styles.css) is their way out besides tapping the backdrop.
+    document
+      .getElementById("command-palette-cancel")
+      ?.addEventListener("click", () => this.closeCommandPalette());
 
     // The controller closes itself on Escape and after running a command,
     // bypassing closeCommandPalette(); follow the root's visibility so the
@@ -10582,7 +10648,6 @@ class TerminalManager {
         title: "Search in Terminal",
         group: "Views",
         icon: "search",
-        keybinding: "Ctrl+F",
         keywords: ["find", "search", "terminal"],
         run: () => this.openTerminalSearch(),
       },
@@ -10634,7 +10699,6 @@ class TerminalManager {
         title: "Open Help",
         group: "Views",
         icon: "circle-help",
-        keybinding: "F1",
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
@@ -10648,7 +10712,13 @@ class TerminalManager {
       },
     ];
 
-    actions.forEach((action) => this.commandPaletteRegistry.register(action));
+    // Hints come from the shortcut registry (the Help modal's source), so a
+    // palette row never advertises a key the app does not handle.
+    const hintedActions =
+      window.KeyboardShortcuts?.withShortcutHints?.(actions) || actions;
+    hintedActions.forEach((action) =>
+      this.commandPaletteRegistry.register(action),
+    );
 
     this.commandPaletteRegistry.registerProvider(() => {
       const query = this.getCommandPaletteQuery();
@@ -12874,9 +12944,83 @@ class TerminalManager {
         heightPct: this.dockState.heightPct,
       });
     }
+    this.syncDockPlaceholder(enabled);
     // xterm instances must refit to the resized terminal area.
     window.dispatchEvent(new Event("resize"));
     this.syncSurfaceButtonState();
+  }
+
+  // The main area above the docked terminals: the surfaces that open there
+  // and the way back (surface-windows.js planDockPlaceholder). Open windows
+  // cover it; styles.css hides it outside the dock and in IDE mode.
+  syncDockPlaceholder(enabled) {
+    let root = document.getElementById("dock-placeholder");
+    if (!enabled) {
+      if (root) root.hidden = true;
+      return;
+    }
+    if (!root) {
+      const plan = window.SurfaceWindows?.planDockPlaceholder?.({
+        keysFor: (id) => {
+          if (id !== "palette") return "";
+          const KS = window.KeyboardShortcuts;
+          const row = KS?.KEYBOARD_SHORTCUTS?.find(
+            (shortcut) => shortcut.id === "command-palette",
+          );
+          return row?.keys?.[0] ? KS.formatCombo(row.keys[0]) : "";
+        },
+      });
+      const area = document.getElementById("workspace-area");
+      if (!plan || !area) return;
+      root = document.createElement("div");
+      root.id = "dock-placeholder";
+      root.className = "dock-placeholder";
+      const title = document.createElement("p");
+      title.className = "dock-placeholder-title";
+      title.textContent = plan.title;
+      const hint = document.createElement("p");
+      hint.className = "dock-placeholder-hint";
+      hint.textContent = plan.hint;
+      const actions = document.createElement("div");
+      actions.className = "dock-placeholder-actions";
+      const run = {
+        files: () => this.openFileExplorer(),
+        git: () => this.openGitPanel(),
+        tasks: () => this.openTaskPanel(),
+        palette: () => this.openCommandPalette(),
+        undock: () => this.toggleSessionsDock(),
+      };
+      for (const action of plan.actions) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dock-placeholder-action";
+        btn.dataset.dockAction = action.id;
+        const icon = document.createElement("i");
+        icon.dataset.lucide = action.icon;
+        icon.setAttribute("aria-hidden", "true");
+        const label = document.createElement("span");
+        label.textContent = action.label;
+        btn.append(icon, label);
+        if (action.keys) {
+          const kbd = document.createElement("kbd");
+          kbd.textContent = action.keys;
+          btn.appendChild(kbd);
+        }
+        btn.addEventListener("click", () => void run[action.id]?.());
+        actions.appendChild(btn);
+      }
+      root.append(title, hint, actions);
+      area.insertBefore(
+        root,
+        document.getElementById("surface-windows-layer") || null,
+      );
+      try {
+        window.lucide?.createIcons?.({ root });
+      } catch {
+        // decorative
+      }
+    }
+    root.hidden = false;
   }
 
   toggleSessionsDock() {
@@ -16730,7 +16874,11 @@ class TerminalManager {
       supportsLinkedView: Boolean(t.supportsLinkedView),
       wasActive: id === this.activeId,
     };
-    if (batch && now - batch.startedAt < 1000) {
+    // A close while the previous close toast is still up joins its batch:
+    // that toast is replaced, so it must say "N terminals closed" and its
+    // Undo must reopen all of them, not only the latest.
+    const toastStillShown = Boolean(window.ToastService?.has?.("session-close"));
+    if (batch && (now - batch.startedAt < 1000 || toastStillShown)) {
       batch.entries.push(entry);
     } else {
       this.closeUndoBatch = { startedAt: now, entries: [entry] };
@@ -16903,6 +17051,7 @@ class TerminalManager {
     body.classList.toggle("virtual-keyboard-open", layout.keyboardOpen);
     body.classList.toggle("phone-landscape", layout.phoneLandscape);
     this.extraKeys?.syncQuickReplies?.({ relayout: false });
+    this.syncBottomChromeInset();
 
     const layoutKey = [
       layout.appHeight,

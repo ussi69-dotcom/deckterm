@@ -9,6 +9,8 @@ const {
   clampDockHeight,
   dockStateFromSettings,
   isDesktopSurfaceWidth,
+  computeBottomChromeInset,
+  planDockPlaceholder,
   DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
@@ -158,4 +160,48 @@ test("absent or invalid snap settings preserve the default corner quadrants", ()
     width: 50,
     height: 50,
   });
+});
+
+test("computeBottomChromeInset measures the bottom bars a floating surface must clear", () => {
+  // iPad: extra keys from y=1052, action bar from y=1105, viewport 1180.
+  expect(
+    computeBottomChromeInset(1180, [
+      { top: 1052, height: 53 },
+      { top: 1105, height: 75 },
+    ]),
+  ).toBe(128);
+  // Hidden bars (zero height / missing) do not count.
+  expect(
+    computeBottomChromeInset(1180, [{ top: 0, height: 0 }, null]),
+  ).toBe(0);
+  expect(computeBottomChromeInset(1180, [])).toBe(0);
+  // A bar scrolled out below the viewport never yields a negative inset.
+  expect(computeBottomChromeInset(800, [{ top: 900, height: 40 }])).toBe(0);
+  // Junk viewport → 0.
+  expect(computeBottomChromeInset(NaN, [{ top: 10, height: 5 }])).toBe(0);
+});
+
+test("planDockPlaceholder fills the area above the docked terminals with surface actions", () => {
+  const plan = planDockPlaceholder();
+  expect(plan.title).toBeTruthy();
+  expect(plan.hint).toBeTruthy();
+  expect(plan.actions.map((action) => action.id)).toEqual([
+    "files",
+    "git",
+    "tasks",
+    "palette",
+    "undock",
+  ]);
+  for (const action of plan.actions) {
+    expect(action.label).toBeTruthy();
+    expect(action.icon).toBeTruthy();
+  }
+  // Keyboard hints are optional and come from the caller's registry.
+  const hinted = planDockPlaceholder({
+    keysFor: (id) => (id === "palette" ? "Ctrl+Shift+P" : ""),
+  });
+  expect(hinted.actions.find((a) => a.id === "palette").keys).toBe(
+    "Ctrl+Shift+P",
+  );
+  expect(hinted.actions.find((a) => a.id === "files").keys).toBe("");
 });
