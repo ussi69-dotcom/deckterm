@@ -194,6 +194,72 @@ function planDockPlaceholder({ keysFor = () => "" } = {}) {
   };
 }
 
+// --- Setup and Sessions as desktop windows ---------------------------------
+
+// Setup and Sessions used to be overlay panels with a backdrop on every
+// layout. On desktop they now open as windows like Files/Git/Tasks/Editor
+// (owner decision 2026-10-13); phones keep the sheets. Default geometry is in
+// layer percentages: Sessions is a narrow list near the left (the Files
+// window defaults to the right edge), Setup a wide report in the middle.
+const OVERLAY_SURFACE_WINDOWS = Object.freeze({
+  sessions: Object.freeze({
+    title: "Sessions",
+    icon: "❐",
+    bounds: Object.freeze({ x: 3, y: 4, width: 34, height: 44 }),
+    minWidthPx: 380,
+    minHeightPx: 260,
+  }),
+  setup: Object.freeze({
+    title: "Setup",
+    icon: "⚑",
+    bounds: Object.freeze({ x: 22, y: 5, width: 54, height: 88 }),
+    minWidthPx: 520,
+    minHeightPx: 320,
+  }),
+});
+
+// What opening a surface dismisses. "tools" is the More sheet, which always
+// closes. Windows coexist on desktop; the phone sheets keep their historical
+// exclusions (Sessions closes Tasks + Setup, Setup and Tasks close each other).
+const SHEET_EXCLUSIONS = Object.freeze({
+  sessions: Object.freeze(["tasks", "setup"]),
+  setup: Object.freeze(["tasks"]),
+  tasks: Object.freeze(["setup"]),
+});
+
+function planSurfaceOpenCloses(id, { windowed = false } = {}) {
+  if (windowed) return ["tools"];
+  return ["tools", ...(SHEET_EXCLUSIONS[id] || [])];
+}
+
+// A toolbar toggle for a surface: closed → open; open and on top → close;
+// open but buried under other windows → bring it to the front first. Sheets
+// have no z-order (frontmost undefined), so an open sheet just closes.
+// Where focus goes once the Sessions window's list has rendered. open()
+// parks focus on the harmless Refresh button while the list loads (Enter
+// right after opening must never create a terminal); after the first render
+// focus moves to the first row (its Focus/Attach/Restore action), or to New
+// session when there are no sessions — but only if the user has not moved
+// focus meanwhile. "Safe" rows are Focus/Attach/Restore; an "Open here" row
+// creates a terminal, so with only those focus stays on Refresh, as it does
+// after a failed load.
+function planSessionsWindowFocus({
+  listState,
+  focusUnchanged,
+  hasSafeRow = true,
+} = {}) {
+  if (!focusUnchanged) return null;
+  if (listState === "rows") return hasSafeRow ? "row" : null;
+  if (listState === "empty") return "new";
+  return null;
+}
+
+function planSurfaceToggle({ open = false, frontmost } = {}) {
+  if (!open) return "open";
+  if (frontmost === false) return "front";
+  return "close";
+}
+
 // ---------------------------------------------------------------------------
 // DOM classes (browser only)
 // ---------------------------------------------------------------------------
@@ -209,12 +275,16 @@ class SurfaceWindow {
     minWidthPx = SURFACE_WINDOW_DEFAULT_MIN_WIDTH_PX,
     minHeightPx = SURFACE_WINDOW_DEFAULT_MIN_HEIGHT_PX,
     onClose = null,
+    onEscape = null,
   }) {
     this.id = id;
     this.manager = manager;
     this.minWidthPx = minWidthPx;
     this.minHeightPx = minHeightPx;
     this.onClose = onClose;
+    // Optional: Escape anywhere in the window (titlebar included) runs this.
+    // Opt-in so the existing Files/Git/Tasks/Editor windows keep their keys.
+    this.onEscape = onEscape;
     this.bounds = { x: 20, y: 10, width: 60, height: 75, ...bounds };
     this.snapZone = this.bounds.snapZone || null;
     this.restoreBounds = null;
@@ -280,6 +350,13 @@ class SurfaceWindow {
   bindEvents() {
     this.element.addEventListener("pointerdown", () => {
       this.manager?.bringToFront(this.id);
+    });
+    this.element.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape" || e.isComposing) return;
+      if (typeof this.onEscape !== "function") return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.onEscape();
     });
 
     this.titlebarEl.addEventListener("pointerdown", (e) => {
@@ -550,6 +627,7 @@ class SurfaceWindowManager {
     minWidthPx,
     minHeightPx,
     onClose,
+    onEscape,
   }) {
     if (this.windows.has(id)) return this.windows.get(id);
     const saved = this.savedLayout[id];
@@ -563,6 +641,7 @@ class SurfaceWindowManager {
       minWidthPx,
       minHeightPx,
       onClose,
+      onEscape,
     });
     if (saved?.snapZone) {
       win.snapZone = saved.snapZone;
@@ -597,6 +676,15 @@ class SurfaceWindowManager {
   toggle(id) {
     if (this.isOpen(id)) this.close(id);
     else this.open(id);
+  }
+
+  // Whether `id` is the top-most OPEN window (closed windows keep their
+  // z-order slot, so they must not count).
+  isFrontmost(id) {
+    for (let i = this.zOrder.length - 1; i >= 0; i -= 1) {
+      if (this.isOpen(this.zOrder[i])) return this.zOrder[i] === id;
+    }
+    return false;
   }
 
   bringToFront(id) {
@@ -649,6 +737,10 @@ const SurfaceWindows = {
   isDesktopSurfaceWidth,
   computeBottomChromeInset,
   planDockPlaceholder,
+  OVERLAY_SURFACE_WINDOWS,
+  planSurfaceOpenCloses,
+  planSurfaceToggle,
+  planSessionsWindowFocus,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,

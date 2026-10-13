@@ -97,3 +97,49 @@ test("connecting chip clears the desktop pane controls", () => {
   const closeWidth = px(resolve(".tile-close-btn", "width", fine));
   expect(chipRight).toBeGreaterThan(containerRight + closeWidth);
 });
+
+test("Setup and Sessions lose their overlay chrome inside a desktop window", () => {
+  // Setup: no backdrop, no fixed full-screen host, shell fills the window.
+  expect(resolve(".surface-window-body > .setup-panel", "position")).toBe(
+    "static",
+  );
+  expect(
+    resolve(
+      ".surface-window-body > .setup-panel .setup-panel-backdrop",
+      "display",
+    ),
+  ).toBe("none");
+  expect(
+    resolve(
+      ".surface-window-body > .setup-panel .setup-panel-shell",
+      "position",
+    ),
+  ).toBe("static");
+  // The window titlebar carries the title and the close button.
+  expect(
+    resolve(
+      ".surface-window-body > .setup-panel .setup-panel-header",
+      "display",
+    ),
+  ).toBe("none");
+  // Sessions shares the .task-panel host rules (backdrop hidden, static
+  // shell) and drops its own title + close for the titlebar's.
+  expect(
+    resolve(
+      ".surface-window-body > .task-panel .task-panel-backdrop",
+      "display",
+    ),
+  ).toBe("none");
+  expect(
+    resolve(
+      ".surface-window-body > #sessions-panel #sessions-panel-title",
+      "display",
+    ),
+  ).toBe("none");
+  expect(
+    resolve(
+      ".surface-window-body > #sessions-panel #sessions-panel-close",
+      "display",
+    ),
+  ).toBe("none");
+});

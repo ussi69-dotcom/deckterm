@@ -29,7 +29,15 @@ test.describe("Sessions drawer attach / open-here", () => {
     const panel = page.locator("#sessions-panel");
     await expect(panel).not.toHaveClass(/hidden/);
     await expect(sessionsTrigger).toHaveAttribute("aria-expanded", "true");
-    await expect(page.locator("#sessions-panel-close")).toBeFocused();
+    // Desktop (2026-10-13): Sessions is a window; once the list renders,
+    // focus lands on the first row (its Focus/Attach/Restore action) and the
+    // window titlebar carries the close button.
+    await expect(
+      page.locator('.surface-window[data-window-id="sessions"]'),
+    ).toBeVisible();
+    await expect(
+      page.locator("#sessions-list .session-row").first(),
+    ).toBeFocused();
 
     // The terminal we just created is open locally → row shows an active badge
     // and a "Focus" action.
@@ -56,7 +64,7 @@ test.describe("Sessions drawer attach / open-here", () => {
     expect(activeAfter).toBe(activeBefore);
   });
 
-  test("traps dialog focus and restores the compact trigger on Escape", async ({
+  test("desktop window is not modal and Escape restores the compact trigger", async ({
     page,
   }) => {
     await resetAppState(page, APP_URL);
@@ -65,9 +73,21 @@ test.describe("Sessions drawer attach / open-here", () => {
     const trigger = page.locator("#sessions-btn");
     await trigger.click();
     const panel = page.locator("#sessions-panel");
-    await expect(page.locator("#sessions-panel-close")).toBeFocused();
+    const win = page.locator('.surface-window[data-window-id="sessions"]');
+    await expect(win).toBeVisible();
+    await expect(
+      page.locator("#sessions-list .session-row").first(),
+    ).toBeFocused();
+    // No backdrop: the terminals stay usable while the window is open.
+    await expect(panel.locator(".task-panel-backdrop")).toBeHidden();
+    await expect(panel.locator(".sessions-panel-shell")).toHaveAttribute(
+      "aria-modal",
+      "false",
+    );
 
+    // Not modal, but Shift+Tab from the first row stays in the window.
     await page.keyboard.press("Shift+Tab");
+    await expect(page.locator("#sessions-refresh-btn")).toBeFocused();
     expect(
       await page.evaluate(() =>
         Boolean(document.activeElement?.closest("#sessions-panel")),
@@ -76,7 +96,26 @@ test.describe("Sessions drawer attach / open-here", () => {
 
     await page.keyboard.press("Escape");
     await expect(panel).toHaveClass(/hidden/);
+    await expect(win).toBeHidden();
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
     await expect(trigger).toBeFocused();
+  });
+
+  test("Enter right after opening never creates a terminal", async ({
+    page,
+  }) => {
+    await resetAppState(page, APP_URL);
+    await waitForTerminal(page);
+    const countTerminals = () =>
+      page.evaluate(() => (window as any).terminalManager.terminals.size);
+    const before = await countTerminals();
+
+    // Before the list renders focus is parked on Refresh; after it, on the
+    // first row (Focus). Neither creates a terminal.
+    await page.locator("#sessions-btn").click();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(1500);
+    expect(await countTerminals()).toBe(before);
   });
 
   test("plans attach for a live session that is not open locally", async ({
