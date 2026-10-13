@@ -301,6 +301,7 @@
             <div>
               <div class="task-panel-kicker">Agent Runner</div>
               <h3 id="task-panel-title">Tasks</h3>
+              <p id="task-panel-intro" class="task-panel-intro"></p>
             </div>
             <div class="task-panel-header-actions">
               <button
@@ -817,7 +818,8 @@
       </div>
     </div>
 
-    <!-- Help Modal: rows are generated from web/keyboard-shortcuts.js -->
+    <!-- Help Modal: "What's what" comes from web/feature-guide.js, the shortcut
+         rows from web/keyboard-shortcuts.js -->
     <div id="help-modal" class="modal hidden">
       <div
         class="modal-content modal-large help-modal-content"
@@ -826,7 +828,7 @@
         aria-labelledby="help-modal-title"
       >
         <div class="modal-header">
-          <h3 id="help-modal-title">Keyboard shortcuts</h3>
+          <h3 id="help-modal-title">Help</h3>
           <button class="modal-close" id="help-close" aria-label="Close">
             &times;
           </button>
@@ -881,6 +883,7 @@
     <script src="/live-cwd.js?v=20261012a"></script>
     <script src="/search-overlay.js?v=20260611a"></script>
     <script src="/keyboard-shortcuts.js?v=20261012a"></script>
+    <script src="/feature-guide.js?v=20261013a"></script>
     <script src="/workspace-launcher.js?v=20261012a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
     <script src="/notification-sounds.js?v=20260719a"></script>

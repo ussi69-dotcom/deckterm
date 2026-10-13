@@ -150,7 +150,7 @@
 
   // ── DOM renderer (browser-only) ──────────────────────────────────────────────
 
-  // model: { sessions, directories, shortcuts, newHint, loading }
+  // model: { sessions, directories, shortcuts, tips, newHint, loading }
   // handlers: { onNewTerminal(), onSession(id), onDirectory(path) }
   function renderWorkspaceLauncher(root, doc, model = {}, handlers = {}) {
     if (!root || !doc) return;
@@ -261,6 +261,26 @@
         shortcuts.appendChild(item);
       }
       card.appendChild(shortcuts);
+    }
+
+    // A calm "Good to know" row: three features people tend to miss. No
+    // dismiss state and no motion; it only occupies the empty workspace.
+    if (model.tips?.length) {
+      const tips = el("section", "launcher-tips");
+      tips.setAttribute("aria-label", "Good to know");
+      tips.appendChild(el("h3", "launcher-tips-title", "Good to know"));
+      const list = el("ul", "launcher-tips-list");
+      for (const tip of model.tips) {
+        const item = el("li", "launcher-tip");
+        item.dataset.tipId = tip.id;
+        const head = el("span", "launcher-tip-head");
+        head.appendChild(el("strong", "launcher-tip-title", tip.title));
+        if (tip.keys?.length) head.appendChild(keys(tip.keys));
+        item.append(head, el("span", "launcher-tip-text", tip.text));
+        list.appendChild(item);
+      }
+      tips.appendChild(list);
+      card.appendChild(tips);
     }
 
     root.replaceChildren(card);

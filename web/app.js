@@ -371,6 +371,11 @@ const ATTENTION_KIND_LABELS = Object.freeze({
 });
 const ATTENTION_ALERT_DEDUPE_MS = 8000;
 
+// One-line "what it does / when it helps" text per action, shared with the
+// tooltips, Help modal and command palette (web/feature-guide.js).
+const describeFeature = (actionId) =>
+  window.FeatureGuide?.describeAction?.(actionId) || "";
+
 const ACTION_BUTTON_CONFIG = Object.freeze({
   files: Object.freeze({
     label: "Files",
@@ -380,6 +385,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-files-btn",
     toolsId: "tools-sheet-files",
     desktopTone: "primary",
+    description: describeFeature("files"),
   }),
   git: Object.freeze({
     label: "Git",
@@ -389,6 +395,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-git-btn",
     toolsId: "tools-sheet-git",
     desktopTone: "primary",
+    description: describeFeature("git"),
   }),
   palette: Object.freeze({
     label: "Palette",
@@ -397,6 +404,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     desktopId: "command-palette-trigger",
     toolsId: "tools-sheet-palette",
     desktopTone: "secondary",
+    description: describeFeature("palette"),
   }),
   tasks: Object.freeze({
     label: "Tasks",
@@ -404,6 +412,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "tasks",
     toolsId: "tools-sheet-tasks",
     desktopTone: "secondary",
+    description: describeFeature("tasks"),
   }),
   setup: Object.freeze({
     label: "Setup",
@@ -411,6 +420,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "setup",
     toolsId: "tools-sheet-setup",
     desktopTone: "secondary",
+    description: describeFeature("setup"),
   }),
   settings: Object.freeze({
     label: "Settings",
@@ -418,6 +428,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "settings",
     toolsId: "tools-sheet-settings",
     desktopTone: "secondary",
+    description: describeFeature("settings"),
   }),
   clipboard: Object.freeze({
     label: "Clipboard",
@@ -425,6 +436,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "clipboard",
     toolsId: "tools-sheet-clipboard",
     desktopTone: "secondary",
+    description: describeFeature("clipboard"),
   }),
   "toggle-extra-keys": Object.freeze({
     label: "Extra Keys",
@@ -432,6 +444,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "toggle-extra-keys",
     toolsId: "tools-sheet-extra-keys",
     desktopTone: "secondary",
+    description: describeFeature("toggle-extra-keys"),
   }),
   "wrap-lines": Object.freeze({
     label: "Wrap",
@@ -439,6 +452,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "wrap-lines",
     toolsId: "tools-sheet-wrap",
     desktopTone: "secondary",
+    description: describeFeature("wrap-lines"),
   }),
   "dock-sessions": Object.freeze({
     label: "Dock",
@@ -446,6 +460,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "dock-sessions",
     toolsId: "tools-sheet-dock-sessions",
     desktopTone: "secondary",
+    description: describeFeature("dock-sessions"),
   }),
   fullscreen: Object.freeze({
     label: "Fullscreen",
@@ -453,6 +468,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "fullscreen",
     toolsId: "tools-sheet-fullscreen",
     desktopTone: "secondary",
+    description: describeFeature("fullscreen"),
   }),
   help: Object.freeze({
     label: "Help",
@@ -460,6 +476,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "help",
     toolsId: "tools-sheet-help",
     desktopTone: "secondary",
+    description: describeFeature("help"),
   }),
   "linked-view": Object.freeze({
     label: "Linked View",
@@ -467,13 +484,14 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "linked-view",
     toolsId: "tools-sheet-linked-view",
     desktopTone: "secondary",
-    description: "Open another synchronized view of this tmux session",
+    description: describeFeature("linked-view"),
   }),
   "font-size": Object.freeze({
     label: "Font size",
     icon: "type",
     action: "font-size",
     kind: "stepper",
+    description: describeFeature("font-size"),
   }),
   paste: Object.freeze({
     label: "Paste",
@@ -482,6 +500,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-paste-btn",
     toolsId: "tools-sheet-paste",
     desktopTone: "secondary",
+    description: describeFeature("paste"),
   }),
   compose: Object.freeze({
     label: "Compose",
@@ -490,7 +509,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-compose-btn",
     toolsId: "tools-sheet-compose",
     desktopTone: "secondary",
-    description: "Write a message in a text box and send it to the terminal",
+    description: describeFeature("compose"),
   }),
   copy: Object.freeze({
     label: "Copy",
@@ -498,6 +517,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "copy",
     toolsId: "tools-sheet-copy",
     desktopTone: "secondary",
+    description: describeFeature("copy"),
   }),
   more: Object.freeze({
     label: "More",
@@ -506,6 +526,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     desktopId: "desktop-more-btn",
     mobileId: "mobile-more-btn",
     desktopTone: "secondary",
+    description: describeFeature("more"),
   }),
 });
 
@@ -6081,6 +6102,7 @@ class TerminalManager {
 
     // Help modal
     this.setupHelpModal();
+    this.applyStaticFeatureTooltips();
 
     // Keyboard shortcuts
     this.setupKeyboardShortcuts();
@@ -6447,6 +6469,10 @@ class TerminalManager {
           window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
         ),
         newHint: api.newTerminalHint({ standalone }),
+        tips: window.FeatureGuide?.planLauncherTips?.(
+          window.FeatureGuide.LAUNCHER_TIPS,
+          window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+        ),
       },
       {
         onNewTerminal: () => void this.createTerminal(),
@@ -6621,7 +6647,12 @@ class TerminalManager {
     return null;
   }
 
-  createActionButton(actionId, surface, density = "normal") {
+  createActionButton(
+    actionId,
+    surface,
+    density = "normal",
+    { showDescription = false } = {},
+  ) {
     const config = this.getActionButtonConfig(actionId);
     if (!config) return null;
 
@@ -6638,10 +6669,17 @@ class TerminalManager {
     }
 
     const label = config.label;
-    button.title = config.description || label;
+    const description = config.description || "";
+    // Tooltip: "Label — what it does (Shortcut)". The name stays the label.
+    button.title =
+      window.FeatureGuide?.tooltipForAction?.(
+        actionId,
+        label,
+        window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+      ) || description || label;
     button.setAttribute("aria-label", label);
-    if (config.description) {
-      button.setAttribute("aria-description", config.description);
+    if (description) {
+      button.setAttribute("aria-description", description);
     }
 
     if (surface === "desktop-primary") {
@@ -6668,7 +6706,22 @@ class TerminalManager {
 
     const text = document.createElement("span");
     text.textContent = label;
-    button.appendChild(text);
+    if (surface === "tools-sheet" && description && showDescription) {
+      // Work-group rows are full width, so they have room for a second line
+      // saying what the action does (the compact 2-column groups keep the
+      // description in the tooltip / aria-description only).
+      button.classList.add("has-description");
+      const wrap = document.createElement("span");
+      wrap.className = "tools-sheet-btn-text";
+      text.className = "tools-sheet-btn-label";
+      const detail = document.createElement("span");
+      detail.className = "tools-sheet-btn-description";
+      detail.textContent = description;
+      wrap.append(text, detail);
+      button.appendChild(wrap);
+    } else {
+      button.appendChild(text);
+    }
 
     return button;
   }
@@ -7108,6 +7161,7 @@ class TerminalManager {
     const groups = [
       {
         label: "Work",
+        describe: true,
         ids: actionIds.filter(
           (id) =>
             id !== "font-size" &&
@@ -7132,7 +7186,12 @@ class TerminalManager {
       heading.textContent = group.label;
       grid.appendChild(heading);
       for (const actionId of group.ids) {
-        const button = this.createActionButton(actionId, "tools-sheet");
+        const button = this.createActionButton(
+          actionId,
+          "tools-sheet",
+          "normal",
+          { showDescription: group.describe === true },
+        );
         if (button) grid.appendChild(button);
       }
       if (group.fontSize)
@@ -7545,6 +7604,9 @@ class TerminalManager {
     const panel = document.getElementById("task-panel");
     if (!panel) return;
 
+    const intro = panel.querySelector("#task-panel-intro");
+    if (intro) intro.textContent = window.FeatureGuide?.PANEL_INTROS?.tasks || "";
+
     panel
       .querySelector(".task-panel-backdrop")
       ?.addEventListener("click", () => this.closeTaskPanel());
@@ -7782,7 +7844,11 @@ class TerminalManager {
     badge.textContent = available > 99 ? "99+" : String(available || "");
     const label = available ? `Sessions, ${available} available` : "Sessions";
     trigger.setAttribute("aria-label", label);
-    trigger.title = label;
+    trigger.title =
+      window.FeatureGuide?.formatTooltip({
+        label,
+        description: window.FeatureGuide.describeAction("sessions"),
+      }) || label;
   }
 
   async refreshSessionsPanel() {
@@ -10716,7 +10782,10 @@ class TerminalManager {
     // palette row never advertises a key the app does not handle.
     const hintedActions =
       window.KeyboardShortcuts?.withShortcutHints?.(actions) || actions;
-    hintedActions.forEach((action) =>
+    // Each row also says in one line what it does (web/feature-guide.js).
+    const describe = (list) =>
+      window.FeatureGuide?.withPaletteDescriptions?.(list) || list;
+    describe(hintedActions).forEach((action) =>
       this.commandPaletteRegistry.register(action),
     );
 
@@ -10927,7 +10996,7 @@ class TerminalManager {
         });
       }
 
-      return contextualActions;
+      return describe(contextualActions);
     });
 
     this.commandPaletteRegistry.registerProvider(() => {
@@ -12497,7 +12566,9 @@ class TerminalManager {
   updateWrapButton() {
     document.querySelectorAll('[data-action="wrap-lines"]').forEach((btn) => {
       btn.classList.toggle("active", this.wrapLines);
-      btn.title = this.wrapLines ? "Line wrap: on" : "Line wrap: off";
+      const state = this.wrapLines ? "Line wrap: on" : "Line wrap: off";
+      const what = describeFeature("wrap-lines");
+      btn.title = what ? `${state} — ${what}` : state;
     });
     this.refreshCommandPalette();
   }
@@ -12559,12 +12630,35 @@ class TerminalManager {
     }
   }
 
+  // Tooltips for the buttons that live in index.html rather than in
+  // ACTION_BUTTON_CONFIG, worded from the same table as every other surface.
+  applyStaticFeatureTooltips() {
+    const guide = window.FeatureGuide;
+    if (!guide) return;
+    const shortcuts = window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS;
+    const set = (id, label, featureId, shortcut = "") => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.title = guide.formatTooltip({
+        label,
+        description: guide.describeAction(featureId),
+        shortcut: shortcut || guide.shortcutLabelForAction(featureId, shortcuts),
+      });
+    };
+    set("sessions-btn", "Sessions", "sessions");
+    set("ide-toggle-btn", "IDE layout", "ide");
+    // Ctrl+N only reaches an installed app window (see keyboard-shortcuts.js),
+    // which is why the browser tooltip never promised more than "Ctrl+N".
+    set("new-terminal", "New terminal", "new-terminal", "Ctrl+N");
+  }
+
   // Rows come from web/keyboard-shortcuts.js (one list, no hand-kept table).
   renderHelpShortcuts() {
     const shortcuts = window.KeyboardShortcuts;
     const container = document.getElementById("help-shortcuts");
     if (!shortcuts || !container || container.childElementCount) return;
     shortcuts.renderHelpShortcuts(container, document);
+    window.FeatureGuide?.renderWhatsWhat(container, document, shortcuts.KEYBOARD_SHORTCUTS);
     const footnote = document.getElementById("help-footnote");
     if (footnote) footnote.textContent = shortcuts.SHORTCUT_FOOTNOTE || "";
   }
@@ -17184,6 +17278,7 @@ class TerminalManager {
         document,
         storage,
         legacyStorage,
+        intro: window.FeatureGuide?.PANEL_INTROS?.compose || "",
         onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
         onClose: ({ restoreFocus }) => {
           // On touch, refocusing xterm would pop the keyboard back up.
