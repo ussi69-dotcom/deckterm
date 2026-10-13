@@ -11,6 +11,9 @@ const {
   isDesktopSurfaceWidth,
   computeBottomChromeInset,
   planDockPlaceholder,
+  OVERLAY_SURFACE_WINDOWS,
+  planSurfaceOpenCloses,
+  planSurfaceToggle,
   DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
@@ -204,4 +207,54 @@ test("planDockPlaceholder fills the area above the docked terminals with surface
     "Ctrl+Shift+P",
   );
   expect(hinted.actions.find((a) => a.id === "files").keys).toBe("");
+});
+
+test("Sessions and Setup have desktop window configs that fit the layer", () => {
+  for (const id of ["sessions", "setup"]) {
+    const config = OVERLAY_SURFACE_WINDOWS[id];
+    expect(config).toBeTruthy();
+    expect(config.title).toBeTruthy();
+    expect(config.icon).toBeTruthy();
+    // Default geometry is already normalized (inside 0-100, never clamped).
+    expect(normalizeWindowBounds(config.bounds)).toEqual(config.bounds);
+    expect(config.minWidthPx).toBeGreaterThanOrEqual(320);
+    expect(config.minHeightPx).toBeGreaterThanOrEqual(240);
+  }
+  // Sessions is a list: a narrower window than Setup's long report.
+  expect(OVERLAY_SURFACE_WINDOWS.sessions.bounds.width).toBeLessThan(
+    OVERLAY_SURFACE_WINDOWS.setup.bounds.width,
+  );
+  expect(Object.isFrozen(OVERLAY_SURFACE_WINDOWS)).toBe(true);
+});
+
+test("planSurfaceOpenCloses: desktop windows coexist, phone sheets keep today's exclusions", () => {
+  // Desktop: opening a window only dismisses the More (tools) sheet.
+  for (const id of ["sessions", "setup", "tasks"]) {
+    expect(planSurfaceOpenCloses(id, { windowed: true })).toEqual(["tools"]);
+  }
+  // Phone / narrow: exactly the old behaviour.
+  expect(planSurfaceOpenCloses("sessions", { windowed: false })).toEqual([
+    "tools",
+    "tasks",
+    "setup",
+  ]);
+  expect(planSurfaceOpenCloses("setup", { windowed: false })).toEqual([
+    "tools",
+    "tasks",
+  ]);
+  expect(planSurfaceOpenCloses("tasks", { windowed: false })).toEqual([
+    "tools",
+    "setup",
+  ]);
+  expect(planSurfaceOpenCloses("unknown", { windowed: false })).toEqual([
+    "tools",
+  ]);
+});
+
+test("planSurfaceToggle: a buried open window comes to the front before it closes", () => {
+  expect(planSurfaceToggle({ open: false, frontmost: false })).toBe("open");
+  expect(planSurfaceToggle({ open: true, frontmost: true })).toBe("close");
+  expect(planSurfaceToggle({ open: true, frontmost: false })).toBe("front");
+  // Sheets have no z-order: an open sheet always closes.
+  expect(planSurfaceToggle({ open: true })).toBe("close");
 });
