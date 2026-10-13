@@ -141,8 +141,9 @@ Checked on the host after the deploy:
   removed, as the owner decided. The journal now shows `[reaper] policy idle=never detached=never`, which
   matches the 2026-08-30 "only an explicit close ends a session" decision. Both the old and the new code
   default to "never", so a rollback would not have brought the reapers back.
-- Production keeps the system tmux 3.4. The 3.8 switch ends every production session once, so it waits for a
-  moment the owner picks ([tmux plan](./2026-10-13-tmux-3.8-upgrade.md), step 3).
+- Production keeps the system tmux 3.4 for this release. The owner then asked for the 3.8 switch right
+  away; it ran at 10:03 UTC, and the operator session continued under the same terminal ID
+  ([tmux plan](./2026-10-13-tmux-3.8-upgrade.md), step 3).
 - `Deploy Main` deploys to a single host (the `DEPLOY_HOST` secret, this OVH host). The owner's separate
   dedicated server runs its own git checkout under a system-level unit, so this deploy did not touch it.
 
