@@ -248,8 +248,11 @@ class ComposeSheet {
     onSend,
     onClose = null,
     mount = null,
+    intro = "",
   }) {
     this.doc = doc;
+    // Optional one-line "what is this for" under the header.
+    this.intro = typeof intro === "string" ? intro.trim() : "";
     this.storage = storage;
     this.onSend = onSend;
     this.onClose = onClose;
@@ -366,7 +369,14 @@ class ComposeSheet {
     });
     historySection.append(historyHeader, list);
 
-    panel.append(header, input, actions, historySection);
+    if (this.intro) {
+      const intro = doc.createElement("p");
+      intro.className = "compose-sheet-intro";
+      intro.textContent = this.intro;
+      panel.append(header, intro, input, actions, historySection);
+    } else {
+      panel.append(header, input, actions, historySection);
+    }
     root.append(backdrop, panel);
     root.addEventListener("keydown", (event) => this.onKeyDown(event));
 

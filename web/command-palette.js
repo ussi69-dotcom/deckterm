@@ -355,6 +355,16 @@ class CommandPaletteController {
           this.appendHighlighted(detail, detailText, detailPositions);
           detail.title = detailText;
           text.appendChild(detail);
+        } else if (result.description) {
+          // No row-specific context (path, branch, state): say what the action
+          // does. Plain text on purpose: the query matches titles, not this.
+          text.classList.add("has-description");
+          const detail = document.createElement("span");
+          detail.className =
+            "command-palette-item-detail command-palette-item-description";
+          detail.textContent = result.description;
+          detail.title = result.description;
+          text.appendChild(detail);
         }
         item.appendChild(text);
 

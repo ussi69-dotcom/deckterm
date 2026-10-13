@@ -4,7 +4,10 @@ import {
   planRecentDirectories,
   planLauncherShortcuts,
   newTerminalHint,
+  renderWorkspaceLauncher,
 } from "./workspace-launcher";
+import { LAUNCHER_TIPS, planLauncherTips } from "./feature-guide";
+import { KEYBOARD_SHORTCUTS } from "./keyboard-shortcuts";
 
 const live = (id, cwd, lastActivityAt, extra = {}) => ({
   id,
@@ -136,4 +139,70 @@ test("newTerminalHint: Ctrl+N only where the browser lets it through", () => {
   // focuses its button so Enter is the honest hint.
   expect(newTerminalHint({ standalone: false })).toEqual(["Enter"]);
   expect(newTerminalHint()).toEqual(["Enter"]);
+});
+
+function fakeDoc() {
+  const make = (tag) => ({
+    tag,
+    className: "",
+    textContent: "",
+    dataset: {},
+    children: [],
+    attrs: {},
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    append(...nodes) {
+      nodes.forEach((node) => this.children.push(node));
+    },
+    replaceChildren(...nodes) {
+      this.children = nodes;
+    },
+    setAttribute(name, value) {
+      this.attrs[name] = value;
+    },
+    addEventListener() {},
+  });
+  return { createElement: make };
+}
+
+function walk(node, visit) {
+  visit(node);
+  (node.children || []).forEach((child) => walk(child, visit));
+}
+
+test("renderWorkspaceLauncher shows a quiet Good to know row with the tips", () => {
+  const doc = fakeDoc();
+  const root = doc.createElement("div");
+  renderWorkspaceLauncher(root, doc, {
+    sessions: [],
+    directories: [],
+    shortcuts: [],
+    tips: planLauncherTips(LAUNCHER_TIPS, KEYBOARD_SHORTCUTS),
+  });
+  const found = [];
+  walk(root, (node) => found.push(node));
+  const tipsSection = found.find((n) => n.className === "launcher-tips");
+  expect(tipsSection.attrs["aria-label"]).toBe("Good to know");
+  const items = found.filter((n) => n.className === "launcher-tip");
+  expect(items.map((n) => n.dataset.tipId)).toEqual([
+    "palette",
+    "compose",
+    "tasks",
+  ]);
+  const paletteKeys = [];
+  walk(items[0], (n) => {
+    if (n.tag === "kbd") paletteKeys.push(n.textContent);
+  });
+  expect(paletteKeys).toEqual(["Ctrl", "Shift", "P"]);
+});
+
+test("renderWorkspaceLauncher omits the tips row when there are none", () => {
+  const doc = fakeDoc();
+  const root = doc.createElement("div");
+  renderWorkspaceLauncher(root, doc, { sessions: [], directories: [] });
+  const found = [];
+  walk(root, (node) => found.push(node));
+  expect(found.some((n) => n.className === "launcher-tips")).toBe(false);
 });
