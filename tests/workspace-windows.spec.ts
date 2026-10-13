@@ -75,6 +75,44 @@ test.describe("Workspace surface windows on desktop", () => {
     ).toBeVisible();
   });
 
+  test("Sessions and Setup open as windows next to Files without closing each other", async ({
+    page,
+  }) => {
+    await page.click("#desktop-files-btn");
+    await page.click("#sessions-btn");
+    await page.evaluate(() => (window as any).terminalManager.openSetupPanel());
+    for (const id of ["files", "sessions", "setup"]) {
+      await expect(
+        page.locator(`.surface-window[data-window-id="${id}"]`),
+      ).toBeVisible();
+    }
+    // No overlay backdrop dims the terminals any more.
+    await expect(page.locator(".setup-panel-backdrop")).toBeHidden();
+    await expect(
+      page.locator("#sessions-panel .task-panel-backdrop"),
+    ).toBeHidden();
+
+    // The Sessions toggle brings a buried window to the front, then closes it.
+    const sessions = page.locator('.surface-window[data-window-id="sessions"]');
+    await page.click("#sessions-btn");
+    await expect(sessions).toHaveClass(/active/);
+    await page.click("#sessions-btn");
+    await expect(sessions).toBeHidden();
+    await expect(
+      page.locator('.surface-window[data-window-id="setup"]'),
+    ).toBeVisible();
+
+    // Escape inside the Setup window closes only that window.
+    await page.locator("#setup-public-origin").focus();
+    await page.keyboard.press("Escape");
+    await expect(
+      page.locator('.surface-window[data-window-id="setup"]'),
+    ).toBeHidden();
+    await expect(
+      page.locator('.surface-window[data-window-id="files"]'),
+    ).toBeVisible();
+  });
+
   test("sessions dock to the bottom and undock", async ({ page }) => {
     await page.evaluate(() => {
       (window as any).terminalManager.toggleSessionsDock();

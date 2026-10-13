@@ -14,7 +14,10 @@ test.describe("Onboarding setup surface", () => {
 
     const panel = page.locator("#setup-panel");
     await expect(panel).toBeVisible();
-    await expect(panel.getByRole("heading", { name: "Setup" })).toBeVisible();
+    // Desktop (2026-10-13): Setup is a window; its titlebar names it.
+    const win = page.locator('.surface-window[data-window-id="setup"]');
+    await expect(win.locator(".surface-window-title")).toHaveText("Setup");
+    await expect(page.locator("#setup-profile")).toBeFocused();
     await expect(
       panel.getByRole("button", { name: "Apply safe settings" }),
     ).toBeVisible();
