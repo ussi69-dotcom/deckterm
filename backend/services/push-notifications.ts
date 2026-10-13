@@ -143,7 +143,7 @@ export async function dispatchCompletionPush({
   config: WebPushConfig | null;
   userId: string;
   terminalId: string;
-  kind: "agent" | "command";
+  kind: "agent" | "command" | "input";
   now?: number;
   send?: PushSender;
 }): Promise<{
@@ -173,7 +173,14 @@ export async function dispatchCompletionPush({
   };
   const payload = JSON.stringify({
     title: "DeckTerm",
-    body: kind === "agent" ? "Agent turn finished" : "Command finished",
+    // Generic text only: terminal/agent output never leaves the host in a
+    // push payload.
+    body:
+      kind === "input"
+        ? "Agent needs your input"
+        : kind === "agent"
+          ? "Agent turn finished"
+          : "Command finished",
     tag: `deckterm-${compactHash(terminalId)}`,
     data: { url: "/" },
     silent: false,

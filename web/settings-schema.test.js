@@ -5,6 +5,7 @@ const {
   categoriesOf,
   defaultsOf,
   coerceValue,
+  schemaForDevice,
 } = require("./settings-schema.js");
 const {
   COMPLETION_SOUND_PATTERNS,
@@ -137,6 +138,55 @@ describe("SETTINGS_SCHEMA shape", () => {
     ]);
     expect(push.type).toBe("toggle");
     expect(push.deviceLocal).toBe(true);
+  });
+});
+
+describe("extra keys bar visibility per device class", () => {
+  test("desktop keeps terminal.extraKeysVisible (default hidden)", () => {
+    const def = byKey("terminal.extraKeysVisible");
+    expect(def.type).toBe("toggle");
+    expect(def.default).toBe(false);
+    expect(def.deviceClass).toBe("desktop");
+  });
+
+  test("touch has its own terminal.extraKeysVisibleTouch (default visible)", () => {
+    const def = byKey("terminal.extraKeysVisibleTouch");
+    expect(def).toBeDefined();
+    expect(def.type).toBe("toggle");
+    expect(def.default).toBe(true);
+    expect(def.deviceClass).toBe("touch");
+    expect(def.category).toBe("Terminal");
+    expect(def.description).toMatch(/phone|tablet/i);
+  });
+
+  test("schemaForDevice keeps only the current device's extra-keys entry", () => {
+    const desktopKeys = schemaForDevice(SETTINGS_SCHEMA, "desktop").map(
+      (d) => d.key,
+    );
+    const touchKeys = schemaForDevice(SETTINGS_SCHEMA, "touch").map(
+      (d) => d.key,
+    );
+    expect(desktopKeys).toContain("terminal.extraKeysVisible");
+    expect(desktopKeys).not.toContain("terminal.extraKeysVisibleTouch");
+    expect(touchKeys).toContain("terminal.extraKeysVisibleTouch");
+    expect(touchKeys).not.toContain("terminal.extraKeysVisible");
+  });
+
+  test("schemaForDevice leaves every device-neutral entry in order", () => {
+    const neutral = SETTINGS_SCHEMA.filter((d) => !d.deviceClass);
+    for (const cls of ["desktop", "touch"]) {
+      expect(
+        schemaForDevice(SETTINGS_SCHEMA, cls).filter((d) => !d.deviceClass),
+      ).toEqual(neutral);
+    }
+    // One extra-keys toggle per device: same length on both.
+    expect(schemaForDevice(SETTINGS_SCHEMA, "desktop").length).toBe(
+      schemaForDevice(SETTINGS_SCHEMA, "touch").length,
+    );
+  });
+
+  test("schemaForDevice tolerates a missing schema", () => {
+    expect(schemaForDevice(null, "touch")).toEqual([]);
   });
 });
 

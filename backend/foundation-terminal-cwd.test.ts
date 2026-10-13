@@ -89,7 +89,17 @@ test("terminal create falls back to an allowed root for a within-roots-but-delet
     }),
   );
   expect(deniedRes.status).toBe(403);
-  await expect(deniedRes.json()).resolves.toMatchObject({
+  const denied = (await deniedRes.json()) as Record<string, string>;
+  expect(denied).toMatchObject({
     error: "Forbidden terminal root",
+    reason: "forbidden_root",
+    path: outsideRoot,
+    setting: "ALLOWED_FILE_ROOTS",
   });
+  // The detail names the rejected value, the governing setting and the fix,
+  // without echoing the configured roots themselves.
+  expect(denied.message).toContain(`"${outsideRoot}"`);
+  expect(denied.message).toContain("ALLOWED_FILE_ROOTS");
+  expect(denied.message.toLowerCase()).toContain("restart");
+  expect(denied.message).not.toContain(projectRoot);
 });

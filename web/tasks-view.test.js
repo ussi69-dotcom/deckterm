@@ -7,6 +7,7 @@ import {
   tasksRenderSignature,
   formatTaskMessageRow,
   taskMessagesSignature,
+  renderTasksViewIcons,
 } from "./tasks-view.js";
 
 test("tasksBoardColumns groups tasks into kanban columns, dropping empties", () => {
@@ -329,4 +330,20 @@ test("tasksViewRenderMode: legacy fallback follows the shared persisted mode", (
     }),
   ).toBe("list");
   expect(tasksViewRenderMode({})).toBe("list");
+});
+
+test("renderTasksViewIcons hydrates only the given root and no-ops without one", () => {
+  const calls = [];
+  const hadWindow = "window" in globalThis;
+  const previous = globalThis.window;
+  globalThis.window = { lucide: { createIcons: (opts) => calls.push(opts) } };
+  try {
+    const root = { id: "tasks-root" };
+    renderTasksViewIcons(root);
+    renderTasksViewIcons(null);
+    expect(calls).toEqual([{ root }]);
+  } finally {
+    if (hadWindow) globalThis.window = previous;
+    else delete globalThis.window;
+  }
 });

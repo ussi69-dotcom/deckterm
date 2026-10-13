@@ -300,6 +300,7 @@ test.describe("Shell action hierarchy on desktop", () => {
       "Files",
       "Git",
       "Paste",
+      "Compose",
       "More",
     ]);
   });

@@ -125,6 +125,27 @@ test("C2-1b: denied file access returns a structured, explainable payload", asyn
   const body = await res.json();
   expect(body.reason).toBe("no_matching_root");
   expect(typeof body.error).toBe("string");
+  // The denial names the rejected path and the governing setting + fix.
+  expect(body.path).toBe(join(outsideRoot, "nope.txt"));
+  expect(body.setting).toBe("ALLOWED_FILE_ROOTS");
+  expect(body.message).toContain(join(outsideRoot, "nope.txt"));
+  expect(body.message).toContain("ALLOWED_FILE_ROOTS");
+  // Outside every root the answer must not depend on whether the path
+  // exists: "or does not exist" here would be a host-path existence oracle
+  // reachable before any grant check.
+  expect(body.message).not.toContain("does not exist");
+
+  // Inside an allowed root a refused path that is missing may say so.
+  const inside = join(allowedRoot, "nope.txt");
+  const insideRes = await app.fetch(
+    new Request(
+      `http://deckterm.test/api/files/download?path=${encodeURIComponent(inside)}`,
+    ),
+  );
+  expect(insideRes.status).toBe(403);
+  const insideBody = await insideRes.json();
+  expect(insideBody.reason).toBe("no_matching_root");
+  expect(insideBody.message).toContain("does not exist");
 });
 
 test("C2-2: task create with a forbidden root is denied and writes a foundation audit deny row", async () => {
@@ -141,6 +162,13 @@ test("C2-2: task create with a forbidden root is denied and writes a foundation 
     }),
   );
   expect(res.status).toBe(403);
+  const denied = await res.json();
+  expect(denied.error).toBe("Forbidden project root");
+  expect(denied.reason).toBe("forbidden_root");
+  expect(denied.path).toBe(outsideRoot);
+  expect(denied.message).toContain("ALLOWED_FILE_ROOTS");
+  // outsideRoot exists, so the denial says plainly that it is out of bounds.
+  expect(denied.message).not.toContain("does not exist");
 
   // taskRunner already throws for forbidden roots, but C2 routes the decision
   // through the foundation layer so it is audited consistently with file/git/terminal.

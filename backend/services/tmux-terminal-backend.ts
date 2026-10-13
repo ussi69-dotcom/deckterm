@@ -1,7 +1,12 @@
 import type { Subprocess } from "bun";
 import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { syncTmuxSessionClients } from "../tmux-client-size";
+import {
+  parseTmuxWindowSize,
+  planTmuxResize,
+  syncTmuxSessionClients,
+  tmuxClientsHaveSize,
+} from "../tmux-client-size";
 import {
   buildTmuxSessionName,
   getTmuxSessionPrefix,
@@ -26,6 +31,66 @@ export type TmuxPipeDelta = {
   chunk: string;
   offset: number;
 };
+
+export type TmuxSessionLiveness = "alive" | "missing" | "unknown";
+
+// A healthy server answers has-session in milliseconds; a wedged one (e.g.
+// SIGSTOPped) would otherwise block the caller forever.
+export const TMUX_LIVENESS_TIMEOUT_MS = 5_000;
+
+/**
+ * Classifies one `tmux has-session` run. tmux exits 1 both when the session
+ * is gone and when it cannot reach the server at all, so the exit code alone
+ * cannot tell "ended" from "unreachable". Only these messages prove absence:
+ * - `can't find session: …` — the server answered without that session;
+ * - `no server running on …` — the socket is stale (ECONNREFUSED);
+ * - `error connecting to … (No such file or directory)` — no socket file,
+ *   so no server (the same end-don't-adopt policy as an unrecoverable row).
+ * Everything else — EACCES, protocol mismatch after a tmux upgrade, a lost
+ * server, a probe we killed on timeout — is "unknown".
+ */
+export function classifyTmuxHasSession({
+  exitCode,
+  stderr,
+  timedOut = false,
+}: {
+  exitCode: number | null;
+  stderr: string;
+  timedOut?: boolean;
+}): TmuxSessionLiveness {
+  if (timedOut) return "unknown";
+  if (exitCode === 0) return "alive";
+  if (
+    /^can't find session/m.test(stderr) ||
+    /^no server running on /m.test(stderr) ||
+    /^error connecting to .* \(No such file or directory\)$/m.test(stderr)
+  ) {
+    return "missing";
+  }
+  return "unknown";
+}
+
+/**
+ * The directory to spawn a `tmux attach-session` client in: the first
+ * candidate that is an existing directory, else "/". The client's own cwd
+ * does not matter to the tmux session it attaches to, but posix_spawn fails
+ * with ENOENT for a missing cwd — and a terminal's recorded creation
+ * directory (e.g. a removed task worktree) can vanish while its session
+ * lives on, which would make the session impossible to re-attach.
+ */
+export async function resolveAttachSpawnCwd(
+  candidates: Array<string | null | undefined>,
+): Promise<string> {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      if ((await stat(candidate)).isDirectory()) return candidate;
+    } catch {
+      // Missing or unreadable: try the next one.
+    }
+  }
+  return "/";
+}
 
 export type TmuxTerminalBackendOptions = {
   namespace: string;
@@ -139,7 +204,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await createProc.exited;
 
     await this.hideStatusBar(sessionName);
-    await this.ensureHistoryLimit();
+    await this.ensureServerOptions();
     await this.resize(sessionName, cols, rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
@@ -165,8 +230,13 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await this.resize(sessionName, options.cols, options.rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
+    const spawnCwd = await resolveAttachSpawnCwd([
+      options.cwd,
+      this.baseEnv.HOME,
+      process.env.HOME,
+    ]);
     const proc = await this.spawnTmux(["attach-session", "-t", sessionName], {
-      cwd: options.cwd,
+      cwd: spawnCwd,
       env: {
         ...this.baseEnv,
         ...options.env,
@@ -202,6 +272,95 @@ export class TmuxTerminalBackend implements TerminalBackend {
     rows: number,
     options: { waitForClient?: boolean } = {},
   ): Promise<void> {
+    await this.resizeWindowAndPane(sessionName, cols, rows);
+
+    await syncTmuxSessionClients(sessionName, cols, rows, {
+      waitForClient: options.waitForClient,
+      socketPath: this.socketPath,
+    });
+  }
+
+  // Resize for a live attach client without tmux ever seeing a window
+  // smaller than the client (that draws a '│···' fill frame at the client
+  // size, which wraps into the browser's scrollback when the xterm has
+  // already shrunk — bug R1). Order: grow the window where it grows, resize
+  // the client PTY and wait until tmux has taken the new client size, then
+  // set the window to the final size. Callers serialize per terminal.
+  async resizeAttached(
+    sessionName: string,
+    cols: number,
+    rows: number,
+    resizeClient: () => void,
+  ): Promise<void> {
+    const plan = planTmuxResize(await this.readWindowSize(sessionName), {
+      cols,
+      rows,
+    });
+    if (plan.growFirst) {
+      await this.resizeWindowAndPane(
+        sessionName,
+        plan.growFirst.cols,
+        plan.growFirst.rows,
+      );
+    }
+    resizeClient();
+    await syncTmuxSessionClients(sessionName, cols, rows, {
+      socketPath: this.socketPath,
+    });
+    await this.waitForClientSize(sessionName, cols, rows);
+    await this.resizeWindowAndPane(
+      sessionName,
+      plan.final.cols,
+      plan.final.rows,
+    );
+  }
+
+  private async readWindowSize(
+    sessionName: string,
+  ): Promise<{ cols: number; rows: number } | null> {
+    const proc = await this.spawnTmux(
+      [
+        "display-message",
+        "-p",
+        "-t",
+        sessionName,
+        "#{window_width} #{window_height}",
+      ],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const output = await new Response((proc as any).stdout).text();
+    await proc.exited;
+    return parseTmuxWindowSize(output);
+  }
+
+  // tmux learns a client's new size from SIGWINCH asynchronously; bounded
+  // wait (about 200 ms) so a stuck client never stalls the resize queue.
+  private async waitForClientSize(
+    sessionName: string,
+    cols: number,
+    rows: number,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const proc = await this.spawnTmux(
+        [
+          "list-clients",
+          "-F",
+          "#{client_tty}\t#{client_width}\t#{client_height}\t#{session_name}",
+        ],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const output = await new Response((proc as any).stdout).text();
+      await proc.exited;
+      if (tmuxClientsHaveSize(output, sessionName, cols, rows)) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+
+  private async resizeWindowAndPane(
+    sessionName: string,
+    cols: number,
+    rows: number,
+  ): Promise<void> {
     const resizeWindowProc = await this.spawnTmux([
       "resize-window",
       "-t",
@@ -223,11 +382,6 @@ export class TmuxTerminalBackend implements TerminalBackend {
       String(rows),
     ]);
     await resizePaneProc.exited;
-
-    await syncTmuxSessionClients(sessionName, cols, rows, {
-      waitForClient: options.waitForClient,
-      socketPath: this.socketPath,
-    });
   }
 
   async scrollHistory(
@@ -339,12 +493,45 @@ export class TmuxTerminalBackend implements TerminalBackend {
   }
 
   async sessionExists(sessionName: string): Promise<boolean> {
-    const proc = await this.spawnTmux(["has-session", "-t", sessionName], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    const exitCode = await proc.exited;
-    return exitCode === 0;
+    return (await this.sessionLiveness(sessionName)) === "alive";
+  }
+
+  /**
+   * Tri-state liveness of one session. Only "missing" is proof that a catalog
+   * row may be ended; "unknown" (server unreachable, wedged, or the probe
+   * could not run) must leave it alone. Never starts a server.
+   */
+  async sessionLiveness(
+    sessionName: string,
+    timeoutMs = TMUX_LIVENESS_TIMEOUT_MS,
+  ): Promise<TmuxSessionLiveness> {
+    let proc: Subprocess<"ignore", "ignore", "pipe">;
+    try {
+      // `=` asks for an exact name: a bare target also matches a prefix.
+      proc = (await this.spawnTmux(["has-session", "-t", `=${sessionName}`], {
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+      })) as Subprocess<"ignore", "ignore", "pipe">;
+    } catch {
+      return "unknown";
+    }
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      proc.kill("SIGKILL");
+    }, timeoutMs);
+    try {
+      const [exitCode, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stderr).text().catch(() => ""),
+      ]);
+      return classifyTmuxHasSession({ exitCode, stderr, timedOut });
+    } catch {
+      return "unknown";
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async getSessionInfo(sessionName: string): Promise<TmuxSessionInfo> {
@@ -424,18 +611,32 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await hideStatusProc.exited;
   }
 
-  // tmux's default history-limit (2000 lines) is far below the frontend's
-  // xterm.js scrollback (10000, see web/app.js) and gets exhausted within a
-  // single long-lived agent session, silently evicting old output (including
-  // completed Codex/Claude responses) long before the alt-screen fix's
-  // failure mode ever triggers. -g applies server-wide, so this is a no-op
-  // once set but safe to repeat on every session create.
-  private async ensureHistoryLimit(): Promise<void> {
+  // Server-wide options DeckTerm depends on. -g applies server-wide, so this
+  // is a no-op once set but safe to repeat on every session create.
+  // - history-limit: tmux's default (2000 lines) is far below the frontend's
+  //   xterm.js scrollback (10000, see web/app.js) and gets exhausted within a
+  //   single long-lived agent session, silently evicting old output
+  //   (including completed Codex/Claude responses).
+  // - mouse off: tmux 3.8 turned mouse on by default, which sends wheel and
+  //   drag to tmux copy mode instead of DeckTerm's own scrollback/selection.
+  // - theme terminal: tmux 3.8 re-colours its own UI by default; -q keeps
+  //   tmux < 3.8 (no such option) quiet. Last in the chain on purpose.
+  private async ensureServerOptions(): Promise<void> {
     const proc = await this.spawnTmux([
       "set-option",
       "-g",
       "history-limit",
       "10000",
+      ";",
+      "set-option",
+      "-g",
+      "mouse",
+      "off",
+      ";",
+      "set-option",
+      "-gq",
+      "theme",
+      "terminal",
     ]);
     await proc.exited;
   }

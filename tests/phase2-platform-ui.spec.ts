@@ -5,6 +5,8 @@
  * - Desktop: extra keys hidden by default, toggle via More or Ctrl+.
  * - Desktop: state persists in the canonical actor-scoped settings store
  * - Mobile: extra keys visible by default and row expansion still works
+ * - Desktop (terminal.extraKeysVisible) and phones/tablets
+ *   (terminal.extraKeysVisibleTouch) remember the bar separately
  */
 
 import type { Page } from "@playwright/test";
@@ -101,6 +103,14 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
         ),
       );
       expect(savedState).toBe(true);
+      // A desktop toggle never writes the phone/tablet key.
+      const touchState = await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.get(
+          "terminal.extraKeysVisibleTouch",
+          "unset",
+        ),
+      );
+      expect(touchState).toBe("unset");
       await page.evaluate(() =>
         (window as any).terminalManager.settingsStore.flush(),
       );
@@ -155,6 +165,47 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       await expect(page.locator("#extra-keys")).toBeVisible();
     });
 
+    test("visible on mobile even when desktop stored hidden", async ({
+      page,
+    }) => {
+      // The desktop key is per-device: a stored desktop "hidden" must not
+      // hide the bar on a phone (no fallback to the desktop key).
+      await page.evaluate(async () => {
+        const store = (window as any).terminalManager.settingsStore;
+        store.set("terminal.extraKeysVisible", false);
+        await store.flush();
+      });
+      await page.reload();
+      await waitForTerminal(page);
+      await expect(page.locator("#extra-keys")).toBeVisible();
+    });
+
+    test("hiding on mobile writes only the touch key and survives reload", async ({
+      page,
+    }) => {
+      const extraKeys = page.locator("#extra-keys");
+      await expect(extraKeys).toBeVisible();
+
+      await toggleExtraKeysFromMore(page);
+      await expect(extraKeys).toHaveClass(/\bhidden\b/);
+
+      const saved = await page.evaluate(() => {
+        const store = (window as any).terminalManager.settingsStore;
+        return {
+          touch: store.get("terminal.extraKeysVisibleTouch", "unset"),
+          desktop: store.get("terminal.extraKeysVisible", "unset"),
+        };
+      });
+      expect(saved).toEqual({ touch: false, desktop: "unset" });
+      await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.flush(),
+      );
+
+      await page.reload();
+      await waitForTerminal(page);
+      await expect(extraKeys).toHaveClass(/\bhidden\b/);
+    });
+
     test("More still lists Extra Keys as a secondary action on mobile", async ({
       page,
     }) => {
@@ -170,15 +221,19 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
       const extraKeysToggle = page.locator("#extra-keys-toggle");
       const row2 = page.locator(".extra-keys-row-2");
 
+      // The F-key row starts collapsed (one key row leaves the terminal more
+      // room); the toggle expands it and reports the state.
+      await expect(row2).toHaveClass(/\bhidden\b/);
+      await expect(extraKeysToggle).toHaveAttribute("aria-expanded", "false");
+
+      await extraKeysToggle.click();
+      await page.waitForTimeout(100);
       await expect(row2).not.toHaveClass(/\bhidden\b/);
+      await expect(extraKeysToggle).toHaveAttribute("aria-expanded", "true");
 
       await extraKeysToggle.click();
       await page.waitForTimeout(100);
       await expect(row2).toHaveClass(/\bhidden\b/);
-
-      await extraKeysToggle.click();
-      await page.waitForTimeout(100);
-      await expect(row2).not.toHaveClass(/\bhidden\b/);
     });
   });
 
@@ -193,18 +248,18 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
     test("extra keys contain expected buttons", async ({ page }) => {
       await toggleExtraKeysFromMore(page);
 
+      // Agent quick-reply chips (.ek-chip) reuse data-key to share the
+      // extra-keys send path, so scope to the key rows themselves.
+      const keyRows = page.locator("#extra-keys .extra-keys-rows");
+
       const essentialKeys = ["ESC", "TAB", "CTRL", "ALT", "SHIFT"];
       for (const key of essentialKeys) {
-        await expect(
-          page.locator(`#extra-keys [data-key="${key}"]`),
-        ).toBeVisible();
+        await expect(keyRows.locator(`[data-key="${key}"]`)).toBeVisible();
       }
 
       const arrowKeys = ["UP", "DOWN", "LEFT", "RIGHT"];
       for (const key of arrowKeys) {
-        await expect(
-          page.locator(`#extra-keys [data-key="${key}"]`),
-        ).toBeVisible();
+        await expect(keyRows.locator(`[data-key="${key}"]`)).toBeVisible();
       }
     });
   });

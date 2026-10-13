@@ -93,6 +93,10 @@ const KEY_SEQUENCES = {
   F10: "\x1b[21~",
   F11: "\x1b[23~",
   F12: "\x1b[24~",
+  // Agent quick-reply chips (quick-replies.js) send through the same table.
+  ENTER: "\r",
+  SHIFT_TAB: "\x1b[Z",
+  CTRL_C: "\x03",
 };
 
 const TERMINAL_FONT_FAMILY =
@@ -100,11 +104,14 @@ const TERMINAL_FONT_FAMILY =
 const TERMINAL_LINE_HEIGHT = 1.2;
 // Scrollback-search match highlighting (GitHub-dark yellows; the overview
 // ruler colors are required fields of the SearchAddon decorations API).
-const TERMINAL_SEARCH_DECORATIONS = {
-  matchBackground: "#5a4a00",
-  matchOverviewRuler: "#d29922",
-  activeMatchBackground: "#9e6a03",
-  activeMatchColorOverviewRuler: "#f0c674",
+// Colours live in web/search-overlay.js; this fallback only covers a stale
+// cached copy of that file.
+const TERMINAL_SEARCH_DECORATIONS = window.SearchOverlay
+  ?.SEARCH_DECORATIONS || {
+  matchBackground: "#3d3214",
+  matchOverviewRuler: "#9e6a03",
+  activeMatchBackground: "#b35c00",
+  activeMatchColorOverviewRuler: "#ffd33d",
 };
 const TERMINAL_PADDING_X = 16;
 const TERMINAL_PADDING_Y = 16;
@@ -112,6 +119,9 @@ const FONT_METRIC_WAIT_MS = 350;
 const DESKTOP_MAX_TERMINAL_COLS = 240;
 const DESKTOP_MAX_TERMINAL_ROWS = 60;
 const DIRECTORY_DRAFT_LOCK_MS = 800;
+// /api/terminals telemetry poll cadence (see startTelemetryRefreshLoop).
+const TELEMETRY_VISIBLE_POLL_MS = 5000;
+const TELEMETRY_HIDDEN_POLL_MS = 30000;
 // Quick-open (Ctrl+P) file-tree cache TTL — the git branch cache never
 // expires (branch switches invalidate it explicitly), but the tree fetch
 // walks the live filesystem, so it is re-fetched after this window.
@@ -350,6 +360,22 @@ const normalizeWorkspacePorts = (ports) => {
   ].sort((left, right) => left - right);
 };
 
+// Agent attention (OSC notifications): tab-dot labels and the window inside
+// which an agent's own "done" notification is folded into DeckTerm's
+// completion alert for the same moment.
+const ATTENTION_KIND_LABELS = Object.freeze({
+  "needs-input": "Needs your input",
+  done: "Finished",
+  error: "Error",
+  info: "Notification",
+});
+const ATTENTION_ALERT_DEDUPE_MS = 8000;
+
+// One-line "what it does / when it helps" text per action, shared with the
+// tooltips, Help modal and command palette (web/feature-guide.js).
+const describeFeature = (actionId) =>
+  window.FeatureGuide?.describeAction?.(actionId) || "";
+
 const ACTION_BUTTON_CONFIG = Object.freeze({
   files: Object.freeze({
     label: "Files",
@@ -359,6 +385,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-files-btn",
     toolsId: "tools-sheet-files",
     desktopTone: "primary",
+    description: describeFeature("files"),
   }),
   git: Object.freeze({
     label: "Git",
@@ -368,6 +395,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-git-btn",
     toolsId: "tools-sheet-git",
     desktopTone: "primary",
+    description: describeFeature("git"),
   }),
   palette: Object.freeze({
     label: "Palette",
@@ -376,6 +404,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     desktopId: "command-palette-trigger",
     toolsId: "tools-sheet-palette",
     desktopTone: "secondary",
+    description: describeFeature("palette"),
   }),
   tasks: Object.freeze({
     label: "Tasks",
@@ -383,6 +412,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "tasks",
     toolsId: "tools-sheet-tasks",
     desktopTone: "secondary",
+    description: describeFeature("tasks"),
   }),
   setup: Object.freeze({
     label: "Setup",
@@ -390,6 +420,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "setup",
     toolsId: "tools-sheet-setup",
     desktopTone: "secondary",
+    description: describeFeature("setup"),
   }),
   settings: Object.freeze({
     label: "Settings",
@@ -397,6 +428,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "settings",
     toolsId: "tools-sheet-settings",
     desktopTone: "secondary",
+    description: describeFeature("settings"),
   }),
   clipboard: Object.freeze({
     label: "Clipboard",
@@ -404,6 +436,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "clipboard",
     toolsId: "tools-sheet-clipboard",
     desktopTone: "secondary",
+    description: describeFeature("clipboard"),
   }),
   "toggle-extra-keys": Object.freeze({
     label: "Extra Keys",
@@ -411,6 +444,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "toggle-extra-keys",
     toolsId: "tools-sheet-extra-keys",
     desktopTone: "secondary",
+    description: describeFeature("toggle-extra-keys"),
   }),
   "wrap-lines": Object.freeze({
     label: "Wrap",
@@ -418,6 +452,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "wrap-lines",
     toolsId: "tools-sheet-wrap",
     desktopTone: "secondary",
+    description: describeFeature("wrap-lines"),
   }),
   "dock-sessions": Object.freeze({
     label: "Dock",
@@ -425,6 +460,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "dock-sessions",
     toolsId: "tools-sheet-dock-sessions",
     desktopTone: "secondary",
+    description: describeFeature("dock-sessions"),
   }),
   fullscreen: Object.freeze({
     label: "Fullscreen",
@@ -432,6 +468,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "fullscreen",
     toolsId: "tools-sheet-fullscreen",
     desktopTone: "secondary",
+    description: describeFeature("fullscreen"),
   }),
   help: Object.freeze({
     label: "Help",
@@ -439,6 +476,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "help",
     toolsId: "tools-sheet-help",
     desktopTone: "secondary",
+    description: describeFeature("help"),
   }),
   "linked-view": Object.freeze({
     label: "Linked View",
@@ -446,13 +484,14 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "linked-view",
     toolsId: "tools-sheet-linked-view",
     desktopTone: "secondary",
-    description: "Open another synchronized view of this tmux session",
+    description: describeFeature("linked-view"),
   }),
   "font-size": Object.freeze({
     label: "Font size",
     icon: "type",
     action: "font-size",
     kind: "stepper",
+    description: describeFeature("font-size"),
   }),
   paste: Object.freeze({
     label: "Paste",
@@ -461,6 +500,16 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     mobileId: "mobile-paste-btn",
     toolsId: "tools-sheet-paste",
     desktopTone: "secondary",
+    description: describeFeature("paste"),
+  }),
+  compose: Object.freeze({
+    label: "Compose",
+    icon: "message-square-text",
+    action: "compose",
+    mobileId: "mobile-compose-btn",
+    toolsId: "tools-sheet-compose",
+    desktopTone: "secondary",
+    description: describeFeature("compose"),
   }),
   copy: Object.freeze({
     label: "Copy",
@@ -468,6 +517,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     action: "copy",
     toolsId: "tools-sheet-copy",
     desktopTone: "secondary",
+    description: describeFeature("copy"),
   }),
   more: Object.freeze({
     label: "More",
@@ -476,6 +526,7 @@ const ACTION_BUTTON_CONFIG = Object.freeze({
     desktopId: "desktop-more-btn",
     mobileId: "mobile-more-btn",
     desktopTone: "secondary",
+    description: describeFeature("more"),
   }),
 });
 
@@ -503,6 +554,12 @@ class ReconnectingWebSocket {
     this.reconnectGeneration = 0;
     this.openedOnce = false;
     this.awaitingReconnectReady = false;
+    // Input typed while the transport is connecting/reconnecting is held here
+    // (bounded: 8 KB / 15 s) and flushed in order once the connection is
+    // ready, instead of being silently dropped. Never replayed after an
+    // intentional close or after the terminal ended.
+    this.inputQueue = window.InputQueue ? new window.InputQueue() : null;
+    this.inputQueueTimer = null;
     this.connect();
   }
 
@@ -537,6 +594,11 @@ class ReconnectingWebSocket {
       if (!isReconnectTransport && this.isCurrentSocket(socket)) {
         this.markConnectionReady(false, socket);
       }
+      // Deliver input queued while connecting right after open. On a
+      // reconnect this lands during the server's replay window, exactly
+      // like input typed there always has, and never waits on a `ready`
+      // that might not come.
+      this.flushQueuedInput(socket);
     };
     socket.onmessage = (e) => {
       if (!this.isCurrentSocket(socket)) return;
@@ -576,6 +638,7 @@ class ReconnectingWebSocket {
         if (data.type === "exit") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("exited", data.code);
           return;
@@ -583,6 +646,7 @@ class ReconnectingWebSocket {
         if (data.type === "terminal_dead") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("dead");
           return;
@@ -590,6 +654,7 @@ class ReconnectingWebSocket {
         if (data.type === "session_handoff") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.stopHeartbeat(socket);
           this.callbacks.onStatusChange("taken_over", data);
           socket.close();
@@ -628,6 +693,7 @@ class ReconnectingWebSocket {
     }
     if (this.retryCount >= this.maxRetries) {
       this.awaitingReconnectReady = false;
+      this.discardQueuedInput({ notify: true });
       this.callbacks.onStatusChange("failed");
       return;
     }
@@ -666,12 +732,14 @@ class ReconnectingWebSocket {
         if (outcome === "gone") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("dead");
           return;
         }
         if (outcome === "blocked") {
           this.intentionallyClosed = true;
           this.awaitingReconnectReady = false;
+          this.discardQueuedInput({ notify: true });
           this.callbacks.onStatusChange("setup_required");
           return;
         }
@@ -762,8 +830,79 @@ class ReconnectingWebSocket {
     return false;
   }
 
+  // True when input would go straight out: socket open, nothing queued.
+  isReadyForInput() {
+    return (
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(this.inputQueue && this.inputQueue.length > 0)
+    );
+  }
+
+  // Send terminal input, queueing it while the transport is not ready. Input
+  // already queued keeps its place: new input goes behind it until the flush,
+  // so keystrokes never reorder. Returns true when the input was sent or
+  // queued, false when it was refused (closed or ended terminal).
+  sendInput(data) {
+    if (typeof data !== "string" || !data) return false;
+    const queue = this.inputQueue;
+    const canSendNow =
+      this.ws?.readyState === WebSocket.OPEN &&
+      !(queue && queue.length > 0);
+    if (canSendNow || !queue) {
+      return this.send(JSON.stringify({ type: "input", data }));
+    }
+    if (this.intentionallyClosed) return false;
+    const dropped = queue.push(data);
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    this.scheduleQueuedInputExpiry();
+    return true;
+  }
+
+  flushQueuedInput(socket = this.ws) {
+    const queue = this.inputQueue;
+    if (!queue || queue.length === 0) return;
+    if (
+      !this.isCurrentSocket(socket) ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    this.clearQueuedInputExpiry();
+    const { items, dropped } = queue.drain();
+    if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+    for (const data of items) {
+      socket.send(JSON.stringify({ type: "input", data }));
+    }
+  }
+
+  discardQueuedInput({ notify = false } = {}) {
+    this.clearQueuedInputExpiry();
+    const discarded = this.inputQueue?.clear() || 0;
+    if (notify && discarded > 0) this.callbacks.onInputDropped?.(discarded);
+    return discarded;
+  }
+
+  scheduleQueuedInputExpiry() {
+    if (this.inputQueueTimer) return;
+    const waitMs = this.inputQueue?.msUntilNextExpiry();
+    if (waitMs === null || waitMs === undefined) return;
+    this.inputQueueTimer = setTimeout(() => {
+      this.inputQueueTimer = null;
+      const dropped = this.inputQueue?.prune() || 0;
+      if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
+      this.scheduleQueuedInputExpiry();
+    }, waitMs + 50);
+  }
+
+  clearQueuedInputExpiry() {
+    clearTimeout(this.inputQueueTimer);
+    this.inputQueueTimer = null;
+  }
+
   close() {
     this.intentionallyClosed = true;
+    // The user closed this terminal: never replay what was typed into it.
+    this.discardQueuedInput();
     this.stopHeartbeat();
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
@@ -2140,6 +2279,12 @@ class ExtraKeysManager {
     const row2 = document.querySelector(".extra-keys-row-2");
 
     let touchedKey = null;
+    // touchstart is preventDefault-ed (keeps focus in the terminal so the
+    // on-screen keyboard stays up), which also blocks native scrolling of
+    // the key rows. Swipes are therefore scrolled by hand: a horizontal move
+    // past EK_SWIPE_SLOP_PX turns the touch into a row scroll, not a key.
+    const EK_SWIPE_SLOP_PX = 8;
+    let swipe = null;
 
     extraKeys.addEventListener(
       "touchstart",
@@ -2153,7 +2298,33 @@ class ExtraKeysManager {
             btn.dataset.key ||
             (btn.id === "extra-keys-toggle" ? "TOGGLE" : null);
           dbg("[ExtraKeys] touchedKey set to:", touchedKey);
+          const row = btn.closest(".extra-keys-row");
+          const touch = e.touches?.[0];
+          swipe =
+            row && touch
+              ? {
+                  row,
+                  startX: touch.clientX,
+                  startScrollLeft: row.scrollLeft,
+                  active: false,
+                }
+              : null;
         }
+      },
+      { passive: false, capture: true },
+    );
+
+    extraKeys.addEventListener(
+      "touchmove",
+      (e) => {
+        const touch = e.touches?.[0];
+        if (!swipe || !touch) return;
+        const dx = touch.clientX - swipe.startX;
+        if (!swipe.active && Math.abs(dx) < EK_SWIPE_SLOP_PX) return;
+        e.preventDefault();
+        swipe.active = true;
+        touchedKey = null;
+        swipe.row.scrollLeft = swipe.startScrollLeft - dx;
       },
       { passive: false, capture: true },
     );
@@ -2164,6 +2335,7 @@ class ExtraKeysManager {
         dbg("[ExtraKeys] touchend, touchedKey:", touchedKey);
         e.preventDefault();
         e.stopImmediatePropagation();
+        swipe = null;
         if (touchedKey) {
           if (touchedKey === "TOGGLE") {
             this.setExtraKeysRow2Collapsed(!row2.classList.contains("hidden"));
@@ -2203,27 +2375,33 @@ class ExtraKeysManager {
     // On mobile: always visible
     this.updateVisibility();
 
-    // Restore the persisted secondary-row collapsed state (default: expanded).
+    // Restore the persisted secondary-row collapsed state (default: collapsed).
     // settingsStore's cache is empty until settingsReady resolves (a server
     // round-trip), so applying it synchronously here always reads the
     // fallback on a fresh browser/profile — apply now (so there's no flash
     // of the wrong state once localStorage IS warm) and re-apply once
     // settingsReady resolves in case the synchronous read missed a
     // server-persisted value.
+    // Default is collapsed (F-keys are rarely needed; one row leaves the
+    // terminal more room); an explicit expand is persisted per actor.
     this.setExtraKeysRow2Collapsed(
       Boolean(
-        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+        this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
       ),
       { persist: false },
     );
     void this.tm?.settingsReady?.then(() => {
       this.setExtraKeysRow2Collapsed(
         Boolean(
-          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", false),
+          this.tm?.settingsStore?.get("terminal.extraKeysRow2Collapsed", true),
         ),
         { persist: false },
       );
     });
+
+    this.quickRepliesEl = document.getElementById("quick-replies");
+    this.renderQuickReplies();
+    this.setupRowOverflowFade();
 
     // Setup toggle button handler
     document
@@ -2289,7 +2467,9 @@ class ExtraKeysManager {
       sequence = sequence.toUpperCase();
     }
 
-    active.ws.send(JSON.stringify({ type: "input", data: sequence }));
+    // Queued send (ReconnectingWebSocket.sendInput): a key tapped while the
+    // socket reconnects is held and flushed in order instead of dropped.
+    active.ws.sendInput(sequence);
     this.resetModifiers();
     // Snap the view back to the prompt on synthetic key input, except for
     // scrollback-navigation keys (PgUp/PgDn). Single source of truth lives in
@@ -2336,7 +2516,9 @@ class ExtraKeysManager {
     );
     btns.forEach((btn) => {
       const mod = btn.dataset.key.toLowerCase();
-      btn.classList.toggle("active", this.modifiers[mod] || false);
+      const latched = Boolean(this.modifiers[mod]);
+      btn.classList.toggle("active", latched);
+      btn.setAttribute("aria-pressed", latched ? "true" : "false");
     });
   }
 
@@ -2350,29 +2532,22 @@ class ExtraKeysManager {
     }
   }
 
-  loadVisibilityState() {
-    // Mobile respects the same persisted terminal.extraKeysVisible pref as
-    // desktop (bug: extra-keys-visibility-pref-ignored-on-mobile) — but its
-    // OWN default is visible=true (an on-screen keyboard row a mobile user
-    // can't otherwise get to), unlike the desktop schema default of hidden.
-    // Read the raw store value with that mobile-specific fallback instead of
-    // going through the schema default (false), which is desktop-oriented.
-    if (platformDetector.isMobile) {
-      return Boolean(
-        this.tm?.settingsStore?.get("terminal.extraKeysVisible", true) ?? true,
-      );
-    }
+  // Phones/tablets (platformDetector.isMobile) and desktops remember the bar
+  // separately (extra-keys-visibility.js): desktop reads
+  // terminal.extraKeysVisible (default hidden), touch reads
+  // terminal.extraKeysVisibleTouch (default visible). Neither falls back to
+  // the other's value, so a choice made on the phone never changes desktop.
+  getVisibilityDeviceClass() {
+    return platformDetector.isMobile ? "touch" : "desktop";
+  }
 
-    // On desktop, read the canonical terminal.extraKeysVisible from the store
-    // (schema default: hidden). No legacy localStorage read — migration owns it.
-    const defaults =
-      window.SettingsSchema?.defaultsOf?.(
-        window.SettingsSchema.SETTINGS_SCHEMA,
-      ) || {};
-    const fallback = Boolean(defaults["terminal.extraKeysVisible"]);
-    return Boolean(
-      this.tm?.settingsStore?.get("terminal.extraKeysVisible", fallback) ??
-      fallback,
+  loadVisibilityState() {
+    const deviceClass = this.getVisibilityDeviceClass();
+    return (
+      window.ExtraKeysVisibility?.readVisible?.(
+        this.tm?.settingsStore,
+        deviceClass,
+      ) ?? deviceClass === "touch"
     );
   }
 
@@ -2381,28 +2556,26 @@ class ExtraKeysManager {
     this.visible = Boolean(visible);
     this.updateVisibility();
     // Showing/hiding the row (and its ⋯ toggle) changes how much vertical
-    // space the terminal has. The container-height calc in
-    // handleViewportResize is otherwise only re-run on the next
-    // visualViewport resize/scroll event — trigger it now so a toggle (e.g.
-    // via the More-sheet action) reclaims/consumes the freed space
-    // synchronously, same as setExtraKeysRow2Collapsed already does.
+    // space the terminal has. Mobile tiles use pixel geometry, so the layout
+    // pass in handleViewportResize must re-run now (not on the next
+    // visualViewport event) to re-fit the terminal into the freed/consumed
+    // space, same as setExtraKeysRow2Collapsed does.
     this.tm?.handleViewportResize?.();
   }
 
   setVisible(visible) {
-    // Persist through the settings runtime/store; the side effect applies it.
-    // Both platforms route through the same terminal.extraKeysVisible pref
-    // now (bug: extra-keys-visibility-pref-ignored-on-mobile) — only the
-    // DEFAULT differs by platform (see loadVisibilityState).
-    if (this.tm?.settingsRuntime) {
-      this.tm.settingsRuntime.apply(
-        "terminal.extraKeysVisible",
-        Boolean(visible),
-      );
-      return;
-    }
-    this.applyVisibility(visible);
-    this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
+    // Persist under THIS device's key only (desktop vs touch); with a
+    // settings runtime the side effect then applies it.
+    const runtime = this.tm?.settingsRuntime || null;
+    window.ExtraKeysVisibility?.persistVisible?.(
+      {
+        runtime,
+        store: this.tm?.settingsStore,
+        deviceClass: this.getVisibilityDeviceClass(),
+      },
+      visible,
+    );
+    if (!runtime) this.applyVisibility(visible);
   }
 
   toggle() {
@@ -2421,6 +2594,7 @@ class ExtraKeysManager {
       this.extraKeysEl.classList.add("hidden");
       toggleBtn?.classList.remove("active");
     }
+    this.updateRowOverflowFades();
   }
 
   // Collapse/expand the secondary extra-keys row + sync the toggle glyph, and
@@ -2431,38 +2605,98 @@ class ExtraKeysManager {
     const toggle = document.getElementById("extra-keys-toggle");
     if (!row2) return;
     row2.classList.toggle("hidden", Boolean(collapsed));
-    if (toggle) toggle.textContent = collapsed ? "⋯" : "⋮";
+    if (toggle) {
+      const label = collapsed ? "Show function keys" : "Hide function keys";
+      toggle.textContent = collapsed ? "⋯" : "⋮";
+      toggle.title = label;
+      toggle.setAttribute("aria-label", label);
+      toggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+    this.updateRowOverflowFade(row2);
     if (persist) {
       this.tm?.settingsStore?.set(
         "terminal.extraKeysRow2Collapsed",
         Boolean(collapsed),
       );
     }
-    // The container-height calc that accounts for the extra-keys row (see
-    // handleViewportResize) is otherwise only re-run on the next
-    // visualViewport resize/scroll event. Trigger it immediately so a
-    // row-2 collapse/expand while the on-screen keyboard is already open
-    // reclaims/consumes the freed vertical space right away, not on the
-    // next keyboard toggle.
+    // Re-run the layout pass (see handleViewportResize) immediately so a
+    // row-2 collapse/expand re-fits the terminal into the freed/consumed
+    // vertical space right away, not on the next viewport event.
     this.tm?.handleViewportResize?.();
   }
 
-  // Called by viewport resize handler for mobile keyboard. Mobile no longer
-  // forces visibility here (bug: extra-keys-visibility-pref-ignored-on-mobile)
-  // — the keyboard opening only REPOSITIONS the row (handleViewportResize's
-  // own inline-style bottom offset, applied unconditionally regardless of
-  // this.visible). Whether the row shows at all is governed solely by the
-  // persisted terminal.extraKeysVisible pref now, same as desktop, so a user
-  // who explicitly hid it (via Settings or the More-sheet action) stays hidden
-  // across keyboard open/close.
-  showForKeyboard() {
-    // No-op: see comment above.
+  // Agent quick-reply chips live in the first extra-keys row, so they share
+  // its focus-preserving touch handling and the handleKey send path.
+  renderQuickReplies() {
+    const root = this.quickRepliesEl;
+    const replies = window.QuickReplies?.QUICK_REPLIES;
+    if (!root || !replies) return;
+    root.replaceChildren(
+      ...replies.map((reply) => {
+        const chip = document.createElement("span");
+        chip.className = "ek-btn ek-chip";
+        chip.dataset.key = reply.key;
+        chip.dataset.replyId = reply.id;
+        chip.setAttribute("role", "button");
+        chip.setAttribute("aria-label", reply.ariaLabel);
+        chip.textContent = reply.label;
+        return chip;
+      }),
+    );
   }
 
-  hideForKeyboard() {
-    // Visibility is owned by terminal.extraKeysVisible on every platform.
-    // A viewport resize (including applyVisibility()'s immediate layout pass)
-    // must never overwrite an explicit user preference.
+  // Show the chips while the active terminal runs an agent on a touch
+  // layout. A visibility change resizes the terminal area, so it re-runs the
+  // viewport layout pass unless the caller is that pass.
+  syncQuickReplies({ relayout = true } = {}) {
+    const root = this.quickRepliesEl;
+    const helpers = window.QuickReplies;
+    if (!root || !helpers) return;
+    const active = this.tm?.terminals?.get(this.tm.activeId);
+    const visible = helpers.shouldShowQuickReplies({
+      touchLayout: Boolean(this.tm?.isTouchLayout?.()),
+      agentName: active?.agentName ?? null,
+      agentState: active?.agentState ?? null,
+      attention: active?.attention ?? null,
+      attentionBaselineSeq: active?.quickReplyAttentionBaseline ?? null,
+    });
+    root.dataset.state = helpers.getQuickReplyState({
+      agentState: active?.agentState ?? null,
+    });
+    if (root.hidden === !visible) return;
+    root.hidden = !visible;
+    this.updateRowOverflowFade(root);
+    if (relayout) this.tm?.handleViewportResize?.();
+  }
+
+  setupRowOverflowFade() {
+    if (!this.extraKeysEl) return;
+    this.extraKeysEl.querySelectorAll(".extra-keys-row").forEach((row) => {
+      row.addEventListener("scroll", () => this.updateRowOverflowFade(row), {
+        passive: true,
+      });
+    });
+    window.addEventListener("resize", () => this.updateRowOverflowFades());
+    this.updateRowOverflowFades();
+  }
+
+  updateRowOverflowFades() {
+    this.extraKeysEl
+      ?.querySelectorAll(".extra-keys-row")
+      .forEach((row) => this.updateRowOverflowFade(row));
+  }
+
+  // Fade the row edge(s) that hide keys, as a hint that the row scrolls.
+  updateRowOverflowFade(row) {
+    const getFade = window.MobileLayout?.getRowOverflowFade;
+    if (!row || !getFade) return;
+    const fade = getFade({
+      scrollLeft: row.scrollLeft,
+      scrollWidth: row.scrollWidth,
+      clientWidth: row.clientWidth,
+    });
+    row.classList.toggle("ek-fade-start", fade.start);
+    row.classList.toggle("ek-fade-end", fade.end);
   }
 }
 
@@ -2480,7 +2714,14 @@ class StatsManager {
 
   init() {
     this.fetchStats();
-    setInterval(() => this.fetchStats(), 5000);
+    // Every 10 s while the tab is visible; a hidden tab skips the poll and
+    // refreshes as soon as it becomes visible again.
+    setInterval(() => {
+      if (!document.hidden) this.fetchStats();
+    }, 10000);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) this.fetchStats();
+    });
   }
 
   async fetchStats() {
@@ -2493,24 +2734,46 @@ class StatsManager {
   }
 
   updateUI(stats) {
-    if (this.cpuEl) {
-      this.cpuEl.textContent = `${stats.cpu.usage}%`;
-      this.cpuEl.title = `CPU: ${stats.cpu.usage}%`;
-      this.updateClass(this.cpuEl, stats.cpu.usage);
+    // Labelled chips ("CPU 4%") with exact numbers in the tooltip; the pure
+    // formatting lives in web/server-stats-format.js.
+    const describe = window.ServerStatsFormat?.describeServerStats;
+    if (!describe) {
+      this.updateUILegacy(stats);
+      return;
     }
-    if (this.ramEl) {
-      this.ramEl.textContent = `${stats.memory.percent}%`;
-      this.ramEl.title = `RAM: ${stats.memory.percent}%`;
-      this.updateClass(this.ramEl, stats.memory.percent);
-    }
-    if (this.diskEl) {
-      this.diskEl.textContent = `${stats.disk.percent}%`;
-      this.diskEl.title = `Disk: ${stats.disk.percent}%`;
-      this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+    const elements = { cpu: this.cpuEl, ram: this.ramEl, disk: this.diskEl };
+    for (const chip of describe(stats)) {
+      const el = elements[chip.id];
+      if (!el) continue;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = chip.value;
+      else el.textContent = chip.value;
+      el.title = chip.title;
+      el.setAttribute("aria-label", chip.title);
+      el.classList.toggle("warning", chip.level === "warning");
+      el.classList.toggle("danger", chip.level === "danger");
     }
   }
 
+  // Fallback for a stale cached index.html without server-stats-format.js.
+  updateUILegacy(stats) {
+    const set = (el, value, label) => {
+      if (!el) return;
+      const valueEl = el.querySelector(".stat-value");
+      if (valueEl) valueEl.textContent = `${value}%`;
+      else el.textContent = `${value}%`;
+      el.title = `${label}: ${value}%`;
+    };
+    set(this.cpuEl, stats.cpu.usage, "CPU");
+    this.updateClass(this.cpuEl, stats.cpu.usage);
+    set(this.ramEl, stats.memory.percent, "RAM");
+    this.updateClass(this.ramEl, stats.memory.percent);
+    set(this.diskEl, stats.disk.percent, "Disk");
+    this.updateClass(this.diskEl, stats.disk.percent, 80, 95);
+  }
+
   updateClass(el, value, warn = 70, danger = 90) {
+    if (!el) return;
     el.classList.remove("warning", "danger");
     if (value >= danger) el.classList.add("danger");
     else if (value >= warn) el.classList.add("warning");
@@ -2528,7 +2791,6 @@ class ClipboardManager {
     this.maxHistory = 20;
     this.maxItemSize = 200 * 1024; // 200KB
     this.panel = null;
-    this.toast = null;
     this.pendingCopy = null;
     this.lastToastTime = 0;
     this.toastDebounceMs = 2000; // 2 seconds
@@ -2546,7 +2808,6 @@ class ClipboardManager {
 
   init() {
     this.createPanel();
-    this.createToast();
   }
 
   createPanel() {
@@ -2599,22 +2860,6 @@ class ClipboardManager {
     document.getElementById("app").appendChild(this.panel);
   }
 
-  createToast() {
-    this.toast = document.createElement("div");
-    this.toast.className = "clipboard-toast hidden";
-    this.toast.innerHTML = `
-      <span class="toast-message"></span>
-      <button class="toast-copy">Copy</button>
-    `;
-    document.getElementById("app").appendChild(this.toast);
-
-    this.toast.querySelector(".toast-copy").addEventListener("click", () => {
-      if (this.pendingCopy) {
-        this.copyWithGesture(this.pendingCopy);
-      }
-    });
-  }
-
   // Handle OSC52 from terminal
   handleOsc52(data) {
     // Parse: c;<base64>
@@ -2630,11 +2875,7 @@ class ClipboardManager {
 
       // Size limit check
       if (text.length > this.maxItemSize) {
-        this.showToast(
-          "Content too large. Click to download.",
-          "download",
-          text,
-        );
+        this.showToast("Too large for the clipboard", "download", text);
         return;
       }
 
@@ -2732,7 +2973,12 @@ class ClipboardManager {
     });
   }
 
-  showToast(message, type, data = null) {
+  // Clipboard notices go through the shared toast service under one key, so
+  // a new clipboard notice replaces the previous one instead of stacking.
+  // `type` keeps the historical vocabulary: success | error | pending |
+  // download. "pending" with data offers a Copy action (the async clipboard
+  // needs a user gesture); "download" offers the oversized text as a file.
+  showToast(message, type, data = null, { timeoutMs } = {}) {
     const now = Date.now();
 
     // Debounce success toasts (2 second cooldown)
@@ -2744,23 +2990,68 @@ class ClipboardManager {
       this.lastToastTime = now;
     }
 
-    const toast = this.toast;
-    const msgEl = toast.querySelector(".toast-message");
-    const copyBtn = toast.querySelector(".toast-copy");
-
-    msgEl.textContent = message;
-    toast.className = `clipboard-toast ${type}`;
-    copyBtn.style.display = type === "pending" ? "inline-block" : "none";
-
-    toast.classList.remove("hidden");
-
-    if (type === "success" || type === "error") {
-      setTimeout(() => toast.classList.add("hidden"), 2000);
+    const actions = [];
+    let kind = "info";
+    if (type === "success") kind = "success";
+    else if (type === "error") kind = "error";
+    else if (type === "download") {
+      kind = "warning";
+      if (typeof data === "string") {
+        actions.push({
+          label: "Download",
+          primary: true,
+          run: () => this.downloadText(data),
+        });
+      }
+    } else if (type === "pending") {
+      kind = data ? "info" : "warning";
+      if (data && this.pendingCopy) {
+        actions.push({
+          label: "Copy",
+          primary: true,
+          // copyWithGesture's result replaces this toast via the same key.
+          dismiss: false,
+          run: () => {
+            if (this.pendingCopy) this.copyWithGesture(this.pendingCopy);
+          },
+        });
+      }
     }
+
+    window.ToastService?.show({
+      key: "clipboard",
+      className: "clipboard-toast",
+      kind,
+      title: message,
+      actions,
+      timeoutMs:
+        timeoutMs !== undefined
+          ? timeoutMs
+          : type === "success"
+            ? 2500
+            : undefined,
+    });
   }
 
   hideToast() {
-    this.toast.classList.add("hidden");
+    window.ToastService?.dismiss("clipboard");
+  }
+
+  downloadText(text) {
+    try {
+      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `deckterm-clipboard-${Date.now()}.txt`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      console.error("Clipboard download failed:", err);
+      this.showToast("Download failed", "error");
+    }
   }
 
   showPanel() {
@@ -2964,7 +3255,7 @@ class ClipboardManager {
   }
 
   async handleImagePaste(blob, terminalWs, terminal = null, inputState = null) {
-    this.showToast("Uploading image...", "pending");
+    this.showToast("Uploading image…", "info", null, { timeoutMs: null });
 
     try {
       const formData = new FormData();
@@ -3056,9 +3347,9 @@ class ClipboardManager {
       }
       return;
     }
-    if (terminalWs && terminalWs.readyState === WebSocket.OPEN) {
-      terminalWs.send(JSON.stringify({ type: "input", data: text }));
-    }
+    // No xterm instance to paste through: send the raw text through the
+    // queued input path so a paste during a reconnect is not lost.
+    terminalWs?.sendInput?.(text);
   }
 
   escapeHtml(text) {
@@ -3130,37 +3421,60 @@ class GitManager {
     this.panel = document.createElement("div");
     this.panel.id = "git-panel";
     this.panel.className = "side-panel hidden";
-    // Static HTML template - no user input, safe for innerHTML
+    const syncButtons = gitSyncActions(null)
+      .map(
+        (a) =>
+          `<button type="button" id="git-${a.op}-btn" class="git-header-btn git-sync-btn git-header-inline" data-git-op="${a.op}" title="${a.title}" aria-label="${a.label}"><i data-lucide="${a.icon}">${a.glyph}</i></button>`,
+      )
+      .join("");
+    const overflowItems = gitSyncActions(null)
+      .map(
+        (a) =>
+          `<button type="button" class="git-overflow-item" role="menuitem" data-git-op="${a.op}" title="${a.title}"><i data-lucide="${a.icon}">${a.glyph}</i><span class="git-overflow-label">${a.label}</span></button>`,
+      )
+      .join("");
+    // Static HTML template - no user input, safe for innerHTML. The header
+    // sits above both columns so its Close control is always pinned at the
+    // top right; Pull/Push/Fetch/Stash show inline when the panel is wide and
+    // move into the overflow menu when it is narrow (container query in
+    // styles.css). Icons are lucide placeholders whose text is the fallback.
     this.panel.innerHTML = `
+      <div class="panel-header git-panel-header">
+        <h3>Git</h3>
+        <span id="git-branch" class="git-branch clickable" role="button" tabindex="0" title="Click to switch branch"></span>
+        <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
+        <div class="git-header-actions">
+          ${syncButtons}
+          <button type="button" class="panel-refresh git-header-btn" title="Refresh (r)" aria-label="Refresh"><i data-lucide="refresh-cw">&#x21bb;</i></button>
+          <div class="git-overflow">
+            <button type="button" class="git-header-btn git-overflow-btn" title="More actions" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" aria-controls="git-overflow-menu"><i data-lucide="ellipsis">&#x22ef;</i></button>
+            <div id="git-overflow-menu" class="git-overflow-menu hidden" role="menu" aria-label="Git actions">${overflowItems}</div>
+          </div>
+        </div>
+        <button type="button" class="panel-close git-header-btn" title="Close (Esc)" aria-label="Close panel"><i data-lucide="x">&times;</i></button>
+      </div>
       <div class="git-panel-layout">
         <div class="git-left-panel">
-          <div class="panel-header">
-            <h3>Git</h3>
-            <span id="git-branch" class="git-branch clickable" title="Click to switch branch"></span>
-            <span id="git-sync-label" class="git-sync-label" title="Commits behind↓ / ahead↑"></span>
-            <button id="git-pull-btn" class="panel-refresh git-sync-btn" title="Pull">↓</button>
-            <button id="git-push-btn" class="panel-refresh git-sync-btn" title="Push">↑</button>
-            <button id="git-fetch-btn" class="panel-refresh git-sync-btn" title="Fetch">⇣</button>
-            <button id="git-stash-btn" class="panel-refresh git-sync-btn" title="Stash changes">≡</button>
-            <button class="panel-refresh" title="Refresh (r)">&#x21bb;</button>
-            <button class="panel-close" title="Close (Esc)">&times;</button>
-          </div>
           <div id="git-files" class="git-files"></div>
           <div id="git-stashes" class="git-stashes"></div>
           <div id="git-branches" class="git-branches hidden"></div>
         </div>
         <div class="git-right-panel">
           <div class="git-diff-header">
-            <span id="git-diff-title">Diff</span>
-            <div class="git-right-views">
-              <button class="git-right-view active" data-view="diff" title="Diff of the selected file">Diff</button>
-              <button class="git-right-view" data-view="timeline" title="Commit history of the selected file">Timeline</button>
-            </div>
-            <div class="git-diff-modes">
-              <button class="git-diff-mode active" data-mode="working">Working Tree</button>
-              <button class="git-diff-mode" data-mode="staged">Staged</button>
-              <button class="git-diff-mode" data-mode="commit">Commit</button>
-              <button id="git-diff-layout" class="git-diff-mode git-diff-layout" title="Toggle split / inline diff">⫿⫿</button>
+            <span id="git-diff-title" class="git-diff-title">Diff</span>
+            <div class="git-diff-controls">
+              <div class="git-right-views git-segmented" role="group" aria-label="Right pane">
+                <button type="button" class="git-right-view active" data-view="diff" aria-pressed="true" title="Diff of the selected file">Diff</button>
+                <button type="button" class="git-right-view" data-view="timeline" aria-pressed="false" title="Commit history of the selected file">Timeline</button>
+              </div>
+              <div class="git-diff-modes">
+                <div class="git-segmented" role="group" aria-label="Compare">
+                  <button type="button" class="git-diff-mode active" data-mode="working" aria-pressed="true">Working Tree</button>
+                  <button type="button" class="git-diff-mode" data-mode="staged" aria-pressed="false">Staged</button>
+                  <button type="button" class="git-diff-mode" data-mode="commit" aria-pressed="false">Commit</button>
+                </div>
+                <button type="button" id="git-diff-layout" class="git-header-btn git-diff-layout" title="Toggle split / inline diff" aria-label="Toggle split / inline diff"><i data-lucide="columns-2">&#x2aff;</i></button>
+              </div>
             </div>
           </div>
           <div id="git-timeline" class="git-timeline hidden"></div>
@@ -3199,21 +3513,40 @@ class GitManager {
     this.panel
       .querySelector("#git-commit-btn")
       .addEventListener("click", () => this.commit());
+    const branchEl = this.panel.querySelector("#git-branch");
+    branchEl.addEventListener("click", () => this.toggleBranches());
+    branchEl.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.toggleBranches();
+    });
+    // Pull/Push/Fetch/Stash: the inline header buttons and the overflow menu
+    // items share one data-git-op dispatcher.
+    this.panel.querySelectorAll("[data-git-op]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        this.closeOverflowMenu();
+        this.runHeaderAction(btn.dataset.gitOp);
+      });
+    });
     this.panel
-      .querySelector("#git-branch")
-      .addEventListener("click", () => this.toggleBranches());
-    this.panel
-      .querySelector("#git-pull-btn")
-      .addEventListener("click", () => this.syncAction("pull"));
-    this.panel
-      .querySelector("#git-push-btn")
-      .addEventListener("click", () => this.syncAction("push"));
-    this.panel
-      .querySelector("#git-fetch-btn")
-      .addEventListener("click", () => this.syncAction("fetch"));
-    this.panel
-      .querySelector("#git-stash-btn")
-      .addEventListener("click", () => this.stashPush());
+      .querySelector(".git-overflow-btn")
+      .addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.toggleOverflowMenu();
+      });
+    document.addEventListener("pointerdown", (e) => {
+      if (!this.isOverflowMenuOpen()) return;
+      if (e.target.closest?.(".git-overflow")) return;
+      this.closeOverflowMenu();
+    });
+    // Not-a-repository empty state: "Choose folder" opens the working
+    // directory picker (delegated — the state is re-rendered on refresh).
+    this.panel.querySelector("#git-files").addEventListener("click", (e) => {
+      if (e.target.closest?.('[data-git-action="choose-folder"]')) {
+        this.chooseWorkingDirectory();
+      }
+    });
     this.panel.querySelector("#git-amend").addEventListener("change", (e) => {
       const messageEl = this.panel.querySelector("#git-message");
       if (e.target.checked && !messageEl.value.trim()) {
@@ -3239,6 +3572,57 @@ class GitManager {
     this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
       btn.addEventListener("click", () => this.setRightView(btn.dataset.view));
     });
+    // The panel is built after the page-level lucide pass; hydrate its icon
+    // placeholders now (their text content stays as the fallback otherwise).
+    window.lucide?.createIcons?.();
+  }
+
+  runHeaderAction(op) {
+    if (op === "stash") return this.stashPush();
+    if (op === "pull" || op === "push" || op === "fetch") {
+      return this.syncAction(op);
+    }
+    return undefined;
+  }
+
+  isOverflowMenuOpen() {
+    const menu = this.panel?.querySelector("#git-overflow-menu");
+    return Boolean(menu && !menu.classList.contains("hidden"));
+  }
+
+  toggleOverflowMenu(force) {
+    const menu = this.panel?.querySelector("#git-overflow-menu");
+    const btn = this.panel?.querySelector(".git-overflow-btn");
+    if (!menu || !btn) return;
+    const open =
+      force === undefined ? menu.classList.contains("hidden") : force;
+    menu.classList.toggle("hidden", !open);
+    btn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) menu.querySelector(".git-overflow-item:not(:disabled)")?.focus();
+  }
+
+  closeOverflowMenu() {
+    if (this.isOverflowMenuOpen()) this.toggleOverflowMenu(false);
+  }
+
+  // Opens the working-directory picker from the not-a-repository state. The
+  // picker commits the chosen folder through commitWorkingDirectory(), which
+  // refreshes this panel against the new cwd.
+  chooseWorkingDirectory() {
+    const tm = window.terminalManager;
+    if (tm?.openDirPicker) {
+      void tm.openDirPicker();
+      return;
+    }
+    document.getElementById("directory")?.focus();
+  }
+
+  // True when the panel renders as one column (phones / narrow windows): the
+  // files, diff and history then share a single scroll container.
+  isSingleColumnLayout() {
+    const layout = this.panel?.querySelector(".git-panel-layout");
+    if (!layout || typeof getComputedStyle !== "function") return false;
+    return getComputedStyle(layout).display === "block";
   }
 
   // Switches the right pane between the Diff editor and the per-file Timeline.
@@ -3259,7 +3643,9 @@ class GitManager {
   updateRightViewUI() {
     const view = this.state.rightView || "diff";
     this.panel.querySelectorAll(".git-right-view").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.view === view);
+      const active = btn.dataset.view === view;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
     });
     const isTimeline = view === "timeline";
     const timelineEl = this.panel.querySelector("#git-timeline");
@@ -3286,6 +3672,39 @@ class GitManager {
           e.target.blur();
           return;
         }
+        return;
+      }
+
+      // Overflow menu: Escape closes it (not the panel), arrows move focus.
+      if (this.isOverflowMenuOpen()) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          this.closeOverflowMenu();
+          this.panel.querySelector(".git-overflow-btn")?.focus();
+          return;
+        }
+        if (e.target.closest?.("#git-overflow-menu")) {
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault();
+            const items = [
+              ...this.panel.querySelectorAll(
+                ".git-overflow-item:not(:disabled)",
+              ),
+            ];
+            const at = items.indexOf(document.activeElement);
+            const step = e.key === "ArrowDown" ? 1 : -1;
+            items[(at + step + items.length) % items.length]?.focus();
+          }
+          return;
+        }
+      }
+
+      // Enter/Space on a focused button keep their native activation; the
+      // panel shortcuts below would otherwise swallow them.
+      if (
+        (e.key === "Enter" || e.key === " ") &&
+        e.target.closest?.("button, [role='button'], a[href]")
+      ) {
         return;
       }
 
@@ -3332,52 +3751,66 @@ class GitManager {
     });
   }
 
-  navigateFiles(delta) {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    if (fileElements.length === 0) return;
+  // Selection is keyed by path: the tree renders folders before files and
+  // sorts each level, so a row's position never matches getAllFiles() order.
+  // data-index is only the row's position in the rendered list.
+  fileRows() {
+    return [...this.panel.querySelectorAll(".git-file")];
+  }
 
-    this.state.selectedIndex = Math.max(
-      0,
-      Math.min(fileElements.length - 1, this.state.selectedIndex + delta),
+  findFile(path) {
+    if (!path) return null;
+    return this.getAllFiles().find((f) => f.path === path) || null;
+  }
+
+  navigateFiles(delta) {
+    const rows = this.fileRows();
+    if (rows.length === 0) return;
+    let at = rows.findIndex(
+      (el) => el.dataset.path === this.state.selectedPath,
     );
+    if (at === -1) at = Math.min(this.state.selectedIndex, rows.length - 1);
+    const next = Math.max(0, Math.min(rows.length - 1, at + delta));
+    this.state.selectedIndex = next;
+    this.state.selectedPath = rows[next].dataset.path;
     this.highlightSelectedFile();
+    // Keyboard users who focused a row keep focus on the selection.
+    if (document.activeElement?.classList?.contains("git-file")) {
+      rows[next].focus();
+    }
   }
 
   highlightSelectedFile() {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    fileElements.forEach((el) => {
-      const elIndex = Number(el.dataset.index || -1);
-      const isSelected =
-        elIndex === this.state.selectedIndex ||
-        el.dataset.path === this.state.selectedPath;
-      el.classList.toggle("selected", isSelected);
-    });
-
-    // Scroll into view
-    const selected = this.panel.querySelector(".git-file.selected");
-    if (selected) {
-      this.state.selectedPath =
-        selected.dataset.path || this.state.selectedPath;
-      this.state.selectedIndex = Number(
-        selected.dataset.index || this.state.selectedIndex,
+    const rows = this.fileRows();
+    let selectedAt = rows.findIndex(
+      (el) => el.dataset.path === this.state.selectedPath,
+    );
+    if (selectedAt === -1 && rows.length > 0) {
+      selectedAt = Math.min(
+        Math.max(0, this.state.selectedIndex),
+        rows.length - 1,
       );
+    }
+    rows.forEach((el, i) => el.classList.toggle("selected", i === selectedAt));
+
+    const selected = rows[selectedAt];
+    if (selected) {
+      this.state.selectedPath = selected.dataset.path;
+      this.state.selectedIndex = selectedAt;
       selected.scrollIntoView({ block: "nearest", behavior: "smooth" });
     }
   }
 
   stageSelectedFile() {
-    const files = this.getAllFiles();
-    const file = files[this.state.selectedIndex];
+    const file = this.findFile(this.state.selectedPath);
     if (file) {
       this.toggleStage(file.path, file.staged);
     }
   }
 
   showSelectedDiff() {
-    const fileElements = this.panel.querySelectorAll(".git-file");
-    const selectedFile = fileElements[this.state.selectedIndex];
-    if (selectedFile) {
-      const path = selectedFile.dataset.path;
+    const path = this.state.selectedPath;
+    if (path && this.fileRows().some((el) => el.dataset.path === path)) {
       this.showDiff(path);
     }
   }
@@ -3419,7 +3852,9 @@ class GitManager {
 
   updateDiffModeUI() {
     this.panel.querySelectorAll(".git-diff-mode").forEach((btn) => {
-      btn.classList.toggle("active", btn.dataset.mode === this.state.diffMode);
+      const active = btn.dataset.mode === this.state.diffMode;
+      btn.classList.toggle("active", active);
+      btn.setAttribute("aria-pressed", active ? "true" : "false");
     });
   }
 
@@ -3521,6 +3956,7 @@ class GitManager {
   }
 
   hide() {
+    this.closeOverflowMenu();
     this.panel.classList.add("hidden");
     // In windowed mode the panel lives inside a SurfaceWindow that must
     // close with it (the in-panel × and Esc call hide() directly).
@@ -3612,13 +4048,12 @@ class GitManager {
       if (stale()) return;
 
       if (statusData.error) {
-        this.state.error = statusData.error;
-        this.panel.querySelector("#git-branch").textContent = "not a repo";
-        this.panel.querySelector("#git-files").innerHTML =
-          `<p class="error">${this.escapeHtml(statusData.error)}</p>`;
+        this.renderStatusFailure(statusData, cwd);
         return;
       }
       this.state.error = null;
+      this.state.notRepository = false;
+      this.panel.classList.remove("git-no-repo");
 
       const prevSelectedPath = this.state.selectedPath;
       const prevDiffMode = this.state.diffMode;
@@ -3636,6 +4071,10 @@ class GitManager {
       this.panel.querySelector("#git-branch").textContent = statusData.branch;
       this.renderSyncState();
       this.renderFiles();
+      // The status store emitted onChange BEFORE this method updated state,
+      // so the IDE Source Control view may have rendered the previous cwd's
+      // result; re-render it from the settled state (deduped by signature).
+      tm?.scmView?.render?.();
 
       if (prevSelectedPath) {
         const allFiles = this.getAllFiles();
@@ -3643,7 +4082,6 @@ class GitManager {
           (f) => f.path === prevSelectedPath,
         );
         if (nextIndex !== -1) {
-          this.state.selectedIndex = nextIndex;
           this.state.selectedPath = prevSelectedPath;
           this.highlightSelectedFile();
           this.state.diffMode = prevDiffMode;
@@ -3687,6 +4125,41 @@ class GitManager {
     } finally {
       if (!stale()) this.state.loading = false;
     }
+  }
+
+  // The status probe failed. A folder outside any repository is a normal
+  // state (calm empty state + "Choose folder"); anything else is a real error.
+  // Either way the previous repository's files, history, stashes and branch
+  // must not linger, and the branch slot stays empty instead of "not …".
+  renderStatusFailure(statusData, cwd) {
+    const notRepository = isNotRepositoryStatus(statusData);
+    this.state.error = statusData.error;
+    this.state.notRepository = notRepository;
+    this.state.files = { merge: [], staged: [], changes: [], untracked: [] };
+    this.state.commits = [];
+    this.state.stashes = [];
+    this.state.sync = { upstream: null, ahead: 0, behind: 0 };
+    this.state.branches.current = "";
+    this.state.selectedPath = null;
+    this.state.selectedIndex = 0;
+    this.closeOverflowMenu();
+    this.panel.classList.toggle("git-no-repo", notRepository);
+    this.panel.querySelector("#git-branch").textContent = "";
+    this.panel.querySelector("#git-branches")?.classList.add("hidden");
+    this.renderSyncState();
+    this.renderStashes();
+    this.renderHistory();
+    const diffTitle = this.panel.querySelector("#git-diff-title");
+    if (diffTitle) diffTitle.textContent = "Diff";
+    const diffEl = this.panel.querySelector("#git-diff");
+    if (diffEl) diffEl.innerHTML = "";
+    this._mergeView?.destroy?.();
+    this._mergeView = null;
+    this.panel.querySelector("#git-files").innerHTML = notRepository
+      ? notRepositoryStateHtml(cwd, (t) => this.escapeHtml(t))
+      : `<p class="error">${this.escapeHtml(formatGitError(statusData, statusData.error))}</p>`;
+    window.lucide?.createIcons?.();
+    window.terminalManager?.scmView?.render?.();
   }
 
   renderStatus(files) {
@@ -3759,9 +4232,10 @@ class GitManager {
         key: "merge",
         label: "Merge Conflicts",
         icon: "!",
+        hideWhenEmpty: true,
         files: this.state.files.merge || [],
         groupAction: null,
-        groupActionGlyph: "",
+        groupActionIcon: "",
         groupActionTitle: "",
       },
       {
@@ -3770,7 +4244,7 @@ class GitManager {
         icon: "\u2713",
         files: this.state.files.staged,
         groupAction: "unstage-all",
-        groupActionGlyph: "\u2212",
+        groupActionIcon: "minus",
         groupActionTitle: "Unstage all",
       },
       {
@@ -3779,7 +4253,7 @@ class GitManager {
         icon: "\u2022",
         files: this.state.files.changes,
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
       {
@@ -3788,39 +4262,50 @@ class GitManager {
         icon: "\u25cb",
         files: this.state.files.untracked || [],
         groupAction: "stage-all",
-        groupActionGlyph: "+",
+        groupActionIcon: "plus",
         groupActionTitle: "Stage all",
       },
     ];
 
+    // Groups with files render first (in their usual order); empty groups
+    // follow as one compact header line each. Row data-index is the row's
+    // position in render order; file lookups go by path (see findFile()).
     let html = "";
-    let globalIndex = 0;
-
-    sections.forEach((section) => {
+    let rowIndex = 0;
+    orderFileSections(sections).forEach((section) => {
       const files = section.files;
-      // The merge section is conflict-only visibility: hidden entirely when
-      // there is no conflict (unlike the three permanent groups).
-      if (section.key === "merge" && files.length === 0) return;
+      const countLabel = `${files.length} ${files.length === 1 ? "file" : "files"}`;
+      if (section.empty) {
+        html += `
+        <div class="git-file-group git-file-group-${section.key} is-empty">
+          <div class="git-file-group-header">
+            <span class="git-file-group-label">${section.label}</span>
+            <span class="git-file-group-count" aria-label="${countLabel}">0</span>
+          </div>
+        </div>
+      `;
+        return;
+      }
       const { html: treeHtml, nextIndex } = this.renderSectionTree(
         files,
         section,
-        globalIndex,
+        rowIndex,
       );
-      globalIndex = nextIndex;
+      rowIndex = nextIndex;
 
       html += `
         <div class="git-file-group git-file-group-${section.key}">
           <div class="git-file-group-header">
-            <span class="git-file-group-icon ${section.key}">${section.icon}</span>
+            <span class="git-file-group-icon ${section.key}" aria-hidden="true">${section.icon}</span>
             <span class="git-file-group-label">${section.label}</span>
-            <span class="git-file-group-count">(${files.length})</span>
+            <span class="git-file-group-count" aria-label="${countLabel}">${files.length}</span>
             ${
-              files.length > 0 && section.groupAction
-                ? `<button class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}">${section.groupActionGlyph}</button>`
+              section.groupAction
+                ? `<button type="button" class="git-group-action" data-group="${section.key}" data-group-action="${section.groupAction}" title="${section.groupActionTitle}" aria-label="${section.groupActionTitle}"><i data-lucide="${section.groupActionIcon}" aria-hidden="true"></i><span class="git-group-action-label" aria-hidden="true">${section.groupActionTitle}</span></button>`
                 : ""
             }
           </div>
-          <div class="git-file-group-items">
+          <div class="git-file-group-items" role="list" aria-label="${section.label}">
             ${treeHtml}
           </div>
         </div>
@@ -3832,18 +4317,23 @@ class GitManager {
     }
 
     container.innerHTML = html;
+    // Row and group actions are lucide placeholders; hydrate just this list.
+    try {
+      window.lucide?.createIcons?.({ root: container });
+    } catch {
+      // icons are decorative; buttons keep their aria-labels
+    }
 
-    if (!this.state.selectedPath) {
-      const firstFile = this.getAllFiles()[0];
-      if (firstFile) {
-        this.state.selectedPath = firstFile.path;
-        this.state.selectedIndex = 0;
-      }
+    // Keep the selection when its file is still listed; otherwise fall back
+    // to the first rendered row (highlightSelectedFile picks it by index).
+    if (!this.findFile(this.state.selectedPath)) {
+      this.state.selectedPath = null;
+      this.state.selectedIndex = 0;
     }
     this.highlightSelectedFile();
 
     container.querySelectorAll(".git-tree-folder").forEach((el) => {
-      el.addEventListener("click", () => {
+      const toggleFolder = () => {
         const key = el.dataset.folderKey;
         if (!key) return;
         if (this.state.collapsedFolders.has(key)) {
@@ -3852,21 +4342,36 @@ class GitManager {
           this.state.collapsedFolders.add(key);
         }
         this.renderFiles();
+        container
+          .querySelector(
+            `.git-tree-folder[data-folder-key="${CSS.escape(key)}"]`,
+          )
+          ?.focus();
+      };
+      el.addEventListener("click", toggleFolder);
+      el.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleFolder();
       });
     });
 
     // Add event listeners
     container.querySelectorAll(".git-file").forEach((el) => {
       el.addEventListener("click", (e) => {
-        const files = this.getAllFiles();
-        const file = files[parseInt(el.dataset.index, 10)];
+        const file = this.findFile(el.dataset.path);
 
-        if (e.target.classList.contains("git-file-stage")) {
+        // Action buttons hold lucide SVGs: match the button, not the target.
+        const action = e.target.closest?.(
+          ".git-file-stage, .git-file-open, .git-file-discard",
+        );
+        if (action?.classList.contains("git-file-stage")) {
           this.toggleStage(el.dataset.path, file?.staged);
           return;
         }
 
-        if (e.target.classList.contains("git-file-open")) {
+        if (action?.classList.contains("git-file-open")) {
           const cwd = (this.state.cwd || this.currentCwd || "").replace(
             /\/$/,
             "",
@@ -3877,19 +4382,26 @@ class GitManager {
           return;
         }
 
-        if (e.target.classList.contains("git-file-discard")) {
+        if (action?.classList.contains("git-file-discard")) {
           this.discardFile(file || { path: el.dataset.path });
           return;
         }
 
+        this.activateFileRow(el);
+      });
+      // Keyboard: Enter opens the row like a click; focusing a row selects
+      // it so Space (stage) and j/k continue from there.
+      el.addEventListener("keydown", (e) => {
+        if (e.target !== el || e.key !== "Enter") return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.activateFileRow(el);
+      });
+      el.addEventListener("focus", () => {
+        if (el.dataset.path === this.state.selectedPath) return;
         this.state.selectedIndex = parseInt(el.dataset.index, 10);
         this.state.selectedPath = el.dataset.path;
         this.highlightSelectedFile();
-        if (this.state.rightView === "timeline") {
-          this.showTimeline(el.dataset.path);
-        } else {
-          this.showDiff(el.dataset.path);
-        }
       });
     });
 
@@ -3908,25 +4420,55 @@ class GitManager {
     });
   }
 
+  // Select a file row and open it in the right pane (diff or timeline). On a
+  // one-column layout the diff sits below the file list, so bring it into
+  // view — otherwise a tap on a phone seems to do nothing.
+  activateFileRow(el) {
+    this.state.selectedIndex = parseInt(el.dataset.index, 10);
+    this.state.selectedPath = el.dataset.path;
+    this.highlightSelectedFile();
+    if (this.state.rightView === "timeline") {
+      this.showTimeline(el.dataset.path);
+    } else {
+      this.showDiff(el.dataset.path);
+    }
+    if (this.isSingleColumnLayout()) {
+      this.panel
+        .querySelector(".git-diff-header")
+        ?.scrollIntoView({ block: "start", behavior: "smooth" });
+    }
+  }
+
   renderSyncState() {
     const el = this.panel.querySelector("#git-sync-label");
     if (!el) return;
     const sync = this.state.sync || { ahead: 0, behind: 0, upstream: null };
     el.textContent = syncLabel(sync.ahead, sync.behind);
     // Pull only makes sense with an upstream; Push without one publishes the
-    // branch (-u origin <branch>), VS Code-style.
-    this.panel.querySelector("#git-pull-btn").disabled = !sync.upstream;
-    this.panel
-      .querySelector("#git-push-btn")
-      .setAttribute(
-        "title",
-        sync.upstream ? "Push" : "Publish branch (push -u origin)",
-      );
+    // branch (-u origin <branch>), VS Code-style. The inline buttons and the
+    // overflow menu items carry the same data-git-op.
+    for (const action of gitSyncActions(sync)) {
+      this.panel
+        .querySelectorAll(`[data-git-op="${action.op}"]`)
+        .forEach((btn) => {
+          btn.disabled = action.disabled;
+          btn.setAttribute("title", action.title);
+          if (btn.classList.contains("git-overflow-item")) {
+            const label = btn.querySelector(".git-overflow-label");
+            if (label) label.textContent = action.label;
+          } else {
+            btn.setAttribute("aria-label", action.label);
+          }
+        });
+    }
   }
 
   async syncAction(op) {
     const btn = this.panel.querySelector(`#git-${op}-btn`);
     if (btn?.disabled) return;
+    const menuItem = this.panel.querySelector(
+      `.git-overflow-item[data-git-op="${op}"]`,
+    );
     const cwd = this.state.cwd || this.currentCwd;
     const body = { cwd };
     if (op === "push" && !this.state.sync?.upstream) {
@@ -3935,6 +4477,7 @@ class GitManager {
       body.branch = this.state.branches.current;
     }
     if (btn) btn.disabled = true;
+    if (menuItem) menuItem.disabled = true;
     try {
       const res = await fetch(`/api/git/${op}`, {
         method: "POST",
@@ -3959,6 +4502,7 @@ class GitManager {
       this.showCommitStatus(`${op} failed: network error`, "error");
     } finally {
       if (btn) btn.disabled = false;
+      if (menuItem) menuItem.disabled = false;
       this.renderSyncState();
     }
   }
@@ -4194,32 +4738,10 @@ class GitManager {
     return { html: rendered.html, nextIndex: rendered.nextIndex };
   }
 
+  // Compact folders (single-child chains render as one "a/b" node) keep deep
+  // paths from eating the row width; see buildFileTree in git-scm.js.
   buildFileTree(files) {
-    const root = { folders: new Map(), files: [] };
-
-    files.forEach((file) => {
-      const parts = file.path.split("/");
-      let node = root;
-      let prefix = "";
-
-      for (let i = 0; i < parts.length - 1; i++) {
-        const folder = parts[i];
-        prefix = prefix ? `${prefix}/${folder}` : folder;
-        if (!node.folders.has(folder)) {
-          node.folders.set(folder, {
-            name: folder,
-            fullPath: prefix,
-            folders: new Map(),
-            files: [],
-          });
-        }
-        node = node.folders.get(folder);
-      }
-
-      node.files.push(file);
-    });
-
-    return root;
+    return buildFileTree(files, { compact: true });
   }
 
   renderTreeNode(node, sectionKey, depth, startIndex) {
@@ -4233,9 +4755,9 @@ class GitManager {
       const folderKey = `${sectionKey}:${folder.fullPath}`;
       const collapsed = this.state.collapsedFolders.has(folderKey);
       html += `
-        <div class="git-tree-folder" data-node-type="folder" data-folder-key="${this.escapeHtml(folderKey)}" style="--tree-depth:${depth}">
-          <span class="git-tree-chevron">${collapsed ? "\u25b8" : "\u25be"}</span>
-          <span class="git-tree-folder-name">${this.escapeHtml(folder.name)}</span>
+        <div class="git-tree-folder" data-node-type="folder" data-folder-key="${this.escapeHtml(folderKey)}" role="button" tabindex="0" aria-expanded="${collapsed ? "false" : "true"}" style="--tree-depth:${depth}">
+          <span class="git-tree-chevron" aria-hidden="true">${collapsed ? "\u25b8" : "\u25be"}</span>
+          <span class="git-tree-folder-name" title="${this.escapeHtml(folder.fullPath)}">${this.escapeHtml(folder.name)}</span>
         </div>
       `;
       if (!collapsed) {
@@ -4254,21 +4776,24 @@ class GitManager {
       a.path.localeCompare(b.path),
     );
     files.forEach((file) => {
-      const isSelected =
-        this.state.selectedPath === file.path ||
-        index === this.state.selectedIndex;
-      const fileName = file.path.split("/").pop() || file.path;
+      const isSelected = this.state.selectedPath === file.path;
+      const { name: fileName, dir } = splitRepoPath(file.path);
       const letter = statusLetter(file);
       const colorClass = statusClass(letter);
       const discardTitle =
         letter === "U" ? "Delete untracked file" : "Discard changes";
+      const stageTitle = file.staged ? "Unstage" : "Stage";
+      const pathAttr = this.escapeHtml(file.path);
       html += `
-        <div class="git-file ${isSelected ? "selected" : ""}" data-path="${this.escapeHtml(file.path)}" data-index="${index}" style="--tree-depth:${depth}">
-          <span class="git-file-path ${colorClass}" title="${this.escapeHtml(file.path)}">${this.escapeHtml(fileName)}</span>
+        <div class="git-file ${isSelected ? "selected" : ""}" role="listitem" tabindex="0" aria-label="${this.escapeHtml(fileName)}, ${statusWord(letter)}${dir ? `, in ${this.escapeHtml(dir)}` : ""}" data-path="${pathAttr}" data-index="${index}" style="--tree-depth:${depth}">
+          <span class="git-file-label" title="${pathAttr}">
+            <span class="git-file-path ${colorClass}">${this.escapeHtml(fileName || file.path)}</span>
+            ${dir ? `<span class="git-file-dir">${this.escapeHtml(dir)}</span>` : ""}
+          </span>
           <div class="git-file-actions">
-            <button class="git-file-open" title="Open file">⤢</button>
-            <button class="git-file-discard" title="${discardTitle}">⟲</button>
-            <button class="git-file-stage" title="${file.staged ? "Unstage" : "Stage"}">${file.staged ? "−" : "+"}</button>
+            <button type="button" class="git-file-open" title="Open file" aria-label="Open ${this.escapeHtml(fileName)}"><i data-lucide="file-symlink" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-discard" title="${discardTitle}" aria-label="${discardTitle}: ${this.escapeHtml(fileName)}"><i data-lucide="undo-2" aria-hidden="true"></i></button>
+            <button type="button" class="git-file-stage" title="${stageTitle}" aria-label="${stageTitle} ${this.escapeHtml(fileName)}"><i data-lucide="${file.staged ? "minus" : "plus"}" aria-hidden="true"></i></button>
           </div>
           <span class="git-file-status ${colorClass}">${this.escapeHtml(letter)}</span>
         </div>
@@ -4919,7 +5444,6 @@ class SettingsManager {
     this.fetchImpl =
       fetchImpl ||
       (typeof fetch === "function" ? fetch.bind(globalThis) : null);
-    this.schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
     this.ui = window.SettingsUI || null;
     this.activeCategory = null;
     this.query = "";
@@ -4933,6 +5457,17 @@ class SettingsManager {
     this.usersAdminVisible = false;
     this.usersAdminCurrentUser = null;
     this.usersAdminController = null;
+  }
+
+  // The schema as this device sees it: per-device settings (the extra-keys
+  // bar) show only the current device class's entry, so the one "Show extra
+  // keys bar" toggle edits this phone's/desktop's own value. Read on every
+  // render because platformDetector.isMobile can change with the viewport.
+  get schema() {
+    const all = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    const forDevice = window.SettingsSchema?.schemaForDevice;
+    if (!forDevice) return all;
+    return forDevice(all, platformDetector.isMobile ? "touch" : "desktop");
   }
 
   // Build (once) the detached content element the SurfaceWindow will host.
@@ -5100,6 +5635,15 @@ class SettingsManager {
 
   focusSearch() {
     this.searchInputEl?.focus?.({ preventScroll: true });
+  }
+
+  // Touch layouts: focusing the search field would pop the on-screen
+  // keyboard over the panel, so focus lands on the active category tab.
+  focusActiveCategory() {
+    const tab =
+      this.sidebarEl?.querySelector?.('[aria-selected="true"]') ||
+      this.sidebarEl?.querySelector?.(".settings-category-btn");
+    tab?.focus?.({ preventScroll: true });
   }
 
   renderControlRow(descriptor) {
@@ -5355,6 +5899,10 @@ class TerminalManager {
     this.telemetryRefreshInterval = null;
     this.viewportSyncFrame = 0;
     this.viewportFocusTimer = null;
+    // Tallest resting visible height per orientation ("portrait" /
+    // "landscape"); keyboard detection measures drops against it.
+    this.viewportBaselines = {};
+    this.viewportLayoutKey = "";
     this.notificationMode =
       settingsDefaults["notifications.soundMode"] || "unfocused";
     this.notificationSound = settingsDefaults["notifications.sound"] || "chime";
@@ -5541,14 +6089,7 @@ class TerminalManager {
     // Sessions button trigger
     const sessionsBtn = document.getElementById("sessions-btn");
     if (sessionsBtn) {
-      sessionsBtn.addEventListener("click", () => {
-        const panel = this.getSessionsPanel();
-        if (panel && !panel.classList.contains("hidden")) {
-          this.closeSessionsPanel();
-        } else {
-          this.openSessionsPanel();
-        }
-      });
+      sessionsBtn.addEventListener("click", () => this.toggleSessionsPanel());
     }
     this.setupLayoutEditor();
     this.setupDesktopTabOverflowScroll();
@@ -5556,6 +6097,7 @@ class TerminalManager {
 
     // Help modal
     this.setupHelpModal();
+    this.applyStaticFeatureTooltips();
 
     // Keyboard shortcuts
     this.setupKeyboardShortcuts();
@@ -5640,8 +6182,10 @@ class TerminalManager {
       this.fileEditor = new window.FileEditorModule.FileEditor();
       // In IDE mode an explorer file click opens a preview editor TAB; outside
       // IDE mode it keeps the terminal-mode modal/SurfaceWindow behavior.
-      this.fileExplorer.onOpenFile = (path, intent) =>
+      this.fileExplorer.onOpenFile = (path, intent) => {
+        this.recordPaletteFileOpen(path);
         this.handleExplorerOpenFile(path, intent);
+      };
     }
     platformDetector.onChange(() => {
       this.renderActionSurfaces();
@@ -5653,6 +6197,10 @@ class TerminalManager {
     this.setupMobileSwipe();
     this.setupTerminalRenderRecovery();
     this.startTelemetryRefreshLoop();
+    document.addEventListener("visibilitychange", () => {
+      // Coming back to the page clears the active session's attention.
+      if (document.visibilityState === "visible") this.updateTabGroups();
+    });
 
     // Check for existing terminals
     this.startBootstrap();
@@ -5764,10 +6312,19 @@ class TerminalManager {
   }
 
   normalizeTerminalGrid({ cols, rows }) {
+    const sizing = window.TerminalSizing;
     return (
-      window.TerminalSizing?.normalizeTerminalGrid?.({
+      sizing?.normalizeTerminalGrid?.({
         cols,
         rows,
+        // Fewer rows on touch while the keyboard is open (R2); undefined from
+        // a stale cached terminal-sizing.js keeps the old 8-row floor.
+        minRows: sizing.minTerminalRows?.({
+          touch: this.isTouchLayout(),
+          keyboardOpen: document.body.classList.contains(
+            "virtual-keyboard-open",
+          ),
+        }),
         maxCols: platformDetector.isMobile
           ? Number.POSITIVE_INFINITY
           : DESKTOP_MAX_TERMINAL_COLS,
@@ -5799,6 +6356,9 @@ class TerminalManager {
 
   fitTerminalState(terminalState) {
     if (!terminalState?.fitAddon || !terminalState?.terminal) return null;
+    // Deferred callers (rAF/timers) can outlive a closed terminal; fitting a
+    // disposed xterm throws inside its render service.
+    if (terminalState.disposed) return null;
     terminalState.fitAddon.fit();
     return this.normalizeTerminalGeometry(terminalState);
   }
@@ -5812,25 +6372,182 @@ class TerminalManager {
     document.body.dataset.bootstrapState = isPending ? "pending" : "ready";
     const newButton = document.getElementById("new-terminal");
     if (newButton) newButton.disabled = isPending;
+    // Bootstrap may end with zero terminals (nothing to restore and the
+    // create failed): show the launcher instead of a blank canvas.
+    if (!isPending) this.syncWorkspaceLauncher();
+  }
+
+  // --- Zero-terminal launcher -------------------------------------------------
+  // Shown in #terminal-container whenever no terminal is open (after
+  // bootstrap): New terminal, restorable/recent sessions, recent directories
+  // and key shortcuts. Planning/DOM: web/workspace-launcher.js.
+
+  syncWorkspaceLauncher({ refresh = false } = {}) {
+    if (!window.WorkspaceLauncher || !this.container) return;
+    const show = !this.bootstrapPending && this.terminals.size === 0;
+    let root = document.getElementById("workspace-launcher");
+    if (!show) {
+      if (root) root.hidden = true;
+      this.workspaceLauncherVisible = false;
+      return;
+    }
+    if (!root) {
+      root = document.createElement("div");
+      root.id = "workspace-launcher";
+      root.className = "workspace-launcher";
+      this.container.appendChild(root);
+    }
+    const wasVisible = Boolean(this.workspaceLauncherVisible);
+    root.hidden = false;
+    this.workspaceLauncherVisible = true;
+    if (!wasVisible || refresh) {
+      void this.refreshWorkspaceLauncher({ focus: !wasVisible });
+    }
+  }
+
+  async refreshWorkspaceLauncher({ focus = false } = {}) {
+    const root = document.getElementById("workspace-launcher");
+    if (!root || root.hidden) return;
+    const token = (this.workspaceLauncherToken =
+      (this.workspaceLauncherToken || 0) + 1);
+    // Re-rendering replaces the buttons: remember whether focus was inside so
+    // it can come back (otherwise a refresh drops focus to <body>).
+    const focusNewButton = () =>
+      root
+        .querySelector("#launcher-new-terminal")
+        ?.focus({ preventScroll: true });
+    let keepFocus = focus || root.contains(document.activeElement);
+    // Paint at once from the cached catalog, then again with fresh data.
+    this.renderWorkspaceLauncher(root, { loading: !this._sessionCatalog });
+    if (keepFocus) focusNewButton();
+    try {
+      const res = await fetch("/api/terminals", {
+        headers: { "x-deckterm-client-id": this.clientInstanceId },
+      });
+      if (res.ok) {
+        this._sessionCatalog = await res.json();
+        this.updateSessionsAvailableBadge(this._sessionCatalog);
+      }
+    } catch {
+      // Keep the cached catalog; the launcher still offers New terminal.
+    }
+    if (token !== this.workspaceLauncherToken || root.hidden) return;
+    keepFocus = keepFocus || root.contains(document.activeElement);
+    this.renderWorkspaceLauncher(root, { loading: false });
+    if (keepFocus) focusNewButton();
+  }
+
+  renderWorkspaceLauncher(root, { loading = false } = {}) {
+    const api = window.WorkspaceLauncher;
+    if (!api || !root) return;
+    const catalog = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    const standalone = Boolean(
+      window.matchMedia?.("(display-mode: standalone)")?.matches,
+    );
+    api.renderWorkspaceLauncher(
+      root,
+      document,
+      {
+        loading,
+        sessions: api.planLauncherSessions(catalog, {
+          openIds: [...this.terminals.keys()],
+          titleOf: window.TaskSignals?.sessionDisplayTitle,
+        }),
+        directories: api.planRecentDirectories({
+          currentCwd: this.getCurrentDirectoryValue(),
+          catalog,
+          registry: this.sessionRegistry?.sessions,
+        }),
+        shortcuts: api.planLauncherShortcuts(
+          window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+        ),
+        newHint: api.newTerminalHint({ standalone }),
+        tips: window.FeatureGuide?.planLauncherTips?.(
+          window.FeatureGuide.LAUNCHER_TIPS,
+          window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+        ),
+      },
+      {
+        onNewTerminal: () => void this.createTerminal(),
+        onSession: (id) => void this.handleSessionRowActivate(id),
+        onDirectory: (cwd) => void this.createTerminal(false, { cwd }),
+      },
+    );
+    initLucideIcons();
   }
 
   setupViewportResizeHandling() {
-    if (!window.visualViewport) return;
-
     const scheduleViewportSync = () => {
       if (this.viewportSyncFrame) return;
       this.viewportSyncFrame = requestAnimationFrame(() => {
         this.viewportSyncFrame = 0;
-        this.handleViewportResize();
+        this.handleViewportResize({ fromViewportEvent: true });
       });
     };
 
+    // Keyboard detection depends on focus as well as on height (a height
+    // drop only counts as a keyboard while an input is focused), and the
+    // Android resizes-content keyboard resizes the layout viewport too.
+    window.addEventListener("resize", scheduleViewportSync);
+    window.addEventListener("orientationchange", scheduleViewportSync);
+    document.addEventListener("focusin", scheduleViewportSync);
+    document.addEventListener("focusout", scheduleViewportSync);
+
     const viewport = window.visualViewport;
-    viewport.addEventListener("resize", scheduleViewportSync);
-    viewport.addEventListener("scroll", scheduleViewportSync);
-    if ("onscrollend" in viewport) {
-      viewport.addEventListener("scrollend", scheduleViewportSync);
+    if (viewport) {
+      viewport.addEventListener("resize", scheduleViewportSync);
+      viewport.addEventListener("scroll", scheduleViewportSync);
+      if ("onscrollend" in viewport) {
+        viewport.addEventListener("scrollend", scheduleViewportSync);
+      }
     }
+    // The bottom bars change height on their own (chips row, extra-keys
+    // toggle, function keys); floating surfaces must follow them.
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(() => this.syncBottomChromeInset());
+      for (const id of ["extra-keys", "mobile-action-bar"]) {
+        const el = document.getElementById(id);
+        if (el) observer.observe(el);
+      }
+    }
+    this.handleViewportResize({ fromViewportEvent: true });
+  }
+
+  // --bottom-chrome-inset: how much of the viewport bottom the touch chrome
+  // (extra keys + action bar) covers. Touch tablets float Files/Git above the
+  // terminal; styles.css stops them above this inset so they never cover the
+  // keys and buttons. 0 on desktop.
+  syncBottomChromeInset() {
+    const compute = window.SurfaceWindows?.computeBottomChromeInset;
+    if (typeof compute !== "function") return;
+    let inset = 0;
+    if (this.isTouchLayout()) {
+      const rects = ["extra-keys", "mobile-action-bar"].map((id) => {
+        const el = document.getElementById(id);
+        return el && el.getClientRects().length
+          ? el.getBoundingClientRect()
+          : null;
+      });
+      const viewport = window.visualViewport;
+      const viewportBottom = viewport
+        ? viewport.offsetTop + viewport.height
+        : window.innerHeight;
+      inset = compute(viewportBottom, rects);
+    }
+    const value = `${inset}px`;
+    if (this.bottomChromeInset === value) return;
+    this.bottomChromeInset = value;
+    document.documentElement.style.setProperty("--bottom-chrome-inset", value);
+  }
+
+  // Touch-first layouts: phones (mobile chrome) and coarse-pointer tablets.
+  isTouchLayout() {
+    return (
+      platformDetector.isMobile ||
+      (platformDetector.hasTouch && platformDetector.isCoarsePointer)
+    );
   }
 
   setupTerminalRenderRecovery() {
@@ -5925,7 +6642,12 @@ class TerminalManager {
     return null;
   }
 
-  createActionButton(actionId, surface, density = "normal") {
+  createActionButton(
+    actionId,
+    surface,
+    density = "normal",
+    { showDescription = false } = {},
+  ) {
     const config = this.getActionButtonConfig(actionId);
     if (!config) return null;
 
@@ -5942,10 +6664,17 @@ class TerminalManager {
     }
 
     const label = config.label;
-    button.title = config.description || label;
+    const description = config.description || "";
+    // Tooltip: "Label — what it does (Shortcut)". The name stays the label.
+    button.title =
+      window.FeatureGuide?.tooltipForAction?.(
+        actionId,
+        label,
+        window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS,
+      ) || description || label;
     button.setAttribute("aria-label", label);
-    if (config.description) {
-      button.setAttribute("aria-description", config.description);
+    if (description) {
+      button.setAttribute("aria-description", description);
     }
 
     if (surface === "desktop-primary") {
@@ -5960,6 +6689,8 @@ class TerminalManager {
       }
     } else if (surface === "mobile-primary") {
       button.className = "mobile-action-btn";
+    } else if (surface === "landscape-primary") {
+      button.className = "landscape-action-btn";
     } else {
       button.className = "tools-sheet-btn";
     }
@@ -5970,7 +6701,22 @@ class TerminalManager {
 
     const text = document.createElement("span");
     text.textContent = label;
-    button.appendChild(text);
+    if (surface === "tools-sheet" && description && showDescription) {
+      // Work-group rows are full width, so they have room for a second line
+      // saying what the action does (the compact 2-column groups keep the
+      // description in the tooltip / aria-description only).
+      button.classList.add("has-description");
+      const wrap = document.createElement("span");
+      wrap.className = "tools-sheet-btn-text";
+      text.className = "tools-sheet-btn-label";
+      const detail = document.createElement("span");
+      detail.className = "tools-sheet-btn-description";
+      detail.textContent = description;
+      wrap.append(text, detail);
+      button.appendChild(wrap);
+    } else {
+      button.appendChild(text);
+    }
 
     return button;
   }
@@ -6028,19 +6774,49 @@ class TerminalManager {
     });
   }
 
+  // Phone landscape hides the bottom action bar (styles.css), so its pinned
+  // actions also render as icon buttons in the toolbar row (shown only under
+  // body.phone-landscape). "More" is left out: the Menu button opens Tools.
+  renderLandscapeActionBar(root) {
+    if (!root) return;
+    root.replaceChildren();
+    this.getPrimaryActionIds("mobile")
+      .filter((actionId) => actionId !== "more" && actionId !== "font-size")
+      .forEach((actionId) => {
+        const button = this.createActionButton(actionId, "landscape-primary");
+        if (button) root.appendChild(button);
+      });
+  }
+
+  // Width of every density-elastic toolbar group (primary actions, IDE
+  // toggle, server-load chips) at each tier, measured by applying the tier
+  // and reading the layout. Actions use scrollWidth (their bar clips).
   measureDesktopActionWidthsByTier(root) {
     const toolbar = this.toolbar;
     if (!root || !toolbar) return null;
 
+    const ideButton = document.getElementById("ide-toggle-btn");
+    const stats = document.getElementById("server-stats");
     const previousDensity = root.dataset.density || "normal";
     const previousTabDensity = toolbar.dataset.tabDensity || "";
-    const widthsByTier = {};
-    const tiers = ["normal", "compact", "tight", "icon-only"];
+    const tiers = window.ToolbarLayout?.TOOLBAR_DENSITY_TIERS || [
+      "normal",
+      "compact",
+      "tight",
+      "icon-only",
+    ];
+    const widthOf = (element) =>
+      element && !element.hidden && element.offsetParent !== null
+        ? Math.ceil(element.getBoundingClientRect().width || 0)
+        : 0;
+    const groups = { actions: {}, ide: {}, stats: {} };
 
     tiers.forEach((tier) => {
       root.dataset.density = tier;
       toolbar.dataset.tabDensity = tier;
-      widthsByTier[tier] = Math.ceil(root.scrollWidth);
+      groups.actions[tier] = Math.ceil(root.scrollWidth);
+      groups.ide[tier] = widthOf(ideButton);
+      groups.stats[tier] = widthOf(stats);
     });
 
     root.dataset.density = previousDensity;
@@ -6050,6 +6826,15 @@ class TerminalManager {
       delete toolbar.dataset.tabDensity;
     }
 
+    const sum = window.ToolbarLayout?.sumTierWidths;
+    const widthsByTier = sum
+      ? sum([groups.actions, groups.ide, groups.stats])
+      : groups.actions;
+    // Current (applied-tier) footprint of the same groups.
+    widthsByTier.current =
+      Math.ceil(root.getBoundingClientRect().width || 0) +
+      widthOf(ideButton) +
+      widthOf(stats);
     return widthsByTier;
   }
 
@@ -6066,11 +6851,19 @@ class TerminalManager {
     }
 
     const tabCount = tabs.querySelectorAll(".tab").length;
-    const preferredTabWidth =
+    const availableWidth = Math.floor(tabs.getBoundingClientRect().width || 0);
+    const baseTabWidth =
       tabCount <= 1 ? 280 : tabCount <= 2 ? 240 : tabCount <= 3 ? 200 : 160;
+    // Wide screens: let tabs grow into the free strip (up to 360px, sharing
+    // it as if there were one more tab, so a lone tab stays wider than each
+    // of two) instead of leaving a dead gap before the directory field.
+    const preferredTabWidth = Math.max(
+      baseTabWidth,
+      Math.min(360, Math.floor(availableWidth / (tabCount + 1)) - 4),
+    );
     return (
       this.navigationSurface.getDesktopTabLayoutByWidth?.({
-        availableWidth: Math.floor(tabs.getBoundingClientRect().width || 0),
+        availableWidth,
         tabCount,
         preferredTabWidth,
         minTabWidth: 96,
@@ -6088,18 +6881,14 @@ class TerminalManager {
   }
 
   getDesktopTabReserveWidth(tabCount) {
+    const shared = window.ToolbarLayout?.getDesktopTabReserveWidth;
+    if (shared) return shared(tabCount);
     const count = Math.max(0, Math.trunc(Number(tabCount) || 0));
     if (!count) return 0;
-
-    const gap = 4;
     const widthFor = (columns, tabWidth) =>
-      columns * tabWidth + Math.max(0, columns - 1) * gap;
-
-    // Preserve four comfortable single-row tabs before spending horizontal
-    // space on full action labels. Beyond four, reserve enough room for the
-    // existing two-row layout at its 96px minimum.
+      columns * tabWidth + Math.max(0, columns - 1) * 4;
     if (count <= 4) return widthFor(count, 144);
-    return Math.max(widthFor(4, 144), widthFor(Math.ceil(count / 2), 96));
+    return Math.max(widthFor(5, 118), widthFor(Math.ceil(count / 2), 96));
   }
 
   syncDesktopTabLayout() {
@@ -6286,13 +7075,18 @@ class TerminalManager {
       return;
     }
 
+    // Budget: the elastic groups (actions, IDE toggle, server-load chips)
+    // plus the tab strip share one width; the tabs keep their reserve and
+    // the tier is the roomiest whose elastic footprint fits the rest.
     const widthsByTier = this.measureDesktopActionWidthsByTier(actionBar);
-    const actionWidth = Math.ceil(actionBar.getBoundingClientRect().width || 0);
+    const elasticWidth =
+      widthsByTier?.current ??
+      Math.ceil(actionBar.getBoundingClientRect().width || 0);
     const tabsWidth = Math.ceil(this.tabs?.getBoundingClientRect().width || 0);
     const tabCount = this.tabs?.querySelectorAll(".tab").length || 0;
     const availableWidth = Math.max(
       0,
-      actionWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
+      elasticWidth + tabsWidth - this.getDesktopTabReserveWidth(tabCount),
     );
     const fallbackDensity =
       actionBar.dataset.density ||
@@ -6362,6 +7156,7 @@ class TerminalManager {
     const groups = [
       {
         label: "Work",
+        describe: true,
         ids: actionIds.filter(
           (id) =>
             id !== "font-size" &&
@@ -6386,7 +7181,12 @@ class TerminalManager {
       heading.textContent = group.label;
       grid.appendChild(heading);
       for (const actionId of group.ids) {
-        const button = this.createActionButton(actionId, "tools-sheet");
+        const button = this.createActionButton(
+          actionId,
+          "tools-sheet",
+          "normal",
+          { showDescription: group.describe === true },
+        );
         if (button) grid.appendChild(button);
       }
       if (group.fontSize)
@@ -6497,12 +7297,44 @@ class TerminalManager {
       "mobile",
       "mobile-primary",
     );
+    this.renderLandscapeActionBar(
+      document.getElementById("landscape-primary-actions"),
+    );
     this.renderToolsSheetGrid();
     initLucideIcons();
     this.syncSurfaceButtonState();
     this.updateWrapButton();
     this.updateLinkedViewButton();
     this.scheduleDesktopToolbarDensitySync();
+  }
+
+  // Whether the Files explorer and the Git panel / IDE SCM view are on screen
+  // right now. Windowed surfaces can be open simultaneously; the exclusive
+  // right-surface notion only applies to the mobile sheets.
+  getFilesGitVisibility(surface = this.getRightSurface()) {
+    const windowed = this.isWindowedSurfaces();
+    let filesOpen = windowed
+      ? Boolean(this.fileExplorer?.isOpen)
+      : surface === "files";
+    let gitOpen = windowed
+      ? Boolean(
+          window.gitManager &&
+          !window.gitManager.panel?.classList.contains("hidden"),
+        )
+      : surface === "git";
+    // IDE mode: Files/Git mirror the sidebar view (the explorer element is
+    // permanently "open" there, so its isOpen flag would keep Files lit).
+    if (this.isIdeModeActive() && this.ideShell) {
+      const sidebarOpen = !this.ideShell.isSidebarCollapsed?.();
+      const view = this.ideShell.activeView?.();
+      filesOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("files")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_EXPLORER);
+      gitOpen =
+        Boolean(this.surfaceWindowManager?.isOpen?.("git")) ||
+        (sidebarOpen && view === window.IdeShell?.VIEW_SCM);
+    }
+    return { filesOpen, gitOpen };
   }
 
   syncSurfaceButtonState() {
@@ -6520,18 +7352,8 @@ class TerminalManager {
     );
     const paletteOpen = this.isCommandPaletteOpen();
 
-    // Windowed surfaces can be open simultaneously; the exclusive
-    // right-surface notion only applies to the mobile sheets.
-    const windowed = this.isWindowedSurfaces();
-    const filesOpen = windowed
-      ? Boolean(this.fileExplorer?.isOpen)
-      : surface === "files";
-    const gitOpen = windowed
-      ? Boolean(
-          window.gitManager &&
-          !window.gitManager.panel?.classList.contains("hidden"),
-        )
-      : surface === "git";
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility(surface);
+    const ideMode = this.isIdeModeActive();
 
     document.querySelectorAll("[data-action-id]").forEach((button) => {
       const actionId = button.dataset.actionId;
@@ -6554,6 +7376,19 @@ class TerminalManager {
         button.classList.toggle("active", paletteOpen);
       } else if (actionId === "dock-sessions") {
         button.classList.toggle("active", Boolean(this.dockState?.enabled));
+      } else if (actionId === "ide") {
+        button.classList.toggle("active", ideMode);
+        button.setAttribute("aria-pressed", ideMode ? "true" : "false");
+      }
+      // Files/Git toolbar buttons are toggles: announce the state too.
+      if (
+        button.classList.contains("toolbar-action-btn") &&
+        (actionId === "files" || actionId === "git")
+      ) {
+        button.setAttribute(
+          "aria-pressed",
+          button.classList.contains("active") ? "true" : "false",
+        );
       }
     });
   }
@@ -6570,6 +7405,7 @@ class TerminalManager {
     else if (action === "clipboard") this.clipboardManager.togglePanel();
     else if (action === "copy") this.copySelection();
     else if (action === "paste") await this.pasteClipboard();
+    else if (action === "compose") this.openComposeSheet();
     else if (action === "font-decrease") this.changeFontSize(-1);
     else if (action === "font-increase") this.changeFontSize(1);
     else if (action === "toggle-extra-keys") this.extraKeys?.toggle();
@@ -6638,7 +7474,10 @@ class TerminalManager {
     return cwd.replace(/\/+$/, "");
   }
 
-  setDirectoryValue(value, { force = false, userDraft = false } = {}) {
+  setDirectoryValue(
+    value,
+    { force = false, userDraft = false, persist = true } = {},
+  ) {
     const next = String(value || "");
     if (userDraft) {
       this.markDirectoryDraftEdited();
@@ -6663,13 +7502,15 @@ class TerminalManager {
     // applyDefaultCwd side effect on every cwd change / OSC7 update (which would
     // recurse). The value is only a navigation default; the backend file gates
     // remain the authorization boundary (Codex #4 — do not trust it).
-    this.settingsStore?.set("files.defaultCwd", next);
+    // persist:false — a live cwd the shell merely `cd`-ed into is shown but
+    // never saved: only values the user commits become the default.
+    if (persist) this.settingsStore?.set("files.defaultCwd", next);
   }
 
   setupToolsSheet() {
     if (!this.toolsSheet) return;
 
-    const close = () => this.closeToolsSheet();
+    const close = () => this.closeToolsSheet({ restoreFocus: true });
 
     this.toolsSheet
       .querySelector(".tools-sheet-backdrop")
@@ -6677,11 +7518,89 @@ class TerminalManager {
     this.toolsSheet
       .querySelector("#tools-sheet-close")
       ?.addEventListener("click", close);
+    // Modal sheet: Escape closes it, Tab cycles inside it.
+    this.toolsSheet.addEventListener("keydown", (event) => {
+      if (this.toolsSheet.classList.contains("hidden")) return;
+      if (event.key === "Escape" && !event.isComposing) {
+        event.preventDefault();
+        event.stopPropagation();
+        close();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = this.getToolsSheetFocusableElements();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      const inside = this.toolsSheet.contains(document.activeElement);
+      if (event.shiftKey && (document.activeElement === first || !inside)) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && (document.activeElement === last || !inside)) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+  }
+
+  getToolsSheetFocusableElements() {
+    const panel = this.toolsSheet?.querySelector(".tools-sheet-panel");
+    if (!panel || this.toolsSheet.classList.contains("hidden")) return [];
+    return Array.from(
+      panel.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (element) =>
+        !element.hidden &&
+        !element.closest("[hidden], .hidden") &&
+        element.getClientRects().length > 0,
+    );
+  }
+
+  // First control on open: the first action tile (not the directory field,
+  // which would pop the on-screen keyboard on touch).
+  focusToolsSheetFirstControl() {
+    const focusable = this.getToolsSheetFocusableElements();
+    const target =
+      focusable.find((element) => element.closest("#tools-sheet-grid")) ||
+      focusable.find(
+        (element) =>
+          !element.matches('input:not([type="checkbox"]), textarea'),
+      ) ||
+      focusable[0];
+    target?.focus({ preventScroll: true });
+  }
+
+  // The visible More / Menu trigger that should get focus back on close.
+  getToolsSheetTrigger() {
+    const opener = this.toolsSheetOpener;
+    if (
+      opener?.isConnected &&
+      !this.toolsSheet?.contains(opener) &&
+      opener.getClientRects().length > 0
+    ) {
+      return opener;
+    }
+    return (
+      Array.from(
+        document.querySelectorAll(
+          '#toolbar-toggle, [data-action="toggle-tools-sheet"]',
+        ),
+      ).find(
+        (element) =>
+          !this.toolsSheet?.contains(element) &&
+          element.getClientRects().length > 0,
+      ) || null
+    );
   }
 
   setupTaskPanel() {
     const panel = document.getElementById("task-panel");
     if (!panel) return;
+
+    const intro = panel.querySelector("#task-panel-intro");
+    if (intro) intro.textContent = window.FeatureGuide?.PANEL_INTROS?.tasks || "";
 
     panel
       .querySelector(".task-panel-backdrop")
@@ -6770,6 +7689,10 @@ class TerminalManager {
     panel
       .querySelector("#sessions-refresh-btn")
       ?.addEventListener("click", () => this.refreshSessionsPanel());
+    panel.querySelector("#sessions-new-btn")?.addEventListener("click", () => {
+      this.closeSessionsPanel({ restoreFocus: false });
+      void this.createTerminal();
+    });
     panel.addEventListener("keydown", (event) => {
       if (event.key === "Escape") {
         event.preventDefault();
@@ -6778,6 +7701,8 @@ class TerminalManager {
         return;
       }
       if (event.key !== "Tab") return;
+      // The phone sheet is modal and traps Tab; the desktop window is not.
+      if (this.isPanelInSurfaceWindow(panel)) return;
       const focusable = this.getSessionsFocusableElements();
       if (focusable.length === 0) return;
       const first = focusable[0];
@@ -6854,38 +7779,104 @@ class TerminalManager {
     this.closeSessionsPanel({ restoreFocus: false });
   }
 
-  openSessionsPanel() {
+  // Desktop: Sessions is a SurfaceWindow (non-modal, terminals stay usable);
+  // phones keep the modal sheet. Either way the 1 s termination countdown
+  // runs only while the list is on screen.
+  async openSessionsPanel() {
     const panel = this.getSessionsPanel();
     if (!panel) return;
-    this.closeToolsSheet();
-    this.closeTaskPanel();
-    this.closeSetupPanel();
-    this.sessionsReturnFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : document.getElementById("sessions-btn");
+    const wasHidden = panel.classList.contains("hidden");
+    this.closeSurfacesForOpen("sessions");
+    // Captured after the More sheet closed (it hands focus to its trigger).
+    if (wasHidden || !this.sessionsReturnFocus) {
+      this.sessionsReturnFocus =
+        document.activeElement instanceof HTMLElement &&
+        !panel.contains(document.activeElement)
+          ? document.activeElement
+          : document.getElementById("sessions-btn");
+    }
+    const inWindow = await this.mountOverlayPanel("sessions", panel, () =>
+      this.closeSessionsPanel(),
+    );
+    panel
+      .querySelector(".sessions-panel-shell")
+      ?.setAttribute("aria-modal", inWindow ? "false" : "true");
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     document
       .getElementById("sessions-btn")
       ?.setAttribute("aria-expanded", "true");
-    void this.refreshSessionsPanel();
+    const refreshed = this.refreshSessionsPanel();
     clearInterval(this.sessionsCountdownTimer);
     this.sessionsCountdownTimer = setInterval(
       () => this.updateSessionTerminationCountdowns(),
       1000,
     );
     this.syncSurfaceButtonState();
-    panel
-      .querySelector("#sessions-panel-close")
-      ?.focus({ preventScroll: true });
+    if (!inWindow) {
+      panel
+        .querySelector("#sessions-panel-close")
+        ?.focus({ preventScroll: true });
+      return;
+    }
+    // Park focus on Refresh while the list loads, then move it to the first
+    // row (or New session for an empty list) unless the user moved it.
+    const parked = panel.querySelector("#sessions-refresh-btn");
+    parked?.focus({ preventScroll: true });
+    const listState = await refreshed;
+    this.focusSessionsWindowAfterRender(panel, listState, parked);
+  }
+
+  focusSessionsWindowAfterRender(panel, listState, parked) {
+    if (panel.classList.contains("hidden")) return;
+    // "Open here" rows create a terminal on Enter; never land on one.
+    const safeRow = panel.querySelector(
+      '#sessions-list .session-row:not([data-row-action="open-here"])',
+    );
+    const target = window.SurfaceWindows?.planSessionsWindowFocus?.({
+      listState,
+      focusUnchanged: Boolean(parked) && document.activeElement === parked,
+      hasSafeRow: Boolean(safeRow),
+    });
+    const el =
+      target === "row"
+        ? safeRow
+        : target === "new"
+          ? panel.querySelector("#sessions-new-btn")
+          : null;
+    el?.focus({ preventScroll: true });
+  }
+
+  toggleSessionsPanel() {
+    const panel = this.getSessionsPanel();
+    if (!panel) return;
+    const open = !panel.classList.contains("hidden");
+    const inWindow = open && this.isPanelInSurfaceWindow(panel);
+    const plan =
+      window.SurfaceWindows?.planSurfaceToggle?.({
+        open,
+        frontmost: inWindow
+          ? Boolean(this.surfaceWindowManager?.isFrontmost?.("sessions"))
+          : undefined,
+      }) || (open ? "close" : "open");
+    if (plan === "close") this.closeSessionsPanel();
+    else if (plan === "front") {
+      this.surfaceWindowManager?.bringToFront("sessions");
+      const row = panel.querySelector(
+        '#sessions-list .session-row:not([data-row-action="open-here"])',
+      );
+      if (row) row.focus({ preventScroll: true });
+      else panel.querySelector("#sessions-refresh-btn")?.focus();
+    } else void this.openSessionsPanel();
   }
 
   closeSessionsPanel({ restoreFocus = true } = {}) {
     const panel = this.getSessionsPanel();
     if (!panel) return;
+    const inWindow = this.isPanelInSurfaceWindow(panel);
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    if (inWindow) this.surfaceWindowManager?.close("sessions");
     clearInterval(this.sessionsCountdownTimer);
     this.sessionsCountdownTimer = null;
     document
@@ -6894,9 +7885,16 @@ class TerminalManager {
     this.syncSurfaceButtonState();
     const returnTarget = this.sessionsReturnFocus;
     this.sessionsReturnFocus = null;
-    if (restoreFocus && returnTarget?.isConnected) {
-      returnTarget.focus({ preventScroll: true });
+    if (!restoreFocus) return;
+    if (!inWindow) {
+      if (returnTarget?.isConnected) {
+        returnTarget.focus({ preventScroll: true });
+      }
+      return;
     }
+    // A window can outlive its opener's visibility (palette, More sheet,
+    // toast): fall back to the terminal the user was working in.
+    if (!this.restorePanelFocus(returnTarget)) this.focusActiveTerminalSoft();
   }
 
   updateSessionsAvailableBadge(sessions = this._sessionCatalog || []) {
@@ -6916,7 +7914,11 @@ class TerminalManager {
     badge.textContent = available > 99 ? "99+" : String(available || "");
     const label = available ? `Sessions, ${available} available` : "Sessions";
     trigger.setAttribute("aria-label", label);
-    trigger.title = label;
+    trigger.title =
+      window.FeatureGuide?.formatTooltip({
+        label,
+        description: window.FeatureGuide.describeAction("sessions"),
+      }) || label;
   }
 
   async refreshSessionsPanel() {
@@ -6934,10 +7936,16 @@ class TerminalManager {
       this.updateSessionsAvailableBadge(sessions);
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
-        return;
+        return "empty";
       }
       const esc = (v) => (this.escapeHtml ? this.escapeHtml(v) : v);
-      list.innerHTML = sessions
+      const signals = window.TaskSignals;
+      const seen = this.getAttentionSeenMap();
+      const now = Date.now();
+      const ordered = signals?.orderSessionsForPanel
+        ? signals.orderSessionsForPanel(sessions, seen)
+        : sessions;
+      list.innerHTML = ordered
         .map((s) => {
           const isLocallyOpen = this.terminals.has(s.id);
           const action = window.SessionActions.planSessionRowAction(s, {
@@ -6951,11 +7959,57 @@ class TerminalManager {
           const terminationLine = terminationScheduledAt
             ? `<small class="session-termination-countdown" data-termination-at="${terminationScheduledAt}"></small>`
             : "";
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${s.id}">
+          const title =
+            signals?.sessionDisplayTitle?.(s) || s.cwd || "Terminal";
+          const unseen = signals?.hasUnseenAttention?.(s, seen[s.id], {
+            isActiveVisible: s.id === this.getActiveVisibleTerminalId(),
+          });
+          const attentionKind = unseen ? s.attention.kind : "";
+          const attentionText = attentionKind
+            ? [s.attention.title, s.attention.body].filter(Boolean).join(" — ")
+            : "";
+          // A needs-input notification the agent is still waiting on beats
+          // agentState ("thinking" is only "no new output"). It is fresh while
+          // the agent is not streaming and nothing (typing, agent output) has
+          // happened since it arrived; the slack covers the prompt render.
+          const attentionAt = Number(s.attention?.at) || 0;
+          const freshNeedsInput =
+            s.attention?.kind === "needs-input" &&
+            attentionAt > 0 &&
+            String(s.agentState || "").toLowerCase() !== "responding" &&
+            (Number(s.lastActivityAt) || 0) <= attentionAt + 15_000;
+          const agentState = !freshNeedsInput
+            ? String(s.agentState || "").toLowerCase()
+            : attentionKind === "needs-input"
+              ? "" // the attention chip already says "Needs your input"
+              : "needs input";
+          const agentChip = s.agentName
+            ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
+            : s.running
+              ? `<span class="session-chip session-chip-running">Running</span>`
+              : "";
+          const attentionChip = attentionKind
+            ? `<span class="session-chip session-chip-attention" data-kind="${esc(attentionKind)}">${esc(ATTENTION_KIND_LABELS[attentionKind] || "Attention")}</span>`
+            : "";
+          const activityAt = signals?.sessionActivityAt?.(s) || 0;
+          const activity =
+            activityAt && signals?.formatActivityAge
+              ? signals.formatActivityAge(now - activityAt)
+              : "";
+          const meta = [
+            esc(status),
+            esc(mode),
+            s.sessionName ? "tmux" : "",
+            activity ? `last activity ${esc(activity)}` : "",
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
           <div class="session-row-main">
-            <strong><span class="session-badge ${action.statusClass}">${dot}</span> ${s.id.slice(0, 8)}</strong>
+            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> <span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
-            <small>${esc(status)} · ${esc(mode)}${s.sessionName ? " · tmux" : ""}</small>
+            ${attentionText ? `<div class="session-row-attention">${esc(attentionText)}</div>` : ""}
+            <small>${meta}</small>
             ${terminationLine}
           </div>
           <span class="session-row-action" aria-hidden="true">${action.label}</span>
@@ -6963,8 +8017,10 @@ class TerminalManager {
         })
         .join("");
       this.updateSessionTerminationCountdowns();
+      return "rows";
     } catch (err) {
       list.innerHTML = `<div class='task-item'>Failed to load sessions: ${err.message}</div>`;
+      return "error";
     }
   }
 
@@ -7016,8 +8072,7 @@ class TerminalManager {
     const panel = this.getTaskPanel();
     if (!panel) return;
 
-    this.closeToolsSheet();
-    this.closeSetupPanel();
+    this.closeSurfacesForOpen("tasks");
     if (this.isWindowedSurfaces()) {
       await this.openSurfaceWindow("tasks", {
         title: "Tasks",
@@ -7176,8 +8231,11 @@ class TerminalManager {
         "terminal.wrapLines": (value) => this.applyWrapLines(value),
         "terminal.autoCopy": (value) =>
           this.clipboardManager?.applyAutoCopy(value),
-        "terminal.extraKeysVisible": (value) =>
-          this.applyExtraKeysVisible(value),
+        // terminal.extraKeysVisible (desktop) and
+        // terminal.extraKeysVisibleTouch (phones/tablets): each only acts on
+        // its own device class, so applyAll() never hides a phone's bar via
+        // the desktop default (nor shows a desktop's via the touch default).
+        ...this.createExtraKeysVisibilitySideEffects(),
         "tasks.view": (value) => this.applyTaskView(value),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
@@ -7314,26 +8372,20 @@ class TerminalManager {
     document.documentElement.style.setProperty("--color-accent", color);
   }
 
-  // Side effect for terminal.extraKeysVisible (value coerced to bool).
-  // Delegates to ExtraKeysManager without re-persisting. Fires from both an
-  // explicit toggle (settingsRuntime.apply — value is already persisted) AND
-  // the startup settingsRuntime.applyAll() sweep, which resolves an UNSET key
-  // to the schema default (false, desktop-oriented). Mobile's own default is
-  // true (see ExtraKeysManager.loadVisibilityState) — so on mobile, only
-  // apply when the key is actually persisted; otherwise leave whatever
-  // loadVisibilityState() already resolved synchronously untouched, instead
-  // of letting the schema default clobber it to hidden on a fresh session.
-  applyExtraKeysVisible(visible) {
-    if (!this.extraKeys) return;
-    if (platformDetector.isMobile) {
-      const UNSET = Symbol("unset");
-      const persisted = this.settingsStore?.get(
-        "terminal.extraKeysVisible",
-        UNSET,
-      );
-      if (persisted === UNSET) return;
-    }
-    this.extraKeys.applyVisibility(Boolean(visible));
+  // Side effects for the per-device extra-keys visibility keys (values
+  // coerced to bool). Delegates to ExtraKeysManager without re-persisting.
+  // They fire from an explicit toggle (settingsRuntime.apply — the value is
+  // already persisted) AND from the startup applyAll() sweep, which resolves
+  // an UNSET key to its schema default: hidden for desktop, visible for touch.
+  // A key only acts on its own device class (see extra-keys-visibility.js).
+  createExtraKeysVisibilitySideEffects() {
+    return (
+      window.ExtraKeysVisibility?.createSideEffects?.({
+        getDeviceClass: () => (platformDetector.isMobile ? "touch" : "desktop"),
+        applyVisibility: (visible) =>
+          this.extraKeys?.applyVisibility(Boolean(visible)),
+      }) || {}
+    );
   }
 
   // Side effect for files.defaultCwd. A path value used purely as a navigation
@@ -7506,7 +8558,12 @@ class TerminalManager {
       this.openSettingsSheet();
     }
     await this.settingsManager.render();
-    requestAnimationFrame(() => this.settingsManager?.focusSearch?.());
+    const touch = this.isTouchLayout();
+    requestAnimationFrame(() =>
+      touch
+        ? this.settingsManager?.focusActiveCategory?.()
+        : this.settingsManager?.focusSearch?.(),
+    );
     this.syncSurfaceButtonState();
   }
 
@@ -7564,12 +8621,17 @@ class TerminalManager {
             return;
           }
           const active = document.activeElement;
+          // Focus that fell back to <body> was lost, not chosen: the same
+          // viewport change re-renders the action bars and removes the
+          // button the synchronous close had just focused.
+          const focusLost = !active || active === document.body;
           const activeIsVisible =
             active instanceof HTMLElement && active.getClientRects().length;
           // The responsive terminal lifecycle can focus xterm's helper
           // textarea after Settings closes. Repair that stale focus, but do
           // not override a visible control selected by the user meanwhile.
           if (
+            !focusLost &&
             activeIsVisible &&
             !active.classList.contains("xterm-helper-textarea")
           ) {
@@ -7640,24 +8702,114 @@ class TerminalManager {
     if (status) status.textContent = message || "";
   }
 
+  // Desktop: Setup is a SurfaceWindow next to the others; phones keep the
+  // sheet (and its historical behaviour: no focus move, no focus return).
   async openSetupPanel() {
     const panel = this.getSetupPanel();
     if (!panel) return;
 
-    this.closeToolsSheet();
-    this.closeTaskPanel();
+    const wasHidden = panel.classList.contains("hidden");
+    this.closeSurfacesForOpen("setup");
+    if (wasHidden) {
+      this.setupReturnFocus =
+        document.activeElement instanceof HTMLElement &&
+        !panel.contains(document.activeElement)
+          ? document.activeElement
+          : null;
+    }
+    const inWindow = await this.mountOverlayPanel("setup", panel, () =>
+      this.closeSetupPanel(),
+    );
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     this.renderSetupReport(this.setupState.report);
     this.syncSurfaceButtonState();
+    if (inWindow) this.focusFirstPanelControl(panel);
   }
 
-  closeSetupPanel() {
+  closeSetupPanel({ restoreFocus = true } = {}) {
     const panel = this.getSetupPanel();
     if (!panel) return;
+    const wasOpen = !panel.classList.contains("hidden");
+    const inWindow = this.isPanelInSurfaceWindow(panel);
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    if (inWindow) this.surfaceWindowManager?.close("setup");
     this.syncSurfaceButtonState();
+    const returnTarget = this.setupReturnFocus;
+    this.setupReturnFocus = null;
+    if (!restoreFocus || !inWindow || !wasOpen) return;
+    if (!this.restorePanelFocus(returnTarget)) {
+      this.focusSettingsReturnTarget();
+    }
+  }
+
+  // --- Setup / Sessions hosting (window on desktop, sheet on phones) -------
+
+  isPanelInSurfaceWindow(panel) {
+    return Boolean(
+      panel?.parentElement?.classList?.contains("surface-window-body"),
+    );
+  }
+
+  // Dismiss what opening `id` replaces (surface-windows.js
+  // planSurfaceOpenCloses): only the More sheet on desktop, the old mutual
+  // exclusions between the phone sheets otherwise.
+  closeSurfacesForOpen(id) {
+    const plan = window.SurfaceWindows?.planSurfaceOpenCloses?.(id, {
+      windowed: this.isWindowedSurfaces(),
+    }) || ["tools"];
+    for (const target of plan) {
+      if (target === "tools") this.closeToolsSheet();
+      else if (target === "tasks") this.closeTaskPanel();
+      else if (target === "setup")
+        this.closeSetupPanel({ restoreFocus: false });
+      else if (target === "sessions") {
+        this.closeSessionsPanel({ restoreFocus: false });
+      }
+    }
+  }
+
+  // Mount Setup/Sessions in their SurfaceWindow on desktop (true), or give
+  // the element back to #app for the sheet (false).
+  async mountOverlayPanel(id, panel, onClose) {
+    const config = window.SurfaceWindows?.OVERLAY_SURFACE_WINDOWS?.[id];
+    if (config && this.isWindowedSurfaces()) {
+      const win = await this.openSurfaceWindow(id, {
+        title: config.title,
+        icon: config.icon,
+        contentEl: panel,
+        bounds: { ...config.bounds },
+        minWidthPx: config.minWidthPx,
+        minHeightPx: config.minHeightPx,
+        onClose,
+        onEscape: onClose,
+      });
+      if (win) return true;
+    }
+    this.releaseSurfaceWindowContent(id, panel);
+    return false;
+  }
+
+  focusFirstPanelControl(panel) {
+    const first = Array.from(
+      panel?.querySelectorAll?.(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ) || [],
+    ).find((el) => !el.hidden && el.getClientRects().length > 0);
+    first?.focus({ preventScroll: true });
+  }
+
+  restorePanelFocus(target) {
+    if (!target?.isConnected || !target.getClientRects().length) return false;
+    target.focus({ preventScroll: true });
+    return document.activeElement === target;
+  }
+
+  focusActiveTerminalSoft() {
+    if (this.activeId && this.terminals.has(this.activeId)) {
+      this.focusTerminal(this.activeId, { ensureVisible: false });
+    }
   }
 
   renderSetupReport(report) {
@@ -8218,28 +9370,21 @@ class TerminalManager {
     this.taskSignalLast = Array.isArray(tasks) ? tasks : [];
   }
 
+  // Shared toast entry point (web/toast-service.js). Returns the toast handle,
+  // or null when the service is unavailable (e.g. a stale cached script).
+  notify(options) {
+    return window.ToastService?.show?.(options) ?? null;
+  }
+
   showTaskToast(transition) {
-    let toast = document.getElementById("task-toast");
-    if (!toast) {
-      toast = document.createElement("div");
-      toast.id = "task-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        void this.openTaskPanel();
-      });
-      document.getElementById("app")?.appendChild(toast);
-    }
-    const verb =
-      transition.to === "complete"
-        ? "completed ✅"
-        : transition.to === "failed"
-          ? "failed ❌"
-          : "needs your input ⏸";
-    toast.textContent = `Task "${transition.title}" ${verb}`;
-    toast.classList.remove("hidden");
-    clearTimeout(this.taskToastTimer);
-    this.taskToastTimer = setTimeout(() => toast.classList.add("hidden"), 8000);
+    const describe = window.TaskSignals?.describeTaskTransitionToast;
+    if (typeof describe !== "function") return;
+    this.notify({
+      ...describe(transition),
+      actions: [
+        { label: "Open", run: () => void this.openTaskPanel() },
+      ],
+    });
   }
 
   getTaskViewMode() {
@@ -8274,14 +9419,55 @@ class TerminalManager {
     const toggle = document.getElementById("task-view-toggle");
     if (!toggle) return;
     const mode = this.getTaskViewMode();
-    toggle.textContent = mode === "board" ? "☰ List" : "▦ Board";
-    toggle.title =
-      mode === "board" ? "Switch to list view" : "Switch to board view";
+    const content = window.TaskBoard?.taskViewToggleContent?.({ mode }) || {
+      icon: mode === "board" ? "list" : "layout-grid",
+      label: mode === "board" ? "List" : "Board",
+      title: mode === "board" ? "Switch to list view" : "Switch to board view",
+    };
+    toggle.title = content.title;
+    if (toggle.dataset.label === content.label) return;
+    toggle.dataset.label = content.label;
+    const icon = document.createElement("i");
+    icon.dataset.lucide = content.icon;
+    const label = document.createElement("span");
+    label.textContent = content.label;
+    toggle.replaceChildren(icon, label);
+    initLucideIcons();
+  }
+
+  // Calm "no tasks" state for the floating panel (shared copy: task-board.js).
+  renderTaskEmptyState(list) {
+    const state = window.TaskBoard?.taskEmptyState?.({ surface: "panel" }) || {
+      icon: "list-checks",
+      title: "No tasks yet",
+      hint: "",
+    };
+    const empty = document.createElement("div");
+    empty.className = "task-empty-state";
+    const icon = document.createElement("i");
+    icon.dataset.lucide = state.icon;
+    const title = document.createElement("p");
+    title.className = "task-empty-title";
+    title.textContent = state.title;
+    empty.append(icon, title);
+    if (state.hint) {
+      const hint = document.createElement("p");
+      hint.className = "task-empty-hint";
+      hint.textContent = state.hint;
+      empty.appendChild(hint);
+    }
+    list.appendChild(empty);
+    initLucideIcons();
   }
 
   renderTasks() {
     this.syncTaskViewToggle();
-    if (this.getTaskViewMode() === "board") {
+    // Zero tasks: one calm empty state in either view (five empty "(0)"
+    // board columns say nothing useful).
+    if (
+      this.getTaskViewMode() === "board" &&
+      this.taskState.items.length > 0
+    ) {
       this.renderTaskBoard();
       return;
     }
@@ -8291,10 +9477,7 @@ class TerminalManager {
     list.replaceChildren();
 
     if (this.taskState.items.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "task-item-meta";
-      empty.textContent = "No tasks";
-      list.appendChild(empty);
+      this.renderTaskEmptyState(list);
       this.renderTaskDetail(null);
       return;
     }
@@ -8781,6 +9964,9 @@ class TerminalManager {
       .querySelectorAll('[data-action="toggle-tools-sheet"], #toolbar-toggle')
       .forEach((btn) => {
         btn.classList.toggle("active", isOpen);
+        if (!btn.closest("#tools-sheet")) {
+          btn.setAttribute("aria-expanded", isOpen ? "true" : "false");
+        }
       });
   }
 
@@ -8789,15 +9975,30 @@ class TerminalManager {
     if (!preserveLayoutEditor) {
       this.layoutEditorOpen = false;
     }
+    const wasHidden = this.toolsSheet.classList.contains("hidden");
+    if (wasHidden) {
+      const active = document.activeElement;
+      this.toolsSheetOpener =
+        active instanceof HTMLElement &&
+        active.matches('#toolbar-toggle, [data-action="toggle-tools-sheet"]')
+          ? active
+          : null;
+    }
     this.toolsSheet.classList.remove("hidden");
     this.toolsSheet.setAttribute("aria-hidden", "false");
     this.setOverflowToggleState(true);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasHidden) this.focusToolsSheetFirstControl();
   }
 
-  closeToolsSheet() {
+  // restoreFocus: the user dismissed the sheet (Escape, X, backdrop, the
+  // trigger again) -> focus returns to the More / Menu button. Closes caused
+  // by opening another surface leave focus to that surface.
+  closeToolsSheet({ restoreFocus = false } = {}) {
     if (!this.toolsSheet) return;
+    const wasOpen = !this.toolsSheet.classList.contains("hidden");
+    const focusWasInside = this.toolsSheet.contains(document.activeElement);
     this.cleanupLayoutDrag({ rerender: false });
     this.layoutEditorOpen = false;
     this.toolsSheet.classList.add("hidden");
@@ -8805,6 +10006,16 @@ class TerminalManager {
     this.setOverflowToggleState(false);
     this.renderToolsSheetView();
     this.syncSurfaceButtonState();
+    if (wasOpen && (restoreFocus || focusWasInside)) {
+      const stranded =
+        !document.activeElement ||
+        document.activeElement === document.body ||
+        this.toolsSheet.contains(document.activeElement);
+      if (restoreFocus || stranded) {
+        this.getToolsSheetTrigger()?.focus({ preventScroll: true });
+      }
+    }
+    if (wasOpen) this.toolsSheetOpener = null;
   }
 
   toggleToolsSheet() {
@@ -8812,7 +10023,7 @@ class TerminalManager {
     if (this.toolsSheet.classList.contains("hidden")) {
       this.openToolsSheet();
     } else {
-      this.closeToolsSheet();
+      this.closeToolsSheet({ restoreFocus: true });
     }
   }
 
@@ -9266,11 +10477,16 @@ class TerminalManager {
     }
 
     this.commandPaletteRegistry = new ActionRegistryCtor();
+    this.paletteMru =
+      window.PaletteProviders?.createPaletteMruStore?.(window.localStorage) ||
+      null;
     this.commandPalette = new CommandPaletteCtor({
       root,
       input,
       results,
       registry: this.commandPaletteRegistry,
+      onRun: (result) => this.recordPaletteUse(result),
+      rankOf: (result) => this.getPaletteUseRank(result),
     });
 
     root.addEventListener("click", (event) => {
@@ -9278,6 +10494,24 @@ class TerminalManager {
         this.closeCommandPalette();
       }
     });
+    // Touch screens have no Esc key: a visible Cancel (coarse pointers only,
+    // styles.css) is their way out besides tapping the backdrop.
+    document
+      .getElementById("command-palette-cancel")
+      ?.addEventListener("click", () => this.closeCommandPalette());
+
+    // The controller closes itself on Escape and after running a command,
+    // bypassing closeCommandPalette(); follow the root's visibility so the
+    // toolbar Palette button never stays lit on a closed palette.
+    if (typeof MutationObserver === "function") {
+      let wasOpen = !root.classList.contains("hidden");
+      new MutationObserver(() => {
+        const isOpen = !root.classList.contains("hidden");
+        if (isOpen === wasOpen) return;
+        wasOpen = isOpen;
+        this.syncSurfaceButtonState();
+      }).observe(root, { attributes: true, attributeFilter: ["class"] });
+    }
 
     this.registerCommandPaletteActions();
   }
@@ -9374,6 +10608,63 @@ class TerminalManager {
 
   getCommandPaletteQuery() {
     return String(this.commandPalette?.input?.value || "").trim();
+  }
+
+  // Palette MRU: files opened (absolute paths) and commands run (action ids).
+  recordPaletteUse(result) {
+    const id = String(result?.id || "");
+    if (!id || !this.paletteMru) return;
+    if (id.startsWith("quick-open:") || id.startsWith("recent-file:")) {
+      return; // recorded by the file open itself (recordPaletteFileOpen)
+    }
+    this.paletteMru.touch("commands", id);
+  }
+
+  recordPaletteFileOpen(path) {
+    if (path) this.paletteMru?.touch("files", String(path));
+  }
+
+  getPaletteUseRank(result) {
+    const id = String(result?.id || "");
+    if (!this.paletteMru || !id) return -1;
+    if (id.startsWith("recent-file:")) {
+      return this.paletteMru.rankOf("files", id.slice("recent-file:".length));
+    }
+    return this.paletteMru.rankOf("commands", id);
+  }
+
+  openFileFromPalette(path) {
+    this.recordPaletteFileOpen(path);
+    this.handleExplorerOpenFile(path, { pinned: true });
+  }
+
+  paletteFileIcon(name) {
+    return (
+      window.FileExplorerController?.fileIconName?.({ name, isDir: false }) ||
+      "file"
+    );
+  }
+
+  // Quick-open file row: basename as the title, its directory (relative to
+  // the searched project) as the dim detail.
+  buildPaletteFileAction(file, { id, keywords, priority, detailPrefix = "" }) {
+    const split = window.PaletteProviders.splitFilePath(
+      file.relativePath || file.path,
+    );
+    const truncate = window.PaletteProviders.truncatePathMiddle;
+    const detail = [detailPrefix, split.dir ? truncate(split.dir, 56) : ""]
+      .filter(Boolean)
+      .join(" · ");
+    return {
+      id,
+      title: split.base || file.path,
+      group: "Files",
+      icon: this.paletteFileIcon(split.base),
+      keywords,
+      meta: detail ? [detail] : null,
+      priority,
+      run: () => this.openFileFromPalette(file.path),
+    };
   }
 
   isPaletteDirectoryQuery(query) {
@@ -9489,6 +10780,8 @@ class TerminalManager {
         id: "new-terminal",
         title: "New Terminal",
         group: "Actions",
+        icon: "square-terminal",
+        keybinding: "Ctrl+N",
         keywords: ["workspace", "shell", "tab"],
         priority: 50,
         run: () => this.createTerminal(),
@@ -9497,6 +10790,8 @@ class TerminalManager {
         id: "split-workspace",
         title: "Split Workspace",
         group: "Actions",
+        icon: "columns-2",
+        keybinding: "Ctrl+Shift+D",
         keywords: ["split", "pane", "terminal"],
         priority: 45,
         run: () => this.splitWorkspace(),
@@ -9505,6 +10800,7 @@ class TerminalManager {
         id: "detach-terminal-pane",
         title: "Move Pane to New Tab",
         group: "Actions",
+        icon: "square-arrow-out-up-right",
         keywords: ["detach", "unmerge", "ungroup", "pane", "tab"],
         priority: 45,
         run: () => this.detachTerminalToWorkspace(),
@@ -9513,6 +10809,7 @@ class TerminalManager {
         id: "new-task-workspace",
         title: "New Task Workspace",
         group: "Actions",
+        icon: "bot",
         keywords: ["agent", "worker", "judge", "task"],
         priority: 44,
         run: () => this.openTaskPanel({ focusTitle: true }),
@@ -9521,6 +10818,7 @@ class TerminalManager {
         id: "open-tasks",
         title: "Open Tasks",
         group: "Actions",
+        icon: "list-todo",
         keywords: ["agent", "runner", "worker", "judge"],
         priority: 43,
         run: () => this.openTaskPanel(),
@@ -9529,6 +10827,7 @@ class TerminalManager {
         id: "open-git",
         title: "Open Git",
         group: "Actions",
+        icon: "git-branch",
         keywords: ["repo", "branch", "diff"],
         priority: 40,
         run: () => this.openGitPanel(),
@@ -9537,14 +10836,25 @@ class TerminalManager {
         id: "open-file-manager",
         title: "Open File Manager",
         group: "Actions",
+        icon: "folder-open",
         keywords: ["files", "explorer", "browse"],
         priority: 40,
         run: () => this.openFileExplorer(),
       },
       {
+        id: "compose-message",
+        title: "Compose message…",
+        group: "Actions",
+        icon: "message-square-text",
+        keywords: ["compose", "write", "message", "prompt", "send", "dictate"],
+        priority: 35,
+        run: () => this.openComposeSheet(),
+      },
+      {
         id: "open-clipboard",
         title: "Open Clipboard",
         group: "Actions",
+        icon: "clipboard",
         keywords: ["paste", "copy", "history"],
         priority: 30,
         run: () => this.clipboardManager.togglePanel(),
@@ -9553,6 +10863,7 @@ class TerminalManager {
         id: "open-settings",
         title: "Open Settings",
         group: "Actions",
+        icon: "settings",
         keywords: ["settings", "preferences", "config", "options"],
         priority: 35,
         run: () => this.openSettings(),
@@ -9561,6 +10872,7 @@ class TerminalManager {
         id: "search-terminal",
         title: "Search in Terminal",
         group: "Views",
+        icon: "search",
         keywords: ["find", "search", "terminal"],
         run: () => this.openTerminalSearch(),
       },
@@ -9568,6 +10880,7 @@ class TerminalManager {
         id: "toggle-line-wrap",
         title: "Toggle Line Wrap",
         group: "Views",
+        icon: "wrap-text",
         keywords: ["wrap", "lines", "overflow"],
         run: () => this.toggleWrapLines(),
       },
@@ -9575,6 +10888,7 @@ class TerminalManager {
         id: "toggle-sessions-dock",
         title: "Dock Sessions to Bottom",
         group: "Views",
+        icon: "panel-bottom",
         keywords: ["dock", "panel", "bottom", "sessions", "terminal"],
         run: () => this.toggleSessionsDock(),
       },
@@ -9582,6 +10896,8 @@ class TerminalManager {
         id: "toggle-fullscreen",
         title: "Toggle Fullscreen",
         group: "Views",
+        icon: "maximize",
+        keybinding: "F11",
         keywords: ["fullscreen", "focus", "zen"],
         run: () => this.toggleFullscreen(),
       },
@@ -9589,6 +10905,8 @@ class TerminalManager {
         id: "font-increase",
         title: "Increase Font Size",
         group: "Views",
+        icon: "zoom-in",
+        keybinding: "Ctrl+=",
         keywords: ["zoom", "font", "larger"],
         run: () => this.changeFontSize(1),
       },
@@ -9596,6 +10914,8 @@ class TerminalManager {
         id: "font-decrease",
         title: "Decrease Font Size",
         group: "Views",
+        icon: "zoom-out",
+        keybinding: "Ctrl+-",
         keywords: ["zoom", "font", "smaller"],
         run: () => this.changeFontSize(-1),
       },
@@ -9603,6 +10923,7 @@ class TerminalManager {
         id: "open-help",
         title: "Open Help",
         group: "Views",
+        icon: "circle-help",
         keywords: ["shortcuts", "docs", "help"],
         run: () => this.openHelp(),
       },
@@ -9610,12 +10931,22 @@ class TerminalManager {
         id: "toggle-ide-mode",
         title: "Toggle IDE Mode",
         group: "Views",
+        icon: "layout-panel-left",
         keywords: ["ide", "editor", "mode", "workspace"],
         run: () => this.toggleIdeMode(),
       },
     ];
 
-    actions.forEach((action) => this.commandPaletteRegistry.register(action));
+    // Hints come from the shortcut registry (the Help modal's source), so a
+    // palette row never advertises a key the app does not handle.
+    const hintedActions =
+      window.KeyboardShortcuts?.withShortcutHints?.(actions) || actions;
+    // Each row also says in one line what it does (web/feature-guide.js).
+    const describe = (list) =>
+      window.FeatureGuide?.withPaletteDescriptions?.(list) || list;
+    describe(hintedActions).forEach((action) =>
+      this.commandPaletteRegistry.register(action),
+    );
 
     this.commandPaletteRegistry.registerProvider(() => {
       const query = this.getCommandPaletteQuery();
@@ -9628,6 +10959,7 @@ class TerminalManager {
           id: `go-to-directory:${query}`,
           title: "Go to Directory...",
           group: "Actions",
+          icon: "folder-input",
           keywords: [query, "directory", "cwd", "jump", "open path"],
           meta: [query],
           priority: 48,
@@ -9644,26 +10976,45 @@ class TerminalManager {
     // comes from this provider via descending priority.
     this.commandPaletteRegistry.registerProvider((context = {}) => {
       const query = this.getCommandPaletteQuery();
-      if (!this.isPaletteBareQuery(query)) return [];
-
       const files = Array.isArray(context.quickOpenFiles)
         ? context.quickOpenFiles
         : [];
+
+      // Empty query: the few most recently opened files of this project.
+      if (!query) {
+        const byPath = new Map(files.map((file) => [file.path, file]));
+        return (this.paletteMru?.list("files") || [])
+          .map((path) => byPath.get(path))
+          .filter(Boolean)
+          .slice(0, 5)
+          .map((file, index) =>
+            this.buildPaletteFileAction(file, {
+              id: `recent-file:${file.path}`,
+              keywords: [],
+              priority: 30 - index,
+              detailPrefix: "recent",
+            }),
+          );
+      }
+      if (!this.isPaletteBareQuery(query)) return [];
+
+      // One MRU snapshot per query: rankOf per candidate re-read and
+      // re-parsed localStorage for every one of up to 5000 files.
+      const fileRank = this.paletteMru?.rankLookup?.("files");
       const matches = window.PaletteProviders.filterQuickOpenFiles(
         query,
         files,
         50,
+        { mruRank: fileRank ? (file) => fileRank(file.path) : undefined },
       );
 
-      return matches.map((file, index) => ({
-        id: `quick-open:${file.path}`,
-        title: file.relativePath || file.path,
-        group: "Files",
-        keywords: [query],
-        meta: [file.path],
-        priority: 50 - index,
-        run: () => this.handleExplorerOpenFile(file.path, { pinned: true }),
-      }));
+      return matches.map((file, index) =>
+        this.buildPaletteFileAction(file, {
+          id: `quick-open:${file.path}`,
+          keywords: [query],
+          priority: 50 - index,
+        }),
+      );
     });
 
     this.commandPaletteRegistry.registerProvider((context = {}) => {
@@ -9673,7 +11024,7 @@ class TerminalManager {
       });
 
       if (newFolderAction) {
-        contextualActions.push(newFolderAction);
+        contextualActions.push({ icon: "folder-plus", ...newFolderAction });
       }
 
       if (context.canCreateLinkedView) {
@@ -9681,6 +11032,7 @@ class TerminalManager {
           id: "open-linked-view",
           title: "Open Linked View",
           group: "Contextual",
+          icon: "link",
           keywords: ["tmux", "linked", "shared"],
           run: () => this.createLinkedView(),
         });
@@ -9691,6 +11043,7 @@ class TerminalManager {
           id: "toggle-extra-keys",
           title: "Toggle Extra Keys",
           group: "Contextual",
+          icon: "keyboard",
           keywords: ["keyboard", "modifiers", "mobile"],
           meta: context.extraKeysVisible ? ["Visible"] : ["Hidden"],
           run: () => this.extraKeys?.toggle(),
@@ -9702,8 +11055,9 @@ class TerminalManager {
           id: `reveal-cwd:${context.cwd}`,
           title: "Reveal Current CWD in Files",
           group: "Contextual",
+          icon: "folder-search",
           keywords: ["files", "explorer", "cwd", "reveal", context.cwd],
-          meta: [context.cwd],
+          meta: [window.PaletteProviders.truncatePathMiddle(context.cwd, 56)],
           priority: 38,
           run: () => this.revealCurrentCwdInFilesFromPalette(context.cwd),
         });
@@ -9714,6 +11068,7 @@ class TerminalManager {
           id: `checkout-git-branch:${context.cwd}`,
           title: "Checkout Git Branch",
           group: "Contextual",
+          icon: "git-branch",
           keywords: ["checkout", "branch", "git", context.cwd],
           meta: context.currentGitBranch
             ? [`Current: ${context.currentGitBranch}`]
@@ -9727,14 +11082,14 @@ class TerminalManager {
         openGitBranches: (cwd) => this.openGitBranchesFromPalette(cwd),
       });
       if (openGitBranchesAction) {
-        contextualActions.push(openGitBranchesAction);
+        contextualActions.push({ icon: "git-branch", ...openGitBranchesAction });
       }
 
       contextualActions.push(
         ...buildGitBranchActions(context, {
           switchBranch: (cwd, branch) =>
             this.switchGitBranchFromPalette(cwd, branch),
-        }),
+        }).map((action) => ({ icon: "git-branch", ...action })),
       );
 
       if (context.paneCount > 1) {
@@ -9743,6 +11098,8 @@ class TerminalManager {
             id: "focus-next-pane",
             title: "Focus Next Pane",
             group: "Contextual",
+            icon: "arrow-down",
+            keybinding: "Alt+Shift+↓",
             keywords: ["pane", "terminal", "next", "down"],
             run: () => this.switchToAdjacentPane(1),
           },
@@ -9750,6 +11107,8 @@ class TerminalManager {
             id: "focus-previous-pane",
             title: "Focus Previous Pane",
             group: "Contextual",
+            icon: "arrow-up",
+            keybinding: "Alt+Shift+↑",
             keywords: ["pane", "terminal", "previous", "up"],
             run: () => this.switchToAdjacentPane(-1),
           },
@@ -9763,6 +11122,7 @@ class TerminalManager {
           id: "close-editor-tab",
           title: "Close Editor Tab",
           group: "Contextual",
+          icon: "x",
           keywords: ["editor", "tab", "close"],
           run: () => this.closeActiveEditorTabFromPalette(),
         });
@@ -9770,6 +11130,7 @@ class TerminalManager {
           id: "next-editor-tab",
           title: "Next Editor Tab",
           group: "Contextual",
+          icon: "chevron-right",
           keywords: ["editor", "tab", "next"],
           run: () => this.stepActiveEditorTab(1),
         });
@@ -9777,6 +11138,7 @@ class TerminalManager {
           id: "previous-editor-tab",
           title: "Previous Editor Tab",
           group: "Contextual",
+          icon: "chevron-left",
           keywords: ["editor", "tab", "previous", "prev"],
           run: () => this.stepActiveEditorTab(-1),
         });
@@ -9787,46 +11149,37 @@ class TerminalManager {
           id: "open-task-board-tab",
           title: "Open Task Board",
           group: "Contextual",
+          icon: "square-kanban",
           keywords: ["tasks", "board", "kanban", "agent"],
           run: () => this.openTaskBoardTab(),
         });
       }
 
-      return contextualActions;
+      return describe(contextualActions);
     });
 
     this.commandPaletteRegistry.registerProvider(() => {
+      const truncate = window.PaletteProviders.truncatePathMiddle;
       return this.loadRecentWorkspaceEntries()
         .map((entry) => {
           const cwd = this.normalizeWorkspaceCwd(entry.cwd);
           if (!cwd) return null;
-
-          const existingWorkspaceId = this.findWorkspaceIdByCwd(cwd);
-          const activeWorkspaceId = this.terminals.get(
-            this.activeId,
-          )?.workspaceId;
-          const metadata = [entry.label];
-
-          if (entry.label !== cwd) {
-            metadata.push(cwd);
-          }
-          if (existingWorkspaceId === activeWorkspaceId) {
-            metadata.push("Active");
-          } else if (existingWorkspaceId) {
-            metadata.push("Open");
-          }
+          // An open workspace in this cwd already has its own row below;
+          // listing it again as "recent" would only duplicate it.
+          if (this.findWorkspaceIdByCwd(cwd)) return null;
 
           return {
             id: `recent-workspace:${cwd}`,
-            title: "Recent Workspace",
+            title: entry.label || this.formatCwdLabel(cwd),
             group: "Workspaces",
+            icon: "history",
             keywords: [
               entry.label,
               cwd,
               `recent ${entry.label}`,
               "recent workspace",
             ],
-            meta: metadata,
+            meta: ["Recent workspace", truncate(cwd, 56)],
             priority: 42,
             run: () => this.switchOrCreateWorkspaceForCwd(cwd),
           };
@@ -9854,7 +11207,9 @@ class TerminalManager {
             metadata.push("Active");
           }
           if (snapshot.cwd) {
-            metadata.push(snapshot.cwd);
+            metadata.push(
+              window.PaletteProviders.truncatePathMiddle(snapshot.cwd, 56),
+            );
           }
           if (snapshot.count > 1) {
             metadata.push(`${snapshot.count} terminals`);
@@ -9867,6 +11222,7 @@ class TerminalManager {
             id: `workspace:${workspaceId}`,
             title: label,
             group: "Workspaces",
+            icon: "square-terminal",
             keywords: [
               workspaceId,
               index,
@@ -9902,19 +11258,22 @@ class TerminalManager {
           window.SessionActions.planSessionRowAction(session, options),
       });
 
-      return entries.map((entry, index) => ({
-        id: `palette-session:${entry.session.id}`,
-        title: this.formatCwdLabel(entry.session.cwd) || entry.session.id,
-        group: "Sessions",
-        keywords: [query],
-        meta: [
-          entry.plan.label,
-          entry.plan.statusClass === "active" ? "● live" : "○ ended",
-          entry.session.id,
-        ],
-        priority: 100 - index,
-        run: () => void this.handleSessionRowActivate(entry.session.id),
-      }));
+      return entries.map((entry, index) => {
+        const described = window.PaletteProviders.describePaletteSession(
+          entry.session,
+          entry.plan,
+        );
+        return {
+          id: `palette-session:${entry.session.id}`,
+          title: described.title,
+          group: "Sessions",
+          icon: entry.session.agentName ? "bot" : "square-terminal",
+          keywords: [query],
+          meta: [described.hint, described.detail],
+          priority: 100 - index,
+          run: () => void this.handleSessionRowActivate(entry.session.id),
+        };
+      });
     });
 
     // "$" mode — saved commands (localStorage), run in the active terminal.
@@ -9935,6 +11294,7 @@ class TerminalManager {
         id: `palette-command:${entry.name}`,
         title: entry.name,
         group: "Commands",
+        icon: "terminal",
         keywords: [query],
         meta: [entry.command],
         priority: 100 - index,
@@ -9945,6 +11305,7 @@ class TerminalManager {
         id: "palette-command-save",
         title: "Save command…",
         group: "Commands",
+        icon: "bookmark",
         keywords: [query],
         meta: ["new $ shortcut"],
         priority: 1,
@@ -9955,6 +11316,7 @@ class TerminalManager {
           id: "palette-command-remove",
           title: "Remove command…",
           group: "Commands",
+          icon: "trash-2",
           keywords: [query],
           meta: ["delete a $ shortcut"],
           priority: 0,
@@ -9968,7 +11330,9 @@ class TerminalManager {
   runSavedCommand(command) {
     const active = this.getActiveTerminal();
     if (!active?.ws) return;
-    active.ws.send(JSON.stringify({ type: "input", data: `${command}\r` }));
+    // Queued send: a saved command run while the socket reconnects is held
+    // (bounded 8 KB / 15 s) and flushed in order, not silently dropped.
+    active.ws.sendInput(`${command}\r`);
     active.terminal?.focus();
   }
 
@@ -10430,10 +11794,27 @@ class TerminalManager {
     if (this.telemetryRefreshInterval) {
       clearInterval(this.telemetryRefreshInterval);
     }
-    this.telemetryRefreshInterval = setInterval(
-      () => this.queueTelemetryRefresh(0),
-      5000,
-    );
+    // Visible tabs poll every 5 s. Hidden tabs slow down to every 30 s (each
+    // poll costs tmux queries on the server) but never stop: agent attention
+    // (needs-input / done) only arrives through this poll, and the local
+    // notification fallback for users without web push depends on it. A tab
+    // catches up immediately when it becomes visible again.
+    this.telemetryRefreshInterval = setInterval(() => {
+      if (document.hidden) {
+        const sinceLast = Date.now() - (this.telemetryLastStartedAt || 0);
+        if (sinceLast < TELEMETRY_HIDDEN_POLL_MS) return;
+      }
+      this.queueTelemetryRefresh(0);
+    }, TELEMETRY_VISIBLE_POLL_MS);
+    if (!this.telemetryVisibilityHandler) {
+      this.telemetryVisibilityHandler = () => {
+        if (!document.hidden) this.queueTelemetryRefresh(0);
+      };
+      document.addEventListener(
+        "visibilitychange",
+        this.telemetryVisibilityHandler,
+      );
+    }
   }
 
   queueTelemetryRefresh(delay = 150) {
@@ -10448,9 +11829,15 @@ class TerminalManager {
     if (this.telemetryRefreshPromise) return this.telemetryRefreshPromise;
     this.telemetryRefreshPromise = (async () => {
       try {
+        // Lets a cwd learned while this poll is in flight (OSC 7) win over
+        // the older server snapshot.
+        const requestStartedAt = Date.now();
+        this.telemetryLastStartedAt = requestStartedAt;
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
+        // Live cwd adoption checks the allowed roots (cached after once).
+        await this.ensureAllowedRoots();
         this._sessionCatalog = Array.isArray(serverTerminals)
           ? serverTerminals
           : [];
@@ -10479,14 +11866,22 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
-          const hasClientCwd =
-            typeof terminal.cwd === "string" && terminal.cwd.trim().length > 0;
-          if (!hasClientCwd && typeof next.cwd === "string" && next.cwd) {
-            terminal.cwd = next.cwd;
-            this.sessionRegistry.update(id, { cwd: next.cwd });
-          }
+          this.applyTerminalAttention(terminal, next, id);
+          // Under tmux the server reads the pane's live cwd on every poll, so
+          // it is authoritative (bash emits no OSC 7 and tmux would not
+          // forward it). The raw backend only knows the spawn cwd, so there
+          // it just fills a missing client cwd.
+          const liveCwd = window.LiveCwd?.resolveServerLiveCwd?.({
+            clientCwd: terminal.cwd,
+            serverCwd: next.cwd,
+            backendMode: next.backendMode || terminal.backendMode,
+            clientCwdUpdatedAt: terminal.cwdUpdatedAt || 0,
+            requestStartedAt,
+          });
+          if (liveCwd) this.applyLiveCwd(id, liveCwd);
         });
 
+        this.pruneAttentionSeen(this._sessionCatalog);
         this.updateTabGroups();
         this.updateLinkedViewButton();
       } catch (err) {
@@ -10595,6 +11990,22 @@ class TerminalManager {
     const isWorktree = terminals.some((terminal) =>
       Boolean(terminal.isWorktree),
     );
+    const workspaceAttention = this.getWorkspaceAttention(terminals);
+    const progressTerminal = activeTerminal?.progress
+      ? activeTerminal
+      : terminals.find((terminal) => terminal.progress) || null;
+    // Red is reserved for failures: the last command in some pane exited
+    // non-zero (Ctrl+C's 130 is a user choice, not an error).
+    const exitStatus =
+      !running &&
+      terminals.some(
+        (terminal) =>
+          typeof terminal.lastExitCode === "number" &&
+          terminal.lastExitCode !== 0 &&
+          terminal.lastExitCode !== 130,
+      )
+        ? "error"
+        : "";
     const descriptors = TerminalColors.getWorkspaceSignalDescriptors({
       running,
       agentName,
@@ -10636,6 +12047,10 @@ class TerminalManager {
       recentTools,
       ports,
       isWorktree,
+      attentionKind: workspaceAttention.kind,
+      attentionText: workspaceAttention.text,
+      progress: progressTerminal?.progress || null,
+      exitStatus,
       descriptors,
       statusLabels,
       statusSummary: this.summarizeWorkspaceValues(statusLabels, 2),
@@ -10672,6 +12087,22 @@ class TerminalManager {
     } else {
       lines.push("Signals: none");
     }
+    if (snapshot.attentionKind) {
+      const kindLabel =
+        ATTENTION_KIND_LABELS[snapshot.attentionKind] || "Attention";
+      lines.push(
+        snapshot.attentionText
+          ? `${kindLabel}: ${snapshot.attentionText}`
+          : kindLabel,
+      );
+    }
+    if (snapshot.progress) {
+      lines.push(
+        snapshot.progress.percent !== null
+          ? `Progress: ${snapshot.progress.percent}%`
+          : "Progress: working…",
+      );
+    }
     let tooltip = lines.join("\n");
     const toolsTooltip = window.TerminalColors?.formatRecentToolsTooltip?.(
       snapshot.recentTools,
@@ -10692,7 +12123,32 @@ class TerminalManager {
     tab.dataset.agentState = snapshot.agentState || "none";
     tab.dataset.ports = snapshot.ports.join(",");
     tab.dataset.isWorktree = snapshot.isWorktree ? "true" : "false";
+    tab.dataset.exitStatus = snapshot.exitStatus || "";
     tab.title = this.composeWorkspaceTooltip(snapshot);
+
+    const attentionDot = tab.querySelector(".tab-attention");
+    tab.dataset.attention = snapshot.attentionKind || "";
+    if (attentionDot) {
+      attentionDot.hidden = !snapshot.attentionKind;
+      attentionDot.dataset.kind = snapshot.attentionKind || "";
+      attentionDot.setAttribute(
+        "aria-label",
+        snapshot.attentionKind
+          ? ATTENTION_KIND_LABELS[snapshot.attentionKind] || "Attention"
+          : "",
+      );
+    }
+    const progressEl = tab.querySelector(".tab-progress");
+    const progress = snapshot.progress;
+    tab.dataset.progress = progress ? progress.state : "";
+    if (progressEl) {
+      progressEl.hidden = !progress;
+      progressEl.style.setProperty(
+        "--tab-progress",
+        progress && progress.percent !== null ? `${progress.percent}%` : "0%",
+      );
+      progressEl.dataset.state = progress ? progress.state : "";
+    }
 
     if (signalBadge) {
       signalBadge.textContent = snapshot.showSignalBadge
@@ -10747,6 +12203,19 @@ class TerminalManager {
       nextAgentTurnCompletedAt > 0 &&
       nextAgentTurnCompletedAt !== previousAgentTurnCompletedAt;
 
+    // A new agent session: attention seen so far belongs to an earlier run
+    // and must not drive its quick-reply chips.
+    const quickReplies = window.QuickReplies;
+    if (typeof quickReplies?.quickReplyAttentionBaseline === "function") {
+      terminal.quickReplyAttentionBaseline =
+        quickReplies.quickReplyAttentionBaseline({
+          previousAgentName: terminal.agentName || null,
+          nextAgentName,
+          attention: terminal.attention || null,
+          currentBaseline: terminal.quickReplyAttentionBaseline ?? null,
+        });
+    }
+
     terminal.running = nextRunning;
     terminal.busy = nextRunning;
     terminal.lastExitCode = nextExitCode;
@@ -10765,6 +12234,7 @@ class TerminalManager {
   }
 
   maybeNotifyCommandFinished(terminal) {
+    terminal.lastCompletionAlertAt = Date.now();
     this.playCompletionSound();
     if (typeof Notification === "undefined") return;
     if (Notification.permission !== "granted") return;
@@ -10791,6 +12261,232 @@ class TerminalManager {
     } catch (err) {
       console.warn("Command completion notification failed:", err);
     }
+  }
+
+  // --- Agent attention (OSC 9/777/99 notifications, OSC 9;4 progress) -------
+  // The server keeps each session's last agent notification as
+  // `attention: {kind,title,body,at,seq}`; this browser remembers the last seq
+  // it has shown per session (localStorage) so tabs and the app badge mark
+  // only unseen events. Alerts reuse the completion sound/notification path.
+
+  applyTerminalAttention(terminal, next, id = terminal?.id) {
+    const signals = window.TaskSignals;
+    // A stale cached task-signals.js (older than this app.js) lacks the
+    // attention helpers: skip attention rather than break telemetry refresh.
+    if (typeof signals?.newAttentionSince !== "function" || !terminal) return;
+    const baseline = terminal.attentionSeqBaseline;
+    const fresh = signals.newAttentionSince(baseline, next);
+    terminal.attentionSeqBaseline = signals.attentionSeq(next);
+    terminal.attention = next?.attention || null;
+    terminal.progress = signals.normalizeProgress(next?.progress);
+    terminal.lastActivityAt = Number(next?.lastActivityAt) || null;
+    if (fresh) {
+      this.maybeNotifyAttention(terminal, fresh);
+      this.maybeToastAttention(id, terminal, fresh);
+    }
+  }
+
+  // In-page toast for a fresh agent notification while the page is visible
+  // (hidden tabs get the system notification above). Open jumps to it.
+  maybeToastAttention(id, terminal, attention) {
+    const signals = window.TaskSignals;
+    if (
+      !id ||
+      typeof signals?.shouldToastAttention !== "function" ||
+      typeof signals?.describeAttentionToast !== "function"
+    ) {
+      return;
+    }
+    const show = signals.shouldToastAttention(attention, {
+      pageVisible: document.visibilityState === "visible",
+      isActiveVisible: id === this.getActiveVisibleTerminalId(),
+    });
+    if (!show) return;
+    const actions =
+      id === this.activeId
+        ? []
+        : [
+            {
+              label: "Open",
+              primary: true,
+              run: () => {
+                if (this.terminals.has(id)) this.switchTo(id);
+              },
+            },
+          ];
+    this.notify({
+      ...signals.describeAttentionToast(attention, {
+        sessionId: id,
+        label: this.formatCwdLabel(terminal.cwd || "") || "Terminal",
+      }),
+      actions,
+    });
+  }
+
+  maybeNotifyAttention(terminal, attention) {
+    if (attention.kind !== "needs-input" && attention.kind !== "done") return;
+    const now = Date.now();
+    // An agent's own "done" notification usually lands next to DeckTerm's
+    // turn/command completion detection — one alert per burst.
+    if (
+      attention.kind === "done" &&
+      now - (Number(terminal.lastCompletionAlertAt) || 0) <
+        ATTENTION_ALERT_DEDUPE_MS
+    ) {
+      return;
+    }
+    terminal.lastCompletionAlertAt = now;
+    this.playCompletionSound();
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    if (!document.hidden) return;
+    if (this.pushNotifications?.hasActiveSubscription?.()) return;
+
+    const title =
+      attention.kind === "needs-input"
+        ? "Agent needs your input"
+        : "Agent finished";
+    const label = this.formatCwdLabel(terminal.cwd || "Terminal");
+    const detail = [attention.title, attention.body]
+      .filter(Boolean)
+      .join(" — ");
+    const body = detail ? `${label}: ${detail}` : label;
+    if (this.pushNotifications?.showLocalFallback) {
+      void this.pushNotifications.showLocalFallback(title, {
+        body,
+        tag: `deckterm-local-${terminal.id}`,
+      });
+      return;
+    }
+    try {
+      new Notification(title, { body });
+    } catch (err) {
+      console.warn("Agent attention notification failed:", err);
+    }
+  }
+
+  getAttentionSeenMap() {
+    if (!this._attentionSeen) {
+      let raw = null;
+      try {
+        raw = localStorage.getItem(
+          window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+            "deckterm.attention.seen.v1",
+        );
+      } catch {
+        raw = null;
+      }
+      this._attentionSeen = window.TaskSignals?.parseSeenMap?.(raw) || {};
+    }
+    return this._attentionSeen;
+  }
+
+  saveAttentionSeenMap() {
+    try {
+      localStorage.setItem(
+        window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+          "deckterm.attention.seen.v1",
+        JSON.stringify(this._attentionSeen || {}),
+      );
+    } catch {
+      // Private mode / quota: unseen state just stays in memory.
+    }
+  }
+
+  pruneAttentionSeen(catalog) {
+    if (!Array.isArray(catalog) || catalog.length === 0) return;
+    const seen = this.getAttentionSeenMap();
+    const pruned = window.TaskSignals?.pruneSeenMap?.(
+      seen,
+      catalog.map((session) => session?.id).filter(Boolean),
+    );
+    if (pruned && Object.keys(pruned).length !== Object.keys(seen).length) {
+      this._attentionSeen = pruned;
+      this.saveAttentionSeenMap();
+    }
+  }
+
+  getActiveVisibleTerminalId() {
+    return document.visibilityState === "visible" ? this.activeId : null;
+  }
+
+  markAttentionSeen(id) {
+    const seq = window.TaskSignals?.attentionSeq?.(this.terminals.get(id));
+    if (!seq) return false;
+    const seen = this.getAttentionSeenMap();
+    if ((seen[id] || 0) >= seq) return false;
+    seen[id] = seq;
+    this.saveAttentionSeenMap();
+    return true;
+  }
+
+  isTerminalAttentionUnseen(id, terminal = this.terminals.get(id)) {
+    return Boolean(
+      window.TaskSignals?.hasUnseenAttention?.(
+        terminal,
+        this.getAttentionSeenMap()[id],
+        { isActiveVisible: id === this.getActiveVisibleTerminalId() },
+      ),
+    );
+  }
+
+  // Marks the active, visible session as seen and refreshes the app badge.
+  syncAttentionIndicators() {
+    const activeVisibleId = this.getActiveVisibleTerminalId();
+    if (activeVisibleId) this.markAttentionSeen(activeVisibleId);
+    const signals = window.TaskSignals;
+    if (typeof signals?.countUnseenAttention !== "function") return;
+    const sessions = new Map();
+    for (const session of this._sessionCatalog || []) {
+      if (session?.id && session.active !== false) {
+        sessions.set(session.id, session);
+      }
+    }
+    this.terminals.forEach((terminal, id) => {
+      sessions.set(id, { id, attention: terminal.attention });
+    });
+    this.updateAppBadge(
+      signals.countUnseenAttention(
+        Array.from(sessions.values()),
+        this.getAttentionSeenMap(),
+        { activeVisibleId },
+      ),
+    );
+  }
+
+  updateAppBadge(count) {
+    if (this._appBadgeCount === count) return;
+    this._appBadgeCount = count;
+    try {
+      if (count > 0 && typeof navigator.setAppBadge === "function") {
+        void navigator.setAppBadge(count).catch(() => {});
+      } else if (count === 0 && typeof navigator.clearAppBadge === "function") {
+        void navigator.clearAppBadge().catch(() => {});
+      }
+    } catch {
+      // Badging API unsupported or blocked: the tab dots still show it.
+    }
+  }
+
+  getWorkspaceAttention(terminals = []) {
+    const signals = window.TaskSignals;
+    const unseen = terminals.filter((terminal) =>
+      this.isTerminalAttentionUnseen(terminal.id, terminal),
+    );
+    const kind = signals?.topAttentionKind?.(
+      unseen.map((terminal) => terminal.attention?.kind),
+    );
+    const source = kind
+      ? unseen.find((terminal) => terminal.attention?.kind === kind)
+      : null;
+    return {
+      kind: kind || null,
+      text: source
+        ? [source.attention.title, source.attention.body]
+            .filter(Boolean)
+            .join(" — ")
+        : "",
+    };
   }
 
   renderWorkspaceTab(tab, preferredCwd = null) {
@@ -10895,26 +12591,143 @@ class TerminalManager {
     return terminal.parser.registerOscHandler(7, (data) => {
       const cwd = this.parseOsc7Cwd(data);
       if (!cwd) return false;
-      const t = this.terminals.get(id);
-      if (!t) return true;
-      t.cwd = cwd;
-      if (t.workspaceId && this.activeId === id) {
-        this.setDirectoryValue(cwd);
-        this.updateWorkspaceLabel(t.workspaceId, cwd);
-        this.rememberWorkspaceById(t.workspaceId, cwd);
-      }
-      this.updateTabGroups();
-      // Update session registry with new cwd
-      this.sessionRegistry.update(id, { cwd });
+      // Under tmux the server's pane cwd is authoritative; a stray OSC 7 in
+      // the output (forgeable by anything printed) is swallowed.
+      const backendMode = this.terminals.get(id)?.backendMode || null;
+      if (window.LiveCwd?.acceptsOsc7Cwd?.(backendMode) === false) return true;
+      this.applyLiveCwd(id, cwd, { source: "osc7" });
       if (DEBUG) dbg("osc7 cwd", { id, cwd });
       return true;
     });
   }
 
+  // One path for every live cwd change (OSC 7 from the shell, or the server's
+  // tmux pane cwd from the telemetry poll): the terminal's cwd, tab/workspace
+  // label and session registry always follow. Only the server source may move
+  // the active terminal's working-directory field and the Files/Git surfaces
+  // (planLiveCwdAdoption): OSC 7 is forgeable by printed output. The field
+  // keeps a draft the user is editing (setDirectoryValue's draft lock).
+  applyLiveCwd(id, cwd, { source = "server" } = {}) {
+    const t = this.terminals.get(id);
+    if (!t || t.disposed || typeof cwd !== "string" || !cwd) return false;
+    const previousCwd = t.cwd;
+    t.cwdUpdatedAt = Date.now();
+    if (previousCwd === cwd) return false;
+    t.cwd = cwd;
+    const active = Boolean(t.workspaceId) && this.activeId === id;
+    if (active) {
+      this.updateWorkspaceLabel(t.workspaceId, cwd);
+      this.rememberWorkspaceById(t.workspaceId, cwd);
+    }
+    t.cwdIsLive = true;
+    const plan = this.planLiveCwdSurfaces({
+      source,
+      active,
+      cwd,
+      workspaceId: t.workspaceId,
+      previousCwd,
+    });
+    if (plan.field) this.setDirectoryValue(cwd, { persist: false });
+    this.followLiveCwdInSurfaces(t.workspaceId, cwd, plan);
+    this.updateTabGroups();
+    this.sessionRegistry.update(id, { cwd });
+    return true;
+  }
+
+  // Allowed roots (realpaths) from /api/foundation/status, cached so a live
+  // cwd outside them never lands in the working-directory field. null until
+  // known; a failed fetch is retried after a minute, a good list is
+  // refreshed every 5 minutes.
+  async ensureAllowedRoots() {
+    const now = Date.now();
+    const age = now - (this.allowedRootsFetchedAt || 0);
+    if (this.allowedRoots ? age < 5 * 60_000 : age < 60_000) {
+      return this.allowedRoots;
+    }
+    if (this.allowedRootsPromise) return this.allowedRootsPromise;
+    this.allowedRootsFetchedAt = now;
+    this.allowedRootsPromise = (async () => {
+      try {
+        const res = await fetch("/api/foundation/status");
+        if (!res.ok) return this.allowedRoots;
+        const status = await res.json();
+        const roots = (Array.isArray(status?.roots) ? status.roots : [])
+          .filter((root) => root && root.status !== "missing")
+          .map((root) => root.path)
+          .filter((path) => typeof path === "string" && path);
+        if (roots.length) this.allowedRoots = roots;
+      } catch (err) {
+        if (DEBUG) dbg("allowed roots fetch failed", err);
+      } finally {
+        this.allowedRootsPromise = null;
+      }
+      return this.allowedRoots;
+    })();
+    return this.allowedRootsPromise;
+  }
+
+  // true / false, or null while the roots list is unknown.
+  isCwdInAllowedRoots(cwd) {
+    return (
+      window.LiveCwd?.isCwdWithinRoots?.(cwd, this.allowedRoots || null) ??
+      null
+    );
+  }
+
+  planLiveCwdSurfaces({ source, active, cwd, workspaceId, previousCwd }) {
+    const explorer = this.fileExplorer;
+    const explorerOnWorkspace = Boolean(
+      explorer && workspaceId && explorer.currentWorkspaceId === workspaceId,
+    );
+    const explorerPath = explorerOnWorkspace ? explorer.currentPath : null;
+    const { filesOpen, gitOpen } = this.getFilesGitVisibility();
+    return (
+      window.LiveCwd?.planLiveCwdAdoption?.({
+        source,
+        active,
+        inRoots: this.isCwdInAllowedRoots(cwd),
+        explorerOnWorkspace: explorerOnWorkspace && Boolean(explorerPath),
+        explorerFollows: window.LiveCwd.shouldSurfaceFollowCwd({
+          surfacePath: explorerPath,
+          previousCwd,
+        }),
+        filesVisible: filesOpen,
+        gitVisible: gitOpen,
+      }) || { field: false, explorer: "none", git: false }
+    );
+  }
+
+  // Move the Files explorer (and with it the Git panel, which resolves its
+  // cwd from the explorer first) to the new cwd — only while it still shows
+  // the terminal's previous cwd (a user who navigated it elsewhere keeps
+  // their place), and only reload/refresh what is on screen. A hidden
+  // explorer just records the new path and drops its stale listing, so
+  // opening Files (or Git, via getGitCwd) loads the current cwd.
+  followLiveCwdInSurfaces(workspaceId, cwd, plan) {
+    const explorer = this.fileExplorer;
+    if (explorer && plan.explorer === "load") {
+      // loadDir records the new path synchronously, so the git refresh
+      // below already resolves the new cwd through getGitCwd().
+      Promise.resolve(explorer.loadDir(cwd, workspaceId)).catch((err) => {
+        if (DEBUG) dbg("live cwd explorer follow failed", err);
+      });
+    } else if (explorer && plan.explorer === "retarget") {
+      explorer.setWorkspacePath(workspaceId, cwd);
+      explorer.setWorkspaceItems(workspaceId, []);
+    }
+    if (plan.git) {
+      Promise.resolve(window.gitManager?.refresh?.()).catch((err) => {
+        if (DEBUG) dbg("live cwd git refresh failed", err);
+      });
+    }
+  }
+
   updateWrapButton() {
     document.querySelectorAll('[data-action="wrap-lines"]').forEach((btn) => {
       btn.classList.toggle("active", this.wrapLines);
-      btn.title = this.wrapLines ? "Line wrap: on" : "Line wrap: off";
+      const state = this.wrapLines ? "Line wrap: on" : "Line wrap: off";
+      const what = describeFeature("wrap-lines");
+      btn.title = what ? `${state} — ${what}` : state;
     });
     this.refreshCommandPalette();
   }
@@ -10967,17 +12780,62 @@ class TerminalManager {
       helpModal.addEventListener("click", (e) => {
         if (e.target === helpModal) this.closeHelp();
       });
+      helpModal.addEventListener("keydown", (e) => {
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+        this.closeHelp({ refocus: true });
+      });
     }
+  }
+
+  // Tooltips for the buttons that live in index.html rather than in
+  // ACTION_BUTTON_CONFIG, worded from the same table as every other surface.
+  applyStaticFeatureTooltips() {
+    const guide = window.FeatureGuide;
+    if (!guide) return;
+    const shortcuts = window.KeyboardShortcuts?.KEYBOARD_SHORTCUTS;
+    const set = (id, label, featureId, shortcut = "") => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.title = guide.formatTooltip({
+        label,
+        description: guide.describeAction(featureId),
+        shortcut: shortcut || guide.shortcutLabelForAction(featureId, shortcuts),
+      });
+    };
+    set("sessions-btn", "Sessions", "sessions");
+    set("ide-toggle-btn", "IDE layout", "ide");
+    // Ctrl+N only reaches an installed app window (see keyboard-shortcuts.js),
+    // which is why the browser tooltip never promised more than "Ctrl+N".
+    set("new-terminal", "New terminal", "new-terminal", "Ctrl+N");
+  }
+
+  // Rows come from web/keyboard-shortcuts.js (one list, no hand-kept table).
+  renderHelpShortcuts() {
+    const shortcuts = window.KeyboardShortcuts;
+    const container = document.getElementById("help-shortcuts");
+    if (!shortcuts || !container || container.childElementCount) return;
+    shortcuts.renderHelpShortcuts(container, document);
+    window.FeatureGuide?.renderWhatsWhat(container, document, shortcuts.KEYBOARD_SHORTCUTS);
+    const footnote = document.getElementById("help-footnote");
+    if (footnote) footnote.textContent = shortcuts.SHORTCUT_FOOTNOTE || "";
   }
 
   openHelp() {
     this.closeToolsSheet();
-    document.getElementById("help-modal")?.classList.remove("hidden");
+    this.renderHelpShortcuts();
+    const modal = document.getElementById("help-modal");
+    modal?.classList.remove("hidden");
+    document.getElementById("help-close")?.focus({ preventScroll: true });
     this.syncSurfaceButtonState();
   }
 
-  closeHelp() {
-    document.getElementById("help-modal")?.classList.add("hidden");
+  closeHelp({ refocus = false } = {}) {
+    const modal = document.getElementById("help-modal");
+    if (!modal || modal.classList.contains("hidden")) return;
+    modal.classList.add("hidden");
+    if (refocus) this.getActiveTerminal()?.terminal?.focus();
   }
 
   getActiveWorkspaceContext() {
@@ -11114,6 +12972,13 @@ class TerminalManager {
     this.closeFileExplorer?.();
     this.closeGitPanel?.();
     this.closeTaskPanel?.();
+    // Setup/Sessions windows close too; they reopen as sheets from here on.
+    if (this.isPanelInSurfaceWindow(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (this.isPanelInSurfaceWindow(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
     if (this.surfaceWindowManager?.isOpen?.("settings")) {
       void this.closeSettings({ repairViewportFocus: true });
     }
@@ -11137,6 +13002,28 @@ class TerminalManager {
     return this.surfaceWindowManager;
   }
 
+  // The Sessions/Setup sheets and the More sheet stack above the floating
+  // windows (styles.css) with a backdrop that dims them. A window opened while
+  // one of those sheets is up (palette action, shortcut) would land under that
+  // backdrop, so opening a window dismisses the sheets first. Sessions/Setup
+  // already hosted in their own windows are windows, not sheets: they stay.
+  closeOverlaySheetsForWindow() {
+    const isSheetOpen = (el) =>
+      Boolean(
+        el &&
+        !el.classList.contains("hidden") &&
+        !this.isPanelInSurfaceWindow(el),
+      );
+    if (isSheetOpen(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (isSheetOpen(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
+    const isOpen = (el) => Boolean(el && !el.classList.contains("hidden"));
+    if (isOpen(this.toolsSheet)) this.closeToolsSheet();
+  }
+
   async openSurfaceWindow(id, config) {
     const manager = await this.ensureSurfaceWindowManager();
     if (!manager) return null;
@@ -11151,6 +13038,7 @@ class TerminalManager {
     ) {
       win.bodyEl.appendChild(config.contentEl);
     }
+    this.closeOverlaySheetsForWindow();
     manager.open(id);
     return win;
   }
@@ -11325,9 +13213,83 @@ class TerminalManager {
         heightPct: this.dockState.heightPct,
       });
     }
+    this.syncDockPlaceholder(enabled);
     // xterm instances must refit to the resized terminal area.
     window.dispatchEvent(new Event("resize"));
     this.syncSurfaceButtonState();
+  }
+
+  // The main area above the docked terminals: the surfaces that open there
+  // and the way back (surface-windows.js planDockPlaceholder). Open windows
+  // cover it; styles.css hides it outside the dock and in IDE mode.
+  syncDockPlaceholder(enabled) {
+    let root = document.getElementById("dock-placeholder");
+    if (!enabled) {
+      if (root) root.hidden = true;
+      return;
+    }
+    if (!root) {
+      const plan = window.SurfaceWindows?.planDockPlaceholder?.({
+        keysFor: (id) => {
+          if (id !== "palette") return "";
+          const KS = window.KeyboardShortcuts;
+          const row = KS?.KEYBOARD_SHORTCUTS?.find(
+            (shortcut) => shortcut.id === "command-palette",
+          );
+          return row?.keys?.[0] ? KS.formatCombo(row.keys[0]) : "";
+        },
+      });
+      const area = document.getElementById("workspace-area");
+      if (!plan || !area) return;
+      root = document.createElement("div");
+      root.id = "dock-placeholder";
+      root.className = "dock-placeholder";
+      const title = document.createElement("p");
+      title.className = "dock-placeholder-title";
+      title.textContent = plan.title;
+      const hint = document.createElement("p");
+      hint.className = "dock-placeholder-hint";
+      hint.textContent = plan.hint;
+      const actions = document.createElement("div");
+      actions.className = "dock-placeholder-actions";
+      const run = {
+        files: () => this.openFileExplorer(),
+        git: () => this.openGitPanel(),
+        tasks: () => this.openTaskPanel(),
+        palette: () => this.openCommandPalette(),
+        undock: () => this.toggleSessionsDock(),
+      };
+      for (const action of plan.actions) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "dock-placeholder-action";
+        btn.dataset.dockAction = action.id;
+        const icon = document.createElement("i");
+        icon.dataset.lucide = action.icon;
+        icon.setAttribute("aria-hidden", "true");
+        const label = document.createElement("span");
+        label.textContent = action.label;
+        btn.append(icon, label);
+        if (action.keys) {
+          const kbd = document.createElement("kbd");
+          kbd.textContent = action.keys;
+          btn.appendChild(kbd);
+        }
+        btn.addEventListener("click", () => void run[action.id]?.());
+        actions.appendChild(btn);
+      }
+      root.append(title, hint, actions);
+      area.insertBefore(
+        root,
+        document.getElementById("surface-windows-layer") || null,
+      );
+      try {
+        window.lucide?.createIcons?.({ root });
+      } catch {
+        // decorative
+      }
+    }
+    root.hidden = false;
   }
 
   toggleSessionsDock() {
@@ -11353,6 +13315,12 @@ class TerminalManager {
       beforeEnterIde: () => this.beforeEnterIdeMode(),
       onEnterIde: () => this.onEnterIdeMode(),
       onExitIde: () => this.onExitIdeMode(),
+      onViewChange: () => {
+        // A live cwd change while the Explorer view was hidden only
+        // retargeted it; load the listing once it is shown again.
+        this.ensureIdeExplorerLoaded();
+        this.syncSurfaceButtonState();
+      },
       // Refit terminals + re-render the explorer after the container resizes.
       afterRender: () => {
         window.dispatchEvent(new Event("resize"));
@@ -11601,12 +13569,21 @@ class TerminalManager {
     // Wrap save() with a minimal success toast (failures already surface their
     // own alert from mountInto's save). The Mod-s keymap inside the editor view
     // routes through this wrapped handle, so a successful Ctrl/Cmd+S flashes
-    // "Saved ✓" — keeping feedback cheap without a status bar.
+    // "Saved" — keeping feedback cheap without a status bar. Autosave also
+    // goes through this wrapper; it stays quiet while autosave is on.
     const innerSave = handle.save;
     if (typeof innerSave === "function") {
       handle.save = async () => {
         const ok = await innerSave();
-        if (ok) this.showToast?.("Saved ✓", "success");
+        if (ok && !this.editorAutosaveMs) {
+          this.notify({
+            key: "editor-save",
+            kind: "success",
+            title: "Saved",
+            body: String(tab.ref || "").split("/").pop(),
+            timeoutMs: 2000,
+          });
+        }
         return ok;
       };
     }
@@ -11974,6 +13951,15 @@ class TerminalManager {
     ["settings", "tasks", "git", "editor"].forEach((id) =>
       this.surfaceWindowManager?.close(id),
     );
+    // Setup/Sessions windows follow the same rule (they still open as
+    // floating windows inside IDE mode, like Tasks). Close them through their
+    // own paths so the countdown timer and aria state stop with them.
+    if (this.isPanelInSurfaceWindow(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (this.isPanelInSurfaceWindow(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
     // The scrollback-search overlay is positioned relative to the active
     // terminal's tile, which the IDE reflow can detach/resize mid-session —
     // close it rather than let it float over stale geometry (bug A2).
@@ -12435,7 +14421,10 @@ class TerminalManager {
         e.preventDefault();
         return;
       }
-      if (e.ctrlKey && e.key === "f") {
+      // Ctrl+Shift+F is the documented scrollback search everywhere (inside a
+      // terminal it is caught by the xterm key handler first). Plain Ctrl+F
+      // only reaches here outside a terminal; it keeps working as before.
+      if (e.ctrlKey && e.key.toLowerCase() === "f") {
         e.preventDefault();
         this.openTerminalSearch();
       }
@@ -12458,10 +14447,20 @@ class TerminalManager {
         e.preventDefault();
         this.changeFontSize(-1);
       }
-      // `?` is a literal character in task/commit/search inputs — only treat it
-      // as the help shortcut when focus is not inside an editable field. F1 is a
-      // function key (never typed as text) so it opens help anywhere.
-      if (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target))) {
+      // Help: Ctrl+Shift+? works everywhere (it never produces terminal
+      // input). F1 and a bare `?` only count outside the terminal — TUIs such
+      // as htop use F1 — and `?` not inside an editable field.
+      const helpShortcut = window.KeyboardShortcuts?.isHelpShortcut;
+      const inTerminal = Boolean(e.target?.closest?.(".xterm"));
+      if (
+        helpShortcut
+          ? helpShortcut(e, {
+              inTerminal,
+              editable: isEditableTarget(e.target),
+            })
+          : !inTerminal &&
+            (e.key === "F1" || (e.key === "?" && !isEditableTarget(e.target)))
+      ) {
         e.preventDefault();
         this.openHelp();
       }
@@ -12564,27 +14563,33 @@ class TerminalManager {
             savedSessionsById,
           }) || [];
 
-        for (const action of bootstrapActions) {
-          const terminalInfo = reconnectableTerminals.find(
-            (terminal) => terminal.id === action.terminalId,
-          );
-          if (!terminalInfo) continue;
+        this.restoringTabOrder = true;
+        try {
+          for (const action of bootstrapActions) {
+            const terminalInfo = reconnectableTerminals.find(
+              (terminal) => terminal.id === action.terminalId,
+            );
+            if (!terminalInfo) continue;
 
-          if (action.type === "linked-view") {
-            await this.bootstrapLinkedView(terminalInfo);
-            continue;
+            if (action.type === "linked-view") {
+              await this.bootstrapLinkedView(terminalInfo);
+              continue;
+            }
+
+            await this.reconnectToTerminal(
+              terminalInfo.id,
+              terminalInfo.cwd,
+              action.savedSession,
+              {
+                backendMode: terminalInfo.backendMode || null,
+                supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
+                agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
+              },
+            );
           }
-
-          await this.reconnectToTerminal(
-            terminalInfo.id,
-            terminalInfo.cwd,
-            action.savedSession,
-            {
-              backendMode: terminalInfo.backendMode || null,
-              supportsLinkedView: Boolean(terminalInfo.supportsLinkedView),
-              agentTurnCompletedAt: terminalInfo.agentTurnCompletedAt || null,
-            },
-          );
+        } finally {
+          this.restoringTabOrder = false;
+          this.persistTabOrder();
         }
         return;
       }
@@ -12712,6 +14717,7 @@ class TerminalManager {
       onTerminalState: (message) => {
         this.applyTerminalRuntimeState(id, message);
       },
+      onInputDropped: () => this.showInputDroppedNotice(id),
       getReconnectBehavior: () => this.reconnectBehavior,
     });
 
@@ -12725,7 +14731,7 @@ class TerminalManager {
       if (inputState.pasteDepth > 0) {
         inputState.lastOnDataAt = performance.now();
         inputState.lastOnDataValue = data;
-        ws.send(JSON.stringify({ type: "input", data }));
+        ws.sendInput(data);
         return;
       }
 
@@ -12738,7 +14744,7 @@ class TerminalManager {
       inputState.lastOnDataAt = performance.now();
       inputState.lastOnDataValue = dedupedData;
       const finalData = this.applyExtraKeyModifiers(dedupedData);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
     });
 
     const inputFallbackCleanup = this.attachMobileInputFallback(
@@ -12808,6 +14814,7 @@ class TerminalManager {
       awaitingReconnectReady: false,
       connectionStatus: "connecting",
     });
+    this.syncWorkspaceLauncher();
 
     dbg(`[reconnect] Terminal ${id} stored in Map with isReconnection=true`);
 
@@ -13031,7 +15038,7 @@ class TerminalManager {
       this.rememberFallbackEcho(inputState, data);
 
       const finalData = this.applyExtraKeyModifiers(data);
-      ws.send(JSON.stringify({ type: "input", data: finalData }));
+      ws.sendInput(finalData);
 
       if (DEBUG) {
         dbg("[ExtraKeys] mobile input fallback:", {
@@ -13414,6 +15421,9 @@ class TerminalManager {
         (event.key === "F" || event.key === "f")
       ) {
         event.preventDefault();
+        // The event still bubbles to the document shortcut handler, which
+        // also maps Ctrl+Shift+F: mark it handled so search opens once.
+        this.handledPaneShortcutEvents.add(event);
         this.openTerminalSearch();
         return false;
       }
@@ -13539,12 +15549,15 @@ class TerminalManager {
     if (this.searchBar) return this.searchBar;
     const bar = document.createElement("div");
     bar.className = "terminal-search-bar hidden";
+    bar.dataset.placement = "bottom";
+    bar.setAttribute("role", "search");
     bar.innerHTML = `
-      <input type="text" class="search-input" placeholder="Search scrollback" spellcheck="false" autocomplete="off" />
+      <i class="search-bar-icon" data-lucide="search" aria-hidden="true"></i>
+      <input type="text" class="search-input" placeholder="Search scrollback" aria-label="Search terminal scrollback" spellcheck="false" autocomplete="off" />
       <span class="search-count" aria-live="polite"></span>
-      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)">↑</button>
-      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)">↓</button>
-      <button type="button" class="search-btn" data-search-act="close" title="Close (Esc)">✕</button>
+      <button type="button" class="search-btn" data-search-act="prev" title="Previous match (Shift+Enter)" aria-label="Previous match"><i data-lucide="chevron-up"></i></button>
+      <button type="button" class="search-btn" data-search-act="next" title="Next match (Enter)" aria-label="Next match"><i data-lucide="chevron-down"></i></button>
+      <button type="button" class="search-btn search-btn-close" data-search-act="close" title="Close (Esc)" aria-label="Close search"><i data-lucide="x"></i></button>
     `;
     const input = bar.querySelector(".search-input");
     input.addEventListener("input", () => {
@@ -13561,13 +15574,64 @@ class TerminalManager {
       }
     });
     bar.addEventListener("click", (e) => {
-      const act = e.target?.dataset?.searchAct;
+      // Buttons hold lucide SVGs: resolve the button, not the clicked icon.
+      const act = e.target?.closest?.("[data-search-act]")?.dataset?.searchAct;
       if (act === "prev") this.searchController?.prev();
       else if (act === "next") this.searchController?.next();
       else if (act === "close") this.closeTerminalSearch({ refocus: true });
     });
     this.searchBar = bar;
     return bar;
+  }
+
+  // Keep the floating bar off the active match: it sits at the tile's bottom
+  // edge and dodges to the top only when the active match is under it (pure
+  // rule: SearchOverlay.searchBarPlacement).
+  syncSearchBarPlacement(terminal, { reset = false } = {}) {
+    const bar = this.searchBar;
+    if (!bar) return;
+    if (reset) bar.dataset.placement = "bottom";
+    const placementFn = window.SearchOverlay?.searchBarPlacement;
+    if (!placementFn || !terminal) return;
+    const rows = terminal.rows || 0;
+    const screen = terminal.element?.querySelector(".xterm-screen");
+    const cellHeight =
+      rows && screen ? screen.getBoundingClientRect().height / rows : 0;
+    const barHeight = bar.getBoundingClientRect().height || 40;
+    // The bar's height plus its 8px inset from the tile edge.
+    const coveredRows = cellHeight
+      ? Math.ceil((barHeight + 8) / cellHeight)
+      : 2;
+    const selection = terminal.getSelectionPosition?.();
+    const viewportY = terminal.buffer?.active?.viewportY ?? 0;
+    const activeRow = selection ? selection.start.y - viewportY : null;
+    // Columns the bar overlaps (it is right-aligned over the screen).
+    let barCols = null;
+    let activeCols = null;
+    if (screen && terminal.cols && selection) {
+      const screenRect = screen.getBoundingClientRect();
+      const barRect = bar.getBoundingClientRect();
+      const cellWidth = screenRect.width / terminal.cols;
+      if (cellWidth > 0 && barRect.width > 0) {
+        barCols = [
+          Math.floor((barRect.left - screenRect.left) / cellWidth),
+          Math.ceil((barRect.right - screenRect.left) / cellWidth),
+        ];
+        // A single-line match; a wrapped one spans to the row end.
+        activeCols =
+          selection.end.y === selection.start.y
+            ? [selection.start.x, selection.end.x]
+            : [selection.start.x, terminal.cols];
+      }
+    }
+    bar.dataset.placement = placementFn({
+      activeRow,
+      rows,
+      coveredRows,
+      current: bar.dataset.placement,
+      activeCols,
+      barCols,
+    });
   }
 
   openTerminalSearch() {
@@ -13578,6 +15642,8 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     const host = active.element?.parentElement || active.element;
     if (bar.parentElement !== host) host.appendChild(bar);
+    // lucide only swaps <i data-lucide> placeholders that are in the document.
+    if (bar.querySelector("i[data-lucide]")) initLucideIcons();
 
     this.searchResultsDisposable?.dispose?.();
     this.searchController = window.SearchOverlay.createSearchController({
@@ -13596,11 +15662,13 @@ class TerminalManager {
       },
       onState: (state) => this.renderSearchState(state),
     });
-    this.searchResultsDisposable = addon.onDidChangeResults?.((r) =>
+    this.searchResultsDisposable = addon.onDidChangeResults?.((r) => {
       this.searchController?.handleResults(
         r || { resultIndex: -1, resultCount: 0 },
-      ),
-    );
+      );
+      this.syncSearchBarPlacement(active.terminal);
+    });
+    this.syncSearchBarPlacement(active.terminal, { reset: true });
 
     // Prefill: short single-line selection wins, then the last search.
     const selection = active.terminal.getSelection?.()?.trim() || "";
@@ -13631,13 +15699,16 @@ class TerminalManager {
     const bar = this.ensureSearchBar();
     bar.classList.toggle("hidden", !state.open);
     const count = bar.querySelector(".search-count");
-    if (!state.query || state.resultCount === null) {
-      count.textContent = "";
-    } else if (state.resultCount === 0) {
-      count.textContent = "0/0";
-    } else {
-      count.textContent = `${state.resultIndex + 1}/${state.resultCount}`;
-    }
+    const format = window.SearchOverlay?.formatSearchCount;
+    count.textContent = format
+      ? format(state)
+      : !state.query || state.resultCount === null
+        ? ""
+        : `${state.resultIndex + 1}/${state.resultCount}`;
+    bar.classList.toggle(
+      "no-results",
+      Boolean(state.query) && state.resultCount === 0,
+    );
   }
 
   createDimensionOverlay(container) {
@@ -13842,6 +15913,24 @@ class TerminalManager {
     this.terminals.get(id)?.ws?.retry();
   }
 
+  // Notice when input typed during a connect/reconnect could not be delivered
+  // (queue bound hit, input too old, or the terminal ended before the
+  // connection came back). One toast per terminal; repeats replace it.
+  showInputDroppedNotice(id) {
+    const t = this.terminals.get(id);
+    if (!t || t.disposed) return;
+    const label = this.formatCwdLabel?.(t.cwd || "") || "";
+    this.notify({
+      key: `input-dropped:${id}`,
+      kind: "warning",
+      title: "Input not sent — connection was down",
+      body: label
+        ? `${label}: retype it once the terminal is connected.`
+        : "Retype it once the terminal is connected.",
+      timeoutMs: 6000,
+    });
+  }
+
   performReconnectLayoutSync(
     id,
     { forceResize = false, scrollToPrompt = false } = {},
@@ -13850,6 +15939,7 @@ class TerminalManager {
     if (!t?.fitAddon || !t?.terminal) return;
 
     requestAnimationFrame(() => {
+      if (t.disposed) return;
       try {
         this.fitTerminalState(t);
         this.sendResize(id, t.terminal.cols, t.terminal.rows, {
@@ -14007,10 +16097,12 @@ class TerminalManager {
     }
 
     const observer = new ResizeObserver(() => {
+      if (t.disposed) return;
       if (!t.element || t.element.offsetParent === null) return;
       if (t.fitFrame) return;
       t.fitFrame = requestAnimationFrame(() => {
         t.fitFrame = 0;
+        if (t.disposed) return;
         try {
           const prevCols = t.terminal?.cols;
           const prevRows = t.terminal?.rows;
@@ -14058,6 +16150,20 @@ class TerminalManager {
             }
           }
 
+          // A selection does not survive a grid change: tmux redraws the pane
+          // at the new size, so the selected cells now hold other text (or
+          // nothing). Left in place it showed as a stray highlight block in
+          // the inactive pane after a split, and a copy would take the wrong
+          // text (R3). Only on a real grid change, never per keystroke, and
+          // not on touch layouts, where the keyboard opening or closing
+          // resizes the grid in the middle of a long-press copy.
+          if (
+            (t.terminal.cols !== prevCols || t.terminal.rows !== prevRows) &&
+            !this.isTouchLayout() &&
+            t.terminal.hasSelection?.()
+          ) {
+            t.terminal.clearSelection();
+          }
           // Always send resize - terminal will work even if small
           this.scheduleResize(id);
 
@@ -14085,27 +16191,61 @@ class TerminalManager {
     }
     await this.waitForFontMetrics();
 
-    const cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
+    let cwd = cwdOverride || this.getCurrentDirectoryValue() || undefined;
     const { cols, rows } = this.estimateInitialTerminalSize(split);
 
     try {
-      const res = await fetch("/api/terminals", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cwd, cols, rows }),
-      });
+      const postTerminal = (requestCwd) =>
+        fetch("/api/terminals", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cwd: requestCwd, cols, rows }),
+        });
+      let res = await postTerminal(cwd);
 
       if (!res.ok) {
         // Surface the backend's real reason (e.g. SQLITE_BUSY-driven 500,
         // max-terminals limit, bad cwd) instead of a generic, doubled message.
         let reason = `HTTP ${res.status}`;
+        let denialReason = null;
         try {
           const body = await res.json();
           reason = body.message || body.error || reason;
+          denialReason = body.reason || null;
         } catch (_) {
           /* non-JSON body — keep the status code */
         }
-        throw new Error(reason);
+        // An implicit cwd (the field / saved default) outside the allowed
+        // roots: start in the server's default root instead of failing.
+        if (
+          window.LiveCwd?.shouldRetryCreateWithoutCwd?.({
+            status: res.status,
+            reason: denialReason,
+            cwd,
+            explicitCwd: Boolean(cwdOverride),
+          })
+        ) {
+          const rejectedCwd = cwd;
+          cwd = undefined;
+          res = await postTerminal(undefined);
+          if (res.ok) {
+            this.notify({
+              key: "terminal-default-root",
+              kind: "info",
+              title: "Opened in the default folder",
+              body: `${rejectedCwd} is outside the allowed folders.`,
+            });
+          } else {
+            reason = `HTTP ${res.status}`;
+            try {
+              const body = await res.json();
+              reason = body.message || body.error || reason;
+            } catch (_) {
+              /* non-JSON body — keep the status code */
+            }
+          }
+        }
+        if (!res.ok) throw new Error(reason);
       }
 
       const terminalInfo = await res.json();
@@ -14191,6 +16331,7 @@ class TerminalManager {
           onLifecycle: (message) => this.handleReconnectLifecycle(id, message),
           onTerminalState: (message) =>
             this.applyTerminalRuntimeState(id, message),
+          onInputDropped: () => this.showInputDroppedNotice(id),
           getReconnectBehavior: () => this.reconnectBehavior,
         },
       );
@@ -14206,7 +16347,7 @@ class TerminalManager {
         if (inputState.pasteDepth > 0) {
           inputState.lastOnDataAt = performance.now();
           inputState.lastOnDataValue = data;
-          ws.send(JSON.stringify({ type: "input", data }));
+          ws.sendInput(data);
           return;
         }
 
@@ -14225,7 +16366,7 @@ class TerminalManager {
         const finalData = this.applyExtraKeyModifiers(dedupedData, {
           log: true,
         });
-        ws.send(JSON.stringify({ type: "input", data: finalData }));
+        ws.sendInput(finalData);
       });
 
       const inputFallbackCleanup = this.attachMobileInputFallback(
@@ -14295,6 +16436,7 @@ class TerminalManager {
         awaitingReconnectReady: false,
         connectionStatus: "connecting",
       });
+      this.syncWorkspaceLauncher();
 
       // Register with session registry for reconnection persistence
       this.sessionRegistry.register(id, {
@@ -14370,15 +16512,20 @@ class TerminalManager {
     const label = this.formatCwdLabel(cwd);
     tab.innerHTML = `
       <span class="tab-dot"></span>
-      <span class="tab-index">${tabNum}</span>
+      <span class="tab-index"></span>
       <span class="tab-count"></span>
       <span class="tab-copy">
-        <span class="tab-label">${label}</span>
+        <span class="tab-label"></span>
         <span class="tab-meta" hidden></span>
         <span class="tab-signal-badge" hidden aria-hidden="true"></span>
       </span>
       <button class="tab-close" title="Close workspace" aria-label="Close workspace">&times;</button>
+      <span class="tab-attention" role="img" hidden></span>
+      <span class="tab-progress" hidden aria-hidden="true"></span>
     `;
+    // textContent: a cwd basename is user data, never markup.
+    tab.querySelector(".tab-index").textContent = String(tabNum);
+    tab.querySelector(".tab-label").textContent = label;
 
     tab.querySelector(".tab-close").addEventListener("click", (e) => {
       e.stopPropagation();
@@ -14445,9 +16592,60 @@ class TerminalManager {
       this.clearDropTargets();
     });
 
-    this.tabs.appendChild(tab);
+    this.insertTabAtSavedRank(tab);
+    this.renumberTabs();
     this.updateTabGroups();
     return tab;
+  }
+
+  // Reload re-creates tabs in the server's session order; while that startup
+  // restore runs, put each one back at its saved position
+  // (web/toolbar-layout.js). New tabs and unknown ones append.
+  insertTabAtSavedRank(tab) {
+    const helpers = window.ToolbarLayout;
+    const existing = Array.from(this.tabs.querySelectorAll(".tab"));
+    if (
+      !this.restoringTabOrder ||
+      !helpers?.getTabInsertionIndex ||
+      existing.length === 0
+    ) {
+      this.tabs.appendChild(tab);
+      return;
+    }
+    const savedOrder = helpers.loadTabOrder(this.getTabOrderStorage());
+    const index = helpers.getTabInsertionIndex(
+      savedOrder,
+      existing.map((element) => element.dataset.workspaceId),
+      tab.dataset.workspaceId,
+    );
+    const before = existing[index];
+    if (before) this.tabs.insertBefore(tab, before);
+    else this.tabs.appendChild(tab);
+  }
+
+  getTabOrderStorage() {
+    try {
+      return window.localStorage;
+    } catch {
+      return null;
+    }
+  }
+
+  // Saved on every render that changes the order; skipped while startup is
+  // still re-attaching tabs (a partial order would overwrite the saved one).
+  persistTabOrder() {
+    const helpers = window.ToolbarLayout;
+    if (!helpers?.saveTabOrder || this.restoringTabOrder) return;
+    const ids = Array.from(this.tabs.querySelectorAll(".tab"))
+      .map((tab) => tab.dataset.workspaceId)
+      .filter(Boolean);
+    // An empty strip (startup before the restore, or every tab closed) keeps
+    // the saved ranks; the next real tab overwrites them anyway.
+    if (ids.length === 0) return;
+    const key = ids.join("|");
+    if (key === this.persistedTabOrderKey) return;
+    this.persistedTabOrderKey = key;
+    helpers.saveTabOrder(this.getTabOrderStorage(), ids);
   }
 
   clearDropTargets() {
@@ -14456,7 +16654,23 @@ class TerminalManager {
       .forEach((t) => t.classList.remove("drop-target", "dragging"));
   }
 
+  // Tab numbers (and the Ctrl+1..9 targets) follow the visual order on every
+  // render; creation-time numbers drifted after closes/merges ("1", "3").
+  renumberTabs() {
+    Array.from(this.tabs.querySelectorAll(".tab")).forEach((tab, index) => {
+      const number = String(index + 1);
+      if (index < 9) tab.dataset.index = number;
+      else delete tab.dataset.index;
+      const indexEl = tab.querySelector(".tab-index");
+      if (indexEl && indexEl.textContent !== number) {
+        indexEl.textContent = number;
+      }
+    });    this.persistTabOrder();
+  }
+
   updateTabGroups() {
+    this.syncAttentionIndicators();
+    this.renumberTabs();
     this.tabs.querySelectorAll(".tab").forEach((tab) => {
       this.renderWorkspaceTab(tab);
     });
@@ -14519,6 +16733,9 @@ class TerminalManager {
         tile.detachButton.setAttribute("aria-label", label);
       }
     });
+    // Agent runtime state changes land here (applyTerminalRuntimeState ->
+    // updateTabGroups), so the quick-reply chips follow the agent.
+    this.extraKeys?.syncQuickReplies?.();
   }
 
   groupWithPrevious() {
@@ -14712,7 +16929,12 @@ class TerminalManager {
     }
     this.tileManager.setActive(id);
     if (t?.workspaceId && t.cwd) {
-      this.setDirectoryValue(t.cwd, { force: true });
+      // A live cwd (the shell's `cd`) is shown but not saved as the default,
+      // and one known to be outside the allowed roots stays out of the field
+      // (New terminal would only get a 403 there).
+      if (this.isCwdInAllowedRoots(t.cwd) !== false) {
+        this.setDirectoryValue(t.cwd, { force: true, persist: !t.cwdIsLive });
+      }
       this.updateWorkspaceLabel(t.workspaceId, t.cwd);
       this.rememberWorkspaceById(t.workspaceId, t.cwd);
     }
@@ -14732,10 +16954,12 @@ class TerminalManager {
       tab.classList.toggle("active", isActive);
       tab.setAttribute("aria-selected", isActive ? "true" : "false");
     });
+    if (this.markAttentionSeen(id)) this.updateTabGroups();
 
     this.updateConnectionStatus(this.getTerminalConnectionStatus(t));
     this.updateLinkedViewButton();
     this.refreshCommandPalette();
+    this.extraKeys?.syncQuickReplies?.();
     void this.syncRightSurfaceForWorkspace();
     return true;
   }
@@ -14785,9 +17009,18 @@ class TerminalManager {
     const terminalLabel = this.formatCwdLabel(t.cwd || "Terminal");
     const closingWorkspaceId = t.workspaceId;
     const wasActive = id === this.activeId;
+    // Snapshot what Undo needs before the registry entry goes away. A
+    // terminal whose process already ended has nothing to restore.
+    const terminalEnded = ["exited", "dead"].includes(t.connectionStatus);
+    const undoEntry = terminalEnded
+      ? null
+      : this.rememberClosedSessionForUndo(id, t);
 
     if (wasActive) this.closeTerminalSearch();
 
+    // Everything deferred (rAF fits, resize timers, layout syncs) checks this
+    // before touching the xterm instance.
+    t.disposed = true;
     t.ws?.close();
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
@@ -14799,6 +17032,10 @@ class TerminalManager {
     if (t.dimensionTimer) clearTimeout(t.dimensionTimer);
     if (t.reconnectCountdownTimer) clearInterval(t.reconnectCountdownTimer);
     if (t.fitFrame) cancelAnimationFrame(t.fitFrame);
+    t.composeSubmit?.cancel();
+    t.resizeObserver = null;
+    t.resizeTimer = null;
+    t.fitFrame = 0;
     t.onDataDisposable?.dispose?.();
     t.osc7Disposable?.dispose?.();
     // The webgl addon must be disposed BEFORE terminal.dispose() — disposing
@@ -14811,6 +17048,7 @@ class TerminalManager {
       }
       t.webglAddon = null;
     }
+    this.quiesceXtermForDispose(t.terminal);
     try {
       t.terminal?.dispose?.();
     } catch (err) {
@@ -14819,6 +17057,7 @@ class TerminalManager {
     this.tileManager.removeTile(id);
     this.terminals.delete(id);
     this.sessionRegistry.remove(id);
+    this.syncWorkspaceLauncher();
 
     const workspaceFallback =
       this.resolveWorkspaceTerminalId(closingWorkspaceId);
@@ -14858,42 +17097,135 @@ class TerminalManager {
         terminalLabel,
         result.terminationScheduledAt,
         Boolean(result.preservedByOtherClient),
+        { canUndo: Boolean(undoEntry) },
       );
       this.queueTelemetryRefresh(0);
+      // The closed session is now restorable: list it in the launcher.
+      this.syncWorkspaceLauncher({ refresh: true });
     } catch (err) {
       console.warn("Could not schedule terminal close:", err);
-      this.showSessionCloseToast(terminalLabel, null);
+      // No termination was scheduled, so the session (if it still exists)
+      // stays in Sessions — but a failed request can also mean it is gone,
+      // so do not promise a one-click Undo here.
+      this.showSessionCloseToast(terminalLabel, null, false, {
+        canUndo: false,
+      });
     }
   }
 
+  // xterm 5.3 leaves two deferred callbacks un-cancelled on dispose: the
+  // render service's paused-resize idle task (queued when a hidden terminal
+  // is resized) and the viewport's refresh animation frame. Either firing
+  // after dispose throws "Cannot read properties of undefined (reading
+  // 'handleResize' / 'dimensions')". Neutralize both before disposing.
+  quiesceXtermForDispose(terminal) {
+    const core = terminal?._core;
+    if (!core) return;
+    try {
+      // set() replaces whatever resize is queued with a no-op.
+      core._renderService?._pausedResizeTask?.set?.(() => {});
+    } catch {}
+    const viewport = core.viewport;
+    if (!viewport) return;
+    try {
+      if (viewport._refreshAnimationFrame != null) {
+        cancelAnimationFrame(viewport._refreshAnimationFrame);
+        viewport._refreshAnimationFrame = null;
+      }
+      // The viewport also schedules syncScrollArea from timers we cannot
+      // reach; make any late call a no-op on this dead instance.
+      viewport.syncScrollArea = () => {};
+      viewport._innerRefresh = () => {};
+    } catch {}
+  }
+
+  // Closes that happen together (closing a multi-pane tab closes every pane
+  // synchronously) share one Undo batch.
+  rememberClosedSessionForUndo(id, t) {
+    const now = Date.now();
+    const batch = this.closeUndoBatch;
+    const entry = {
+      id,
+      cwd: t.cwd || "",
+      savedSession: this.sessionRegistry.get(id) || null,
+      backendMode: t.backendMode || null,
+      supportsLinkedView: Boolean(t.supportsLinkedView),
+      wasActive: id === this.activeId,
+    };
+    // A close while the previous close toast is still up joins its batch:
+    // that toast is replaced, so it must say "N terminals closed" and its
+    // Undo must reopen all of them, not only the latest.
+    const toastStillShown = Boolean(window.ToastService?.has?.("session-close"));
+    if (batch && (now - batch.startedAt < 1000 || toastStillShown)) {
+      batch.entries.push(entry);
+    } else {
+      this.closeUndoBatch = { startedAt: now, entries: [entry] };
+    }
+    return entry;
+  }
+
+  // Undo for the close toast: reattach every session closed in the last
+  // batch through the same path the Sessions panel's "Restore" uses
+  // (cancel the scheduled termination, then reconnect into the saved
+  // workspace slot).
+  async undoRecentSessionClose() {
+    const batch = this.closeUndoBatch;
+    this.closeUndoBatch = null;
+    window.ToastService?.dismiss?.("session-close");
+    if (!batch?.entries?.length) return;
+    let focusId = null;
+    for (const entry of batch.entries) {
+      if (this.terminals.has(entry.id)) continue;
+      await this.cancelScheduledTerminalClose(entry.id);
+      await this.reconnectToTerminal(entry.id, entry.cwd, entry.savedSession, {
+        backendMode: entry.backendMode,
+        supportsLinkedView: entry.supportsLinkedView,
+      });
+      if (entry.wasActive || !focusId) focusId = entry.id;
+    }
+    if (focusId && this.terminals.has(focusId)) this.switchTo(focusId);
+    this.updateSessionsAvailableBadge();
+    this.queueTelemetryRefresh(0);
+  }
+
+  // The close toast keeps id="session-close-toast" (e2e) and offers Undo
+  // (reattach the batch just closed) plus a shortcut into Sessions.
   showSessionCloseToast(
     label,
     terminationScheduledAt,
     preservedByOtherClient = false,
+    { canUndo = false } = {},
   ) {
-    let toast = document.getElementById("session-close-toast");
-    if (!toast) {
-      toast = document.createElement("button");
-      toast.type = "button";
-      toast.id = "session-close-toast";
-      toast.className = "task-toast hidden";
-      toast.addEventListener("click", () => {
-        toast.classList.add("hidden");
-        this.openSessionsPanel();
+    const batchSize = this.closeUndoBatch?.entries?.length || 0;
+    const plural = batchSize > 1;
+    const subject = plural ? `${batchSize} terminals` : label;
+    const it = plural ? "them" : "it";
+    const scheduled = Boolean(terminationScheduledAt);
+    const body = preservedByOtherClient
+      ? `${plural ? "They remain" : "It remains"} active in another client. You can restore ${it} from Sessions.`
+      : scheduled
+        ? `Restore ${it} from Sessions within 15 minutes.`
+        : `Automatic termination could not be scheduled. ${plural ? "They remain" : "It remains"} in Sessions.`;
+    const actions = [];
+    if (canUndo && batchSize > 0) {
+      actions.push({
+        label: "Undo",
+        primary: true,
+        ariaLabel: plural ? `Reopen ${batchSize} terminals` : `Reopen ${label}`,
+        run: () => this.undoRecentSessionClose(),
       });
-      document.getElementById("app")?.appendChild(toast);
     }
-    toast.textContent = preservedByOtherClient
-      ? `${label} closed here and remains active in another client. You can restore it from Sessions.`
-      : terminationScheduledAt
-        ? `${label} closed. Restore it from Sessions within 15 minutes.`
-        : `${label} closed, but automatic termination could not be scheduled. It remains in Sessions.`;
-    toast.classList.remove("hidden");
-    clearTimeout(this.sessionCloseToastTimer);
-    this.sessionCloseToastTimer = setTimeout(
-      () => toast.classList.add("hidden"),
-      9000,
-    );
+    actions.push({ label: "Sessions", run: () => this.openSessionsPanel() });
+    this.notify({
+      key: "session-close",
+      id: "session-close-toast",
+      className: "session-close-toast",
+      kind: preservedByOtherClient || scheduled ? "info" : "warning",
+      title: `${subject} closed`,
+      body,
+      actions,
+      timeoutMs: 15000,
+    });
   }
 
   sendResize(id, colsOverride = null, rowsOverride = null, options = {}) {
@@ -14912,9 +17244,14 @@ class TerminalManager {
 
   updateConnectionStatus(status) {
     if (!this.connectionStatus) return;
-    const normalized = this.normalizeConnectionStatus(status);
-    this.connectionStatus.className = "status-dot " + normalized;
-    this.connectionStatus.title = this.getConnectionStatusLabel(normalized);
+    const indicator = window.ToolbarLayout?.getToolbarStatusIndicator?.({
+      status,
+      terminalCount: this.terminals.size,
+    });
+    const state = indicator?.state || this.normalizeConnectionStatus(status);
+    const label = indicator?.label || this.getConnectionStatusLabel(state);
+    this.connectionStatus.className = "status-dot " + state;
+    this.connectionStatus.title = label;
   }
 
   changeFontSize(delta) {
@@ -14944,56 +17281,129 @@ class TerminalManager {
     this.syncFontSizeStepper();
   }
 
-  handleViewportResize() {
-    if (!window.visualViewport) return;
+  // Layout pass for touch devices. Sizes the app shell from the visual
+  // viewport (so the on-screen keyboard really shrinks the terminal instead
+  // of covering it), flags keyboard-open / phone-landscape for the compact
+  // chrome CSS, then re-fits the active terminal and keeps its prompt in
+  // view. Pure decisions live in mobile-layout.js (window.MobileLayout).
+  //
+  // fromViewportEvent: viewport/focus listeners pass true and the pass is
+  // skipped when nothing changed (visualViewport scroll fires often while
+  // panning). Direct callers (extra-keys toggles, action-bar changes) omit
+  // it: their chrome change needs the re-fit even at the same viewport size.
+  handleViewportResize({ fromViewportEvent = false } = {}) {
+    const helpers = window.MobileLayout;
+    if (!helpers) return;
 
     const viewport = window.visualViewport;
-    const windowHeight = window.innerHeight;
-    const viewportHeight = viewport.height;
-    const keyboardHeight = windowHeight - viewportHeight - viewport.offsetTop;
+    const touch = this.isTouchLayout();
+    const orientation = helpers.getOrientation({
+      screenOrientationType: window.screen?.orientation?.type,
+      screenWidth: window.screen?.width,
+      screenHeight: window.screen?.height,
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+    });
+    const layout = helpers.computeViewportLayout({
+      touch,
+      orientation,
+      innerHeight: window.innerHeight,
+      visualHeight: viewport?.height,
+      visualOffsetTop: viewport?.offsetTop,
+      visualScale: viewport?.scale,
+      inputFocused: this.isEditableElementFocused(),
+      baselines: this.viewportBaselines,
+    });
+    this.viewportBaselines = layout.baselines;
 
-    const extraKeys = document.getElementById("extra-keys");
-    const mobileActionBar = document.getElementById("mobile-action-bar");
-    const toolbarHeight = this.toolbar?.offsetHeight || 0;
-    const extraKeysHeight = extraKeys?.offsetHeight || 0;
-    const mobileActionBarHeight =
-      mobileActionBar && getComputedStyle(mobileActionBar).display !== "none"
-        ? mobileActionBar.offsetHeight || 0
-        : 0;
-    const isKeyboardOpen = keyboardHeight > 100;
-
-    if (isKeyboardOpen) {
-      // Show extra keys above virtual keyboard
-      this.extraKeys?.showForKeyboard();
-      extraKeys.style.position = "fixed";
-      extraKeys.style.bottom = `${keyboardHeight}px`;
-      extraKeys.style.left = "0";
-      extraKeys.style.right = "0";
-      extraKeys.style.zIndex = "1000";
-      this.container.style.height = `calc(${viewportHeight}px - ${toolbarHeight}px - ${extraKeysHeight}px - ${mobileActionBarHeight}px)`;
-      document.body.classList.add("virtual-keyboard-open");
+    const root = document.documentElement;
+    const body = document.body;
+    if (layout.appHeight !== null) {
+      root.style.setProperty("--app-vvh", `${layout.appHeight}px`);
+      root.style.setProperty("--app-vv-top", `${layout.appTop}px`);
     } else {
-      // Hide extra keys when keyboard closes (mobile only)
-      this.extraKeys?.hideForKeyboard();
-      extraKeys.style.cssText = "";
-      this.container.style.height = "";
-      document.body.classList.remove("virtual-keyboard-open");
+      root.style.removeProperty("--app-vvh");
+      root.style.removeProperty("--app-vv-top");
     }
+    body.classList.toggle("vv-sized", layout.appHeight !== null);
+    body.classList.toggle("virtual-keyboard-open", layout.keyboardOpen);
+    body.classList.toggle("phone-landscape", layout.phoneLandscape);
+    this.extraKeys?.syncQuickReplies?.({ relayout: false });
+    this.syncBottomChromeInset();
 
-    const active = this.terminals.get(this.activeId);
-    if (active) {
-      if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
-      this.viewportFocusTimer = setTimeout(
-        () => {
-          this.focusTerminal(this.activeId, {
-            syncSize: true,
-            scrollToPrompt: isKeyboardOpen || platformDetector.hasTouch,
-          });
-          this.disableMobileKeyboardFeatures(active.element);
-        },
-        isKeyboardOpen ? 50 : 0,
+    const layoutKey = [
+      layout.appHeight,
+      layout.appTop,
+      layout.keyboardOpen,
+      layout.phoneLandscape,
+      this.extraKeys?.quickRepliesEl?.hidden,
+    ].join("|");
+    const changed = layoutKey !== this.viewportLayoutKey;
+    this.viewportLayoutKey = layoutKey;
+    if (fromViewportEvent && !changed) return;
+
+    // Mobile tiles use pixel geometry from the container rect; refresh it so
+    // the tile follows the new shell height (window "resize" alone does not
+    // fire for an iOS keyboard). The tile ResizeObserver then re-fits xterm.
+    if (this.tileManager?.isMobile) {
+      this.tileManager.normalizeWorkspaceTiles(
+        this.tileManager.activeWorkspaceId,
       );
     }
+    this.extraKeys?.updateRowOverflowFades?.();
+
+    const activeId = this.activeId;
+    if (!this.terminals.get(activeId)) return;
+    if (this.viewportFocusTimer) clearTimeout(this.viewportFocusTimer);
+    this.viewportFocusTimer = setTimeout(
+      () => {
+        this.viewportFocusTimer = null;
+        const active = this.terminals.get(activeId);
+        if (!active || activeId !== this.activeId) return;
+        const scrollToPrompt = layout.keyboardOpen || platformDetector.hasTouch;
+        if (
+          this.isEditableElementFocused() &&
+          !this.isTerminalInputFocused()
+        ) {
+          // Another input (sheet form, palette) owns focus: re-fit only,
+          // never pull focus back into the terminal.
+          this.fitTerminalState(active);
+          this.syncTerminalSize(activeId);
+          if (scrollToPrompt) this.scrollActiveTerminalToPrompt();
+          return;
+        }
+        this.focusTerminal(activeId, { syncSize: true, scrollToPrompt });
+        this.disableMobileKeyboardFeatures(active.element);
+      },
+      layout.keyboardOpen ? 50 : 0,
+    );
+  }
+
+  isEditableElementFocused() {
+    const el = document.activeElement;
+    if (!el || el === document.body) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName;
+    if (tag === "TEXTAREA" || tag === "SELECT") return true;
+    if (tag !== "INPUT") return false;
+    const type = String(el.type || "text").toLowerCase();
+    return ![
+      "button",
+      "checkbox",
+      "color",
+      "file",
+      "hidden",
+      "image",
+      "radio",
+      "range",
+      "reset",
+      "submit",
+    ].includes(type);
+  }
+
+  isTerminalInputFocused() {
+    const el = document.activeElement;
+    return Boolean(el?.classList?.contains("xterm-helper-textarea"));
   }
 
   scrollActiveTerminalToPrompt() {
@@ -15011,6 +17421,130 @@ class TerminalManager {
     const selection = active.terminal.getSelection();
     if (selection)
       navigator.clipboard.writeText(selection).catch(console.error);
+  }
+
+  // --- Compose sheet (web/compose-sheet.js) ---------------------------------
+  // A real text box for writing a message to the active terminal (phones
+  // first; desktop through the palette). It targets the terminal that was
+  // active when it opened.
+  openComposeSheet() {
+    const helpers = window.ComposeSheet;
+    const targetId = this.activeId;
+    const target = this.terminals.get(targetId);
+    if (!helpers?.ComposeSheet || !target) {
+      if (!target) {
+        this.notify({
+          key: "compose",
+          kind: "warning",
+          title: "No terminal to write to",
+          body: "Open a terminal first.",
+        });
+      }
+      return;
+    }
+    this.closeToolsSheet?.();
+    if (!this.composeSheet) {
+      // Recent messages live for this tab only (they can hold secrets);
+      // the old persistent localStorage copy is deleted.
+      let storage = null;
+      let legacyStorage = null;
+      try {
+        storage = window.sessionStorage;
+      } catch {
+        storage = null;
+      }
+      try {
+        legacyStorage = window.localStorage;
+      } catch {
+        legacyStorage = null;
+      }
+      this.composeSheet = new helpers.ComposeSheet({
+        document,
+        storage,
+        legacyStorage,
+        intro: window.FeatureGuide?.PANEL_INTROS?.compose || "",
+        onSend: (plan) => this.sendComposedText(this.composeTargetId, plan),
+        onClose: ({ restoreFocus }) => {
+          // On touch, refocusing xterm would pop the keyboard back up.
+          if (restoreFocus && !this.isTouchLayout() && this.activeId) {
+            this.focusTerminal(this.activeId);
+          }
+        },
+      });
+    }
+    this.composeTargetId = targetId;
+    this.composeSheet.open({
+      targetLabel: this.formatCwdLabel(target.cwd || "") || "terminal",
+    });
+  }
+
+  // Paste through xterm (bracketed-paste markers when the program asked for
+  // them), then — for Send — a separate deferred Enter once that input has
+  // settled (see scheduleDeferredSubmit). Only a connected terminal accepts
+  // the text (deliverComposePlan); otherwise it stays in the sheet.
+  sendComposedText(id, plan) {
+    const helpers = window.ComposeSheet;
+    const t = this.terminals.get(id);
+    if (!plan || !t || t.disposed || !t.ws || !helpers) {
+      this.notify({
+        key: "compose",
+        kind: "error",
+        title: "Message not sent",
+        body: "That terminal is no longer open.",
+      });
+      return false;
+    }
+    const result = helpers.deliverComposePlan({
+      plan,
+      isReady: () => t.ws.isReadyForInput?.(),
+      paste: (text) =>
+        this.clipboardManager.executePaste(
+          text,
+          t.ws,
+          t.terminal,
+          t.inputState,
+        ),
+      scheduleSubmit: () => this.scheduleComposeSubmit(id, t, plan),
+    });
+    if (!result.accepted) {
+      this.notify({
+        key: `compose-kept:${id}`,
+        kind: "warning",
+        title: "Not connected — message kept",
+        body: "Your message is still in the compose box. Send it again once the terminal reconnects.",
+      });
+      return false;
+    }
+    return true;
+  }
+
+  scheduleComposeSubmit(id, t, plan) {
+    const helpers = window.ComposeSheet;
+    t.composeSubmit?.cancel();
+    t.composeSubmit = helpers.scheduleDeferredSubmit({
+      // The paste went straight out (deliverComposePlan only accepts ready
+      // input).
+      readyAtStart: true,
+      delayMs: plan.submitDelayMs,
+      isReady: () =>
+        this.terminals.get(id) === t &&
+        !t.disposed &&
+        Boolean(t.ws?.isReadyForInput?.()),
+      send: () => {
+        t.composeSubmit = null;
+        t.ws.sendInput("\r");
+      },
+      onGiveUp: () => {
+        t.composeSubmit = null;
+        if (this.terminals.get(id) !== t || t.disposed) return;
+        this.notify({
+          key: `compose-submit:${id}`,
+          kind: "warning",
+          title: "Message inserted but not submitted",
+          body: "The terminal was not connected. Press Enter once it is.",
+        });
+      },
+    });
   }
 
   async pasteClipboard() {

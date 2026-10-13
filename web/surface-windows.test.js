@@ -9,6 +9,12 @@ const {
   clampDockHeight,
   dockStateFromSettings,
   isDesktopSurfaceWidth,
+  computeBottomChromeInset,
+  planDockPlaceholder,
+  OVERLAY_SURFACE_WINDOWS,
+  planSurfaceOpenCloses,
+  planSurfaceToggle,
+  planSessionsWindowFocus,
   DOCK_DEFAULT_HEIGHT_PCT,
 } = require("./surface-windows.js");
 
@@ -158,4 +164,135 @@ test("absent or invalid snap settings preserve the default corner quadrants", ()
     width: 50,
     height: 50,
   });
+});
+
+test("computeBottomChromeInset measures the bottom bars a floating surface must clear", () => {
+  // iPad: extra keys from y=1052, action bar from y=1105, viewport 1180.
+  expect(
+    computeBottomChromeInset(1180, [
+      { top: 1052, height: 53 },
+      { top: 1105, height: 75 },
+    ]),
+  ).toBe(128);
+  // Hidden bars (zero height / missing) do not count.
+  expect(
+    computeBottomChromeInset(1180, [{ top: 0, height: 0 }, null]),
+  ).toBe(0);
+  expect(computeBottomChromeInset(1180, [])).toBe(0);
+  // A bar scrolled out below the viewport never yields a negative inset.
+  expect(computeBottomChromeInset(800, [{ top: 900, height: 40 }])).toBe(0);
+  // Junk viewport → 0.
+  expect(computeBottomChromeInset(NaN, [{ top: 10, height: 5 }])).toBe(0);
+});
+
+test("planDockPlaceholder fills the area above the docked terminals with surface actions", () => {
+  const plan = planDockPlaceholder();
+  expect(plan.title).toBeTruthy();
+  expect(plan.hint).toBeTruthy();
+  expect(plan.actions.map((action) => action.id)).toEqual([
+    "files",
+    "git",
+    "tasks",
+    "palette",
+    "undock",
+  ]);
+  for (const action of plan.actions) {
+    expect(action.label).toBeTruthy();
+    expect(action.icon).toBeTruthy();
+  }
+  // Keyboard hints are optional and come from the caller's registry.
+  const hinted = planDockPlaceholder({
+    keysFor: (id) => (id === "palette" ? "Ctrl+Shift+P" : ""),
+  });
+  expect(hinted.actions.find((a) => a.id === "palette").keys).toBe(
+    "Ctrl+Shift+P",
+  );
+  expect(hinted.actions.find((a) => a.id === "files").keys).toBe("");
+});
+
+test("Sessions and Setup have desktop window configs that fit the layer", () => {
+  for (const id of ["sessions", "setup"]) {
+    const config = OVERLAY_SURFACE_WINDOWS[id];
+    expect(config).toBeTruthy();
+    expect(config.title).toBeTruthy();
+    expect(config.icon).toBeTruthy();
+    // Default geometry is already normalized (inside 0-100, never clamped).
+    expect(normalizeWindowBounds(config.bounds)).toEqual(config.bounds);
+    expect(config.minWidthPx).toBeGreaterThanOrEqual(320);
+    expect(config.minHeightPx).toBeGreaterThanOrEqual(240);
+  }
+  // One or two sessions should not leave a mostly empty window.
+  expect(OVERLAY_SURFACE_WINDOWS.sessions.bounds.height).toBeGreaterThanOrEqual(
+    42,
+  );
+  expect(OVERLAY_SURFACE_WINDOWS.sessions.bounds.height).toBeLessThanOrEqual(
+    45,
+  );
+  // Sessions is a list: a narrower window than Setup's long report.
+  expect(OVERLAY_SURFACE_WINDOWS.sessions.bounds.width).toBeLessThan(
+    OVERLAY_SURFACE_WINDOWS.setup.bounds.width,
+  );
+  expect(Object.isFrozen(OVERLAY_SURFACE_WINDOWS)).toBe(true);
+});
+
+test("planSurfaceOpenCloses: desktop windows coexist, phone sheets keep today's exclusions", () => {
+  // Desktop: opening a window only dismisses the More (tools) sheet.
+  for (const id of ["sessions", "setup", "tasks"]) {
+    expect(planSurfaceOpenCloses(id, { windowed: true })).toEqual(["tools"]);
+  }
+  // Phone / narrow: exactly the old behaviour.
+  expect(planSurfaceOpenCloses("sessions", { windowed: false })).toEqual([
+    "tools",
+    "tasks",
+    "setup",
+  ]);
+  expect(planSurfaceOpenCloses("setup", { windowed: false })).toEqual([
+    "tools",
+    "tasks",
+  ]);
+  expect(planSurfaceOpenCloses("tasks", { windowed: false })).toEqual([
+    "tools",
+    "setup",
+  ]);
+  expect(planSurfaceOpenCloses("unknown", { windowed: false })).toEqual([
+    "tools",
+  ]);
+});
+
+test("planSurfaceToggle: a buried open window comes to the front before it closes", () => {
+  expect(planSurfaceToggle({ open: false, frontmost: false })).toBe("open");
+  expect(planSurfaceToggle({ open: true, frontmost: true })).toBe("close");
+  expect(planSurfaceToggle({ open: true, frontmost: false })).toBe("front");
+  // Sheets have no z-order: an open sheet always closes.
+  expect(planSurfaceToggle({ open: true })).toBe("close");
+});
+
+test("planSessionsWindowFocus: first row after render, New session only for an empty list", () => {
+  // Rows rendered and the user has not moved focus: the first row's action.
+  expect(
+    planSessionsWindowFocus({ listState: "rows", focusUnchanged: true }),
+  ).toBe("row");
+  // Only "Open here" rows (ended sessions): Enter on one would create a
+  // terminal, so focus stays on Refresh.
+  expect(
+    planSessionsWindowFocus({
+      listState: "rows",
+      focusUnchanged: true,
+      hasSafeRow: false,
+    }),
+  ).toBe(null);
+  // Empty list: New session is the only useful action.
+  expect(
+    planSessionsWindowFocus({ listState: "empty", focusUnchanged: true }),
+  ).toBe("new");
+  // Load failed: stay on the harmless Refresh button.
+  expect(
+    planSessionsWindowFocus({ listState: "error", focusUnchanged: true }),
+  ).toBe(null);
+  // The user already moved focus: never steal it.
+  for (const listState of ["rows", "empty", "error"]) {
+    expect(planSessionsWindowFocus({ listState, focusUnchanged: false })).toBe(
+      null,
+    );
+  }
 });

@@ -1,6 +1,10 @@
 import { afterEach, test, expect } from "bun:test";
 import { ActionRegistry } from "./action-registry";
-import { CommandPaletteController } from "./command-palette";
+import {
+  CommandPaletteController,
+  formatResultDetail,
+  getHighlightQuery,
+} from "./command-palette";
 
 function createClassList() {
   const classes = new Set();
@@ -405,4 +409,184 @@ test("command focus destinations win both synchronously and after an await", asy
   expect(dom.document.activeElement).toBe(opener);
   await Promise.resolve();
   expect(dom.document.activeElement).toBe(destination);
+});
+
+test("rows carry an icon, one-line detail and a keybinding hint", () => {
+  const dom = createPaletteDom();
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "new-terminal",
+    title: "New Terminal",
+    group: "Actions",
+    icon: "square-terminal",
+    keybinding: "Ctrl+N",
+    meta: ["New Terminal", "", "shell", "shell"],
+    run: () => {},
+  });
+  registry.register({
+    id: "plain",
+    title: "Plain",
+    group: "Views",
+    run: () => {},
+  });
+  const iconRoots = [];
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry,
+    renderIcons: (root) => iconRoots.push(root),
+  });
+  controller.open();
+
+  const [first, second] = dom.results.querySelectorAll(".command-palette-item");
+  const icon = first.querySelector(".command-palette-item-icon");
+  expect(icon.getAttribute("aria-hidden")).toBe("true");
+  expect(icon.children[0].getAttribute("data-lucide")).toBe("square-terminal");
+  expect(
+    first.querySelector(".command-palette-item-detail").textContent,
+  ).toBe("shell");
+  expect(first.querySelector(".command-palette-item-key").textContent).toBe(
+    "Ctrl+N",
+  );
+  expect(
+    second
+      .querySelector(".command-palette-item-icon")
+      .children[0].getAttribute("data-lucide"),
+  ).toBe("eye");
+  expect(second.querySelector(".command-palette-item-key")).toBeNull();
+  expect(second.querySelector(".command-palette-item-detail")).toBeNull();
+  expect(iconRoots).toEqual([dom.results]);
+});
+
+test("matched title characters are wrapped in marks", () => {
+  const dom = createPaletteDom();
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: createRegistry(),
+    renderIcons: null,
+  });
+  controller.open();
+  controller.setQuery("git");
+  const title = dom.results.querySelector(".command-palette-item-title");
+  expect(title.children.map((child) => child.tagName)).toEqual([
+    "SPAN",
+    "MARK",
+  ]);
+  expect(title.children.map((child) => child.textContent)).toEqual([
+    "Open ",
+    "Git",
+  ]);
+  expect(title.children[1].className).toBe("command-palette-match");
+});
+
+test("with an empty query recently used results lead their group", () => {
+  const dom = createPaletteDom();
+  const runs = [];
+  const recent = ["open-file-manager"];
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry: createRegistry(),
+    rankOf: (result) => recent.indexOf(result.id),
+    onRun: (result) => runs.push(result.id),
+    renderIcons: null,
+  });
+  controller.open();
+  expect(controller.visibleResults.map((result) => result.id)).toEqual([
+    "open-file-manager",
+    "open-git",
+  ]);
+  controller.setQuery("open");
+  expect(controller.visibleResults.map((result) => result.id)).toEqual([
+    "open-git",
+    "open-file-manager",
+  ]);
+  controller.runSelected();
+  expect(runs).toEqual(["open-git"]);
+});
+
+test("formatResultDetail drops blanks, repeats and the title itself", () => {
+  expect(formatResultDetail("deploy", ["deploy", "/home/deploy", "Active"])).toBe(
+    "/home/deploy · Active",
+  );
+  expect(formatResultDetail("x", null)).toBe("");
+});
+
+test("getHighlightQuery strips the session and saved-command prefixes", () => {
+  expect(getHighlightQuery("@ dev")).toBe("dev");
+  expect(getHighlightQuery("$logs")).toBe("logs");
+  expect(getHighlightQuery(" git ")).toBe("git");
+});
+
+test("rows show the action description as muted secondary text", () => {
+  const dom = createPaletteDom();
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "open-tasks",
+    title: "Open Tasks",
+    group: "Actions",
+    description: "Give an agent a job",
+    run: () => {},
+  });
+  registry.register({
+    id: "plain",
+    title: "Plain",
+    group: "Actions",
+    run: () => {},
+  });
+  registry.register({
+    id: "with-meta",
+    title: "With Meta",
+    group: "Actions",
+    description: "Never shown next to meta",
+    meta: ["Visible"],
+    run: () => {},
+  });
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry,
+    renderIcons: null,
+  });
+  controller.open();
+
+  const rows = dom.results.querySelectorAll(".command-palette-item");
+  const byId = (id) => rows.find((row) => row.dataset.actionId === id);
+  const described = byId("open-tasks");
+  const detail = described.querySelector(".command-palette-item-detail");
+  expect(detail.textContent).toBe("Give an agent a job");
+  expect(detail.className).toContain("command-palette-item-description");
+  expect(detail.title).toBe("Give an agent a job");
+  expect(
+    described.querySelector(".command-palette-item-text").className,
+  ).toContain("has-description");
+  expect(byId("plain").querySelector(".command-palette-item-detail")).toBeNull();
+  // Context in meta (a path, a branch, a state) wins over the description.
+  expect(
+    byId("with-meta").querySelector(".command-palette-item-detail").textContent,
+  ).toBe("Visible");
+});
+
+test("the description does not disturb title match highlighting", () => {
+  const dom = createPaletteDom();
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "open-git",
+    title: "Open Git",
+    group: "Actions",
+    description: "Review changes and commit",
+    run: () => {},
+  });
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry,
+    renderIcons: null,
+  });
+  controller.open();
+  controller.setQuery("git");
+  const title = dom.results.querySelector(".command-palette-item-title");
+  expect(title.children.map((child) => child.tagName)).toEqual([
+    "SPAN",
+    "MARK",
+  ]);
+  const detail = dom.results.querySelector(".command-palette-item-detail");
+  expect(detail.children.length).toBe(0);
+  expect(detail.textContent).toBe("Review changes and commit");
 });

@@ -6,7 +6,9 @@ import {
   cleanupTempDir,
   createTrackedTerminalRequest,
   createGitFixtureRepo,
+  createExplorerFixtureDir,
 } from "./fixtures";
+import type { Page } from "@playwright/test";
 import { execFileSync } from "node:child_process";
 import { mkdir, rm } from "node:fs/promises";
 import os from "node:os";
@@ -31,6 +33,96 @@ async function acquireServerLock(timeoutMs = 30000) {
 
 async function releaseServerLock() {
   await rm(SERVER_LOCK_DIR, { recursive: true, force: true });
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+type WorkspaceContext = { activeId: string; workspaceId: string };
+
+async function getActiveWorkspaceContext(
+  page: Page,
+): Promise<WorkspaceContext | null> {
+  return page.evaluate(() => {
+    // @ts-ignore
+    const tm = window.terminalManager;
+    const activeId = tm?.activeId ?? null;
+    const workspaceId = tm?.terminals?.get(activeId)?.workspaceId ?? null;
+    return activeId && workspaceId ? { activeId, workspaceId } : null;
+  });
+}
+
+async function skipUnlessActiveTerminalIsTmux(page: Page) {
+  const activeId = await page.evaluate(
+    // @ts-ignore
+    () => window.terminalManager?.activeId ?? null,
+  );
+  const response = await page.request.get(`${BASE_URL}/api/terminals`);
+  expect(response.ok()).toBeTruthy();
+  const terminals = (await response.json()) as Array<{
+    id?: string;
+    backendMode?: string;
+  }>;
+  const backendMode = terminals.find((t) => t.id === activeId)?.backendMode;
+  test.skip(
+    backendMode !== "tmux",
+    `live cwd is authoritative only under the tmux backend (got ${backendMode})`,
+  );
+}
+
+async function sendTerminalInput(page: Page, data: string) {
+  await page.evaluate((input) => {
+    // @ts-ignore
+    const tm = window.terminalManager;
+    const active = tm?.terminals?.get(tm.activeId);
+    active?.ws?.send(JSON.stringify({ type: "input", data: input }));
+  }, data);
+}
+
+async function readCwdState(page: Page, context: WorkspaceContext) {
+  return page.evaluate(({ activeId, workspaceId }) => {
+    // @ts-ignore
+    const tm = window.terminalManager;
+    const active = tm?.terminals?.get(activeId);
+    const tab = document.querySelector(
+      `.tab[data-workspace-id="${workspaceId}"]`,
+    );
+    return {
+      terminalCwd: active?.cwd ?? null,
+      sessionCwd: tm?.sessionRegistry?.get(activeId)?.cwd ?? null,
+      label: tab?.querySelector(".tab-label")?.textContent?.trim() || null,
+    };
+  }, context);
+}
+
+// Samples the tab label every 250 ms for durationMs; a flip-flop between the
+// live cwd and an older one shows up as more than one distinct label.
+async function sampleTabLabels(
+  page: Page,
+  tabSelector: string,
+  durationMs: number,
+) {
+  return page.evaluate(
+    ({ selector, duration }) =>
+      new Promise<string[]>((resolve) => {
+        const labels: string[] = [];
+        const read = () =>
+          labels.push(
+            document
+              .querySelector(`${selector} .tab-label`)
+              ?.textContent?.trim() || "",
+          );
+        read();
+        const timer = setInterval(read, 250);
+        setTimeout(() => {
+          clearInterval(timer);
+          read();
+          resolve(labels);
+        }, duration);
+      }),
+    { selector: tabSelector, duration: durationMs },
+  );
 }
 
 test.describe("Workspace telemetry contract", () => {
@@ -188,7 +280,9 @@ test.describe("Workspace telemetry contract", () => {
     expect(workspaceContext.workspaceId).toBeTruthy();
     expect(workspaceContext.activeId).toBeTruthy();
 
-    await page.keyboard.type("printf 'listening on port 4174\\n'; sleep 1");
+    // Running state is sampled about every 2 s (tmux pipe pump and the
+    // shared runtime-sync TTL), so the command must outlast one sample.
+    await page.keyboard.type("printf 'listening on port 4174\\n'; sleep 4");
     await page.keyboard.press("Enter");
 
     await expect
@@ -300,7 +394,9 @@ test.describe("Workspace telemetry contract", () => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
 
-    await page.keyboard.type("sleep 1");
+    // Must outlast one ~2 s running-state sample (tmux pipe pump / runtime
+    // sync TTL); a shorter command can start and finish between samples.
+    await page.keyboard.type("sleep 3");
     await page.keyboard.press("Enter");
 
     await expect
@@ -524,132 +620,107 @@ test.describe("Workspace telemetry contract", () => {
     });
   });
 
-  test("client-side cwd survives telemetry refresh without reverting", async ({
+  // Under the tmux backend the server reads the pane's live cwd on every
+  // /api/terminals poll (bash emits no OSC 7 and tmux would not forward it),
+  // so that cwd is authoritative: a `cd` in the shell moves the tab label and
+  // the client's cwd, and a stale client-only cwd is replaced. The raw
+  // backend only knows the spawn cwd; its contract (a client cwd survives) is
+  // covered by web/live-cwd.test.js.
+  test("tab follows the live tmux cwd after cd without reverting", async ({
     page,
   }) => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
+    await skipUnlessActiveTerminalIsTmux(page);
 
-    const clientCwd = `/tmp/deckterm-client-side-${Date.now()}`;
-    const expectedLabel = path.basename(clientCwd);
+    const fixture = await createExplorerFixtureDir([`live-cwd-${Date.now()}`]);
+    tempDirs.push(fixture.root);
+    const liveCwd = fixture.children[0];
+    const expectedLabel = path.basename(liveCwd);
 
-    const workspaceContext = await page.evaluate((nextCwd) => {
-      // @ts-ignore
-      const tm = window.terminalManager;
-      const activeId = tm?.activeId ?? null;
-      const active = tm?.terminals?.get(activeId);
-      const workspaceId = active?.workspaceId ?? null;
-
-      if (!activeId || !workspaceId || !active) {
-        return null;
-      }
-
-      active.cwd = nextCwd;
-      tm.sessionRegistry.update(activeId, { cwd: nextCwd });
-      tm.updateWorkspaceLabel(workspaceId, nextCwd);
-
-      return { activeId, workspaceId };
-    }, clientCwd);
-
+    const workspaceContext = await getActiveWorkspaceContext(page);
     expect(workspaceContext).toBeTruthy();
+    const tabSelector = `.tab[data-workspace-id="${workspaceContext!.workspaceId}"]`;
 
-    const tabSelector = `.tab[data-workspace-id="${workspaceContext?.workspaceId}"]`;
-    await expect(page.locator(`${tabSelector} .tab-label`)).toHaveText(
-      expectedLabel,
-    );
+    await sendTerminalInput(page, `cd ${liveCwd}\r`);
+
+    // One telemetry poll (5 s) plus slack.
+    await expect
+      .poll(() => readCwdState(page, workspaceContext!), { timeout: 12000 })
+      .toMatchObject({
+        terminalCwd: liveCwd,
+        sessionCwd: liveCwd,
+        label: expectedLabel,
+      });
     await expect(page.locator(tabSelector)).toHaveAttribute(
       "title",
-      new RegExp(clientCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      new RegExp(escapeRegExp(liveCwd)),
     );
 
-    await page.waitForTimeout(6500);
-
-    const finalState = await page.evaluate(({ activeId, workspaceId }) => {
-      // @ts-ignore
-      const tm = window.terminalManager;
-      const active = tm?.terminals?.get(activeId);
-      const tab = document.querySelector(
-        `.tab[data-workspace-id="${workspaceId}"]`,
-      );
-      return {
-        terminalCwd: active?.cwd ?? null,
-        sessionCwd: tm?.sessionRegistry?.get(activeId)?.cwd ?? null,
-        label: tab?.querySelector(".tab-label")?.textContent?.trim() || null,
-        title: tab?.getAttribute("title") || null,
-      };
-    }, workspaceContext!);
-
-    expect(finalState).toMatchObject({
-      terminalCwd: clientCwd,
-      sessionCwd: clientCwd,
-      label: expectedLabel,
+    // Across the next poll the label must stay on the live cwd.
+    const labels = await sampleTabLabels(page, tabSelector, 6500);
+    expect(new Set(labels)).toEqual(new Set([expectedLabel]));
+    expect(await readCwdState(page, workspaceContext!)).toMatchObject({
+      terminalCwd: liveCwd,
+      sessionCwd: liveCwd,
     });
-    expect(finalState.title).toContain(clientCwd);
   });
 
-  test("saved client-side cwd survives page reload reconnect", async ({
+  test("page reload shows the live tmux cwd, not a stale saved one", async ({
     page,
   }) => {
     await page.goto(BASE_URL);
     await waitForTerminal(page);
+    await skipUnlessActiveTerminalIsTmux(page);
 
-    const clientCwd = `/tmp/deckterm-reload-cwd-${Date.now()}`;
-    const expectedLabel = path.basename(clientCwd);
+    const fixture = await createExplorerFixtureDir([
+      `live-cwd-reload-${Date.now()}`,
+    ]);
+    tempDirs.push(fixture.root);
+    const liveCwd = fixture.children[0];
+    const expectedLabel = path.basename(liveCwd);
+    const staleCwd = `/tmp/deckterm-stale-cwd-${Date.now()}`;
 
-    const workspaceContext = await page.evaluate((nextCwd) => {
-      // @ts-ignore
-      const tm = window.terminalManager;
-      const activeId = tm?.activeId ?? null;
-      const active = tm?.terminals?.get(activeId);
-      const workspaceId = active?.workspaceId ?? null;
-
-      if (!activeId || !workspaceId || !active) {
-        return null;
-      }
-
-      active.cwd = nextCwd;
-      tm.sessionRegistry.update(activeId, { cwd: nextCwd });
-      tm.updateWorkspaceLabel(workspaceId, nextCwd);
-
-      return { activeId, workspaceId };
-    }, clientCwd);
-
+    const workspaceContext = await getActiveWorkspaceContext(page);
     expect(workspaceContext).toBeTruthy();
+    const tabSelector = `.tab[data-workspace-id="${workspaceContext!.workspaceId}"]`;
+
+    await sendTerminalInput(page, `cd ${liveCwd}\r`);
+    await expect
+      .poll(() => readCwdState(page, workspaceContext!), { timeout: 12000 })
+      .toMatchObject({ terminalCwd: liveCwd, label: expectedLabel });
+
+    // Save a client-only cwd the shell never entered, then reload.
+    await page.evaluate(
+      ({ activeId, workspaceId, nextCwd }) => {
+        // @ts-ignore
+        const tm = window.terminalManager;
+        const active = tm.terminals.get(activeId);
+        active.cwd = nextCwd;
+        tm.sessionRegistry.update(activeId, { cwd: nextCwd });
+        tm.updateWorkspaceLabel(workspaceId, nextCwd);
+      },
+      { ...workspaceContext!, nextCwd: staleCwd },
+    );
 
     await page.reload();
     await page.waitForLoadState("domcontentloaded");
     await waitForTerminal(page);
 
-    const tabSelector = `.tab[data-workspace-id="${workspaceContext?.workspaceId}"]`;
-    await expect(page.locator(`${tabSelector} .tab-label`)).toHaveText(
-      expectedLabel,
-    );
+    await expect
+      .poll(() => readCwdState(page, workspaceContext!), { timeout: 12000 })
+      .toMatchObject({
+        terminalCwd: liveCwd,
+        sessionCwd: liveCwd,
+        label: expectedLabel,
+      });
     await expect(page.locator(tabSelector)).toHaveAttribute(
       "title",
-      new RegExp(clientCwd.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      new RegExp(escapeRegExp(liveCwd)),
     );
 
-    const restoredState = await page.evaluate(({ activeId, workspaceId }) => {
-      // @ts-ignore
-      const tm = window.terminalManager;
-      const active = tm?.terminals?.get(activeId);
-      const tab = document.querySelector(
-        `.tab[data-workspace-id="${workspaceId}"]`,
-      );
-      return {
-        terminalCwd: active?.cwd ?? null,
-        sessionCwd: tm?.sessionRegistry?.get(activeId)?.cwd ?? null,
-        label: tab?.querySelector(".tab-label")?.textContent?.trim() || null,
-        title: tab?.getAttribute("title") || null,
-      };
-    }, workspaceContext!);
-
-    expect(restoredState).toMatchObject({
-      terminalCwd: clientCwd,
-      sessionCwd: clientCwd,
-      label: expectedLabel,
-    });
-    expect(restoredState.title).toContain(clientCwd);
+    const labels = await sampleTabLabels(page, tabSelector, 6500);
+    expect(new Set(labels)).toEqual(new Set([expectedLabel]));
   });
 
   test("merged workspace tabs summarize multiple folders and statuses while tooltip keeps the full list", async ({

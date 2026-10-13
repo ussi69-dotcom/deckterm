@@ -30,6 +30,18 @@ function prepareAction(action, order) {
     group: String(action.group || "Other"),
     keywords: normalizeKeywords(action.keywords),
     meta: action.meta ?? null,
+    // Display-only metadata for palette rows: a lucide icon name and the
+    // shortcut label of an existing global keybinding (never bound here).
+    icon: typeof action.icon === "string" && action.icon ? action.icon : null,
+    keybinding:
+      typeof action.keybinding === "string" && action.keybinding
+        ? action.keybinding
+        : null,
+    // One plain line on what the action does; shown muted under/after the title.
+    description:
+      typeof action.description === "string" && action.description.trim()
+        ? action.description.trim()
+        : null,
     priority: Number.isFinite(action.priority) ? action.priority : 0,
     order,
     run: action.run,
@@ -140,6 +152,9 @@ class ActionRegistry {
         group: action.group,
         keywords: [...action.keywords],
         meta: action.meta,
+        icon: action.icon,
+        keybinding: action.keybinding,
+        description: action.description,
         priority: action.priority,
         run: action.run,
       }));

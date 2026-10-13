@@ -8,8 +8,10 @@
 // is applied (see the phase-4 plan, resolved decision #3).
 //
 // Each entry: { key, category, label, description, type, default,
-//               options?, min?, max?, searchText }.
+//               options?, min?, max?, deviceClass?, searchText }.
 // type ∈ toggle | number | select | text.
+// deviceClass ∈ "desktop" | "touch": the entry belongs to that device class
+// only (see schemaForDevice); entries without it apply everywhere.
 
 const SETTINGS_SCHEMA = [
   // ── Appearance ──────────────────────────────────────────────────────────
@@ -60,14 +62,33 @@ const SETTINGS_SCHEMA = [
     default: false,
     searchText: "auto copy clipboard select selection paste",
   },
+  // The extra-keys bar is remembered per device class: a phone wants it, a
+  // desktop usually does not, and one shared value made a phone choice show
+  // the bar on desktop too. Exactly one of these two entries is shown in the
+  // Settings UI (schemaForDevice) and applied at runtime
+  // (extra-keys-visibility.js); the other device's value is left alone.
   {
     key: "terminal.extraKeysVisible",
     category: "Terminal",
     label: "Show extra keys bar",
-    description: "Display the mobile extra-keys toolbar (Esc, Tab, arrows, …).",
+    description:
+      "Display the extra-keys toolbar (Esc, Tab, arrows, …) on desktop. Phones and tablets remember their own choice.",
     type: "toggle",
     default: false,
-    searchText: "extra keys bar mobile toolbar esc tab arrows ctrl",
+    deviceClass: "desktop",
+    searchText: "extra keys bar mobile toolbar esc tab arrows ctrl desktop",
+  },
+  {
+    key: "terminal.extraKeysVisibleTouch",
+    category: "Terminal",
+    label: "Show extra keys bar",
+    description:
+      "Display the extra-keys toolbar (Esc, Tab, arrows, …) on this phone or tablet. Desktop remembers its own choice.",
+    type: "toggle",
+    default: true,
+    deviceClass: "touch",
+    searchText:
+      "extra keys bar mobile phone tablet touch toolbar esc tab arrows ctrl",
   },
   {
     key: "terminal.renderer",
@@ -306,6 +327,16 @@ function defaultsOf(schema) {
   return out;
 }
 
+// The schema as seen from one device class ("desktop" | "touch"): entries
+// tagged with another deviceClass are dropped, everything else keeps its order.
+// The Settings UI renders and searches this view so each device shows (and
+// edits) only its own copy of a per-device setting.
+function schemaForDevice(schema, deviceClass) {
+  return (schema || []).filter(
+    (def) => def && (!def.deviceClass || def.deviceClass === deviceClass),
+  );
+}
+
 // Case-insensitive search across label/description/searchText/category.
 // Returns a filtered + ranked copy (label matches rank highest, then
 // category, then description/searchText). Empty/whitespace query → all entries
@@ -381,6 +412,7 @@ const SettingsSchema = {
   defaultsOf,
   coerceValue,
   optionValues,
+  schemaForDevice,
 };
 
 if (typeof window !== "undefined") {

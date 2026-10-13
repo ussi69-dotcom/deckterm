@@ -1,5 +1,23 @@
 import { test, expect } from "bun:test";
-import { computeTaskSignals, diffTaskTransitions } from "./task-signals";
+import {
+  computeTaskSignals,
+  diffTaskTransitions,
+  attentionSeq,
+  hasUnseenAttention,
+  topAttentionKind,
+  countUnseenAttention,
+  newAttentionSince,
+  pruneSeenMap,
+  parseSeenMap,
+  normalizeProgress,
+  sessionDisplayTitle,
+  formatActivityAge,
+  sessionActivityAt,
+  orderSessionsForPanel,
+  describeTaskTransitionToast,
+  shouldToastAttention,
+  describeAttentionToast,
+} from "./task-signals";
 
 test("computeTaskSignals counts running and needs-attention tasks", () => {
   const signals = computeTaskSignals([
@@ -55,4 +73,199 @@ test("diffTaskTransitions ignores unknown/new tasks and non-notable moves", () =
     { id: "new", title: "N", status: "needs-user" },
   ];
   expect(diffTaskTransitions(prev, next)).toEqual([]);
+});
+
+// --- Agent attention -------------------------------------------------------
+
+const att = (kind, seq, extra = {}) => ({
+  kind,
+  seq,
+  at: seq,
+  title: "",
+  body: "",
+  ...extra,
+});
+
+test("attentionSeq reads a valid seq and ignores junk", () => {
+  expect(attentionSeq({ attention: att("done", 42) })).toBe(42);
+  expect(attentionSeq({ attention: null })).toBe(0);
+  expect(attentionSeq({ attention: { seq: "x" } })).toBe(0);
+  expect(attentionSeq(null)).toBe(0);
+});
+
+test("hasUnseenAttention compares against lastSeenSeq and skips the active visible session", () => {
+  const session = { id: "a", attention: att("needs-input", 10) };
+  expect(hasUnseenAttention(session, 0)).toBe(true);
+  expect(hasUnseenAttention(session, 9)).toBe(true);
+  expect(hasUnseenAttention(session, 10)).toBe(false);
+  expect(hasUnseenAttention(session, 0, { isActiveVisible: true })).toBe(false);
+  expect(hasUnseenAttention({ id: "b" }, 0)).toBe(false);
+  expect(hasUnseenAttention({ id: "c", attention: att("bogus", 5) }, 0)).toBe(
+    false,
+  );
+});
+
+test("topAttentionKind picks needs-input over error over done over info", () => {
+  expect(topAttentionKind(["done", "info"])).toBe("done");
+  expect(topAttentionKind(["done", "error", "info"])).toBe("error");
+  expect(topAttentionKind(["error", "needs-input"])).toBe("needs-input");
+  expect(topAttentionKind([])).toBe(null);
+  expect(topAttentionKind(["nope"])).toBe(null);
+});
+
+test("countUnseenAttention counts unseen sessions except the active visible one", () => {
+  const sessions = [
+    { id: "a", attention: att("done", 5) },
+    { id: "b", attention: att("needs-input", 7) },
+    { id: "c", attention: att("info", 3) },
+    { id: "d" },
+  ];
+  const seen = { c: 3 };
+  expect(countUnseenAttention(sessions, seen, { activeVisibleId: null })).toBe(
+    2,
+  );
+  expect(countUnseenAttention(sessions, seen, { activeVisibleId: "b" })).toBe(
+    1,
+  );
+});
+
+test("newAttentionSince reports only a seq that grew past a known baseline", () => {
+  expect(newAttentionSince(undefined, { attention: att("done", 5) })).toBe(
+    null,
+  );
+  expect(newAttentionSince(5, { attention: att("done", 5) })).toBe(null);
+  expect(newAttentionSince(5, { attention: att("done", 9) })).toEqual(
+    att("done", 9),
+  );
+  expect(newAttentionSince(0, { attention: null })).toBe(null);
+});
+
+test("parseSeenMap tolerates garbage and pruneSeenMap keeps known ids only", () => {
+  expect(parseSeenMap("not json")).toEqual({});
+  expect(parseSeenMap(JSON.stringify({ a: 3, b: "x", c: -1 }))).toEqual({
+    a: 3,
+  });
+  expect(pruneSeenMap({ a: 1, b: 2 }, ["b", "z"])).toEqual({ b: 2 });
+});
+
+test("normalizeProgress clamps percent and drops unknown states", () => {
+  expect(normalizeProgress({ state: "normal", percent: 140 })).toEqual({
+    state: "normal",
+    percent: 100,
+  });
+  expect(normalizeProgress({ state: "indeterminate", percent: null })).toEqual({
+    state: "indeterminate",
+    percent: null,
+  });
+  expect(normalizeProgress({ state: "weird", percent: 3 })).toBe(null);
+  expect(normalizeProgress(null)).toBe(null);
+});
+
+test("sessionDisplayTitle prefers a name, then the cwd basename, never a UUID", () => {
+  expect(
+    sessionDisplayTitle({ id: "0f3e9a1c-aaaa", name: "api", cwd: "/x/y" }),
+  ).toBe("api");
+  expect(
+    sessionDisplayTitle({ id: "0f3e9a1c-aaaa", cwd: "/home/u/proj/" }),
+  ).toBe("proj");
+  expect(sessionDisplayTitle({ id: "0f3e9a1c-aaaa", cwd: "/" })).toBe("/");
+  expect(sessionDisplayTitle({ id: "0f3e9a1c-aaaa", cwd: "" })).toBe(
+    "Terminal",
+  );
+});
+
+test("formatActivityAge renders short relative ages", () => {
+  expect(formatActivityAge(10_000)).toBe("just now");
+  expect(formatActivityAge(60_000)).toBe("1 min ago");
+  expect(formatActivityAge(59 * 60_000)).toBe("59 min ago");
+  expect(formatActivityAge(2 * 3600_000 + 5)).toBe("2 h ago");
+  expect(formatActivityAge(3 * 86_400_000)).toBe("3 d ago");
+  expect(formatActivityAge(NaN)).toBe("");
+});
+
+test("sessionActivityAt prefers live activity, then updatedAt, then createdAt", () => {
+  expect(sessionActivityAt({ lastActivityAt: 50, createdAt: 10 })).toBe(50);
+  expect(
+    sessionActivityAt({ updatedAt: "2026-10-12T10:00:00.000Z", createdAt: 1 }),
+  ).toBe(Date.parse("2026-10-12T10:00:00.000Z"));
+  expect(sessionActivityAt({ createdAt: 7 })).toBe(7);
+  expect(sessionActivityAt({})).toBe(0);
+});
+
+test("orderSessionsForPanel puts needs-input first, then running, then the rest (stable)", () => {
+  const sessions = [
+    { id: "idle1" },
+    { id: "run1", running: true },
+    { id: "ask", attention: att("needs-input", 9) },
+    { id: "agent", agentState: "thinking" },
+    { id: "askSeen", attention: att("needs-input", 4) },
+    { id: "idle2" },
+  ];
+  const ordered = orderSessionsForPanel(sessions, { askSeen: 4 });
+  expect(ordered.map((s) => s.id)).toEqual([
+    "ask",
+    "run1",
+    "agent",
+    "idle1",
+    "askSeen",
+    "idle2",
+  ]);
+  // Input array is not mutated.
+  expect(sessions[0].id).toBe("idle1");
+});
+
+test("describeTaskTransitionToast maps each transition to a toast kind", () => {
+  expect(
+    describeTaskTransitionToast({ id: "t1", title: "Fix CI", to: "complete" }),
+  ).toEqual({
+    key: "task:t1",
+    kind: "success",
+    title: "Task completed",
+    body: "Fix CI",
+  });
+  expect(
+    describeTaskTransitionToast({ id: "t1", title: "Fix CI", to: "failed" }),
+  ).toMatchObject({ key: "task:t1", kind: "error", title: "Task failed" });
+  expect(
+    describeTaskTransitionToast({ id: "t2", title: "  ", to: "needs-user" }),
+  ).toMatchObject({
+    key: "task:t2",
+    kind: "warning",
+    title: "Task needs your input",
+    body: "Untitled task",
+  });
+});
+
+test("shouldToastAttention: visible page only; the active session toasts only for prompts", () => {
+  const prompt = { kind: "needs-input" };
+  const done = { kind: "done" };
+  expect(shouldToastAttention(prompt, { pageVisible: false })).toBe(false);
+  expect(
+    shouldToastAttention(prompt, { pageVisible: true, isActiveVisible: true }),
+  ).toBe(true);
+  expect(
+    shouldToastAttention(done, { pageVisible: true, isActiveVisible: true }),
+  ).toBe(false);
+  expect(
+    shouldToastAttention(done, { pageVisible: true, isActiveVisible: false }),
+  ).toBe(true);
+  expect(shouldToastAttention({ kind: "bogus" })).toBe(false);
+  expect(shouldToastAttention(null)).toBe(false);
+});
+
+test("describeAttentionToast names the session and keeps the agent text as the body", () => {
+  expect(
+    describeAttentionToast(
+      { kind: "needs-input", title: "Claude Code", body: "Allow edit?" },
+      { sessionId: "abc", label: "deckterm_dev" },
+    ),
+  ).toEqual({
+    key: "attention:abc",
+    kind: "warning",
+    title: "deckterm_dev: Needs your input",
+    body: "Claude Code — Allow edit?",
+  });
+  expect(
+    describeAttentionToast({ kind: "info", title: "", body: "hi" }, {}),
+  ).toEqual({ key: "attention:", kind: "info", title: "Notification", body: "hi" });
 });

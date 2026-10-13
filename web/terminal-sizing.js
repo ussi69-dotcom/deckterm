@@ -100,6 +100,19 @@ function normalizeTerminalGrid({
   };
 }
 
+// Row floor for a fitted terminal. 8 rows everywhere, except on a touch
+// layout while the on-screen keyboard is open: a phone in landscape then has
+// about 96px of terminal, and an 8-row xterm overflowed that box and hid the
+// prompt and cursor (R2). 3 rows keep the prompt line plus some context.
+const DEFAULT_MIN_TERMINAL_ROWS = 8;
+const KEYBOARD_MIN_TERMINAL_ROWS = 3;
+
+function minTerminalRows({ touch = false, keyboardOpen = false } = {}) {
+  return touch && keyboardOpen
+    ? KEYBOARD_MIN_TERMINAL_ROWS
+    : DEFAULT_MIN_TERMINAL_ROWS;
+}
+
 // Conservative cell-height estimate (px) used only when no terminal is
 // mounted yet and no live renderer metrics are available — deliberately a bit
 // generous so the resulting minimum height errs large rather than letting a
@@ -173,6 +186,7 @@ const TerminalSizing = {
   predictInitialTilePixels,
   estimateTerminalGrid,
   normalizeTerminalGrid,
+  minTerminalRows,
   minPanelHeightPx,
   clampPanelHeightPercent,
 };
@@ -193,6 +207,7 @@ if (typeof exports !== "undefined") {
   exports.predictInitialTilePixels = predictInitialTilePixels;
   exports.estimateTerminalGrid = estimateTerminalGrid;
   exports.normalizeTerminalGrid = normalizeTerminalGrid;
+  exports.minTerminalRows = minTerminalRows;
   exports.minPanelHeightPx = minPanelHeightPx;
   exports.clampPanelHeightPercent = clampPanelHeightPercent;
 }

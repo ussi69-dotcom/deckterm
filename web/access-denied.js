@@ -7,7 +7,25 @@ function describeAccessDenied(payload) {
   if (!payload || typeof payload !== "object") return null;
 
   switch (payload.reason) {
-    case "no_matching_root": {
+    case "no_matching_root":
+    case "forbidden_root": {
+      // Root denials carry a server-written detail (backend/forbidden-root.ts)
+      // that names the rejected path, the governing setting and the fix. Only
+      // trust `message` when `setting` marks it as that detail.
+      const detail =
+        typeof payload.message === "string" && payload.setting
+          ? payload.message.trim()
+          : "";
+      if (detail) return { text: detail, showSetupCta: true };
+      if (payload.reason === "forbidden_root") {
+        const where = payload.path ? ` (${payload.path})` : "";
+        return {
+          text:
+            `That directory${where} is outside the allowed roots. ` +
+            "Use a directory inside an allowed root, or add it to ALLOWED_FILE_ROOTS and restart DeckTerm.",
+          showSetupCta: true,
+        };
+      }
       const where = payload.path ? `: ${payload.path}` : "";
       return {
         text:

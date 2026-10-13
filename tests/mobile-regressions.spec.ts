@@ -131,6 +131,7 @@ test.describe("Mobile regressions", () => {
       "Files",
       "Git",
       "Paste",
+      "Compose",
       "More",
     ]);
   });
@@ -245,7 +246,7 @@ test.describe("Mobile regressions", () => {
       LAYOUT_EDITOR_TEST_IDS.available,
     );
 
-    for (const label of ["Files", "Git", "Paste"]) {
+    for (const label of ["Files", "Git", "Paste", "Compose"]) {
       await dragLayoutEditorItem(
         page,
         layoutEditor
@@ -299,7 +300,7 @@ test.describe("Mobile regressions", () => {
       LAYOUT_EDITOR_TEST_IDS.available,
     );
 
-    for (const label of ["Files", "Git", "Paste"]) {
+    for (const label of ["Files", "Git", "Paste", "Compose"]) {
       await dragLayoutEditorItem(
         page,
         layoutEditor

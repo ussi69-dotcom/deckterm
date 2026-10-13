@@ -35,7 +35,19 @@ export type TmuxRuntimeState = {
   lastExitCode: number | null;
   agentName: AgentName | null;
   agentState: AgentState | null;
+  /**
+   * Consecutive conclusive tmux samples in which a process-detected agent was
+   * missing from both the process tree and pane_current_command.
+   */
+  agentMissedSamples?: number;
 };
+
+/**
+ * A process-detected agent is dropped after this many consecutive samples
+ * without it. The process tree is sampled, so one empty sample (a race with a
+ * respawn, a short-lived exec) must not clear the badge.
+ */
+export const AGENT_MISSING_SAMPLES_TO_CLEAR = 2;
 
 export type TerminalTelemetry = {
   busy: boolean;
@@ -279,6 +291,28 @@ export function inferPolledTmuxAgentState({
   return classifiedState || "thinking";
 }
 
+/**
+ * Whether an explicit `agent;<name>;start` marker is still open after these
+ * shell-integration events. `agent;done` closes it, and so does a returned
+ * shell prompt (`running;done`): the prompt only comes back once the wrapped
+ * agent has left the foreground, even if the wrapper never printed its done
+ * marker (interrupted function).
+ */
+export function nextAgentMarkerActive(
+  current: boolean,
+  events: ShellIntegrationEvent[],
+): boolean {
+  let active = current;
+  for (const event of events) {
+    if (event.type === "agent-start") {
+      active = true;
+    } else if (event.type === "agent-done" || event.type === "running-done") {
+      active = false;
+    }
+  }
+  return active;
+}
+
 export function inferTmuxRuntimeState({
   paneCurrentCommand,
   processTree = [],
@@ -291,13 +325,17 @@ export function inferTmuxRuntimeState({
     agentState: null,
   },
   hasUserPrompted = false,
+  agentMarkerActive = false,
 }: {
   paneCurrentCommand?: string | null;
-  processTree?: string[];
+  /** Agent process args under the pane; null when the read failed. */
+  processTree?: string[] | null;
   previousCapture?: string | null;
   capture?: string | null;
   previousState?: TmuxRuntimeState;
   hasUserPrompted?: boolean;
+  /** An explicit agent;start marker is open (see nextAgentMarkerActive). */
+  agentMarkerActive?: boolean;
 }): TmuxRuntimeState {
   const safeCapture = capture || "";
   const parsedCapture = parseShellIntegrationChunk(safeCapture);
@@ -309,9 +347,32 @@ export function inferTmuxRuntimeState({
   );
   const recoveredState = inferRecoveredTmuxRuntimeState({
     paneCurrentCommand,
-    processTree,
+    processTree: processTree || [],
     capture: safeCapture,
   });
+
+  // A previous agent that nothing confirms any more (no process, no pane
+  // command, no open marker) is kept only until the miss count reaches
+  // AGENT_MISSING_SAMPLES_TO_CLEAR. A sample is inconclusive when tmux gave
+  // no pane command or the process tree read failed; it neither counts nor
+  // resets.
+  const sampleConclusive =
+    String(paneCurrentCommand || "").trim().length > 0 && processTree !== null;
+  const previousMisses = previousState.agentMissedSamples || 0;
+  let agentMissedSamples = 0;
+  let carriedAgentName = previousState.agentName;
+  if (
+    !hasAgentMarkers &&
+    !recoveredState.agentName &&
+    previousState.agentName &&
+    !agentMarkerActive
+  ) {
+    agentMissedSamples = sampleConclusive ? previousMisses + 1 : previousMisses;
+    if (agentMissedSamples >= AGENT_MISSING_SAMPLES_TO_CLEAR) {
+      carriedAgentName = null;
+      agentMissedSamples = 0;
+    }
+  }
 
   const running = hasRunningMarkers
     ? parsedCapture.state.running
@@ -319,8 +380,7 @@ export function inferTmuxRuntimeState({
   const lastExitCode = hasRunningMarkers
     ? parsedCapture.state.lastExitCode
     : previousState.lastExitCode;
-  const recoveredAgentName =
-    recoveredState.agentName || previousState.agentName;
+  const recoveredAgentName = recoveredState.agentName || carriedAgentName;
   const agentName = hasAgentMarkers
     ? parsedCapture.state.agentName
     : recoveredAgentName;
@@ -337,6 +397,7 @@ export function inferTmuxRuntimeState({
       lastExitCode,
       agentName: null,
       agentState: null,
+      agentMissedSamples: 0,
     };
   }
 
@@ -361,6 +422,7 @@ export function inferTmuxRuntimeState({
     lastExitCode,
     agentName,
     agentState,
+    agentMissedSamples,
   };
 }
 
@@ -666,4 +728,459 @@ async function runGitCommand(
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal notification escapes
+//
+// Agents and tools ask the hosting terminal for attention with OSC
+// notification sequences. DeckTerm reads them from the raw pane output (the
+// tmux pipe log, or the raw PTY stream), next to — but independent of — the
+// DeckTerm 9;9 markers parsed above:
+//
+//   OSC 9 ; <text>                     iTerm2 / Ghostty / WezTerm notification
+//                                      (Claude Code `preferredNotifChannel:
+//                                      "iterm2"`, Codex `tui.notifications`)
+//   OSC 777 ; notify ; <title> ; <body> urxvt / Ghostty / Warp notification
+//                                      (Claude Code `"ghostty"`)
+//   OSC 99 ; <k=v:...> ; <payload>     kitty notification (`"kitty"`), minimal:
+//                                      title/body payloads, d=0 chunking, e=1
+//   OSC 9 ; 4 ; <state> ; <percent>    ConEmu / Windows Terminal progress
+//
+// Numeric OSC 9 subcommands (ConEmu 9;1..9;12, DeckTerm's own 9;9) are never
+// notifications. Inside tmux both Claude Code and Codex wrap the sequence in
+// a `ESC P tmux; ... ESC \` passthrough envelope, which is unwrapped here.
+// Everything is untrusted in-band data: bounded carry, sanitized text, and a
+// per-session rate limit in applyTerminalNotificationEvents.
+// ---------------------------------------------------------------------------
+
+export type AttentionKind = "needs-input" | "done" | "error" | "info";
+export type TerminalProgressState =
+  "normal" | "error" | "indeterminate" | "paused";
+
+export type TerminalNotificationEvent =
+  | {
+      type: "notify";
+      source: "osc9" | "osc777" | "osc99";
+      title: string;
+      body: string;
+    }
+  | {
+      type: "progress";
+      state: TerminalProgressState | null;
+      percent: number | null;
+    };
+
+type KittyPending = { id: string; title: string; body: string };
+
+export type TerminalNotificationParseState = {
+  carry: string;
+  kitty: KittyPending | null;
+};
+
+export type TerminalAttention = {
+  kind: AttentionKind;
+  title: string;
+  body: string;
+  at: number;
+  seq: number;
+};
+
+export type TerminalProgress = {
+  state: TerminalProgressState;
+  percent: number | null;
+  at: number;
+};
+
+export type AttentionTracker = {
+  attention: TerminalAttention | null;
+  progress: TerminalProgress | null;
+  lastAcceptedAt: number;
+  lastAcceptedKind: AttentionKind | null;
+};
+
+const NOTIFICATION_MAX_SEQUENCE_LENGTH = 8192;
+const NOTIFICATION_TEXT_MAX_CHARS = 200;
+const KITTY_PENDING_MAX_LENGTH = 2048;
+const ATTENTION_RATE_WINDOW_MS = 2_000;
+const TMUX_PASSTHROUGH_PREFIX = "\x1bPtmux;";
+const NOTIFICATION_CONTROL_RE = /[\x00-\x08\x0b-\x1f\x7f-\x9f​-‏‪-‮⁦-⁩﻿]/g;
+const KITTY_ID_RE = /^[A-Za-z0-9_+.-]{0,64}$/;
+const PROGRESS_STATES: Record<string, TerminalProgressState | null> = {
+  "0": null,
+  "1": "normal",
+  "2": "error",
+  "3": "indeterminate",
+  "4": "paused",
+};
+const ATTENTION_PRIORITY: Record<AttentionKind, number> = {
+  info: 1,
+  done: 2,
+  error: 3,
+  "needs-input": 4,
+};
+
+// Texts come from the official sources: Claude Code Notification messages
+// ("Claude needs your permission…", "Claude is waiting for your input") and
+// Codex TUI notifications (codex-rs/tui/src/chatwidget/notifications.rs:
+// "Approval requested: …", "Codex wants to edit …", "Question: …",
+// "Plan mode prompt: …", and the agent-turn-complete preview).
+const NEEDS_INPUT_PATTERNS = [
+  /permission/i,
+  /\bapprov(?:al|e)\b/i,
+  /\bwaiting for (?:your )?(?:input|response|reply|answer)/i,
+  /\bneeds? (?:your )?(?:input|attention|approval|response|answer)\b/i,
+  /\b(?:input|action|attention|response) (?:is )?(?:needed|required)\b/i,
+  /\bwants to (?:edit|run|write|delete)\b/i,
+  /^question\b/i,
+  /\bplan mode prompt\b/i,
+  /\bconfirm(?:ation)?\b/i,
+];
+const ERROR_PATTERN =
+  /\b(?:error|errors|failed|failure|fatal|crash(?:ed)?|exception|panic(?:ked)?)\b/i;
+const DONE_PATTERN =
+  /\b(?:complete|completed|finished|done|succeeded|success|successful(?:ly)?|ready)\b/i;
+
+export function sanitizeNotificationText(input: string): string {
+  const cleaned = String(input || "")
+    .replace(/[\t\n\r\v\f]/g, " ")
+    .replace(NOTIFICATION_CONTROL_RE, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const chars = Array.from(cleaned);
+  return chars.length > NOTIFICATION_TEXT_MAX_CHARS
+    ? chars.slice(0, NOTIFICATION_TEXT_MAX_CHARS).join("")
+    : cleaned;
+}
+
+export function classifyAttentionText(
+  { title, body }: { title: string; body: string },
+  { agentName = null }: { agentName?: AgentName | null } = {},
+): AttentionKind {
+  const text = `${title || ""} ${body || ""}`.trim();
+  if (!text) return "info";
+  if (NEEDS_INPUT_PATTERNS.some((pattern) => pattern.test(text))) {
+    return "needs-input";
+  }
+  // Codex only sends approval/question prompts (handled above) and the
+  // agent-turn-complete preview, whose text is the agent's own reply.
+  if (agentName === "codex") return "done";
+  if (ERROR_PATTERN.test(text)) return "error";
+  if (DONE_PATTERN.test(text)) return "done";
+  return "info";
+}
+
+export function createTerminalNotificationParseState(): TerminalNotificationParseState {
+  return { carry: "", kitty: null };
+}
+
+export function createAttentionTracker(): AttentionTracker {
+  return {
+    attention: null,
+    progress: null,
+    lastAcceptedAt: 0,
+    lastAcceptedKind: null,
+  };
+}
+
+function parseProgressPayload(
+  payload: string,
+): TerminalNotificationEvent | null {
+  // payload = "4;<state>[;<percent>]"
+  const [, rawState = "", rawPercent = ""] = payload.split(";");
+  if (!Object.prototype.hasOwnProperty.call(PROGRESS_STATES, rawState)) {
+    return null;
+  }
+  const state = PROGRESS_STATES[rawState];
+  if (!state) return { type: "progress", state: null, percent: null };
+  if (state === "indeterminate") {
+    return { type: "progress", state, percent: null };
+  }
+  const parsed = /^\d{1,6}$/.test(rawPercent)
+    ? Number.parseInt(rawPercent, 10)
+    : null;
+  return {
+    type: "progress",
+    state,
+    percent: parsed === null ? null : Math.max(0, Math.min(100, parsed)),
+  };
+}
+
+function capRaw(value: string): string {
+  return value.length > KITTY_PENDING_MAX_LENGTH
+    ? value.slice(0, KITTY_PENDING_MAX_LENGTH)
+    : value;
+}
+
+function handleKittyPayload(
+  rest: string,
+  state: TerminalNotificationParseState,
+): TerminalNotificationEvent | null {
+  const separator = rest.indexOf(";");
+  if (separator === -1) return null;
+  const metadata = rest.slice(0, separator);
+  let payload = rest.slice(separator + 1);
+  const meta: Record<string, string> = {};
+  for (const pair of metadata.split(":")) {
+    if (!pair) continue;
+    const eq = pair.indexOf("=");
+    if (eq <= 0) continue;
+    meta[pair.slice(0, eq)] = pair.slice(eq + 1);
+  }
+  const id = KITTY_ID_RE.test(meta.i || "") ? meta.i || "" : "";
+  const payloadType = meta.p || "title";
+  if (payloadType !== "title" && payloadType !== "body") return null;
+  if (meta.e === "1") {
+    if (!BASE64_RE.test(payload)) return null;
+    try {
+      payload = Buffer.from(payload, "base64").toString("utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  const pending =
+    state.kitty && state.kitty.id === id
+      ? state.kitty
+      : { id, title: "", body: "" };
+  if (payloadType === "title") pending.title = capRaw(pending.title + payload);
+  else pending.body = capRaw(pending.body + payload);
+
+  if (meta.d === "0") {
+    state.kitty = pending;
+    return null;
+  }
+  state.kitty = null;
+  const title = sanitizeNotificationText(pending.title);
+  const body = sanitizeNotificationText(pending.body);
+  if (!title && !body) return null;
+  return { type: "notify", source: "osc99", title, body };
+}
+
+function handleOscPayload(
+  payload: string,
+  state: TerminalNotificationParseState,
+): TerminalNotificationEvent | null {
+  if (payload.startsWith("9;")) {
+    const rest = payload.slice(2);
+    if (rest.startsWith("4;")) return parseProgressPayload(rest);
+    // ConEmu numeric subcommands, DeckTerm's own 9;9 markers.
+    if (/^\d+(?:;|$)/.test(rest)) return null;
+    const body = sanitizeNotificationText(rest);
+    return body ? { type: "notify", source: "osc9", title: "", body } : null;
+  }
+  if (payload.startsWith("777;notify;")) {
+    const rest = payload.slice("777;notify;".length);
+    const separator = rest.indexOf(";");
+    const title = sanitizeNotificationText(
+      separator === -1 ? rest : rest.slice(0, separator),
+    );
+    const body = sanitizeNotificationText(
+      separator === -1 ? "" : rest.slice(separator + 1),
+    );
+    return title || body
+      ? { type: "notify", source: "osc777", title, body }
+      : null;
+  }
+  if (payload.startsWith("99;")) {
+    return handleKittyPayload(payload.slice(3), state);
+  }
+  return null;
+}
+
+// Scans `input` for notification sequences, pushing events. Returns the
+// unterminated tail to carry into the next chunk ("" when nothing is pending
+// or when `allowCarry` is false, as for an unwrapped tmux passthrough body).
+function scanNotificationInput(
+  input: string,
+  state: TerminalNotificationParseState,
+  events: TerminalNotificationEvent[],
+  allowCarry: boolean,
+): string {
+  let cursor = 0;
+  while (cursor < input.length) {
+    const escIndex = input.indexOf("\x1b", cursor);
+    if (escIndex === -1) return "";
+    if (escIndex + 1 >= input.length) {
+      return allowCarry ? input.slice(escIndex) : "";
+    }
+    const introducer = input[escIndex + 1];
+
+    if (introducer === "]") {
+      const payloadStart = escIndex + 2;
+      let end = -1;
+      let terminatorLength = 0;
+      let incomplete = false;
+      for (let i = payloadStart; i < input.length; i++) {
+        const ch = input[i];
+        if (ch === "\x07") {
+          end = i;
+          terminatorLength = 1;
+          break;
+        }
+        if (ch === "\x1b") {
+          if (i + 1 >= input.length) {
+            incomplete = true;
+          } else if (input[i + 1] === "\\") {
+            end = i;
+            terminatorLength = 2;
+          } else {
+            // ESC that is not ST aborts the OSC; rescan from that ESC.
+            end = -2;
+            cursor = i;
+          }
+          break;
+        }
+        if (i - escIndex > NOTIFICATION_MAX_SEQUENCE_LENGTH) {
+          end = -3;
+          break;
+        }
+      }
+      if (end === -2) continue;
+      if (end === -3) {
+        // Oversized: drop it. Its eventual terminator arrives as plain text.
+        cursor = escIndex + 2;
+        const next = input.indexOf("\x1b", cursor);
+        if (next === -1) return "";
+        cursor = next;
+        continue;
+      }
+      if (end === -1 || incomplete) {
+        if (!allowCarry) return "";
+        const pending = input.slice(escIndex);
+        return pending.length > NOTIFICATION_MAX_SEQUENCE_LENGTH ? "" : pending;
+      }
+      const event = handleOscPayload(input.slice(payloadStart, end), state);
+      if (event) events.push(event);
+      cursor = end + terminatorLength;
+      continue;
+    }
+
+    if (introducer === "P") {
+      const head = input.slice(
+        escIndex,
+        escIndex + TMUX_PASSTHROUGH_PREFIX.length,
+      );
+      if (head.length < TMUX_PASSTHROUGH_PREFIX.length) {
+        if (TMUX_PASSTHROUGH_PREFIX.startsWith(head)) {
+          return allowCarry ? input.slice(escIndex) : "";
+        }
+        cursor = escIndex + 2;
+        continue;
+      }
+      if (head !== TMUX_PASSTHROUGH_PREFIX) {
+        cursor = escIndex + 2;
+        continue;
+      }
+      let inner = "";
+      let i = escIndex + TMUX_PASSTHROUGH_PREFIX.length;
+      let status: "done" | "incomplete" | "abort" = "incomplete";
+      while (i < input.length) {
+        const ch = input[i];
+        if (ch === "\x1b") {
+          if (i + 1 >= input.length) break;
+          const next = input[i + 1];
+          if (next === "\x1b") {
+            inner += "\x1b";
+            i += 2;
+            continue;
+          }
+          if (next === "\\") {
+            status = "done";
+            i += 2;
+            break;
+          }
+          status = "abort";
+          break;
+        }
+        inner += ch;
+        i++;
+        if (inner.length > NOTIFICATION_MAX_SEQUENCE_LENGTH) {
+          status = "abort";
+          break;
+        }
+      }
+      if (status === "incomplete") {
+        if (!allowCarry) return "";
+        const pending = input.slice(escIndex);
+        return pending.length > NOTIFICATION_MAX_SEQUENCE_LENGTH ? "" : pending;
+      }
+      if (status === "abort") {
+        cursor = escIndex + 2;
+        continue;
+      }
+      scanNotificationInput(inner, state, events, false);
+      cursor = i;
+      continue;
+    }
+
+    cursor = escIndex + 1;
+  }
+  return "";
+}
+
+export function parseTerminalNotifications(
+  chunk: string,
+  state: TerminalNotificationParseState = createTerminalNotificationParseState(),
+): {
+  events: TerminalNotificationEvent[];
+  state: TerminalNotificationParseState;
+} {
+  const nextState: TerminalNotificationParseState = {
+    carry: "",
+    kitty: state.kitty ? { ...state.kitty } : null,
+  };
+  const events: TerminalNotificationEvent[] = [];
+  const input = `${state.carry || ""}${chunk || ""}`;
+  // Fast path: nothing escape-like at all.
+  if (input.indexOf("\x1b") === -1) {
+    return { events, state: nextState };
+  }
+  nextState.carry = scanNotificationInput(input, nextState, events, true);
+  return { events, state: nextState };
+}
+
+export function applyTerminalNotificationEvents(
+  tracker: AttentionTracker,
+  events: TerminalNotificationEvent[],
+  {
+    now = Date.now(),
+    agentName = null,
+  }: { now?: number; agentName?: AgentName | null } = {},
+): { tracker: AttentionTracker; accepted: TerminalAttention[] } {
+  const next: AttentionTracker = { ...tracker };
+  const accepted: TerminalAttention[] = [];
+  for (const event of events) {
+    if (event.type === "progress") {
+      next.progress = event.state
+        ? { state: event.state, percent: event.percent, at: now }
+        : null;
+      continue;
+    }
+    const kind = classifyAttentionText(event, { agentName });
+    const withinWindow =
+      next.lastAcceptedKind !== null &&
+      now - next.lastAcceptedAt < ATTENTION_RATE_WINDOW_MS;
+    if (
+      withinWindow &&
+      ATTENTION_PRIORITY[kind] <= ATTENTION_PRIORITY[next.lastAcceptedKind!]
+    ) {
+      continue;
+    }
+    const previousSeq = next.attention?.seq || 0;
+    // Wall-clock based so a server restart never hands out a seq the browser
+    // already marked as seen; +1 keeps it strictly monotonic.
+    const attention: TerminalAttention = {
+      kind,
+      title: event.title,
+      body: event.body,
+      at: now,
+      seq: Math.max(previousSeq + 1, now),
+    };
+    next.attention = attention;
+    next.lastAcceptedAt = now;
+    next.lastAcceptedKind = kind;
+    accepted.push(attention);
+  }
+  return { tracker: next, accepted };
 }

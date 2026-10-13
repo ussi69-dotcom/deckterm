@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { FileExplorerController, breadcrumbSegments } from "./file-explorer";
+import {
+  FileExplorerController,
+  breadcrumbSegments,
+  compactBreadcrumbs,
+  fileIconName,
+} from "./file-explorer";
 import { FileTreeStore } from "./file-tree-store";
 import { isViewController } from "./view-host";
 
@@ -1515,4 +1520,163 @@ test("Trash opened before a pending file deletion commits receives the new item"
   expect(controller.trashDialog).toBe(dialog);
   expect(dialog.items.map((item) => item.id)).toEqual([trashFixtureItem.id]);
   expect(controller.fileNotice).toBeNull();
+});
+
+// --- icons, compact breadcrumbs, row layout ---
+
+test("fileIconName maps folders and common file types to lucide icons", () => {
+  expect(fileIconName({ name: "src", isDir: true })).toBe("folder");
+  expect(fileIconName({ name: "..", isDir: true, isParent: true })).toBe(
+    "folder-up",
+  );
+  expect(fileIconName({ name: "app.js" })).toBe("file-code");
+  expect(fileIconName({ name: "server.TS" })).toBe("file-code");
+  expect(fileIconName({ name: "package.json" })).toBe("file-json");
+  expect(fileIconName({ name: "config.yaml" })).toBe("file-json");
+  expect(fileIconName({ name: "README.md" })).toBe("file-text");
+  expect(fileIconName({ name: "logo.svg" })).toBe("image");
+  expect(fileIconName({ name: "release.tar.gz" })).toBe("archive");
+  expect(fileIconName({ name: "deploy.sh" })).toBe("terminal");
+  expect(fileIconName({ name: "Makefile" })).toBe("terminal");
+  expect(fileIconName({ name: "Dockerfile" })).toBe("file-code");
+  expect(fileIconName({ name: "LICENSE" })).toBe("file");
+  expect(fileIconName({ name: ".bashrc" })).toBe("terminal");
+  expect(fileIconName(null)).toBe("file");
+});
+
+test("compactBreadcrumbs keeps the root and the deepest crumbs", () => {
+  const crumbs = breadcrumbSegments("/r/a/b/c/d", "/r");
+  expect(compactBreadcrumbs(crumbs, 4).map((crumb) => crumb.label)).toEqual([
+    "r",
+    "…",
+    "c",
+    "d",
+  ]);
+  const hidden = compactBreadcrumbs(crumbs, 4)[1];
+  expect(hidden.ellipsis).toBe(true);
+  expect(hidden.path).toBe("/r/a/b");
+  expect(compactBreadcrumbs(crumbs.slice(0, 3), 4)).toEqual(crumbs.slice(0, 3));
+  expect(compactBreadcrumbs([], 4)).toEqual([]);
+});
+
+test("rows use a lucide icon and icon-only actions beside the filename", () => {
+  withFakeDocument(() => {
+    const controller = interactiveExplorer();
+    controller.onOpenFile = () => {};
+    controller.renderList();
+    const row = controller.listEl.querySelectorAll(".file-item")[0];
+    const icon = row.querySelectorAll(".file-icon")[0];
+    expect(icon.attrs["aria-hidden"]).toBe("true");
+    expect(icon.children[0].tagName).toBe("I");
+    expect(icon.children[0].attrs["data-lucide"]).toBe("file-text");
+    const name = row.querySelectorAll(".file-open")[0];
+    expect(name.textContent).toBe("alpha.txt");
+    const actions = row.querySelectorAll(".file-actions")[0];
+    expect(row.children.indexOf(actions)).toBeGreaterThan(
+      row.children.indexOf(name),
+    );
+    const buttons = actions.children;
+    expect(buttons.map((button) => button.dataset.explorerAction)).toEqual([
+      "edit",
+      "download",
+      "rename",
+      "delete",
+    ]);
+    for (const button of buttons) {
+      expect(button.textContent || "").toBe("");
+      expect(button.children[0].tagName).toBe("I");
+      expect(button.title).toBeTruthy();
+    }
+    expect(buttons[0].attrs["aria-label"]).toBe("Edit alpha.txt");
+    expect(buttons[3].attrs["aria-label"]).toBe("Delete alpha.txt");
+  });
+});
+
+test("deep breadcrumbs collapse their middle into one ellipsis", () => {
+  withFakeDocument(() => {
+    const controller = interactiveExplorer();
+    controller.setWorkspacePath("keyboard-workspace", "/workspace/a/b/c/d");
+    const buttons = controller.breadcrumbEl.querySelectorAll("button");
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "workspace",
+      "c",
+      "d",
+    ]);
+    const ellipsis = controller.breadcrumbEl.querySelectorAll(
+      ".file-breadcrumb-ellipsis",
+    );
+    expect(ellipsis).toHaveLength(1);
+    expect(ellipsis[0].title).toBe("/workspace/a/b");
+  });
+});
+
+test("rows clone one cached lucide SVG per icon name instead of placeholders", () => {
+  const hadWindow = "window" in globalThis;
+  const previousWindow = globalThis.window;
+  const built = [];
+  let scans = 0;
+  const node = (name) => [["path", { d: name }]];
+  globalThis.window = {
+    lucide: {
+      icons: {
+        FileText: node("file-text"),
+        SquarePen: node("square-pen"),
+        Download: node("download"),
+        TextCursorInput: node("text-cursor-input"),
+        Trash2: node("trash-2"),
+      },
+      createElement(iconNode, attrs) {
+        built.push(attrs["data-lucide"]);
+        const svg = makeNodeStub("svg");
+        Object.assign(svg.attrs, attrs);
+        svg.cloneNode = () => {
+          const copy = makeNodeStub("svg");
+          Object.assign(copy.attrs, attrs);
+          copy.isClone = true;
+          return copy;
+        };
+        return svg;
+      },
+      createIcons() {
+        scans += 1;
+      },
+    },
+  };
+  try {
+    withFakeDocument(() => {
+      const controller = interactiveExplorer();
+      controller.onOpenFile = () => {};
+      controller.renderList();
+      // Earlier lucide-less renders may have left placeholders pending; the
+      // first render with lucide hydrates them once. After that, none.
+      scans = 0;
+      controller.renderList();
+      const rows = controller.listEl.querySelectorAll(".file-item");
+      expect(rows.length).toBe(2);
+      for (const row of rows) {
+        const icon = row.querySelectorAll(".file-icon")[0].children[0];
+        expect(icon.tagName).toBe("SVG");
+        expect(icon.isClone).toBe(true);
+        expect(icon.attrs["data-lucide"]).toBe("file-text");
+        expect(icon.attrs.class).toBe("lucide lucide-file-text");
+        expect(icon.attrs["aria-hidden"]).toBe("true");
+        const actions = row.querySelectorAll(".file-actions")[0].children;
+        expect(actions.map((button) => button.children[0].tagName)).toEqual([
+          "SVG",
+          "SVG",
+          "SVG",
+          "SVG",
+        ]);
+      }
+      // Each icon is built once, however many rows and re-renders use it.
+      expect(built.sort()).toEqual(
+        ["download", "file-text", "square-pen", "text-cursor-input", "trash-2"].sort(),
+      );
+      // Nothing was left as a placeholder, so no createIcons DOM scan ran.
+      expect(scans).toBe(0);
+    });
+  } finally {
+    if (hadWindow) globalThis.window = previousWindow;
+    else delete globalThis.window;
+  }
 });

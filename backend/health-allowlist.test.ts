@@ -25,6 +25,9 @@ test("GET /api/health responds 200 without a Cloudflare Access JWT", async () =>
   expect(res.status).toBe(200);
   const body = await res.json();
   expect(body.status).toBe("ok");
+  // Short fingerprint of the served web files; open tabs compare it to the
+  // value they loaded with and offer a reload when a new build is deployed.
+  expect(body.build).toMatch(/^[0-9a-f]{12}$/);
 });
 
 test("guarded API routes still demand the JWT", async () => {

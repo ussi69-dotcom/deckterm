@@ -66,6 +66,53 @@ function getBoard() {
   return null;
 }
 
+// task-board.js also owns the shared empty state + list/board toggle content.
+// Falls back to inline copies so the view never breaks on a stale cached
+// task-board.js (it is a separate static file).
+function getTaskBoardHelpers() {
+  const mod =
+    (typeof window !== "undefined" && window.TaskBoard) ||
+    (typeof require !== "undefined"
+      ? (() => {
+          try {
+            return require("./task-board");
+          } catch {
+            return null;
+          }
+        })()
+      : null);
+  return {
+    taskEmptyState:
+      mod?.taskEmptyState ||
+      (() => ({
+        icon: "list-checks",
+        title: "No tasks yet",
+        hint: "",
+        action: { id: "new", label: "New task" },
+      })),
+    taskViewToggleContent:
+      mod?.taskViewToggleContent ||
+      (({ mode, hasBoardTab } = {}) =>
+        hasBoardTab || mode !== "board"
+          ? { icon: "layout-grid", label: "Board", title: "Switch view" }
+          : { icon: "list", label: "List", title: "Switch view" }),
+  };
+}
+
+// Swap freshly inserted <i data-lucide> placeholders under `root` for SVGs
+// (no-op under bun). Uniquely named: every web module is a classic script, so
+// a shared top-level name would resolve to whichever script loaded last.
+function renderTasksViewIcons(root) {
+  if (!root || typeof window === "undefined" || !window.lucide?.createIcons) {
+    return;
+  }
+  try {
+    window.lucide.createIcons({ root });
+  } catch {
+    // cosmetic
+  }
+}
+
 // ── Pure helpers (DOM-free, unit-tested) ─────────────────────────────────────
 
 // Group tasks into the kanban board columns, dropping empty columns so the
@@ -272,6 +319,7 @@ class TasksViewController {
         : "ide-tasks-view";
     root.innerHTML = this.skeletonHtml();
     container.appendChild(root);
+    renderTasksViewIcons(root);
     this.root = root;
     this._renderSig = null;
     this.bindEvents();
@@ -344,10 +392,10 @@ class TasksViewController {
         : '<button type="button" class="ide-tasks-action" data-action="view" title="Toggle list / board"></button>';
     return `
       <div class="ide-tasks-actions">
-        <button type="button" class="ide-tasks-action" data-action="new" title="New task">+ Task</button>
+        <button type="button" class="ide-tasks-action" data-action="new" title="New task"><i data-lucide="plus"></i><span>Task</span></button>
         <span class="ide-tasks-actions-spacer"></span>
         ${viewBtn}
-        <button type="button" class="ide-tasks-action" data-action="refresh" title="Refresh">&#x21bb;</button>
+        <button type="button" class="ide-tasks-action" data-action="refresh" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
       </div>
       <div class="ide-tasks-status"></div>
       <div class="ide-tasks-list"></div>
@@ -407,12 +455,15 @@ class TasksViewController {
     // full-width board in the editor area; legacy fallback toggles in place.
     const viewBtn = this.q('[data-action="view"]');
     if (viewBtn) {
-      if (this.hasBoardTab()) {
-        viewBtn.textContent = "▦ Board";
-        viewBtn.title = "Open board in the editor area";
-      } else {
-        viewBtn.textContent = viewMode === "board" ? "☰ List" : "▦ Board";
-        viewBtn.title = "Toggle list / board";
+      const content = getTaskBoardHelpers().taskViewToggleContent({
+        mode: viewMode,
+        hasBoardTab: this.hasBoardTab(),
+      });
+      viewBtn.title = content.title;
+      if (viewBtn.dataset.label !== content.label) {
+        viewBtn.dataset.label = content.label;
+        viewBtn.innerHTML = `<i data-lucide="${this.esc(content.icon)}"></i><span>${this.esc(content.label)}</span>`;
+        renderTasksViewIcons(viewBtn);
       }
     }
 
@@ -428,7 +479,8 @@ class TasksViewController {
     if (!list) return;
     if (tasks.length === 0) {
       list.classList.remove("board");
-      list.innerHTML = '<p class="ide-tasks-empty">No tasks</p>';
+      list.innerHTML = this.emptyStateHtml();
+      renderTasksViewIcons(list);
       return;
     }
     if (viewMode === "board") {
@@ -440,6 +492,22 @@ class TasksViewController {
     list.innerHTML = tasks
       .map((task) => this.taskRowHtml(task, selectedId))
       .join("");
+  }
+
+  emptyStateHtml() {
+    const state = getTaskBoardHelpers().taskEmptyState({
+      surface: this.variant,
+    });
+    const action = state.action
+      ? `<button type="button" class="ide-tasks-empty-action" data-action="${this.esc(state.action.id)}"><i data-lucide="plus"></i><span>${this.esc(state.action.label)}</span></button>`
+      : "";
+    return `
+      <div class="ide-tasks-empty">
+        <i class="ide-tasks-empty-icon" data-lucide="${this.esc(state.icon)}"></i>
+        <p class="ide-tasks-empty-title">${this.esc(state.title)}</p>
+        ${state.hint ? `<p class="ide-tasks-empty-hint">${this.esc(state.hint)}</p>` : ""}
+        ${action}
+      </div>`;
   }
 
   taskRowHtml(task, selectedId) {
@@ -540,6 +608,12 @@ class TasksViewController {
     const list = this.q(".ide-tasks-list");
     if (list) {
       list.addEventListener("click", (e) => {
+        // The empty state's primary action (New task).
+        const actionBtn = e.target.closest("[data-action]");
+        if (actionBtn) {
+          this.onAction(actionBtn.dataset.action);
+          return;
+        }
         const item = e.target.closest("[data-task-id]");
         if (!item) return;
         const tm = this.taskManager;
@@ -606,6 +680,7 @@ const TasksViewModule = {
   formatTaskMessageRow,
   taskMessagesSignature,
   TasksViewController,
+  renderTasksViewIcons,
 };
 
 if (typeof window !== "undefined") {
@@ -625,4 +700,5 @@ if (typeof exports !== "undefined") {
   exports.formatTaskMessageRow = formatTaskMessageRow;
   exports.taskMessagesSignature = taskMessagesSignature;
   exports.TasksViewController = TasksViewController;
+  exports.renderTasksViewIcons = renderTasksViewIcons;
 }

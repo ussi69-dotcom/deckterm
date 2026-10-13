@@ -463,8 +463,14 @@ function makeFakeEl(id = null) {
         ? el._attrs[key]
         : null;
     },
-    addEventListener() {},
+    _listeners: {},
+    addEventListener(type, handler) {
+      (el._listeners[type] ||= []).push(handler);
+    },
     removeEventListener() {},
+    dispatch(type, event = {}) {
+      for (const handler of el._listeners[type] || []) handler(event);
+    },
     appendChild(child) {
       if (child.parentElement && child.parentElement !== el) {
         const sibs = child.parentElement.children;
@@ -922,4 +928,46 @@ test("enter/exit fire the app dock hooks and never recreate the terminal node", 
   // The identity of the terminal node is preserved across the round-trip — the
   // contract is "move the node", not "rebuild the terminal area".
   expect(h.doc.getElementById("terminal-container")).toBe(tc);
+});
+
+test("activityItemTooltip: view title, its shortcut, and what a click does", () => {
+  const { activityItemTooltip } = require("./ide-shell");
+  // Inactive view: the click opens it.
+  expect(
+    activityItemTooltip({ title: "Source Control" }, { active: false }),
+  ).toBe("Source Control");
+  // With a shortcut the label carries it.
+  expect(
+    activityItemTooltip(
+      { title: "Explorer", shortcut: "Ctrl+Shift+E" },
+      { active: false },
+    ),
+  ).toBe("Explorer (Ctrl+Shift+E)");
+  // Active + open: a click hides the sidebar; active + collapsed: shows it.
+  expect(
+    activityItemTooltip(
+      { title: "Explorer" },
+      { active: true, collapsed: false },
+    ),
+  ).toBe("Explorer\nClick to hide the sidebar");
+  expect(
+    activityItemTooltip(
+      { title: "Explorer" },
+      { active: true, collapsed: true },
+    ),
+  ).toBe("Explorer\nClick to show the sidebar");
+  // Junk-tolerant.
+  expect(activityItemTooltip(null)).toBe("");
+  expect(activityItemTooltip({ id: "tasks" })).toBe("tasks");
+});
+
+test("activity-bar tooltip hides on pointerdown until the pointer leaves", () => {
+  const h = makeController();
+  h.controller.applyMode(); // enter IDE → activity bar renders
+  const btn = h.controller.activityBarEl.children[0];
+  expect(btn.dataset.tooltip).toBeTruthy();
+  btn.dispatch("pointerdown");
+  expect(btn.classList.contains("tooltip-dismissed")).toBe(true);
+  btn.dispatch("pointerleave");
+  expect(btn.classList.contains("tooltip-dismissed")).toBe(false);
 });

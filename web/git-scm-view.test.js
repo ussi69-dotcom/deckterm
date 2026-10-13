@@ -1,10 +1,15 @@
 import { test, expect } from "bun:test";
+
 import {
   scmSections,
   scmTotalCount,
   scmDiffModeForSection,
   GitScmViewController,
 } from "./git-scm-view.js";
+
+// Tests below stub global.fetch; restore the real one (never delete it — later
+// test files in the same `bun test` process need it).
+const ORIGINAL_FETCH = global.fetch;
 
 test("scmSections leads with Merge Changes, then the three existing groups, in render order", () => {
   const groups = {
@@ -590,7 +595,7 @@ test("renderMergeFileHtml shows the hint (not buttons) for a UU file before elig
     );
     expect(html).toContain("resolve in terminal");
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
 });
 
@@ -607,7 +612,7 @@ test("fetchConflictEligibility caches eligible:true when the fetched content par
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   const cached = ctl._conflictEligibility.get("u.txt");
   expect(cached.eligible).toBe(true);
@@ -626,7 +631,7 @@ test("fetchConflictEligibility caches eligible:false when the content has no con
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
 });
@@ -642,7 +647,7 @@ test("fetchConflictEligibility caches eligible:false on a fetch failure (never t
       ctl._conflictGeneration,
     );
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(ctl._conflictEligibility.get("u.txt").eligible).toBe(false);
 });
@@ -659,7 +664,7 @@ test("getConflictEligibility only kicks off ONE in-flight fetch per path+generat
     ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
     ctl.getConflictEligibility({ path: "u.txt", status: "UU" });
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
   expect(fetchCalls).toBe(1);
 });
@@ -678,7 +683,7 @@ test("a cached eligibility from a stale generation is ignored (re-checked, not r
     expect(result).toBe(false); // unresolved-for-this-generation → hint, not buttons
     expect(fetchCalls).toBe(1); // re-checked rather than trusting the stale cache
   } finally {
-    delete global.fetch;
+    global.fetch = ORIGINAL_FETCH;
   }
 });
 
@@ -712,4 +717,105 @@ test("onTreeClick dispatches accept-current/incoming/both to gm.resolveConflict 
     ["m.txt", "theirs"],
     ["m.txt", "both"],
   ]);
+});
+
+// ── Git UX pass: rows, keyboard, not-a-repository state ──────────────────────
+
+const scmHelpers = require("./git-scm.js");
+
+function mountWithTree(overrides = {}) {
+  const harness = makeScmController(overrides);
+  harness.ctl.mount(harness.container);
+  const tree = makeFakeEl();
+  harness.ctl.root._subs[".ide-scm-tree"] = tree;
+  return { ...harness, tree };
+}
+
+test("renderTree shows a calm not-a-repository state with a choose-folder action", () => {
+  const { ctl, tree } = mountWithTree();
+  ctl.renderTree({}, scmHelpers, "Not a git repository");
+  expect(tree.innerHTML).toContain("git-empty-state");
+  expect(tree.innerHTML).toContain('data-git-action="choose-folder"');
+  expect(tree.innerHTML).not.toContain('class="error"');
+  // The commit box + remote actions are hidden while there is no repository.
+  expect(ctl.root.classList.contains("ide-scm-no-repo")).toBe(true);
+});
+
+test("renderTree keeps a real status failure as an error banner", () => {
+  const { ctl, tree } = mountWithTree();
+  ctl.renderTree({}, scmHelpers, "Git status failed");
+  expect(tree.innerHTML).toContain('class="error"');
+  expect(tree.innerHTML).not.toContain("git-empty-state");
+  expect(ctl.root.classList.contains("ide-scm-no-repo")).toBe(false);
+});
+
+test("renderTree rows show the file name, a dim directory and are focusable", () => {
+  const { ctl, tree } = mountWithTree();
+  ctl.renderTree(
+    {
+      changes: [{ path: "web/git/app.js", unstagedStatus: "M" }],
+      untracked: [{ path: "README.md", status: "??" }],
+    },
+    scmHelpers,
+    null,
+  );
+  expect(tree.innerHTML).toContain(">app.js<");
+  expect(tree.innerHTML).toContain('class="ide-scm-file-dir">web/git<');
+  expect(tree.innerHTML).toContain('tabindex="0"');
+  expect(tree.innerHTML).toContain('role="listitem"');
+  // A root-level file has no directory hint.
+  expect(tree.innerHTML).not.toContain('class="ide-scm-file-dir"></span>');
+  expect(ctl.root.classList.contains("ide-scm-no-repo")).toBe(false);
+});
+
+test("Enter on a focused file row opens its diff tab in the section's mode", () => {
+  const opened = [];
+  const gm = makeFakeGm();
+  const ctl = new GitScmViewController({
+    document: makeFakeDoc(),
+    getGitManager: () => gm,
+    getStatusStore: () => makeFakeStore(),
+    getTerminalManager: () => ({ openDiffTab: (args) => opened.push(args) }),
+  });
+  const row = { dataset: { path: "a/b.js", section: "staged" } };
+  row.closest = (sel) => (sel === ".ide-scm-file" ? row : null);
+  let prevented = false;
+  ctl.onTreeKeydown({
+    key: "Enter",
+    target: row,
+    preventDefault() {
+      prevented = true;
+    },
+  });
+  expect(prevented).toBe(true);
+  expect(opened).toEqual([{ relPath: "a/b.js", mode: "staged", cwd: "/repo" }]);
+
+  // Enter on a nested action button keeps the button's own behaviour.
+  const button = { closest: (sel) => (sel === ".ide-scm-file" ? row : null) };
+  ctl.onTreeKeydown({ key: "Enter", target: button, preventDefault() {} });
+  ctl.onTreeKeydown({ key: "a", target: row, preventDefault() {} });
+  expect(opened).toHaveLength(1);
+});
+
+test("the choose-folder action opens the working-directory picker", () => {
+  let pickerOpened = 0;
+  const gm = makeFakeGm();
+  const ctl = new GitScmViewController({
+    document: makeFakeDoc(),
+    getGitManager: () => gm,
+    getStatusStore: () => makeFakeStore(),
+    getTerminalManager: () => ({
+      openDirPicker: () => {
+        pickerOpened += 1;
+      },
+    }),
+  });
+  ctl.onTreeClick({
+    target: {
+      closest: (sel) =>
+        sel === '[data-git-action="choose-folder"]' ? {} : null,
+    },
+    stopPropagation() {},
+  });
+  expect(pickerOpened).toBe(1);
 });

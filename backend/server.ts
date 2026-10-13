@@ -25,8 +25,20 @@ import {
   configuredBrowserBoundary,
   SECURITY_HEADERS,
 } from "./services/browser-boundary";
+import {
+  collectProcessTreeArgs,
+  createLazyOnce,
+  createSingleFlightCache,
+  parseProcessTable,
+  type ProcessSnapshot,
+} from "./services/runtime-sync-cache";
+import { createCpuUsageMeter } from "./services/cpu-usage";
+import {
+  NO_STORE_CACHE_CONTROL,
+  createBuildFingerprint,
+  createStaticAssetServer,
+} from "./services/static-assets";
 import { Hono } from "hono";
-import { serveStatic } from "hono/bun";
 import { cors } from "hono/cors";
 import type { ServerWebSocket, Subprocess } from "bun";
 import { Database } from "bun:sqlite";
@@ -53,14 +65,22 @@ import {
 } from "node:fs";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { assertPortAvailable } from "./port-probe";
+import { cpus } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  applyTerminalNotificationEvents,
   classifyAgentOutputPhase,
+  createAttentionTracker,
   createGitWorktreeDetector,
+  createTerminalNotificationParseState,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
+  nextAgentMarkerActive,
   parseShellIntegrationChunk,
+  parseTerminalNotifications,
   resolveAgentOutputState,
+  type AttentionTracker,
+  type TerminalNotificationParseState,
 } from "./telemetry";
 import { isCloudflareAudienceAllowed } from "./cloudflare-access-guards";
 import {
@@ -70,8 +90,14 @@ import {
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
-import { TmuxTerminalBackend } from "./services/tmux-terminal-backend";
-import type { TerminalBackend } from "./services/terminal-backend";
+import {
+  TmuxTerminalBackend,
+  type TmuxSessionLiveness,
+} from "./services/tmux-terminal-backend";
+import type {
+  TerminalBackend,
+  TerminalBackendAttachResult,
+} from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
   TaskRunnerError,
@@ -79,7 +105,10 @@ import {
   buildWorkerCommand,
   createTaskRunner,
 } from "./task-runner";
-import { syncTmuxSessionClients } from "./tmux-client-size";
+import {
+  createLatestWinsRunner,
+  syncTmuxSessionClients,
+} from "./tmux-client-size";
 import {
   buildTmuxSessionName,
   getTmuxSocketPath,
@@ -221,6 +250,15 @@ import {
   type DeckTermActor,
 } from "./services/foundation-actors";
 import { buildBashIntegrationRcContents } from "./shell-integration";
+import { hardenGitInvocation } from "./git-readonly";
+import {
+  TMUX_REATTACH_BACKOFF_MS,
+  planTmuxReattach,
+} from "./services/tmux-reattach-policy";
+import {
+  forbiddenRootDetail,
+  rejectedPathMayBeMissing,
+} from "./forbidden-root";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -273,18 +311,32 @@ type Terminal = {
   sessionName?: string; // tmux session name (when TMUX_BACKEND=1)
   scrollback: string[]; // ring buffer of recent terminal output chunks
   scrollbackBytes: number; // current bytes in ring buffer
+  scrollbackChunkBytes: number[]; // byte length of each scrollback chunk (parallel array)
   hadSocketConnection: boolean; // tracks whether a websocket was ever connected
   running: boolean;
   lastExitCode: number | null;
   agentName: "codex" | "claude" | null;
   agentState: "thinking" | "responding" | null;
   agentHasUserPrompt: boolean;
+  // An explicit agent;start marker is open: the agent stays until agent;done
+  // or a returned prompt, whatever the process tree shows.
+  agentMarkerActive: boolean;
+  // Consecutive tmux samples without the process-detected agent (see
+  // inferTmuxRuntimeState); the agent is cleared at two.
+  agentMissedSamples: number;
   agentTurnCompletedAt: number | null;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
   // S11: display-only ring of recent tool-used marker events (untrusted,
   // forgeable in-band data — never feeds transitions or authz).
   recentTools: Array<{ name: string; summary: string; at: number }>;
   toolRate: { windowStart: number; count: number };
+  // Agent attention (OSC 9/777/99 notifications + OSC 9;4 progress) read
+  // from raw pane output. In-memory only: untrusted in-band data that never
+  // feeds transitions, authz, or the persisted event log.
+  notificationParse: TerminalNotificationParseState;
+  attention: AttentionTracker;
+  lastCompletionPushAt?: number;
+  tmuxPipeRead?: Promise<string>;
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
   tmuxPipePath: string | null;
@@ -428,6 +480,23 @@ const DECKTERM_RELEASE = ((): string => {
   }
   return "dev";
 })();
+// Served web files: ETag/304 + gzip for static assets, and a short build
+// fingerprint (/api/health `build`) so open tabs notice a new version. Both
+// resolve ./web against the working directory, as serveStatic did.
+const WEB_ROOT = "./web";
+const staticAssets = createStaticAssetServer({ root: WEB_ROOT });
+const webBuildFingerprint = createBuildFingerprint({
+  root: WEB_ROOT,
+  ttlMs: 5000,
+});
+const hostCpuUsage = createCpuUsageMeter({ readCpus: () => cpus() });
+declare module "hono" {
+  interface ContextVariableMap {
+    // Set when the static handler already chose this response's
+    // Cache-Control, so the global no-store middleware leaves it alone.
+    staticCacheManaged: boolean;
+  }
+}
 const DECKTERM_TASK_MAX_ROUNDS = parseInt(
   process.env.DECKTERM_TASK_MAX_ROUNDS || "5",
   10,
@@ -698,6 +767,10 @@ function applyParsedShellIntegrationState(
   const wasRunning = term.running;
   let completedAgentTurn = false;
   term.shellIntegrationCarry = parsed.state.carry;
+  term.agentMarkerActive = nextAgentMarkerActive(
+    term.agentMarkerActive,
+    parsed.events,
+  );
   let stateChanged = false;
   if (term.running !== parsed.state.running) {
     term.running = parsed.state.running;
@@ -784,7 +857,7 @@ function applyParsedShellIntegrationState(
 function processShellIntegrationChunk(
   term: Terminal,
   chunk: string,
-  options: { emitOutput?: boolean } = {},
+  options: { emitOutput?: boolean; source?: "live" | "pipe" } = {},
 ) {
   const parsed = parseShellIntegrationChunk(chunk, {
     carry: term.shellIntegrationCarry || "",
@@ -795,6 +868,45 @@ function processShellIntegrationChunk(
     agentState: term.agentState || null,
   });
   applyParsedShellIntegrationState(term, parsed, options);
+  processTerminalNotifications(term, chunk, options.source || "live");
+  if (
+    term.attention.progress &&
+    parsed.events.some(
+      (event) => event.type === "running-done" || event.type === "agent-done",
+    )
+  ) {
+    // A finished command/agent cannot still be reporting progress.
+    term.attention = { ...term.attention, progress: null };
+  }
+}
+
+// Notification escapes are read from exactly one raw source per terminal:
+// tmux swallows unknown OSC sequences (and passthrough is off), so tmux-backed
+// terminals read them from the pipe-pane log; raw PTYs from the live stream.
+// Pipe deltas start at the attach-time offset, so they are always new output.
+function processTerminalNotifications(
+  term: Terminal,
+  chunk: string,
+  source: "live" | "pipe",
+) {
+  const expectedSource = term.tmuxPipePath ? "pipe" : "live";
+  if (source !== expectedSource) return;
+  const parsed = parseTerminalNotifications(chunk, term.notificationParse);
+  term.notificationParse = parsed.state;
+  if (parsed.events.length === 0) return;
+  const applied = applyTerminalNotificationEvents(
+    term.attention,
+    parsed.events,
+    { now: Date.now(), agentName: term.agentName },
+  );
+  term.attention = applied.tracker;
+  for (const attention of applied.accepted) {
+    if (attention.kind === "needs-input") {
+      notifyCompletionPush(term, "input");
+    } else if (attention.kind === "done") {
+      notifyCompletionPush(term, "agent");
+    }
+  }
 }
 
 function clearAgentRespondingTimer(term: Terminal) {
@@ -829,7 +941,7 @@ async function finalizeReconnectReady(
   if (TMUX_BACKEND) {
     if (term.sessionName) {
       try {
-        await syncTmuxSessionSize(term.sessionName, term.cols, term.rows);
+        await requestTerminalResize(term, term.cols, term.rows);
         await sendTmuxPaneCapture(ws, term.sessionName, terminalId, {
           waitMs: 120,
           reason: "refresh",
@@ -1039,11 +1151,19 @@ export async function reconcileSessionsOnStartup(
         namespace: TMUX_SESSION_NAMESPACE,
         terminalId: session.id,
       });
-      if (!(await tmuxSessionExists(sessionName))) {
+      // Only proof of absence ends a row. An unreachable tmux server (EACCES,
+      // protocol mismatch after a tmux upgrade, a wedged server) used to read
+      // as "every session is missing" and ended live sessions wholesale.
+      const liveness = await tmuxSessionLiveness(sessionName);
+      if (liveness === "missing") {
         markTerminalSessionEnded(db, session.id);
         fixed++;
         console.log(
           `[reconciliation] Closed zombie session ${session.id} (DB was active, but tmux session was missing)`,
+        );
+      } else if (liveness === "unknown") {
+        console.warn(
+          `[reconciliation] tmux session ${sessionName} for ${session.id} is unknown (tmux server unreachable or not answering); leaving the row active`,
         );
       }
     }
@@ -1077,69 +1197,13 @@ async function recoverTmuxSessions(): Promise<number> {
     const state = await getFoundationState();
 
     for (const sessionName of sessions) {
-      const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
-      if (!parsed) continue;
-
-      const { terminalId: id } = parsed;
-      const recordedSession = getTerminalSession(state.db, id);
-      if (!recordedSession) {
-        console.warn(
-          `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
-        );
-        continue;
+      // One session that fails to attach must not strand every session
+      // listed after it.
+      try {
+        if (await recoverTmuxSession(state, sessionName)) recovered++;
+      } catch (err) {
+        console.error(`[tmux] Failed to recover session ${sessionName}:`, err);
       }
-      if (recordedSession.status !== "active") {
-        console.warn(
-          `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
-        );
-        continue;
-      }
-
-      const ownerId = recordedSession.actorUserId || "unknown";
-      const ownerEmail = resolveRecoveredOwnerEmail(
-        state,
-        recordedSession.actorUserId,
-      );
-
-      const { cwd, cols, rows, panePid, paneCurrentCommand } =
-        await getTmuxSessionInfo(sessionName);
-      const paneCapture = await captureTmuxPane(sessionName);
-      const processTree = panePid > 0 ? await getProcessTreeArgs(panePid) : [];
-      const recoveredRuntimeState = inferTmuxRuntimeState({
-        paneCurrentCommand,
-        processTree,
-        capture: paneCapture,
-        previousCapture: "",
-        previousState: {
-          running: false,
-          lastExitCode: null,
-          agentName: null,
-          agentState: null,
-        },
-        hasUserPrompted: true,
-      });
-      const recoveredTerminal = await createManagedTerminal({
-        id,
-        cwd: recordedSession.cwd || cwd,
-        cols,
-        rows,
-        ownerId,
-        ownerEmail,
-        sessionName,
-        initialRuntimeState: recoveredRuntimeState,
-        initialLastExitCode: recoveredRuntimeState.lastExitCode,
-        initialScrollback: paneCapture,
-      });
-      recoveredTerminal.hadSocketConnection = true;
-      recoveredTerminal.terminationScheduledAt =
-        recordedSession.terminationScheduledAt
-          ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
-          : undefined;
-
-      recovered++;
-      console.log(
-        `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
-      );
     }
 
     return recovered;
@@ -1148,6 +1212,36 @@ async function recoverTmuxSessions(): Promise<number> {
     console.log("[tmux] No existing sessions to recover");
     return 0;
   }
+}
+
+async function recoverTmuxSession(
+  state: FoundationState,
+  sessionName: string,
+): Promise<boolean> {
+  const parsed = parseTmuxSessionName(sessionName, TMUX_SESSION_PREFIX);
+  if (!parsed) return false;
+
+  const { terminalId: id } = parsed;
+  const recordedSession = getTerminalSession(state.db, id);
+  if (!recordedSession) {
+    console.warn(
+      `[tmux] Orphan session found: ${sessionName}, skipping recovery`,
+    );
+    return false;
+  }
+  if (recordedSession.status !== "active") {
+    console.warn(
+      `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
+    );
+    return false;
+  }
+  if (terminals.has(id)) return false;
+
+  await attachRecordedTmuxSession(state, recordedSession, sessionName);
+  console.log(
+    `[tmux] Recovered session: ${sessionName} -> terminal ${id} (root: ${recordedSession.rootId || "unknown"})`,
+  );
+  return true;
 }
 
 function resolveRecoveredOwnerEmail(
@@ -1161,29 +1255,39 @@ function resolveRecoveredOwnerEmail(
   return row?.email || actorUserId;
 }
 
-async function tmuxSessionExists(sessionName: string): Promise<boolean> {
-  if (!TMUX_BACKEND || !tmuxTerminalBackend) return false;
-  return tmuxTerminalBackend.sessionExists(sessionName);
+async function tmuxSessionLiveness(
+  sessionName: string,
+): Promise<TmuxSessionLiveness> {
+  // Unreachable in tmux mode (the backend always exists there); "unknown"
+  // keeps a caller from ending a row it has no way to probe.
+  if (!TMUX_BACKEND || !tmuxTerminalBackend) return "unknown";
+  return tmuxTerminalBackend.sessionLiveness(sessionName);
 }
 
-async function restoreRecordedTmuxSession(
+// GET /api/terminals runs every few seconds per open tab; while the tmux
+// server stays unreachable, say so once a minute per session, not per poll.
+const TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS = 60_000;
+const tmuxLivenessUnknownWarnedAt = new Map<string, number>();
+
+function warnTmuxLivenessUnknown(id: string, sessionName: string) {
+  const now = Date.now();
+  const last = tmuxLivenessUnknownWarnedAt.get(id) ?? -Infinity;
+  if (now - last < TMUX_LIVENESS_UNKNOWN_WARN_INTERVAL_MS) return;
+  tmuxLivenessUnknownWarnedAt.set(id, now);
+  console.warn(
+    `[tmux] tmux session ${sessionName} for ${id} is unknown (tmux server unreachable or not answering); not restoring it now, row stays active`,
+  );
+}
+
+/**
+ * Builds the managed terminal for a recorded, still-active tmux session that
+ * nothing in this process is attached to (startup recovery, lazy restore).
+ */
+async function attachRecordedTmuxSession(
   state: FoundationState,
   recordedSession: RecordedTerminalSession,
-): Promise<Terminal | null> {
-  if (!TMUX_BACKEND || recordedSession.status !== "active") return null;
-
-  const existing = terminals.get(recordedSession.id);
-  if (existing) return existing;
-
-  const sessionName = buildTmuxSessionName({
-    namespace: TMUX_SESSION_NAMESPACE,
-    terminalId: recordedSession.id,
-  });
-  if (!(await tmuxSessionExists(sessionName))) {
-    markTerminalSessionEnded(state.db, recordedSession.id);
-    return null;
-  }
-
+  sessionName: string,
+): Promise<Terminal> {
   const ownerId = recordedSession.actorUserId || "unknown";
   const ownerEmail = resolveRecoveredOwnerEmail(
     state,
@@ -1207,9 +1311,17 @@ async function restoreRecordedTmuxSession(
     hasUserPrompted: true,
   });
 
+  // Another path may have attached this id while tmux was queried above.
+  const raced = terminals.get(recordedSession.id);
+  if (raced) return raced;
+
   const restoredTerminal = await createManagedTerminal({
     id: recordedSession.id,
+    // The recorded cwd stays metadata (root mapping, labels). The attach
+    // client is spawned in the live pane cwd; the backend falls back to HOME
+    // or / when that is gone too (a removed task worktree).
     cwd: recordedSession.cwd || cwd,
+    attachCwd: cwd,
     cols,
     rows,
     ownerId,
@@ -1225,6 +1337,193 @@ async function restoreRecordedTmuxSession(
       ? parseSessionTimestamp(recordedSession.terminationScheduledAt)
       : undefined;
   return restoredTerminal;
+}
+
+// Concurrent GET /api/terminals polls and a WebSocket upgrade can all find
+// the same active row with nothing attached in memory. They share ONE
+// restore: separate restores would each spawn a managed terminal (and a tmux
+// attach client), and all but the last would be orphaned.
+const tmuxRestoreFlights = new Map<string, Promise<Terminal | null>>();
+
+// A row whose restore throws (it never should, but one bad row must not take
+// the whole catalog or a reconnect down with it) is logged at most once a
+// minute per id and left active: the caller serializes it as detached / 404s
+// the upgrade, and the next ask retries.
+const TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS = 60_000;
+const tmuxRestoreFailureWarnedAt = new Map<string, number>();
+
+function restoreRecordedTmuxSessionSafely(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  return restoreRecordedTmuxSession(state, recordedSession).then(
+    (term) => {
+      tmuxRestoreFailureWarnedAt.delete(recordedSession.id);
+      return term;
+    },
+    (err) => {
+      const now = Date.now();
+      const last =
+        tmuxRestoreFailureWarnedAt.get(recordedSession.id) ?? -Infinity;
+      if (now - last >= TMUX_RESTORE_FAILURE_WARN_INTERVAL_MS) {
+        tmuxRestoreFailureWarnedAt.set(recordedSession.id, now);
+        console.error(
+          `[tmux] Failed to restore session for ${recordedSession.id}; row stays active, will retry on the next request:`,
+          err,
+        );
+      }
+      return null;
+    },
+  );
+}
+
+function restoreRecordedTmuxSession(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  if (!TMUX_BACKEND || recordedSession.status !== "active") {
+    return Promise.resolve(null);
+  }
+
+  const id = recordedSession.id;
+  const existing = terminals.get(id);
+  if (existing) return Promise.resolve(existing);
+
+  const inFlight = tmuxRestoreFlights.get(id);
+  if (inFlight) return inFlight;
+
+  // Every caller awaits the returned promise, so a rejection is handled.
+  const flight: Promise<Terminal | null> = restoreRecordedTmuxSessionNow(
+    state,
+    recordedSession,
+  ).finally(() => {
+    if (tmuxRestoreFlights.get(id) === flight) tmuxRestoreFlights.delete(id);
+  });
+  tmuxRestoreFlights.set(id, flight);
+  return flight;
+}
+
+async function restoreRecordedTmuxSessionNow(
+  state: FoundationState,
+  recordedSession: RecordedTerminalSession,
+): Promise<Terminal | null> {
+  const id = recordedSession.id;
+  const sessionName = buildTmuxSessionName({
+    namespace: TMUX_SESSION_NAMESPACE,
+    terminalId: id,
+  });
+  const liveness = await tmuxSessionLiveness(sessionName);
+  if (liveness === "unknown") {
+    // Not proof the session ended: keep the row, try again on the next ask.
+    warnTmuxLivenessUnknown(id, sessionName);
+    return null;
+  }
+  tmuxLivenessUnknownWarnedAt.delete(id);
+  if (liveness === "missing") {
+    markTerminalSessionEnded(state.db, id);
+    forgetTmuxReattach(id);
+    return null;
+  }
+
+  // Re-check after the probe: another path may have attached the id or
+  // ended the row meanwhile.
+  const raced = terminals.get(id);
+  if (raced) return raced;
+  if (getTerminalSession(state.db, id)?.status !== "active") return null;
+
+  return attachRecordedTmuxSession(state, recordedSession, sessionName);
+}
+
+// Pipe-log hand-off across a detach. When an attach client dies while its
+// session lives, the dropped handle's last PROCESSED pipe offset (and the
+// parser carries for a sequence split at that offset) are kept here, and the
+// next attach of the same session resumes from there instead of from the
+// current end of the log. Notifications and shell-integration markers the
+// pane wrote while nothing was attached are then processed exactly once.
+type TmuxPipeResume = {
+  pipePath: string;
+  offset: number;
+  shellIntegrationCarry: string;
+  notificationParse: TerminalNotificationParseState;
+};
+const tmuxPipeResume = new Map<string, TmuxPipeResume>();
+
+function rememberTmuxPipeResume(term: Terminal) {
+  if (!term.tmuxPipePath) return;
+  tmuxPipeResume.set(term.id, {
+    pipePath: term.tmuxPipePath,
+    offset: term.tmuxPipeOffset,
+    shellIntegrationCarry: term.shellIntegrationCarry,
+    notificationParse: term.notificationParse,
+  });
+}
+
+// Server-side re-attach after detachDeadAttach (policy and rationale in
+// services/tmux-reattach-policy.ts). A browser reconnect or catalog poll
+// may restore the session first; restoreRecordedTmuxSession single-flights
+// them, so the timer then finds the id attached and does nothing.
+const tmuxReattachAttempts = new Map<string, number>();
+const tmuxReattachTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function forgetTmuxReattach(id: string) {
+  const timer = tmuxReattachTimers.get(id);
+  if (timer) clearTimeout(timer);
+  tmuxReattachTimers.delete(id);
+  tmuxReattachAttempts.delete(id);
+  tmuxPipeResume.delete(id);
+}
+
+function scheduleTmuxReattach(id: string, attachLivedMs: number) {
+  if (shutdownInProgress || tmuxReattachTimers.has(id)) return;
+  const plan = planTmuxReattach(
+    tmuxReattachAttempts.get(id) ?? 0,
+    attachLivedMs,
+  );
+  if (!plan) {
+    console.warn(
+      `[lifecycle] not re-attaching ${id} server-side again: its attach keeps dying (${TMUX_REATTACH_BACKOFF_MS.length} attempts); a client reconnect still restores it`,
+    );
+    return;
+  }
+  tmuxReattachAttempts.set(id, plan.attempt);
+  const timer = setTimeout(() => {
+    tmuxReattachTimers.delete(id);
+    void runTmuxReattach(id).catch((err) =>
+      console.error(`[lifecycle] server-side re-attach of ${id} failed:`, err),
+    );
+  }, plan.delayMs);
+  (timer as { unref?: () => void }).unref?.();
+  tmuxReattachTimers.set(id, timer);
+}
+
+async function runTmuxReattach(id: string): Promise<void> {
+  if (shutdownInProgress || terminals.has(id)) return;
+  const state = await getFoundationState();
+  const recordedSession = getTerminalSession(state.db, id);
+  if (!recordedSession || recordedSession.status !== "active") {
+    forgetTmuxReattach(id);
+    return;
+  }
+  let restored: Terminal | null = null;
+  try {
+    restored = await restoreRecordedTmuxSession(state, recordedSession);
+  } catch (err) {
+    console.error(`[lifecycle] server-side re-attach of ${id} failed:`, err);
+  }
+  if (restored) {
+    console.log(`[lifecycle] re-attached ${id} server-side`);
+    return;
+  }
+  // Nothing attached (tmux unreachable, or the restore threw): try again
+  // later while the row stays active. An ended row stops here.
+  if (
+    !terminals.has(id) &&
+    getTerminalSession(state.db, id)?.status === "active"
+  ) {
+    scheduleTmuxReattach(id, 0);
+  } else if (!terminals.has(id)) {
+    forgetTmuxReattach(id);
+  }
 }
 
 // Debug logger
@@ -1275,7 +1574,24 @@ async function getFoundationState(): Promise<FoundationState> {
   return foundationStatePromise;
 }
 
-function notifyCompletionPush(term: Terminal, kind: "agent" | "command") {
+// An agent's own "done" notification and DeckTerm's turn/command completion
+// detection often fire for the same moment; one push per burst is enough. A
+// needs-input push is never swallowed by an earlier completion push.
+const COMPLETION_PUSH_DEDUPE_MS = 5_000;
+
+function notifyCompletionPush(
+  term: Terminal,
+  kind: "agent" | "command" | "input",
+) {
+  const now = Date.now();
+  if (
+    kind !== "input" &&
+    term.lastCompletionPushAt &&
+    now - term.lastCompletionPushAt < COMPLETION_PUSH_DEDUPE_MS
+  ) {
+    return;
+  }
+  term.lastCompletionPushAt = now;
   void getFoundationState()
     .then((state) =>
       dispatchCompletionPush({
@@ -1954,6 +2270,19 @@ function isWithinAllowedRoots(pathValue: string, roots: string[]): boolean {
   return roots.some(
     (root) => pathValue === root || pathValue.startsWith(`${root}/`),
   );
+}
+
+// "…outside the allowed roots or does not exist" wording for a path refused by
+// resolveAllowedPath. Stats only paths lexically inside an allowed root (see
+// rejectedPathMayBeMissing), so it is no existence oracle for host paths.
+async function rejectedPathMayBeMissingForRoots(
+  inputPath: string,
+): Promise<boolean> {
+  const roots = [
+    ...ALLOWED_FILESYSTEM_ROOTS.map((root) => resolve(root)),
+    ...(await getAllowedRealRoots()),
+  ];
+  return rejectedPathMayBeMissing(inputPath, roots);
 }
 
 async function resolveAllowedPath(
@@ -2738,6 +3067,12 @@ export function computeLiteralEdits(
   return { edits, matchCount, truncated, newContent: outLines.join("\n") };
 }
 
+// Environment overlay for git calls whose stderr DeckTerm parses: pins the
+// message catalogue to untranslated English (see the /api/git/status route).
+export const GIT_PROBE_ENV: Readonly<Record<string, string>> = Object.freeze({
+  LC_ALL: "C",
+});
+
 export function classifyGitStatusFailure(exitCode: number, stderr: string) {
   const message = stderr.trim() || "git status failed";
   if (/not a git repository/i.test(message)) {
@@ -3283,6 +3618,7 @@ interface ScopedTreeFile {
 
 async function walkScopedFileTree(
   root: string,
+  { maxDepth = TREE_MAX_DEPTH }: { maxDepth?: number } = {},
 ): Promise<{ files: ScopedTreeFile[]; truncated: boolean }> {
   const files: ScopedTreeFile[] = [];
   let truncated = false;
@@ -3346,7 +3682,7 @@ async function walkScopedFileTree(
         if (entryStat.isSymbolicLink()) continue;
 
         if (entryStat.isDirectory()) {
-          if (depth + 1 > TREE_MAX_DEPTH) continue;
+          if (depth + 1 > maxDepth) continue;
           if (dirsVisited >= TREE_MAX_DIRS) {
             truncated = true;
             continue;
@@ -3403,6 +3739,159 @@ async function walkScopedFileTree(
   return { files: finalFiles, truncated };
 }
 
+// ── Quick-open scope (GET /api/files/tree) ───────────────────────────────────
+// Quick-open searches the active PROJECT, never all of $HOME:
+//   - "git":  the cwd is inside a git work tree → the repository's tracked +
+//             untracked-not-ignored files (`git ls-files -co --exclude-standard`).
+//             When the toplevel itself is not an allowed/granted path, git runs
+//             in the cwd instead, which limits the listing to that subtree.
+//   - "dir":  not a repository → the existing bounded walk of the cwd subtree.
+//   - "home": the cwd IS the home directory → its top-level files only.
+// A repository whose toplevel is the home directory (a dotfiles repo) does not
+// count as a project. Paths with a dot segment are skipped (parity with the
+// walk), and every returned path is lstat'ed (plain files only, never a
+// symlink) and realpath'd back inside the scope root.
+type QuickOpenScopeKind = "git" | "dir" | "home";
+const TREE_GIT_TIMEOUT_MS = 3000;
+const TREE_GIT_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+
+async function runTreeGit(
+  cwd: string,
+  args: string[],
+): Promise<{ code: number | null; stdout: string; truncated: boolean }> {
+  let proc;
+  try {
+    proc = Bun.spawn(["git", "-c", "core.fsmonitor=false", ...args], {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GIT_OPTIONAL_LOCKS: "0",
+      },
+    });
+  } catch {
+    return { code: null, stdout: "", truncated: false };
+  }
+  let truncated = false;
+  const timer = setTimeout(() => {
+    truncated = true;
+    proc.kill();
+  }, TREE_GIT_TIMEOUT_MS);
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    const reader = proc.stdout.getReader();
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (bytes + value.byteLength > TREE_GIT_MAX_OUTPUT_BYTES) {
+        chunks.push(value.subarray(0, TREE_GIT_MAX_OUTPUT_BYTES - bytes));
+        bytes = TREE_GIT_MAX_OUTPUT_BYTES;
+        truncated = true;
+        proc.kill();
+        break;
+      }
+      chunks.push(value);
+      bytes += value.byteLength;
+    }
+  } catch {
+    truncated = true;
+  }
+  const code = await proc.exited;
+  clearTimeout(timer);
+  return {
+    code: truncated ? null : code,
+    stdout: Buffer.concat(chunks).toString("utf8"),
+    truncated,
+  };
+}
+
+async function resolveHomeRealPath(): Promise<string | null> {
+  const home = process.env.HOME;
+  if (!home) return null;
+  try {
+    return await realpath(home);
+  } catch {
+    return null;
+  }
+}
+
+async function listGitScopedFiles(
+  base: string,
+): Promise<{ files: ScopedTreeFile[]; truncated: boolean }> {
+  const listing = await runTreeGit(base, [
+    "ls-files",
+    "-z",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+  ]);
+  let truncated = listing.truncated;
+  const entries = listing.stdout.split("\0");
+  // A cut-off listing ends mid-path: drop the partial last entry.
+  if (truncated) entries.pop();
+  const isInside = (p: string) => p === base || p.startsWith(`${base}/`);
+  const seen = new Set<string>();
+  const files: ScopedTreeFile[] = [];
+  for (const rel of entries) {
+    if (!rel || seen.has(rel)) continue;
+    seen.add(rel);
+    const segments = rel.split("/");
+    if (segments.some((segment) => !segment || segment.startsWith("."))) {
+      continue;
+    }
+    if (segments.some((segment) => SEARCH_EXCLUDE_DIRS.includes(segment))) {
+      continue;
+    }
+    if (files.length >= TREE_MAX_ENTRIES) {
+      truncated = true;
+      break;
+    }
+    const entryPath = join(base, rel);
+    try {
+      const entryStat = await lstat(entryPath);
+      if (!entryStat.isFile()) continue; // symlinks, gitlinks, deleted paths
+      const real = await realpath(entryPath);
+      if (!isInside(real)) continue;
+      files.push({ path: real, relativePath: rel });
+    } catch {
+      // tracked but deleted from the work tree, or vanished — dropped
+    }
+  }
+  return { files, truncated };
+}
+
+async function resolveQuickOpenScope(
+  c: any,
+  cwd: string,
+): Promise<{ kind: QuickOpenScopeKind; root: string }> {
+  const home = await resolveHomeRealPath();
+  const topLevel = await runTreeGit(cwd, ["rev-parse", "--show-toplevel"]);
+  if (topLevel.code === 0) {
+    const reported = topLevel.stdout.trim();
+    let gitRoot: string | null = null;
+    try {
+      gitRoot = reported ? await realpath(reported) : null;
+    } catch {
+      gitRoot = null;
+    }
+    if (gitRoot && gitRoot !== home) {
+      if (gitRoot === cwd) return { kind: "git", root: cwd };
+      const allowedTop = await resolveAllowedPath(gitRoot);
+      if (allowedTop === gitRoot) {
+        const access = await requireFileAccess(c, gitRoot);
+        if (access.ok) return { kind: "git", root: gitRoot };
+      }
+      return { kind: "git", root: cwd };
+    }
+  }
+  if (home && cwd === home) return { kind: "home", root: cwd };
+  return { kind: "dir", root: cwd };
+}
+
 function resolveFoundationRootIdForPath(
   state: FoundationState,
   pathValue: string,
@@ -3452,7 +3941,7 @@ async function requireFileAccess(
       body: {
         error: "Forbidden path (no matching registered root)",
         reason: "no_matching_root",
-        path: resolvedPath,
+        ...forbiddenRootDetail({ path: resolvedPath, subject: "path" }),
       },
     };
   }
@@ -3569,10 +4058,20 @@ async function resolveScopedFsPath(
   if (ctx.kind === "legacy") {
     const abs = await resolveAllowedPath(clientPath, opts);
     if (!abs) {
+      // resolveAllowedPath also returns null for a path that does not exist
+      // (realpath ENOENT), so the message must not claim it is out of bounds.
       return {
         ok: false,
         status: 403,
-        body: { error: "Forbidden path", reason: "no_matching_root" },
+        body: {
+          error: "Forbidden path",
+          reason: "no_matching_root",
+          ...forbiddenRootDetail({
+            path: clientPath,
+            subject: "path",
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(clientPath),
+          }),
+        },
       };
     }
     const access = await requireFileAccess(c, abs);
@@ -3600,7 +4099,15 @@ async function resolveScopedFsPath(
     return {
       ok: false,
       status: 403,
-      body: { error: "Forbidden path", reason: "no_matching_root" },
+      body: {
+        error: "Forbidden path",
+        reason: "no_matching_root",
+        ...forbiddenRootDetail({
+          path: clientPath,
+          subject: "path",
+          scope: "granted",
+        }),
+      },
     };
   }
   const actor = getCurrentActor(c);
@@ -3628,6 +4135,11 @@ async function resolveScopedFsPath(
     body: lastDeny?.body ?? {
       error: "Forbidden path",
       reason: "no_matching_root",
+      ...forbiddenRootDetail({
+        path: clientPath,
+        subject: "path",
+        scope: "granted",
+      }),
     },
   };
 }
@@ -3937,8 +4449,10 @@ function appendScrollback(terminalId: string, data: string) {
   const chunks = data.split(/(?<=\n)/g);
   for (const chunk of chunks) {
     if (!chunk) continue;
+    const bytes = Buffer.byteLength(chunk);
     term.scrollback.push(chunk);
-    term.scrollbackBytes += Buffer.byteLength(chunk);
+    term.scrollbackChunkBytes.push(bytes);
+    term.scrollbackBytes += bytes;
   }
 
   while (
@@ -3946,8 +4460,9 @@ function appendScrollback(terminalId: string, data: string) {
     term.scrollbackBytes > SCROLLBACK_MAX_BYTES
   ) {
     const removed = term.scrollback.shift();
+    const removedBytes = term.scrollbackChunkBytes.shift();
     if (!removed) break;
-    term.scrollbackBytes -= Buffer.byteLength(removed);
+    term.scrollbackBytes -= removedBytes ?? Buffer.byteLength(removed);
   }
 }
 
@@ -4164,6 +4679,9 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
     recentTools: term.recentTools,
+    attention: term.attention.attention,
+    progress: term.attention.progress,
+    lastActivityAt: Math.max(term.lastActivityAt, term.lastOutputAt || 0),
     backendMode: getBackendMode(),
     supportsLinkedView: supportsLinkedView(term),
     sharedSessionKey: term.sessionName || null,
@@ -4329,7 +4847,9 @@ function handoffTmuxSession(
 function broadcastTerminalOutput(id: string, data: string) {
   const sockets = terminalSockets.get(id);
   if (!sockets || sockets.size === 0) return;
-  debug(`PTY ${id} data (${data.length} bytes)`);
+  if (DEBUG) debug(`PTY ${id} data (${data.length} bytes)`);
+  // Hot path: serialise the v2 envelope at most once per chunk, not per socket.
+  let v2Frame: string | null = null;
   for (const ws of sockets) {
     const reconnectState = socketReconnectState.get(ws);
     if (reconnectState?.pendingReady || reconnectState?.replaying) {
@@ -4337,13 +4857,12 @@ function broadcastTerminalOutput(id: string, data: string) {
     }
     try {
       if (ws.data.type === "terminal" && ws.data.protocol === "v2") {
-        ws.send(
-          JSON.stringify({
-            type: "terminal_event",
-            kind: "output",
-            data,
-          }),
-        );
+        v2Frame ??= JSON.stringify({
+          type: "terminal_event",
+          kind: "output",
+          data,
+        });
+        ws.send(v2Frame);
       } else {
         ws.send(data);
       }
@@ -4700,6 +5219,24 @@ async function captureTmuxPane(sessionName: string): Promise<string> {
 
 async function readTmuxPipeDelta(term: Terminal): Promise<string> {
   if (!term.tmuxPipePath) return "";
+  // Single reader per terminal: the attention pump and /api/terminals polls
+  // both drain the pipe; two concurrent reads from the same offset would
+  // process the same bytes twice. The waiting caller gets nothing new.
+  if (term.tmuxPipeRead) {
+    await term.tmuxPipeRead.catch(() => "");
+    return "";
+  }
+  const read = readTmuxPipeDeltaOnce(term);
+  term.tmuxPipeRead = read;
+  try {
+    return await read;
+  } finally {
+    if (term.tmuxPipeRead === read) term.tmuxPipeRead = undefined;
+  }
+}
+
+async function readTmuxPipeDeltaOnce(term: Terminal): Promise<string> {
+  if (!term.tmuxPipePath) return "";
   // Brokered terminals read their fd-safe spool via the per-uid backend; legacy
   // uses the shared tmux backend.
   const backend =
@@ -4709,6 +5246,9 @@ async function readTmuxPipeDelta(term: Terminal): Promise<string> {
     term.tmuxPipePath,
     term.tmuxPipeOffset,
   );
+  // Detached while reading: leave the bytes (and the offset) for the handle
+  // that re-attaches, which resumes from this handle's offset.
+  if (terminals.get(term.id) !== term) return "";
   term.tmuxPipeOffset = delta.offset;
   return delta.chunk;
 }
@@ -4721,6 +5261,44 @@ async function syncTmuxSessionSize(
 ): Promise<void> {
   if (!tmuxTerminalBackend) return;
   await tmuxTerminalBackend.resize(sessionName, cols, rows, options);
+}
+
+// One resize at a time per terminal, the last requested size wins (bug R1).
+// Unserialized resizes interleaved their tmux steps (resize-window of one,
+// resize-pane of another), and resizing the PTY before the tmux window let
+// tmux paint '│···' fill frames that wrapped into the browser's scrollback.
+const terminalResizeRunners = new WeakMap<
+  Terminal,
+  (size: { cols: number; rows: number }) => Promise<void>
+>();
+
+function requestTerminalResize(
+  term: Terminal,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  let run = terminalResizeRunners.get(term);
+  if (!run) {
+    run = createLatestWinsRunner(
+      async (size: { cols: number; rows: number }) => {
+        // A detached handle must not resize the session for its successor.
+        if (terminals.get(term.id) !== term) return;
+        if (TMUX_BACKEND && term.sessionName && tmuxTerminalBackend) {
+          await tmuxTerminalBackend.resizeAttached(
+            term.sessionName,
+            size.cols,
+            size.rows,
+            () => term.terminal.resize(size.cols, size.rows),
+          );
+          return;
+        }
+        term.terminal.resize(size.cols, size.rows);
+      },
+      (err) => debug(`Resize error for ${term.id}:`, err),
+    );
+    terminalResizeRunners.set(term, run);
+  }
+  return run({ cols, rows });
 }
 
 async function scrollTmuxSessionHistory(
@@ -4886,57 +5464,83 @@ async function completeTmuxReconnectReplay(
   }
 }
 
-async function getProcessTreeArgs(rootPid: number): Promise<string[]> {
-  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
-
+async function readProcessSnapshot(): Promise<ProcessSnapshot> {
   const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], {
     stdout: "pipe",
     stderr: "pipe",
   });
   const output = await new Response(proc.stdout).text();
   await proc.exited;
-
-  const childrenByParent = new Map<number, number[]>();
-  const argsByPid = new Map<number, string>();
-
-  for (const line of output.split("\n")) {
-    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.*)$/);
-    if (!match) continue;
-    const pid = Number.parseInt(match[1] || "", 10);
-    const ppid = Number.parseInt(match[2] || "", 10);
-    const args = (match[3] || "").trim();
-    if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !args) continue;
-    argsByPid.set(pid, args);
-    const siblings = childrenByParent.get(ppid) || [];
-    siblings.push(pid);
-    childrenByParent.set(ppid, siblings);
-  }
-
-  const processTree: string[] = [];
-  const stack = [rootPid];
-  const visited = new Set<number>();
-
-  while (stack.length > 0) {
-    const pid = stack.pop();
-    if (!pid || visited.has(pid)) continue;
-    visited.add(pid);
-    const args = argsByPid.get(pid);
-    if (args) processTree.push(args);
-    const children = childrenByParent.get(pid) || [];
-    for (let index = children.length - 1; index >= 0; index--) {
-      stack.push(children[index]);
-    }
-  }
-
-  return processTree;
+  return parseProcessTable(output);
 }
 
-async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
+// Drains tmux pipe logs between /api/terminals polls so agent notifications
+// (and the web push they trigger) arrive while no browser tab is polling —
+// hidden tabs are throttled and a closed browser does not poll at all.
+// Same processing as the poll path (emitOutput:false); only the timing moves.
+const TMUX_PIPE_PUMP_INTERVAL_MS = 2_000;
+let tmuxPipePumpRunning = false;
+
+async function pumpTmuxPipeOutput(): Promise<void> {
+  if (!TMUX_BACKEND || tmuxPipePumpRunning || shutdownInProgress) return;
+  tmuxPipePumpRunning = true;
+  try {
+    for (const term of Array.from(terminals.values())) {
+      if (!term.sessionName || !term.tmuxPipePath) continue;
+      const delta = await readTmuxPipeDelta(term).catch(() => "");
+      if (delta && terminals.get(term.id) === term) {
+        processShellIntegrationChunk(term, delta, {
+          emitOutput: false,
+          source: "pipe",
+        });
+      }
+    }
+  } finally {
+    tmuxPipePumpRunning = false;
+  }
+}
+
+// Pass a snapshot to share one `ps` run across many sessions (GET
+// /api/terminals); without one a fresh snapshot is taken.
+async function getProcessTreeArgs(
+  rootPid: number,
+  snapshot?: ProcessSnapshot | Promise<ProcessSnapshot>,
+): Promise<string[]> {
+  if (!Number.isInteger(rootPid) || rootPid <= 0) return [];
+  return collectProcessTreeArgs(
+    await (snapshot ?? readProcessSnapshot()),
+    rootPid,
+  );
+}
+
+// Concurrent and back-to-back /api/terminals polls (every open tab polls)
+// share one tmux runtime sync per terminal for this long.
+const TMUX_RUNTIME_SYNC_TTL_MS = 2000;
+const tmuxRuntimeSyncFlights = createSingleFlightCache<Terminal, void>({
+  ttlMs: TMUX_RUNTIME_SYNC_TTL_MS,
+});
+
+function syncTmuxRuntimeStateShared(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot>,
+): Promise<void> {
+  return tmuxRuntimeSyncFlights.run(term, () =>
+    syncTmuxRuntimeState(term, getProcessSnapshot),
+  );
+}
+
+async function syncTmuxRuntimeState(
+  term: Terminal,
+  getProcessSnapshot: () => Promise<ProcessSnapshot> = readProcessSnapshot,
+): Promise<void> {
   if (!TMUX_BACKEND || !term.sessionName) return;
 
   const pipeDelta = await readTmuxPipeDelta(term);
   if (pipeDelta) {
-    processShellIntegrationChunk(term, pipeDelta, { emitOutput: false });
+    processShellIntegrationChunk(term, pipeDelta, {
+      emitOutput: false,
+      source: "pipe",
+    });
   }
 
   const { cwd, panePid, paneCurrentCommand } = await getTmuxSessionInfo(
@@ -4949,7 +5553,12 @@ async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
   const [capture, processTree] = await Promise.all([
     captureTmuxPane(term.sessionName).catch(() => ""),
     panePid > 0
-      ? getProcessTreeArgs(panePid).catch(() => [])
+      ? getProcessTreeArgs(panePid, getProcessSnapshot()).then(
+          // The tree always contains the pane process itself; an empty one
+          // means the ps snapshot failed, so the sample is inconclusive.
+          (args) => (args.length > 0 ? args : null),
+          () => null,
+        )
       : Promise.resolve([]),
   ]);
   const nextRuntimeState = inferTmuxRuntimeState({
@@ -4962,8 +5571,10 @@ async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
       lastExitCode: term.lastExitCode,
       agentName: term.agentName,
       agentState: term.agentState,
+      agentMissedSamples: term.agentMissedSamples,
     },
     hasUserPrompted: term.agentHasUserPrompt,
+    agentMarkerActive: term.agentMarkerActive,
   });
 
   if (term.agentName && term.agentName !== nextRuntimeState.agentName) {
@@ -4974,8 +5585,10 @@ async function syncTmuxRuntimeState(term: Terminal): Promise<void> {
   term.lastExitCode = nextRuntimeState.lastExitCode;
   term.agentName = nextRuntimeState.agentName;
   term.agentState = nextRuntimeState.agentState;
+  term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
   if (!nextRuntimeState.agentName) {
     term.agentHasUserPrompt = false;
+    term.agentMarkerActive = false;
   }
   term.lastTmuxCapture = capture;
 
@@ -4999,9 +5612,12 @@ async function createManagedTerminal({
   initialLastExitCode = null,
   initialScrollback = "",
   exec,
+  attachCwd,
 }: {
   id?: string;
   cwd: string;
+  /** Where to spawn the attach client, when it differs from `cwd`. */
+  attachCwd?: string;
   cols: number;
   rows: number;
   ownerId: string;
@@ -5026,13 +5642,34 @@ async function createManagedTerminal({
     ? backendForExec(exec)
     : terminalBackend;
 
-  const closeAndRemoveTerminal = (
+  // Identity guard. A re-attach after a detach registers a NEWER handle under
+  // the same id; this handle's exit must never end, close or remove that one.
+  const ownsTerminalSlot = () => {
+    const current = terminals.get(id);
+    return !current || current.terminal === terminal;
+  };
+
+  // `registered` flips when this call puts its handle into `terminals`;
+  // `handleSettled` resolves then, or when the attach fails before that. The
+  // tmux exit path waits for it, so an attach client that dies while the
+  // handle is still being built is not judged against an empty slot.
+  let registered = false;
+  let markHandleSettled!: () => void;
+  const handleSettled = new Promise<void>((resolve) => {
+    markHandleSettled = resolve;
+  });
+
+  const finalizeTerminalExit = (
     exitCode: number,
     signalCode?: number | null,
   ) => {
-    // Deploy detach, not a real terminal exit: the shutdown routine already
-    // closed the sockets and (raw mode only) persisted ended synchronously.
-    if (shutdownInProgress) return;
+    if (!ownsTerminalSlot()) {
+      debug(
+        `Stale attach for terminal ${id} exited; a newer attach owns it, leaving it alone`,
+      );
+      terminal.close();
+      return;
+    }
     debug(
       `Terminal ${id}${activeSessionName ? ` (tmux: ${activeSessionName})` : ""} exited: code=${exitCode}, signal=${signalCode}`,
     );
@@ -5042,7 +5679,83 @@ async function createManagedTerminal({
       .catch((err) => debug("Failed to mark terminal session ended:", err));
     notifyTerminalExit(ownerId, id);
     removeTerminalState(id);
+    forgetTmuxReattach(id);
     terminal.close();
+  };
+
+  // The tmux session outlived its attach client: drop this attach only. A
+  // plain close (no exit frame) makes ReconnectingWebSocket reconnect, and
+  // the upgrade lazily re-attaches through restoreRecordedTmuxSession. With
+  // no browser around, the server re-attaches by itself (backoff + cap), so
+  // the pipe pump and the reapers keep covering the session; the pipe offset
+  // is handed over so the gap's markers are processed once.
+  const detachDeadAttach = (
+    exitCode: number,
+    signalCode: number | null | undefined,
+    sessionName: string,
+    liveness: TmuxSessionLiveness,
+  ) => {
+    console.warn(
+      `[lifecycle] attach client for ${id} exited (code=${exitCode}, signal=${signalCode ?? "none"}) but tmux session ${sessionName} is ${liveness}; detaching, row stays active`,
+    );
+    const current = terminals.get(id);
+    if (current?.terminal === terminal) {
+      rememberTmuxPipeResume(current);
+      closeTerminalSockets(id);
+      removeTerminalState(id);
+      scheduleTmuxReattach(id, Date.now() - attachStartedAt);
+    }
+    terminal.close();
+  };
+
+  const closeAndRemoveTerminal = (
+    exitCode: number,
+    signalCode?: number | null,
+  ) => {
+    // Deploy detach, not a real terminal exit: the shutdown routine already
+    // closed the sockets and (raw mode only) persisted ended synchronously.
+    if (shutdownInProgress) return;
+    // Legacy tmux: the PTY is a `tmux attach-session` client, and its exit is
+    // not proof the session ended — detach-client, a stray or child-first
+    // kill, or the OOM killer all leave the pane running. Probe before any
+    // DB write; only a session proven missing is a terminal exit. Raw and
+    // brokered terminals, and linked views (a second client on another
+    // terminal's session, which restore cannot re-attach), keep the direct
+    // path.
+    const probedSessionName = activeSessionName;
+    const reattachable =
+      TMUX_BACKEND &&
+      !exec &&
+      probedSessionName !== undefined &&
+      probedSessionName ===
+        buildTmuxSessionName({
+          namespace: TMUX_SESSION_NAMESPACE,
+          terminalId: id,
+        });
+    if (!reattachable || !tmuxTerminalBackend) {
+      finalizeTerminalExit(exitCode, signalCode);
+      return;
+    }
+    const probe = tmuxTerminalBackend.sessionLiveness(probedSessionName);
+    void Promise.all([probe, handleSettled])
+      .then(([liveness]) => {
+        if (shutdownInProgress) return;
+        // DELETE, the reapers and revocation remove the handle BEFORE they
+        // kill: a registered handle that is gone now was torn down on
+        // purpose, which stays a terminal exit whatever tmux says.
+        const tornDown = registered && !terminals.has(id);
+        if (liveness === "missing" || tornDown) {
+          finalizeTerminalExit(exitCode, signalCode);
+        } else {
+          detachDeadAttach(exitCode, signalCode, probedSessionName, liveness);
+        }
+      })
+      .catch((err) => {
+        console.error(
+          `[lifecycle] attach exit handling failed for ${id}:`,
+          err,
+        );
+      });
   };
 
   let tmuxPipePath: string | null = null;
@@ -5065,24 +5778,41 @@ async function createManagedTerminal({
   }
 
   const attachSessionName = activeSessionName || id;
-  const attachResult = await backend.attach(attachSessionName, {
-    cwd,
-    cols,
-    rows,
-    terminal,
-    waitForClient: TMUX_BACKEND,
-    exec,
-    onExit(
-      _proc: Subprocess,
-      exitCode: number | null,
-      signalCode?: number | null,
-    ) {
-      closeAndRemoveTerminal(exitCode ?? 0, signalCode);
-    },
-  });
+  const attachStartedAt = Date.now();
+  let attachResult: TerminalBackendAttachResult;
+  try {
+    attachResult = await backend.attach(attachSessionName, {
+      cwd: attachCwd || cwd,
+      cols,
+      rows,
+      terminal,
+      waitForClient: TMUX_BACKEND,
+      exec,
+      onExit(
+        _proc: Subprocess,
+        exitCode: number | null,
+        signalCode?: number | null,
+      ) {
+        closeAndRemoveTerminal(exitCode ?? 0, signalCode);
+      },
+    });
+  } catch (err) {
+    markHandleSettled();
+    throw err;
+  }
   const proc = attachResult.proc as Subprocess;
   tmuxPipePath = attachResult.pipePath ?? tmuxPipePath;
   tmuxPipeOffset = attachResult.pipeOffset ?? tmuxPipeOffset;
+  // Re-attach after a dead attach: resume where the dropped handle stopped
+  // (never past the current end of the log).
+  const pipeResume = tmuxPipeResume.get(id);
+  const resumePipe =
+    pipeResume && tmuxPipePath && pipeResume.pipePath === tmuxPipePath
+      ? pipeResume
+      : null;
+  if (resumePipe) {
+    tmuxPipeOffset = Math.min(resumePipe.offset, tmuxPipeOffset);
+  }
 
   const now = Date.now();
   const managedTerminal: Terminal = {
@@ -5101,6 +5831,7 @@ async function createManagedTerminal({
     sessionName,
     scrollback: [],
     scrollbackBytes: 0,
+    scrollbackChunkBytes: [],
     hadSocketConnection: false,
     running: initialRuntimeState?.running || false,
     lastExitCode:
@@ -5108,11 +5839,16 @@ async function createManagedTerminal({
     agentName: initialRuntimeState?.agentName || null,
     agentState: initialRuntimeState?.agentState || null,
     agentHasUserPrompt: Boolean(initialRuntimeState?.agentName),
+    agentMarkerActive: false,
+    agentMissedSamples: 0,
     agentTurnCompletedAt: null,
     agentRespondingTimer: null,
     recentTools: [],
     toolRate: { windowStart: 0, count: 0 },
-    shellIntegrationCarry: "",
+    notificationParse:
+      resumePipe?.notificationParse ?? createTerminalNotificationParseState(),
+    attention: createAttentionTracker(),
+    shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
     tmuxPipeOffset,
@@ -5121,7 +5857,10 @@ async function createManagedTerminal({
   };
 
   terminals.set(id, managedTerminal);
+  registered = true;
+  if (pipeResume) tmuxPipeResume.delete(id);
   getTerminalSockets(id);
+  markHandleSettled();
   if (initialScrollback) {
     // Recovery keeps the raw snapshot above for runtime-state inference, but
     // the fallback is terminal-bound and therefore needs terminal newlines.
@@ -5528,21 +6267,27 @@ export function createWebApp() {
     await next();
   });
 
-  // No-cache headers - bypass CF cache
+  // No-cache headers - bypass CF cache. API, WebSocket and HTML responses stay
+  // no-store. Static web files set their own `private` browser-cache policy
+  // (ETag revalidation or immutable for versioned /assets/); `private` keeps
+  // Cloudflare from storing them, and the CDN headers below forbid it outright.
   app.use("/*", async (c, next) => {
     await next();
-    c.header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-    c.header("Pragma", "no-cache");
-    c.header("Expires", "0");
+    if (!c.get("staticCacheManaged")) {
+      c.header("Cache-Control", NO_STORE_CACHE_CONTROL);
+      c.header("Pragma", "no-cache");
+      c.header("Expires", "0");
+    }
     c.header("CDN-Cache-Control", "no-store");
     c.header("Cloudflare-CDN-Cache-Control", "no-store");
   });
 
   // Health endpoint
-  app.get("/api/health", (c) => {
+  app.get("/api/health", async (c) => {
     return c.json({
       status: "ok",
       release: DECKTERM_RELEASE,
+      build: await webBuildFingerprint.get().catch(() => null),
       terminals: terminals.size,
       maxTerminals: MAX_TERMINALS,
       uptime: process.uptime(),
@@ -6516,13 +7261,8 @@ export function createWebApp() {
     const os = await import("os");
     const fs = await import("fs/promises");
 
-    const cpus = os.cpus();
-    const cpuUsage =
-      cpus.reduce((acc, cpu) => {
-        const total = Object.values(cpu.times).reduce((a, b) => a + b, 0);
-        const idle = cpu.times.idle;
-        return acc + ((total - idle) / total) * 100;
-      }, 0) / cpus.length;
+    // Busy share since the previous /api/stats read (not since boot).
+    const cpuUsage = await hostCpuUsage.read();
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
@@ -6676,7 +7416,18 @@ export function createWebApp() {
           reason: "forbidden_root",
           data: { projectRoot: requestedRoot },
         });
-        return c.json({ error: "Forbidden project root" }, 403);
+        return c.json(
+          {
+            error: "Forbidden project root",
+            reason: "forbidden_root",
+            ...forbiddenRootDetail({
+              path: requestedRoot,
+              subject: "project",
+              mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedRoot),
+            }),
+          },
+          403,
+        );
       }
       const access = await requireFileAccess(c, resolvedRoot);
       if (!access.ok) {
@@ -7140,7 +7891,20 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden terminal root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden terminal root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: isOsIsolationEnabled(process.env)
+              ? (body.cwd ?? null)
+              : requestedCwd,
+            subject: "terminal",
+            scope: isOsIsolationEnabled(process.env) ? "granted" : "allowed",
+          }),
+        },
+        403,
+      );
     }
 
     // Lexical (no realpath) root match, same helper requireFileAccess uses.
@@ -7161,6 +7925,7 @@ export function createWebApp() {
         {
           error: "Forbidden path (no matching registered root)",
           reason: "no_matching_root",
+          ...forbiddenRootDetail({ path: resolvedCwd, subject: "terminal" }),
         },
         403,
       );
@@ -7490,19 +8255,25 @@ export function createWebApp() {
       endedLimit: TERMINAL_LIST_ENDED_LIMIT,
     });
     const seenIds = new Set<string>();
+    // One `ps` snapshot per request, taken only if some session needs a
+    // fresh runtime sync (cached syncs reuse their earlier result).
+    const getProcessSnapshot = createLazyOnce(readProcessSnapshot);
 
     const list = await Promise.all(
       recordedSessions.map(async (recordedSession) => {
         const restoredTerm =
           terminals.get(recordedSession.id) ||
           (recordedSession.status === "active"
-            ? await restoreRecordedTmuxSession(state, recordedSession)
+            ? await restoreRecordedTmuxSessionSafely(state, recordedSession)
             : null);
 
         if (restoredTerm) {
           seenIds.add(restoredTerm.id);
           if (TMUX_BACKEND && restoredTerm.sessionName) {
-            await syncTmuxRuntimeState(restoredTerm).catch((err) => {
+            await syncTmuxRuntimeStateShared(
+              restoredTerm,
+              getProcessSnapshot,
+            ).catch((err) => {
               debug(`[tmux] runtime sync failed for ${restoredTerm.id}:`, err);
             });
           }
@@ -7557,9 +8328,11 @@ export function createWebApp() {
         .map(async (t) => {
           ensureTerminalSessionRecorded(state, t);
           if (TMUX_BACKEND && t.sessionName) {
-            await syncTmuxRuntimeState(t).catch((err) => {
-              debug(`[tmux] runtime sync failed for ${t.id}:`, err);
-            });
+            await syncTmuxRuntimeStateShared(t, getProcessSnapshot).catch(
+              (err) => {
+                debug(`[tmux] runtime sync failed for ${t.id}:`, err);
+              },
+            );
           }
           return {
             ...serializeTerminal(t, requestingClientId),
@@ -7727,20 +8500,9 @@ export function createWebApp() {
     term.cols = cols;
     term.rows = rows;
 
-    // Actually resize the PTY - this sends SIGWINCH to the process
-    try {
-      term.terminal.resize(cols, rows);
-
-      // Also resize tmux pane if using tmux backend
-      if (TMUX_BACKEND && term.sessionName) {
-        await syncTmuxSessionSize(term.sessionName, cols, rows);
-        debug(`Terminal ${id} tmux session resized to ${cols}x${rows}`);
-      }
-
-      debug(`Terminal ${id} resized to ${cols}x${rows}`);
-    } catch (err) {
-      debug(`Terminal ${id} resize error:`, err);
-    }
+    // Resize the PTY (SIGWINCH) and the tmux window, serialized per terminal.
+    await requestTerminalResize(term, cols, rows);
+    debug(`Terminal ${id} resized to ${cols}x${rows}`);
 
     return c.json({ ok: true, cols, rows });
   });
@@ -8007,7 +8769,19 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root", requestId }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
+          }),
+          requestId,
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
@@ -8097,7 +8871,18 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json({ error: "Forbidden search root" }, 403);
+      return c.json(
+        {
+          error: "Forbidden search root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({
+            path: requestedCwd,
+            subject: "search",
+            mayBeMissing: await rejectedPathMayBeMissingForRoots(requestedCwd),
+          }),
+        },
+        403,
+      );
     }
 
     const fileAccess = await requireFileAccess(c, resolvedRoot);
@@ -8114,21 +8899,27 @@ export function createWebApp() {
       return c.json(fileAccess.body, { status: fileAccess.status as any });
     }
 
-    const { files, truncated } = await walkScopedFileTree(resolvedRoot);
+    const scope = await resolveQuickOpenScope(c, resolvedRoot);
+    const { files, truncated } =
+      scope.kind === "git"
+        ? await listGitScopedFiles(scope.root)
+        : await walkScopedFileTree(scope.root, {
+            maxDepth: scope.kind === "home" ? 0 : TREE_MAX_DEPTH,
+          });
 
     const state = await getFoundationState();
-    const rootId = resolveFoundationRootIdForPath(state, resolvedRoot);
+    const rootId = resolveFoundationRootIdForPath(state, scope.root);
     writeAuditEvent(state.db, {
       actorUserId: ownerId,
       action: "files.tree",
       resourceType: "root",
-      resourceId: rootId || resolvedRoot,
+      resourceId: rootId || scope.root,
       decision: "allow",
       // DECISION (mirrors files.search): counts only, never the paths.
-      data: { fileCount: files.length, truncated },
+      data: { fileCount: files.length, truncated, scope: scope.kind },
     });
 
-    return c.json({ files, truncated });
+    return c.json({ files, truncated, scope });
   });
 
   // Downloads share a bounded per-actor/global budget with uploads.
@@ -8759,13 +9550,15 @@ export function createWebApp() {
   }
 
   // Shared runner for git child processes. Legacy: direct spawn with
-  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast. Brokered: the broker
+  // GIT_TERMINAL_PROMPT=0 so credential prompts fail fast, read-only calls
+  // hardened by hardenGitInvocation. Brokered: the broker
   // `git` profile (argv rebuilt from the fixed schema; cwd resolved fd-safely
   // beneath the granted root as the mapped user). `args` is the argv AFTER `git`.
   async function runGit(
     git: GitCwd,
     args: string[],
     timeoutMs = 10000,
+    extraEnv: Record<string, string> = {},
   ): Promise<{ ok: boolean; output: string; stderr: string; code: number }> {
     if (git.ctx.kind === "brokered") {
       // Brokered git shares the per-uid/global broker concurrency cap so it can't
@@ -8812,11 +9605,21 @@ export function createWebApp() {
       }
     }
     const cwd = git.reldir ? join(git.root, git.reldir) : git.root;
-    const proc = Bun.spawn(["git", ...args], {
+    // Read-only calls (status/diff/log/…) run in whatever directory a
+    // terminal enters: repo-local fsmonitor, hooks and diff drivers must not
+    // execute there. Writes keep the user's hooks. The broker git profile
+    // applies its own fixed hardening.
+    const hardened = hardenGitInvocation(args);
+    const proc = Bun.spawn(["git", ...hardened.argv], {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        ...hardened.env,
+        ...extraEnv,
+      },
     });
     const timeoutId = setTimeout(() => proc.kill(), timeoutMs);
     const [output, stderr, code] = await Promise.all([
@@ -8834,10 +9637,10 @@ export function createWebApp() {
   app.get("/api/notifications/push", async (c) => {
     const gate = await requirePushNotificationUser(c);
     if (!gate.ok) {
-      return c.json(
-        { error: "Push notifications unavailable", reason: gate.reason },
-        gate.status,
-      );
+      // The settings UI probes this on every page load. An actor without
+      // push rights gets a quiet "not available" answer instead of a 403 in
+      // the console; the key is withheld and every write stays denied.
+      return c.json({ configured: false, publicKey: null, available: false });
     }
     const config = resolveWebPushConfig(process.env);
     return c.json({
@@ -9103,12 +9906,17 @@ export function createWebApp() {
     }
 
     try {
-      const statusRes = await runGit(g.git, [
-        "status",
-        "--porcelain",
-        "-uall",
-        "-b",
-      ]);
+      // LC_ALL=C keeps git's stderr in English so the non-repository probe in
+      // classifyGitStatusFailure() works under any service locale (a
+      // translated "not a git repository" would otherwise surface as a 502).
+      // Porcelain output itself is never localized. Brokered git runs with
+      // the broker's own fixed environment (LANG defaults to C.UTF-8).
+      const statusRes = await runGit(
+        g.git,
+        ["status", "--porcelain", "-uall", "-b"],
+        undefined,
+        GIT_PROBE_ENV,
+      );
       const output = statusRes.output;
       const stderr = statusRes.stderr;
       const exitCode = statusRes.code;
@@ -10086,14 +10894,13 @@ export function createWebApp() {
     }
   });
 
-  // Serve static files
-  app.use(
-    "/*",
-    serveStatic({
-      root: "./web",
-      rewriteRequestPath: (path) => (path === "/" ? "/index.html" : path),
-    }),
-  );
+  // Serve static files (see services/static-assets.ts for the cache policy)
+  app.use("/*", async (c, next) => {
+    const response = await staticAssets.handle(c.req.raw);
+    if (!response) return next();
+    c.set("staticCacheManaged", true);
+    return c.newResponse(response.body, response);
+  });
 
   return app;
 }
@@ -10484,7 +11291,8 @@ async function startOwnedWebServer(
               actorId: ownerId,
               recordedOwnerId: recordedSession.actorUserId,
               requestUrl: req.url,
-              restore: () => restoreRecordedTmuxSession(state, recordedSession),
+              restore: () =>
+                restoreRecordedTmuxSessionSafely(state, recordedSession),
             });
             if (!restored.ok) {
               return new Response("Terminal not found", { status: 404 });
@@ -10768,23 +11576,7 @@ async function startOwnedWebServer(
                 debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
                 term.cols = parsed.cols;
                 term.rows = parsed.rows;
-                try {
-                  term.terminal.resize(parsed.cols, parsed.rows);
-                  if (TMUX_BACKEND && term.sessionName) {
-                    void syncTmuxSessionSize(
-                      term.sessionName,
-                      parsed.cols,
-                      parsed.rows,
-                    ).catch((err) => {
-                      debug(
-                        `[reconnect] tmux async resize failed for ${terminalId}:`,
-                        err,
-                      );
-                    });
-                  }
-                } catch (err) {
-                  debug(`Resize error for ${terminalId}:`, err);
-                }
+                void requestTerminalResize(term, parsed.cols, parsed.rows);
                 return;
               }
               if (parsed.type === "input") {
@@ -11044,6 +11836,11 @@ async function startOwnedWebServer(
     setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
     setInterval(reapDetachedSessions, 15 * 60 * 1000),
     setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+    setInterval(() => {
+      void pumpTmuxPipeOutput().catch((err) =>
+        debug("[tmux] pipe pump failed:", err),
+      );
+    }, TMUX_PIPE_PUMP_INTERVAL_MS),
   ];
 
   // B6 retention scheduler (plan D-B6-5): an hourly tick consults the
