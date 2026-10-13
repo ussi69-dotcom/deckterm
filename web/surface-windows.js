@@ -205,7 +205,7 @@ const OVERLAY_SURFACE_WINDOWS = Object.freeze({
   sessions: Object.freeze({
     title: "Sessions",
     icon: "❐",
-    bounds: Object.freeze({ x: 3, y: 4, width: 34, height: 72 }),
+    bounds: Object.freeze({ x: 3, y: 4, width: 34, height: 60 }),
     minWidthPx: 380,
     minHeightPx: 260,
   }),

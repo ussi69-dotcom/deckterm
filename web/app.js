@@ -6066,14 +6066,7 @@ class TerminalManager {
     // Sessions button trigger
     const sessionsBtn = document.getElementById("sessions-btn");
     if (sessionsBtn) {
-      sessionsBtn.addEventListener("click", () => {
-        const panel = this.getSessionsPanel();
-        if (panel && !panel.classList.contains("hidden")) {
-          this.closeSessionsPanel();
-        } else {
-          this.openSessionsPanel();
-        }
-      });
+      sessionsBtn.addEventListener("click", () => this.toggleSessionsPanel());
     }
     this.setupLayoutEditor();
     this.setupDesktopTabOverflowScroll();
@@ -7644,6 +7637,8 @@ class TerminalManager {
         return;
       }
       if (event.key !== "Tab") return;
+      // The phone sheet is modal and traps Tab; the desktop window is not.
+      if (this.isPanelInSurfaceWindow(panel)) return;
       const focusable = this.getSessionsFocusableElements();
       if (focusable.length === 0) return;
       const first = focusable[0];
@@ -7720,16 +7715,28 @@ class TerminalManager {
     this.closeSessionsPanel({ restoreFocus: false });
   }
 
-  openSessionsPanel() {
+  // Desktop: Sessions is a SurfaceWindow (non-modal, terminals stay usable);
+  // phones keep the modal sheet. Either way the 1 s termination countdown
+  // runs only while the list is on screen.
+  async openSessionsPanel() {
     const panel = this.getSessionsPanel();
     if (!panel) return;
-    this.closeToolsSheet();
-    this.closeTaskPanel();
-    this.closeSetupPanel();
-    this.sessionsReturnFocus =
-      document.activeElement instanceof HTMLElement
-        ? document.activeElement
-        : document.getElementById("sessions-btn");
+    const wasHidden = panel.classList.contains("hidden");
+    this.closeSurfacesForOpen("sessions");
+    // Captured after the More sheet closed (it hands focus to its trigger).
+    if (wasHidden || !this.sessionsReturnFocus) {
+      this.sessionsReturnFocus =
+        document.activeElement instanceof HTMLElement &&
+        !panel.contains(document.activeElement)
+          ? document.activeElement
+          : document.getElementById("sessions-btn");
+    }
+    const inWindow = await this.mountOverlayPanel("sessions", panel, () =>
+      this.closeSessionsPanel(),
+    );
+    panel
+      .querySelector(".sessions-panel-shell")
+      ?.setAttribute("aria-modal", inWindow ? "false" : "true");
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     document
@@ -7742,16 +7749,39 @@ class TerminalManager {
       1000,
     );
     this.syncSurfaceButtonState();
-    panel
-      .querySelector("#sessions-panel-close")
-      ?.focus({ preventScroll: true });
+    if (inWindow) this.focusFirstPanelControl(panel);
+    else
+      panel
+        .querySelector("#sessions-panel-close")
+        ?.focus({ preventScroll: true });
+  }
+
+  toggleSessionsPanel() {
+    const panel = this.getSessionsPanel();
+    if (!panel) return;
+    const open = !panel.classList.contains("hidden");
+    const inWindow = open && this.isPanelInSurfaceWindow(panel);
+    const plan =
+      window.SurfaceWindows?.planSurfaceToggle?.({
+        open,
+        frontmost: inWindow
+          ? Boolean(this.surfaceWindowManager?.isFrontmost?.("sessions"))
+          : undefined,
+      }) || (open ? "close" : "open");
+    if (plan === "close") this.closeSessionsPanel();
+    else if (plan === "front") {
+      this.surfaceWindowManager?.bringToFront("sessions");
+      this.focusFirstPanelControl(panel);
+    } else void this.openSessionsPanel();
   }
 
   closeSessionsPanel({ restoreFocus = true } = {}) {
     const panel = this.getSessionsPanel();
     if (!panel) return;
+    const inWindow = this.isPanelInSurfaceWindow(panel);
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    if (inWindow) this.surfaceWindowManager?.close("sessions");
     clearInterval(this.sessionsCountdownTimer);
     this.sessionsCountdownTimer = null;
     document
@@ -7760,9 +7790,16 @@ class TerminalManager {
     this.syncSurfaceButtonState();
     const returnTarget = this.sessionsReturnFocus;
     this.sessionsReturnFocus = null;
-    if (restoreFocus && returnTarget?.isConnected) {
-      returnTarget.focus({ preventScroll: true });
+    if (!restoreFocus) return;
+    if (!inWindow) {
+      if (returnTarget?.isConnected) {
+        returnTarget.focus({ preventScroll: true });
+      }
+      return;
     }
+    // A window can outlive its opener's visibility (palette, More sheet,
+    // toast): fall back to the terminal the user was working in.
+    if (!this.restorePanelFocus(returnTarget)) this.focusActiveTerminalSoft();
   }
 
   updateSessionsAvailableBadge(sessions = this._sessionCatalog || []) {
@@ -7934,8 +7971,7 @@ class TerminalManager {
     const panel = this.getTaskPanel();
     if (!panel) return;
 
-    this.closeToolsSheet();
-    this.closeSetupPanel();
+    this.closeSurfacesForOpen("tasks");
     if (this.isWindowedSurfaces()) {
       await this.openSurfaceWindow("tasks", {
         title: "Tasks",
@@ -8568,24 +8604,114 @@ class TerminalManager {
     if (status) status.textContent = message || "";
   }
 
+  // Desktop: Setup is a SurfaceWindow next to the others; phones keep the
+  // sheet (and its historical behaviour: no focus move, no focus return).
   async openSetupPanel() {
     const panel = this.getSetupPanel();
     if (!panel) return;
 
-    this.closeToolsSheet();
-    this.closeTaskPanel();
+    const wasHidden = panel.classList.contains("hidden");
+    this.closeSurfacesForOpen("setup");
+    if (wasHidden) {
+      this.setupReturnFocus =
+        document.activeElement instanceof HTMLElement &&
+        !panel.contains(document.activeElement)
+          ? document.activeElement
+          : null;
+    }
+    const inWindow = await this.mountOverlayPanel("setup", panel, () =>
+      this.closeSetupPanel(),
+    );
     panel.classList.remove("hidden");
     panel.setAttribute("aria-hidden", "false");
     this.renderSetupReport(this.setupState.report);
     this.syncSurfaceButtonState();
+    if (inWindow) this.focusFirstPanelControl(panel);
   }
 
-  closeSetupPanel() {
+  closeSetupPanel({ restoreFocus = true } = {}) {
     const panel = this.getSetupPanel();
     if (!panel) return;
+    const wasOpen = !panel.classList.contains("hidden");
+    const inWindow = this.isPanelInSurfaceWindow(panel);
     panel.classList.add("hidden");
     panel.setAttribute("aria-hidden", "true");
+    if (inWindow) this.surfaceWindowManager?.close("setup");
     this.syncSurfaceButtonState();
+    const returnTarget = this.setupReturnFocus;
+    this.setupReturnFocus = null;
+    if (!restoreFocus || !inWindow || !wasOpen) return;
+    if (!this.restorePanelFocus(returnTarget)) {
+      this.focusSettingsReturnTarget();
+    }
+  }
+
+  // --- Setup / Sessions hosting (window on desktop, sheet on phones) -------
+
+  isPanelInSurfaceWindow(panel) {
+    return Boolean(
+      panel?.parentElement?.classList?.contains("surface-window-body"),
+    );
+  }
+
+  // Dismiss what opening `id` replaces (surface-windows.js
+  // planSurfaceOpenCloses): only the More sheet on desktop, the old mutual
+  // exclusions between the phone sheets otherwise.
+  closeSurfacesForOpen(id) {
+    const plan = window.SurfaceWindows?.planSurfaceOpenCloses?.(id, {
+      windowed: this.isWindowedSurfaces(),
+    }) || ["tools"];
+    for (const target of plan) {
+      if (target === "tools") this.closeToolsSheet();
+      else if (target === "tasks") this.closeTaskPanel();
+      else if (target === "setup")
+        this.closeSetupPanel({ restoreFocus: false });
+      else if (target === "sessions") {
+        this.closeSessionsPanel({ restoreFocus: false });
+      }
+    }
+  }
+
+  // Mount Setup/Sessions in their SurfaceWindow on desktop (true), or give
+  // the element back to #app for the sheet (false).
+  async mountOverlayPanel(id, panel, onClose) {
+    const config = window.SurfaceWindows?.OVERLAY_SURFACE_WINDOWS?.[id];
+    if (config && this.isWindowedSurfaces()) {
+      const win = await this.openSurfaceWindow(id, {
+        title: config.title,
+        icon: config.icon,
+        contentEl: panel,
+        bounds: { ...config.bounds },
+        minWidthPx: config.minWidthPx,
+        minHeightPx: config.minHeightPx,
+        onClose,
+        onEscape: onClose,
+      });
+      if (win) return true;
+    }
+    this.releaseSurfaceWindowContent(id, panel);
+    return false;
+  }
+
+  focusFirstPanelControl(panel) {
+    const first = Array.from(
+      panel?.querySelectorAll?.(
+        'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+      ) || [],
+    ).find((el) => !el.hidden && el.getClientRects().length > 0);
+    first?.focus({ preventScroll: true });
+  }
+
+  restorePanelFocus(target) {
+    if (!target?.isConnected || !target.getClientRects().length) return false;
+    target.focus({ preventScroll: true });
+    return document.activeElement === target;
+  }
+
+  focusActiveTerminalSoft() {
+    if (this.activeId && this.terminals.has(this.activeId)) {
+      this.focusTerminal(this.activeId, { ensureVisible: false });
+    }
   }
 
   renderSetupReport(report) {
@@ -12719,6 +12845,13 @@ class TerminalManager {
     this.closeFileExplorer?.();
     this.closeGitPanel?.();
     this.closeTaskPanel?.();
+    // Setup/Sessions windows close too; they reopen as sheets from here on.
+    if (this.isPanelInSurfaceWindow(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (this.isPanelInSurfaceWindow(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
     if (this.surfaceWindowManager?.isOpen?.("settings")) {
       void this.closeSettings({ repairViewportFocus: true });
     }
@@ -12745,13 +12878,22 @@ class TerminalManager {
   // The Sessions/Setup sheets and the More sheet stack above the floating
   // windows (styles.css) with a backdrop that dims them. A window opened while
   // one of those sheets is up (palette action, shortcut) would land under that
-  // backdrop, so opening a window dismisses the sheets first.
+  // backdrop, so opening a window dismisses the sheets first. Sessions/Setup
+  // already hosted in their own windows are windows, not sheets: they stay.
   closeOverlaySheetsForWindow() {
-    const isOpen = (el) => Boolean(el && !el.classList.contains("hidden"));
-    if (isOpen(this.getSessionsPanel())) {
+    const isSheetOpen = (el) =>
+      Boolean(
+        el &&
+        !el.classList.contains("hidden") &&
+        !this.isPanelInSurfaceWindow(el),
+      );
+    if (isSheetOpen(this.getSessionsPanel())) {
       this.closeSessionsPanel({ restoreFocus: false });
     }
-    if (isOpen(this.getSetupPanel())) this.closeSetupPanel();
+    if (isSheetOpen(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
+    const isOpen = (el) => Boolean(el && !el.classList.contains("hidden"));
     if (isOpen(this.toolsSheet)) this.closeToolsSheet();
   }
 
@@ -13682,6 +13824,15 @@ class TerminalManager {
     ["settings", "tasks", "git", "editor"].forEach((id) =>
       this.surfaceWindowManager?.close(id),
     );
+    // Setup/Sessions windows follow the same rule (they still open as
+    // floating windows inside IDE mode, like Tasks). Close them through their
+    // own paths so the countdown timer and aria state stop with them.
+    if (this.isPanelInSurfaceWindow(this.getSessionsPanel())) {
+      this.closeSessionsPanel({ restoreFocus: false });
+    }
+    if (this.isPanelInSurfaceWindow(this.getSetupPanel())) {
+      this.closeSetupPanel({ restoreFocus: false });
+    }
     // The scrollback-search overlay is positioned relative to the active
     // terminal's tile, which the IDE reflow can detach/resize mid-session —
     // close it rather than let it float over stale geometry (bug A2).
