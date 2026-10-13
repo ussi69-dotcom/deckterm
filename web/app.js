@@ -7742,18 +7742,45 @@ class TerminalManager {
     document
       .getElementById("sessions-btn")
       ?.setAttribute("aria-expanded", "true");
-    void this.refreshSessionsPanel();
+    const refreshed = this.refreshSessionsPanel();
     clearInterval(this.sessionsCountdownTimer);
     this.sessionsCountdownTimer = setInterval(
       () => this.updateSessionTerminationCountdowns(),
       1000,
     );
     this.syncSurfaceButtonState();
-    if (inWindow) this.focusFirstPanelControl(panel);
-    else
+    if (!inWindow) {
       panel
         .querySelector("#sessions-panel-close")
         ?.focus({ preventScroll: true });
+      return;
+    }
+    // Park focus on Refresh while the list loads, then move it to the first
+    // row (or New session for an empty list) unless the user moved it.
+    const parked = panel.querySelector("#sessions-refresh-btn");
+    parked?.focus({ preventScroll: true });
+    const listState = await refreshed;
+    this.focusSessionsWindowAfterRender(panel, listState, parked);
+  }
+
+  focusSessionsWindowAfterRender(panel, listState, parked) {
+    if (panel.classList.contains("hidden")) return;
+    // "Open here" rows create a terminal on Enter; never land on one.
+    const safeRow = panel.querySelector(
+      '#sessions-list .session-row:not([data-row-action="open-here"])',
+    );
+    const target = window.SurfaceWindows?.planSessionsWindowFocus?.({
+      listState,
+      focusUnchanged: Boolean(parked) && document.activeElement === parked,
+      hasSafeRow: Boolean(safeRow),
+    });
+    const el =
+      target === "row"
+        ? safeRow
+        : target === "new"
+          ? panel.querySelector("#sessions-new-btn")
+          : null;
+    el?.focus({ preventScroll: true });
   }
 
   toggleSessionsPanel() {
@@ -7771,7 +7798,11 @@ class TerminalManager {
     if (plan === "close") this.closeSessionsPanel();
     else if (plan === "front") {
       this.surfaceWindowManager?.bringToFront("sessions");
-      this.focusFirstPanelControl(panel);
+      const row = panel.querySelector(
+        '#sessions-list .session-row:not([data-row-action="open-here"])',
+      );
+      if (row) row.focus({ preventScroll: true });
+      else panel.querySelector("#sessions-refresh-btn")?.focus();
     } else void this.openSessionsPanel();
   }
 
@@ -7837,7 +7868,7 @@ class TerminalManager {
       this.updateSessionsAvailableBadge(sessions);
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
-        return;
+        return "empty";
       }
       const esc = (v) => (this.escapeHtml ? this.escapeHtml(v) : v);
       const signals = window.TaskSignals;
@@ -7905,7 +7936,7 @@ class TerminalManager {
           ]
             .filter(Boolean)
             .join(" · ");
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
           <div class="session-row-main">
             <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> <span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
@@ -7918,8 +7949,10 @@ class TerminalManager {
         })
         .join("");
       this.updateSessionTerminationCountdowns();
+      return "rows";
     } catch (err) {
       list.innerHTML = `<div class='task-item'>Failed to load sessions: ${err.message}</div>`;
+      return "error";
     }
   }
 

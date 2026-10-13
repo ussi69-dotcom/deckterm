@@ -205,7 +205,7 @@ const OVERLAY_SURFACE_WINDOWS = Object.freeze({
   sessions: Object.freeze({
     title: "Sessions",
     icon: "❐",
-    bounds: Object.freeze({ x: 3, y: 4, width: 34, height: 60 }),
+    bounds: Object.freeze({ x: 3, y: 4, width: 34, height: 44 }),
     minWidthPx: 380,
     minHeightPx: 260,
   }),
@@ -235,6 +235,25 @@ function planSurfaceOpenCloses(id, { windowed = false } = {}) {
 // A toolbar toggle for a surface: closed → open; open and on top → close;
 // open but buried under other windows → bring it to the front first. Sheets
 // have no z-order (frontmost undefined), so an open sheet just closes.
+// Where focus goes once the Sessions window's list has rendered. open()
+// parks focus on the harmless Refresh button while the list loads (Enter
+// right after opening must never create a terminal); after the first render
+// focus moves to the first row (its Focus/Attach/Restore action), or to New
+// session when there are no sessions — but only if the user has not moved
+// focus meanwhile. "Safe" rows are Focus/Attach/Restore; an "Open here" row
+// creates a terminal, so with only those focus stays on Refresh, as it does
+// after a failed load.
+function planSessionsWindowFocus({
+  listState,
+  focusUnchanged,
+  hasSafeRow = true,
+} = {}) {
+  if (!focusUnchanged) return null;
+  if (listState === "rows") return hasSafeRow ? "row" : null;
+  if (listState === "empty") return "new";
+  return null;
+}
+
 function planSurfaceToggle({ open = false, frontmost } = {}) {
   if (!open) return "open";
   if (frontmost === false) return "front";
@@ -721,6 +740,7 @@ const SurfaceWindows = {
   OVERLAY_SURFACE_WINDOWS,
   planSurfaceOpenCloses,
   planSurfaceToggle,
+  planSessionsWindowFocus,
   DOCK_DEFAULT_HEIGHT_PCT,
   SURFACE_WINDOW_LAYOUT_SETTINGS_KEY,
   SURFACE_WINDOW_SNAP_THRESHOLD_PCT,
