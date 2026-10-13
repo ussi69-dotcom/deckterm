@@ -2532,29 +2532,22 @@ class ExtraKeysManager {
     }
   }
 
-  loadVisibilityState() {
-    // Mobile respects the same persisted terminal.extraKeysVisible pref as
-    // desktop (bug: extra-keys-visibility-pref-ignored-on-mobile) — but its
-    // OWN default is visible=true (an on-screen keyboard row a mobile user
-    // can't otherwise get to), unlike the desktop schema default of hidden.
-    // Read the raw store value with that mobile-specific fallback instead of
-    // going through the schema default (false), which is desktop-oriented.
-    if (platformDetector.isMobile) {
-      return Boolean(
-        this.tm?.settingsStore?.get("terminal.extraKeysVisible", true) ?? true,
-      );
-    }
+  // Phones/tablets (platformDetector.isMobile) and desktops remember the bar
+  // separately (extra-keys-visibility.js): desktop reads
+  // terminal.extraKeysVisible (default hidden), touch reads
+  // terminal.extraKeysVisibleTouch (default visible). Neither falls back to
+  // the other's value, so a choice made on the phone never changes desktop.
+  getVisibilityDeviceClass() {
+    return platformDetector.isMobile ? "touch" : "desktop";
+  }
 
-    // On desktop, read the canonical terminal.extraKeysVisible from the store
-    // (schema default: hidden). No legacy localStorage read — migration owns it.
-    const defaults =
-      window.SettingsSchema?.defaultsOf?.(
-        window.SettingsSchema.SETTINGS_SCHEMA,
-      ) || {};
-    const fallback = Boolean(defaults["terminal.extraKeysVisible"]);
-    return Boolean(
-      this.tm?.settingsStore?.get("terminal.extraKeysVisible", fallback) ??
-      fallback,
+  loadVisibilityState() {
+    const deviceClass = this.getVisibilityDeviceClass();
+    return (
+      window.ExtraKeysVisibility?.readVisible?.(
+        this.tm?.settingsStore,
+        deviceClass,
+      ) ?? deviceClass === "touch"
     );
   }
 
@@ -2571,19 +2564,18 @@ class ExtraKeysManager {
   }
 
   setVisible(visible) {
-    // Persist through the settings runtime/store; the side effect applies it.
-    // Both platforms route through the same terminal.extraKeysVisible pref
-    // now (bug: extra-keys-visibility-pref-ignored-on-mobile) — only the
-    // DEFAULT differs by platform (see loadVisibilityState).
-    if (this.tm?.settingsRuntime) {
-      this.tm.settingsRuntime.apply(
-        "terminal.extraKeysVisible",
-        Boolean(visible),
-      );
-      return;
-    }
-    this.applyVisibility(visible);
-    this.tm?.settingsStore?.set("terminal.extraKeysVisible", this.visible);
+    // Persist under THIS device's key only (desktop vs touch); with a
+    // settings runtime the side effect then applies it.
+    const runtime = this.tm?.settingsRuntime || null;
+    window.ExtraKeysVisibility?.persistVisible?.(
+      {
+        runtime,
+        store: this.tm?.settingsStore,
+        deviceClass: this.getVisibilityDeviceClass(),
+      },
+      visible,
+    );
+    if (!runtime) this.applyVisibility(visible);
   }
 
   toggle() {
@@ -5452,7 +5444,6 @@ class SettingsManager {
     this.fetchImpl =
       fetchImpl ||
       (typeof fetch === "function" ? fetch.bind(globalThis) : null);
-    this.schema = window.SettingsSchema?.SETTINGS_SCHEMA || [];
     this.ui = window.SettingsUI || null;
     this.activeCategory = null;
     this.query = "";
@@ -5466,6 +5457,17 @@ class SettingsManager {
     this.usersAdminVisible = false;
     this.usersAdminCurrentUser = null;
     this.usersAdminController = null;
+  }
+
+  // The schema as this device sees it: per-device settings (the extra-keys
+  // bar) show only the current device class's entry, so the one "Show extra
+  // keys bar" toggle edits this phone's/desktop's own value. Read on every
+  // render because platformDetector.isMobile can change with the viewport.
+  get schema() {
+    const all = window.SettingsSchema?.SETTINGS_SCHEMA || [];
+    const forDevice = window.SettingsSchema?.schemaForDevice;
+    if (!forDevice) return all;
+    return forDevice(all, platformDetector.isMobile ? "touch" : "desktop");
   }
 
   // Build (once) the detached content element the SurfaceWindow will host.
@@ -8229,8 +8231,11 @@ class TerminalManager {
         "terminal.wrapLines": (value) => this.applyWrapLines(value),
         "terminal.autoCopy": (value) =>
           this.clipboardManager?.applyAutoCopy(value),
-        "terminal.extraKeysVisible": (value) =>
-          this.applyExtraKeysVisible(value),
+        // terminal.extraKeysVisible (desktop) and
+        // terminal.extraKeysVisibleTouch (phones/tablets): each only acts on
+        // its own device class, so applyAll() never hides a phone's bar via
+        // the desktop default (nor shows a desktop's via the touch default).
+        ...this.createExtraKeysVisibilitySideEffects(),
         "tasks.view": (value) => this.applyTaskView(value),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
@@ -8367,26 +8372,20 @@ class TerminalManager {
     document.documentElement.style.setProperty("--color-accent", color);
   }
 
-  // Side effect for terminal.extraKeysVisible (value coerced to bool).
-  // Delegates to ExtraKeysManager without re-persisting. Fires from both an
-  // explicit toggle (settingsRuntime.apply — value is already persisted) AND
-  // the startup settingsRuntime.applyAll() sweep, which resolves an UNSET key
-  // to the schema default (false, desktop-oriented). Mobile's own default is
-  // true (see ExtraKeysManager.loadVisibilityState) — so on mobile, only
-  // apply when the key is actually persisted; otherwise leave whatever
-  // loadVisibilityState() already resolved synchronously untouched, instead
-  // of letting the schema default clobber it to hidden on a fresh session.
-  applyExtraKeysVisible(visible) {
-    if (!this.extraKeys) return;
-    if (platformDetector.isMobile) {
-      const UNSET = Symbol("unset");
-      const persisted = this.settingsStore?.get(
-        "terminal.extraKeysVisible",
-        UNSET,
-      );
-      if (persisted === UNSET) return;
-    }
-    this.extraKeys.applyVisibility(Boolean(visible));
+  // Side effects for the per-device extra-keys visibility keys (values
+  // coerced to bool). Delegates to ExtraKeysManager without re-persisting.
+  // They fire from an explicit toggle (settingsRuntime.apply — the value is
+  // already persisted) AND from the startup applyAll() sweep, which resolves
+  // an UNSET key to its schema default: hidden for desktop, visible for touch.
+  // A key only acts on its own device class (see extra-keys-visibility.js).
+  createExtraKeysVisibilitySideEffects() {
+    return (
+      window.ExtraKeysVisibility?.createSideEffects?.({
+        getDeviceClass: () => (platformDetector.isMobile ? "touch" : "desktop"),
+        applyVisibility: (visible) =>
+          this.extraKeys?.applyVisibility(Boolean(visible)),
+      }) || {}
+    );
   }
 
   // Side effect for files.defaultCwd. A path value used purely as a navigation
