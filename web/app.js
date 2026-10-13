@@ -10846,6 +10846,7 @@ class TerminalManager {
         id: "compose-message",
         title: "Compose message…",
         group: "Actions",
+        icon: "message-square-text",
         keywords: ["compose", "write", "message", "prompt", "send", "dictate"],
         priority: 35,
         run: () => this.openComposeSheet(),
