@@ -204,7 +204,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await createProc.exited;
 
     await this.hideStatusBar(sessionName);
-    await this.ensureHistoryLimit();
+    await this.ensureServerOptions();
     await this.resize(sessionName, cols, rows);
     const { pipePath, pipeOffset } = await this.ensurePipeCapture(sessionName);
 
@@ -611,18 +611,32 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await hideStatusProc.exited;
   }
 
-  // tmux's default history-limit (2000 lines) is far below the frontend's
-  // xterm.js scrollback (10000, see web/app.js) and gets exhausted within a
-  // single long-lived agent session, silently evicting old output (including
-  // completed Codex/Claude responses) long before the alt-screen fix's
-  // failure mode ever triggers. -g applies server-wide, so this is a no-op
-  // once set but safe to repeat on every session create.
-  private async ensureHistoryLimit(): Promise<void> {
+  // Server-wide options DeckTerm depends on. -g applies server-wide, so this
+  // is a no-op once set but safe to repeat on every session create.
+  // - history-limit: tmux's default (2000 lines) is far below the frontend's
+  //   xterm.js scrollback (10000, see web/app.js) and gets exhausted within a
+  //   single long-lived agent session, silently evicting old output
+  //   (including completed Codex/Claude responses).
+  // - mouse off: tmux 3.8 turned mouse on by default, which sends wheel and
+  //   drag to tmux copy mode instead of DeckTerm's own scrollback/selection.
+  // - theme terminal: tmux 3.8 re-colours its own UI by default; -q keeps
+  //   tmux < 3.8 (no such option) quiet. Last in the chain on purpose.
+  private async ensureServerOptions(): Promise<void> {
     const proc = await this.spawnTmux([
       "set-option",
       "-g",
       "history-limit",
       "10000",
+      ";",
+      "set-option",
+      "-g",
+      "mouse",
+      "off",
+      ";",
+      "set-option",
+      "-gq",
+      "theme",
+      "terminal",
     ]);
     await proc.exited;
   }
