@@ -37,6 +37,11 @@ function prepareAction(action, order) {
       typeof action.keybinding === "string" && action.keybinding
         ? action.keybinding
         : null,
+    // One plain line on what the action does; shown muted under/after the title.
+    description:
+      typeof action.description === "string" && action.description.trim()
+        ? action.description.trim()
+        : null,
     priority: Number.isFinite(action.priority) ? action.priority : 0,
     order,
     run: action.run,
@@ -149,6 +154,7 @@ class ActionRegistry {
         meta: action.meta,
         icon: action.icon,
         keybinding: action.keybinding,
+        description: action.description,
         priority: action.priority,
         run: action.run,
       }));

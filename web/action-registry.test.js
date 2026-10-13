@@ -128,3 +128,21 @@ test("passes icon and keybinding display metadata through to results", () => {
   expect(second.icon).toBeNull();
   expect(second.keybinding).toBeNull();
 });
+
+test("passes a one-line description through to results", () => {
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "open-tasks",
+    title: "Open Tasks",
+    group: "Actions",
+    description: "  Give an agent a job  ",
+    run: () => {},
+  });
+  registry.register({ id: "plain", title: "Plain", run: () => {} });
+
+  const results = registry.getResults("");
+  expect(results.find((r) => r.id === "open-tasks").description).toBe(
+    "Give an agent a job",
+  );
+  expect(results.find((r) => r.id === "plain").description).toBeNull();
+});

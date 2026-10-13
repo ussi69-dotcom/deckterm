@@ -515,3 +515,78 @@ test("getHighlightQuery strips the session and saved-command prefixes", () => {
   expect(getHighlightQuery("$logs")).toBe("logs");
   expect(getHighlightQuery(" git ")).toBe("git");
 });
+
+test("rows show the action description as muted secondary text", () => {
+  const dom = createPaletteDom();
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "open-tasks",
+    title: "Open Tasks",
+    group: "Actions",
+    description: "Give an agent a job",
+    run: () => {},
+  });
+  registry.register({
+    id: "plain",
+    title: "Plain",
+    group: "Actions",
+    run: () => {},
+  });
+  registry.register({
+    id: "with-meta",
+    title: "With Meta",
+    group: "Actions",
+    description: "Never shown next to meta",
+    meta: ["Visible"],
+    run: () => {},
+  });
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry,
+    renderIcons: null,
+  });
+  controller.open();
+
+  const rows = dom.results.querySelectorAll(".command-palette-item");
+  const byId = (id) => rows.find((row) => row.dataset.actionId === id);
+  const described = byId("open-tasks");
+  const detail = described.querySelector(".command-palette-item-detail");
+  expect(detail.textContent).toBe("Give an agent a job");
+  expect(detail.className).toContain("command-palette-item-description");
+  expect(detail.title).toBe("Give an agent a job");
+  expect(
+    described.querySelector(".command-palette-item-text").className,
+  ).toContain("has-description");
+  expect(byId("plain").querySelector(".command-palette-item-detail")).toBeNull();
+  // Context in meta (a path, a branch, a state) wins over the description.
+  expect(
+    byId("with-meta").querySelector(".command-palette-item-detail").textContent,
+  ).toBe("Visible");
+});
+
+test("the description does not disturb title match highlighting", () => {
+  const dom = createPaletteDom();
+  const registry = new ActionRegistry();
+  registry.register({
+    id: "open-git",
+    title: "Open Git",
+    group: "Actions",
+    description: "Review changes and commit",
+    run: () => {},
+  });
+  const controller = new CommandPaletteController({
+    ...dom,
+    registry,
+    renderIcons: null,
+  });
+  controller.open();
+  controller.setQuery("git");
+  const title = dom.results.querySelector(".command-palette-item-title");
+  expect(title.children.map((child) => child.tagName)).toEqual([
+    "SPAN",
+    "MARK",
+  ]);
+  const detail = dom.results.querySelector(".command-palette-item-detail");
+  expect(detail.children.length).toBe(0);
+  expect(detail.textContent).toBe("Review changes and commit");
+});
