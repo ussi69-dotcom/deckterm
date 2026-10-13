@@ -119,6 +119,8 @@ The owner accepted every recommendation above:
 The owner also said they had never used Compose, Tasks or the command palette and did not know what
 they are for, so the 2026-10-13 follow-up adds one-line descriptions to every action (tooltips, palette,
 More sheet), a "What's what" section in Help and short tips on the empty-workspace launcher.
+A live look at dev also showed that turning the extra-keys bar on with a phone showed it on the desktop
+too (one setting per account); phones/tablets and desktop now remember it separately.
 
 ## Follow-ups noticed
 
