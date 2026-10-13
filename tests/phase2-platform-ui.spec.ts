@@ -5,6 +5,8 @@
  * - Desktop: extra keys hidden by default, toggle via More or Ctrl+.
  * - Desktop: state persists in the canonical actor-scoped settings store
  * - Mobile: extra keys visible by default and row expansion still works
+ * - Desktop (terminal.extraKeysVisible) and phones/tablets
+ *   (terminal.extraKeysVisibleTouch) remember the bar separately
  */
 
 import type { Page } from "@playwright/test";
@@ -101,6 +103,14 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
         ),
       );
       expect(savedState).toBe(true);
+      // A desktop toggle never writes the phone/tablet key.
+      const touchState = await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.get(
+          "terminal.extraKeysVisibleTouch",
+          "unset",
+        ),
+      );
+      expect(touchState).toBe("unset");
       await page.evaluate(() =>
         (window as any).terminalManager.settingsStore.flush(),
       );
@@ -153,6 +163,47 @@ test.describe("Phase 2: Platform-Adaptive UI", () => {
 
     test("extra keys visible on mobile by default", async ({ page }) => {
       await expect(page.locator("#extra-keys")).toBeVisible();
+    });
+
+    test("visible on mobile even when desktop stored hidden", async ({
+      page,
+    }) => {
+      // The desktop key is per-device: a stored desktop "hidden" must not
+      // hide the bar on a phone (no fallback to the desktop key).
+      await page.evaluate(async () => {
+        const store = (window as any).terminalManager.settingsStore;
+        store.set("terminal.extraKeysVisible", false);
+        await store.flush();
+      });
+      await page.reload();
+      await waitForTerminal(page);
+      await expect(page.locator("#extra-keys")).toBeVisible();
+    });
+
+    test("hiding on mobile writes only the touch key and survives reload", async ({
+      page,
+    }) => {
+      const extraKeys = page.locator("#extra-keys");
+      await expect(extraKeys).toBeVisible();
+
+      await toggleExtraKeysFromMore(page);
+      await expect(extraKeys).toHaveClass(/\bhidden\b/);
+
+      const saved = await page.evaluate(() => {
+        const store = (window as any).terminalManager.settingsStore;
+        return {
+          touch: store.get("terminal.extraKeysVisibleTouch", "unset"),
+          desktop: store.get("terminal.extraKeysVisible", "unset"),
+        };
+      });
+      expect(saved).toEqual({ touch: false, desktop: "unset" });
+      await page.evaluate(() =>
+        (window as any).terminalManager.settingsStore.flush(),
+      );
+
+      await page.reload();
+      await waitForTerminal(page);
+      await expect(extraKeys).toHaveClass(/\bhidden\b/);
     });
 
     test("More still lists Extra Keys as a secondary action on mobile", async ({
