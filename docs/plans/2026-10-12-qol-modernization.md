@@ -104,6 +104,22 @@ session).
 | WebGL glyphs drawn too large at device scale factor 2–3 | Seen only in headless emulation; check on a real phone. |
 | Short commands (< about 2 s) may not show "running" or a completion alert under tmux | Accepted trade-off of the 2 s sync cache. |
 
+## Owner decisions (2026-10-13)
+
+The owner accepted every recommendation above:
+
+- xterm.js 6: later, as its own slice, after the tmux upgrade.
+- tmux 3.8: yes, as its own planned action — [2026-10-13-tmux-3.8-upgrade.md](./2026-10-13-tmux-3.8-upgrade.md).
+- Approving agent prompts from a push notification: no. Push text stays generic.
+- Product shape: Setup and Sessions become desktop windows first (built 2026-10-13 on dev).
+- WebGL glyph size at device scale factor 2–3: the owner checks on a real device.
+- Production `idle-timeout.conf` drop-in: remove at the next production promotion.
+- Promotion: after a day or two of use on dev, through a `dev` → `main` pull request.
+
+The owner also said they had never used Compose, Tasks or the command palette and did not know what
+they are for, so the 2026-10-13 follow-up adds one-line descriptions to every action (tooltips, palette,
+More sheet), a "What's what" section in Help and short tips on the empty-workspace launcher.
+
 ## Follow-ups noticed
 
 - Production still runs the `deckterm.service.d/idle-timeout.conf` drop-in (24 h idle / 72 h detached
