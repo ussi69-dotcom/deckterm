@@ -295,12 +295,15 @@ for (const device of [
       // Type through the real client path (helper textarea -> xterm onData
       // -> socket sendInput), not a raw socket message. The arithmetic only
       // prints 42 when the shell really ran the line, so keys eaten by tmux
-      // copy-mode cannot pass.
+      // copy-mode cannot pass. Lowercase and no space (${IFS}): under
+      // Chromium's mobile emulation page.keyboard.type sends uppercase
+      // letters and the space twice on this path, which is not what this
+      // test is about (the focus spec types lowercase for the same reason).
       await page
         .locator(".tile.active .xterm-helper-textarea")
         .first()
         .focus();
-      await page.keyboard.type("echo M0TYPE_$((6*7))");
+      await page.keyboard.type("echo${IFS}m0type_$((6*7))");
       await page.keyboard.press("Enter");
 
       await expect(latestPill(page)).toBeHidden({ timeout: 5000 });
@@ -309,7 +312,7 @@ for (const device of [
         .poll(async () => (await visibleRows(page)).join("\n"), {
           timeout: 10000,
         })
-        .toContain("M0TYPE_42");
+        .toContain("m0type_42");
     });
 
     test("a mouse app gets wheel reports and less scrolls on a drag", async ({
