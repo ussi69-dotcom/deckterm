@@ -22,6 +22,33 @@
   // exit. Ignore them until the server confirms or this grace runs out.
   const EXIT_GRACE_MS = 1500;
 
+  // A "terminal reply" is input the browser terminal generates by itself in
+  // answer to pane output, not user typing: cursor position reports
+  // (ESC [ n ; n R), device attribute replies (ESC [ ? ... c, ESC [ > ... c),
+  // status reports (ESC [ 0 n, ESC [ 3 n), focus reports (ESC [ I, ESC [ O),
+  // OSC replies (ESC ] ... BEL or ESC \) and DCS replies (ESC P ... ESC \),
+  // or any run made only of these. A reply must never pull a reader out of
+  // the history. The server uses the same definition for its input barrier.
+  const TERMINAL_REPLY_RE =
+    /^(?:\x1b\[\d+;\d+R|\x1b\[\?[\d;]*c|\x1b\[>[\d;]*c|\x1b\[[03]n|\x1b\[[IO]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\)+$/;
+
+  function isTerminalReply(data) {
+    return (
+      typeof data === "string" &&
+      data.length > 0 &&
+      TERMINAL_REPLY_RE.test(data)
+    );
+  }
+
+  // Whether input `data` must first take the pane back to the latest output:
+  // the pane is (or may be) scrolled back and the input is real typing.
+  function shouldLeaveScrollbackForInput(state, data) {
+    if (!state || !state.maybeScrolledBack) return false;
+    return (
+      typeof data === "string" && data.length > 0 && !isTerminalReply(data)
+    );
+  }
+
   const nonNegativeInt = (value) =>
     Number.isFinite(value) && value >= 0 ? Math.floor(value) : null;
 
@@ -64,12 +91,22 @@
       mouseApp: false,
     };
     let exitPendingSince = null;
+    // A touch-scroll or scroll-to was sent after the last frame that said
+    // inMode=false: tmux may already be in copy-mode although no frame has
+    // said so yet.
+    let scrollRequested = false;
 
     const snapshot = () => ({ ...current });
 
     return {
       get inMode() {
         return current.inMode;
+      },
+
+      // Scrolled back as far as the page knows: a frame said so, or a scroll
+      // request went out that no inMode=false frame has answered yet.
+      get maybeScrolledBack() {
+        return current.inMode || scrollRequested;
       },
 
       snapshot,
@@ -89,6 +126,7 @@
         }
         const { seq: _seq, ...state } = next;
         current = state;
+        if (!state.inMode) scrollRequested = false;
         return snapshot();
       },
 
@@ -101,12 +139,16 @@
       markLeft() {
         current = { ...current, inMode: false, position: 0 };
         exitPendingSince = now();
+        scrollRequested = false;
         return snapshot();
       },
 
       // The user scrolls again: frames saying inMode are wanted once more.
-      markScrollIntent() {
+      // `mayEnter` is false for a request that can only leave scrollback
+      // (scroll-to 0); anything else may put the pane into copy-mode.
+      markScrollIntent({ mayEnter = true } = {}) {
         exitPendingSince = null;
+        if (mayEnter) scrollRequested = true;
       },
     };
   }
@@ -216,6 +258,8 @@
     MIN_HANDLE_PX,
     SCROLL_TO_INTERVAL_MS,
     EXIT_GRACE_MS,
+    isTerminalReply,
+    shouldLeaveScrollbackForInput,
     normalizeScrollPositionFrame,
     createScrollPositionState,
     computeIndicatorGeometry,

@@ -6,6 +6,7 @@ import {
   directionForLines,
   cellFromPoint,
   takeTouchScrollMessage,
+  createTouchScrollPump,
 } from "./touch-scroll.js";
 
 const sumLines = (results) =>
@@ -229,4 +230,149 @@ test("takeTouchScrollMessage caps at 100 lines and carries the rest", () => {
     message: null,
     rest: 0,
   });
+});
+
+// ── pump: frames, momentum and halt ──────────────────────────────────────
+
+function fakeFrames() {
+  let nextId = 1;
+  const queued = new Map();
+  return {
+    requestFrame: (fn) => {
+      const id = nextId++;
+      queued.set(id, fn);
+      return id;
+    },
+    cancelFrame: (id) => queued.delete(id),
+    get size() {
+      return queued.size;
+    },
+    // Run every callback queued before this call (one animation frame).
+    tick() {
+      const due = [...queued.entries()];
+      queued.clear();
+      for (const [, fn] of due) fn();
+    },
+  };
+}
+
+function makePump({ cell = { col: 3, row: 4 } } = {}) {
+  const frames = fakeFrames();
+  const sent = [];
+  let clock = 0;
+  const tracker = createTouchScrollTracker();
+  const pump = createTouchScrollPump({
+    tracker,
+    send: (message) => sent.push(message),
+    getCell: () => cell,
+    requestFrame: frames.requestFrame,
+    cancelFrame: frames.cancelFrame,
+    now: () => clock,
+  });
+  return {
+    pump,
+    tracker,
+    frames,
+    sent,
+    setClock: (t) => {
+      clock = t;
+    },
+  };
+}
+
+// A fast downward fling (finger down = older output = "up").
+function fling(tracker) {
+  tracker.start({ x: 0, y: 0, t: 0, rowHeight: 10 });
+  for (let i = 1; i <= 6; i++) tracker.move({ x: 0, y: i * 40, t: i * 16 });
+  return tracker.end({ t: 6 * 16 });
+}
+
+test("lines queued in one frame go out as one message", () => {
+  const { pump, frames, sent } = makePump();
+  pump.queue(2);
+  pump.queue(3);
+  expect(sent).toEqual([]);
+  expect(frames.size).toBe(1);
+  frames.tick();
+  expect(sent).toEqual([
+    { type: "touch-scroll", direction: "up", lines: 5, col: 3, row: 4 },
+  ]);
+  expect(pump.isBusy()).toBe(false);
+});
+
+test("more than 100 lines spill into the next frame", () => {
+  const { pump, frames, sent } = makePump({ cell: null });
+  pump.queue(-130);
+  frames.tick();
+  frames.tick();
+  expect(sent).toEqual([
+    { type: "touch-scroll", direction: "down", lines: 100 },
+    { type: "touch-scroll", direction: "down", lines: 30 },
+  ]);
+});
+
+test("momentum keeps sending lines frame by frame until it stops", () => {
+  const { pump, tracker, frames, sent, setClock } = makePump();
+  expect(fling(tracker).momentum).toBe(true);
+  setClock(96);
+  pump.startMomentum();
+  for (let i = 1; i <= 200 && frames.size > 0; i++) {
+    setClock(96 + i * 16);
+    frames.tick();
+  }
+  expect(sent.length).toBeGreaterThan(3);
+  expect(sent.every((m) => m.direction === "up")).toBe(true);
+  expect(tracker.isMomentumActive()).toBe(false);
+  expect(pump.isBusy()).toBe(false);
+});
+
+test("halt stops the fling, drops unsent lines and cancels the flush frame", () => {
+  const { pump, tracker, frames, sent, setClock } = makePump();
+  fling(tracker);
+  setClock(96);
+  pump.startMomentum();
+  setClock(112);
+  frames.tick(); // momentum step queues lines and a flush
+  setClock(128);
+  frames.tick(); // flush sends, momentum continues
+  const before = sent.length;
+  expect(before).toBeGreaterThan(0);
+  pump.queue(7); // lines waiting for the next flush
+  expect(pump.pendingLines).not.toBe(0);
+
+  pump.halt();
+  expect(pump.pendingLines).toBe(0);
+  expect(pump.isBusy()).toBe(false);
+  expect(tracker.isMomentumActive()).toBe(false);
+  expect(frames.size).toBe(0);
+  for (let i = 0; i < 20; i++) {
+    setClock(144 + i * 16);
+    frames.tick();
+  }
+  // Nothing goes out after the halt: no late batch re-enters the history.
+  expect(sent.length).toBe(before);
+});
+
+test("halt is safe when nothing is running, and the pump works again after it", () => {
+  const { pump, frames, sent } = makePump();
+  pump.halt();
+  pump.halt();
+  pump.queue(1);
+  frames.tick();
+  expect(sent).toHaveLength(1);
+});
+
+test("stopMomentum alone (new touch) keeps lines already queued", () => {
+  const { pump, tracker, frames, sent, setClock } = makePump();
+  fling(tracker);
+  setClock(96);
+  pump.startMomentum();
+  pump.queue(4);
+  pump.stopMomentum();
+  setClock(112);
+  frames.tick();
+  expect(sent).toEqual([
+    { type: "touch-scroll", direction: "up", lines: 4, col: 3, row: 4 },
+  ]);
+  expect(tracker.isMomentumActive()).toBe(false);
 });

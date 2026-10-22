@@ -178,6 +178,57 @@ async function openSimulatedKeyboard(
   await settle(page);
 }
 
+// A one-finger drag as real touch input (CDP; Playwright's touchscreen only
+// taps). dy > 0 moves the finger down, which brings older output into view.
+async function touchDrag(
+  page: Page,
+  from: { x: number; y: number },
+  dy: number,
+  steps = 12,
+) {
+  const cdp = await page.context().newCDPSession(page);
+  const point = (x: number, y: number) => [
+    { x: Math.round(x), y: Math.round(y), id: 1, radiusX: 1, radiusY: 1, force: 1 },
+  ];
+  try {
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchStart",
+      touchPoints: point(from.x, from.y),
+    });
+    for (let i = 1; i <= steps; i++) {
+      await cdp.send("Input.dispatchTouchEvent", {
+        type: "touchMove",
+        touchPoints: point(from.x, from.y + (dy * i) / steps),
+      });
+      await page.waitForTimeout(16);
+    }
+    // Rest before lifting: no fling.
+    await page.waitForTimeout(150);
+    await cdp.send("Input.dispatchTouchEvent", {
+      type: "touchEnd",
+      touchPoints: [],
+    });
+  } finally {
+    await cdp.detach().catch(() => {});
+  }
+}
+
+// The rows of the active terminal that are on screen (not the whole buffer,
+// which can hold stale rows from earlier screens).
+async function visibleRows(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const tm = (window as any).terminalManager;
+    const t = tm?.terminals?.get?.(tm?.activeId)?.terminal;
+    if (!t) return [];
+    const buf = t.buffer.active;
+    const rows: string[] = [];
+    for (let i = buf.viewportY; i < buf.viewportY + t.rows; i++) {
+      rows.push(buf.getLine(i)?.translateToString(true) || "");
+    }
+    return rows;
+  });
+}
+
 async function typedTextReached(page: Page, marker: string) {
   await expect
     .poll(async () => (await readActiveTerminalText(page)).replace(/\n/g, ""), {
@@ -504,22 +555,32 @@ for (const device of [
         const tm = (window as any).terminalManager;
         tm.terminals
           .get(tm.activeId)
-          .ws.send(JSON.stringify({ type: "input", data: "seq 1 300\r" }));
+          .ws.send(JSON.stringify({ type: "input", data: "clear; seq 1 300\r" }));
       });
       await expect
-        .poll(() => readActiveTerminalText(page), { timeout: 15000 })
+        .poll(async () => (await visibleRows(page)).map((r) => r.trim()), {
+          timeout: 15000,
+        })
         .toContain("300");
-      await page.evaluate(() => {
-        const tm = (window as any).terminalManager;
-        tm.terminals
-          .get(tm.activeId)
-          .ws.send(
-            JSON.stringify({ type: "scrollback", direction: "up", lines: 20 }),
-          );
-      });
-      // tmux draws its copy-mode position marker "[n/m]" on the first row.
+      await blurActiveElement(page);
+
+      // Enter the history the way a phone user does: a finger drag down.
+      const box = await page
+        .locator(".tile.active .xterm-screen:visible")
+        .first()
+        .boundingBox();
+      if (!box) throw new Error("active terminal screen has no box");
+      await touchDrag(
+        page,
+        { x: box.x + box.width * 0.4, y: box.y + box.height * 0.2 },
+        box.height * 0.6,
+      );
+      const indicator = page.locator(".tile.active .touch-scroll-indicator");
+      // Scrolled back = the server says so (indicator) and tmux draws its
+      // copy-mode position marker "[n/m]" in a row that is on screen.
       const inCopyMode = async () =>
-        /\[\d+\/\d+\]/.test(await readActiveTerminalText(page));
+        (await indicator.isVisible()) &&
+        (await visibleRows(page)).some((row) => /\[\d+\/\d+\]/.test(row));
       await expect.poll(inCopyMode, { timeout: 10000 }).toBe(true);
 
       await openSimulatedKeyboard(page, full);

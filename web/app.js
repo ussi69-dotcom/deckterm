@@ -868,7 +868,7 @@ class ReconnectingWebSocket {
       this.ws?.readyState === WebSocket.OPEN &&
       !(queue && queue.length > 0);
     if (canSendNow || !queue) {
-      this.leaveScrollbackBeforeInput();
+      this.leaveScrollbackBeforeInput(this.ws, data);
       return this.send(JSON.stringify({ type: "input", data }));
     }
     if (this.intentionallyClosed) return false;
@@ -890,35 +890,58 @@ class ReconnectingWebSocket {
     this.clearQueuedInputExpiry();
     const { items, dropped } = queue.drain();
     if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
-    if (items.length > 0) this.leaveScrollbackBeforeInput(socket);
     for (const data of items) {
+      // Terminal replies queued ahead of the first real keystroke go out
+      // as they are; the first keystroke leaves scrollback first.
+      this.leaveScrollbackBeforeInput(socket, data);
       socket.send(JSON.stringify({ type: "input", data }));
     }
   }
 
   // Keys typed into a pane that is scrolled back would be eaten by tmux
-  // copy-mode. When the last known state says the pane is scrolled back, ask
-  // the server to return to the latest output first; it writes the input
-  // that follows only after that exit finished, so nothing is reordered.
-  leaveScrollbackBeforeInput(socket = this.ws) {
-    if (!this.scrollState?.inMode) return;
-    if (socket?.readyState !== WebSocket.OPEN) return;
+  // copy-mode. When the pane is or may be scrolled back (a frame said so, or
+  // a touch-scroll / scroll-to went out that no inMode=false frame has
+  // answered yet), stop any touch fling and ask the server to return to the
+  // latest output first; it writes the input that follows only after that
+  // exit finished, so nothing is reordered. One scroll-latest per leave:
+  // markLeft() clears the state until the next scroll. Terminal replies
+  // (cursor reports, focus reports, ...) are not typing and never leave.
+  leaveScrollbackBeforeInput(socket = this.ws, data) {
+    const helpers = window.ScrollIndicator;
+    if (!this.scrollState || !helpers) return false;
+    if (helpers.isTerminalReply(data)) return false;
+    // Real typing ends a fling even before it was confirmed by the server.
+    this.callbacks.onHaltTouchScroll?.();
+    if (!helpers.shouldLeaveScrollbackForInput(this.scrollState, data)) {
+      return false;
+    }
+    if (socket?.readyState !== WebSocket.OPEN) return false;
     socket.send(JSON.stringify({ type: "scroll-latest" }));
     this.callbacks.onScrollPosition?.(this.scrollState.markLeft());
+    return true;
   }
 
   // Touch scroll controls (touch-scroll, scroll-to, scroll-latest). Only
   // sent while the socket is open: a scroll gesture is not worth queueing.
+  // A jump (scroll-to, scroll-latest) first stops any touch fling, so a late
+  // touch-scroll batch cannot land after it.
   sendScrollControl(message) {
     if (!message || typeof message.type !== "string") return false;
     if (message.type === "scroll-latest") {
+      this.callbacks.onHaltTouchScroll?.();
       if (!this.send(JSON.stringify({ type: "scroll-latest" }))) return false;
       if (this.scrollState) {
         this.callbacks.onScrollPosition?.(this.scrollState.markLeft());
       }
       return true;
     }
-    this.scrollState?.markScrollIntent();
+    if (message.type === "scroll-to") {
+      this.callbacks.onHaltTouchScroll?.();
+    }
+    // scroll-to 0 can only leave scrollback; anything else may enter it.
+    this.scrollState?.markScrollIntent({
+      mayEnter: !(message.type === "scroll-to" && message.position === 0),
+    });
     return this.send(JSON.stringify(message));
   }
 
@@ -1551,15 +1574,22 @@ class TileManager {
   }
 
   ensureTileVisible(terminalId) {
-    // Mobile tiles are a full-size stack that is always in view; a
-    // scrollIntoView there only panned the page (iOS) under the keyboard.
-    if (this.isMobile) return;
+    // Touch layouts (phones, touch tablets) never scroll here: on a phone
+    // the tile stack is always in view and a scrollIntoView only panned the
+    // page (iOS) under the keyboard. Same test as
+    // TerminalManager.isTouchLayout(). Desktop keeps its smooth scroll.
+    if (
+      platformDetector.isMobile ||
+      (platformDetector.hasTouch && platformDetector.isCoarsePointer)
+    ) {
+      return;
+    }
     const tile = this.tiles.get(terminalId);
     if (!tile || tile.element.style.display === "none") return;
     tile.element.scrollIntoView({
       block: "nearest",
       inline: "nearest",
-      behavior: "auto",
+      behavior: "smooth",
     });
   }
 
@@ -14788,6 +14818,7 @@ class TerminalManager {
       },
       onScrollPosition: (state) =>
         this.terminals.get(id)?.touchScroll?.render(state),
+      onHaltTouchScroll: () => this.terminals.get(id)?.touchScroll?.halt(),
       onInputDropped: () => this.showInputDroppedNotice(id),
       getReconnectBehavior: () => this.reconnectBehavior,
     });
@@ -15388,51 +15419,38 @@ class TerminalManager {
   // from tmux's live pane state (history, wheel reports for a mouse app, or
   // arrow keys for a full-screen app), because the browser's own xterm buffer
   // and mouse-mode state are not reliable under tmux. Pure maths:
-  // web/touch-scroll.js. Returns { render(state), cleanup() } or null.
+  // web/touch-scroll.js. Returns { render(state), halt(), cleanup() } or
+  // null. halt() stops the fling and drops every line not yet sent; the
+  // socket calls it (onHaltTouchScroll) before a jump or before typing leaves
+  // scrollback, and render() calls it when the server says the pane is no
+  // longer scrolled back.
   attachTouchScrollGesture(element, terminalId, { ws, terminal, backendMode }) {
     const TouchScroll = window.TouchScroll;
     if (!TouchScroll || !element || !ws || !terminal) return null;
     if (backendMode !== "tmux" || !this.isTouchLayout()) return null;
 
     const tracker = TouchScroll.createTouchScrollTracker();
+    let cell = null;
+    let lockedVertical = false;
+    const pump = TouchScroll.createTouchScrollPump({
+      tracker,
+      send: (message) => ws.sendScrollControl(message),
+      getCell: () => cell,
+      requestFrame: (fn) => requestAnimationFrame(fn),
+      cancelFrame: (id) => cancelAnimationFrame(id),
+      now: () => performance.now(),
+    });
+    const halt = () => pump.halt();
     const indicator = this.createTouchScrollIndicator(
       element.parentElement,
       ws,
+      { onUserControl: halt },
     );
-    let pendingLines = 0;
-    let cell = null;
-    let flushFrame = 0;
-    let momentumFrame = 0;
-    let lockedVertical = false;
+    const queueLines = (lines) => pump.queue(lines);
+    const stopMomentum = () => pump.stopMomentum();
 
     const screenRect = () =>
       element.querySelector(".xterm-screen")?.getBoundingClientRect() || null;
-    const flush = () => {
-      flushFrame = 0;
-      const { message, rest } = TouchScroll.takeTouchScrollMessage(
-        pendingLines,
-        cell,
-      );
-      pendingLines = rest;
-      if (message) ws.sendScrollControl(message);
-      if (pendingLines) flushFrame = requestAnimationFrame(flush);
-    };
-    const queueLines = (lines) => {
-      if (!lines) return;
-      pendingLines += lines;
-      if (!flushFrame) flushFrame = requestAnimationFrame(flush);
-    };
-    const stopMomentum = () => {
-      tracker.stopMomentum();
-      if (momentumFrame) cancelAnimationFrame(momentumFrame);
-      momentumFrame = 0;
-    };
-    const runMomentum = () => {
-      momentumFrame = 0;
-      const step = tracker.stepMomentum(performance.now());
-      queueLines(step.linesDelta);
-      if (!step.done) momentumFrame = requestAnimationFrame(runMomentum);
-    };
 
     // Capture phase on the wrapper: runs before xterm's own touch handlers on
     // .xterm and before the #terminal-container swipe/pan listeners.
@@ -15488,7 +15506,7 @@ class TerminalManager {
       }
       lockedVertical = false;
       const { momentum } = tracker.end({ t: event.timeStamp });
-      if (momentum) momentumFrame = requestAnimationFrame(runMomentum);
+      if (momentum) pump.startMomentum();
     };
     const onTouchCancel = () => {
       lockedVertical = false;
@@ -15514,11 +15532,16 @@ class TerminalManager {
     });
 
     return {
-      render: (state) => indicator.render(state),
+      render: (state) => {
+        // The pane is back at the latest output (Jump to latest, typing,
+        // tmux leaving copy-mode at the bottom, another viewer): nothing
+        // still in flight may take it back into the history.
+        if (state && !state.inMode) halt();
+        indicator.render(state);
+      },
+      halt,
       cleanup: () => {
-        stopMomentum();
-        if (flushFrame) cancelAnimationFrame(flushFrame);
-        flushFrame = 0;
+        halt();
         element.removeEventListener("touchstart", onTouchStart, true);
         element.removeEventListener("touchmove", onTouchMove, true);
         element.removeEventListener("touchend", onTouchEnd, true);
@@ -15533,7 +15556,7 @@ class TerminalManager {
   // tile while its tmux pane is scrolled back. It sits above the tile's
   // resize edges and keeps its touches to itself, so dragging it never
   // resizes the tile or switches sessions. Geometry: web/scroll-indicator.js.
-  createTouchScrollIndicator(tileElement, ws) {
+  createTouchScrollIndicator(tileElement, ws, { onUserControl } = {}) {
     const helpers = window.ScrollIndicator;
     const root = document.createElement("div");
     root.className = "touch-scroll-indicator";
@@ -15617,10 +15640,16 @@ class TerminalManager {
     for (const type of ["touchstart", "touchmove", "touchend", "pointerdown"]) {
       latest.addEventListener(type, stop, { passive: true });
     }
+    // Touching the pill or the handle ends any fling still running on the
+    // terminal, so it cannot pull the pane back into the history.
+    latest.addEventListener("touchstart", () => onUserControl?.(), {
+      passive: true,
+    });
     // Tapping the pill must not take focus from the terminal (keyboard).
     latest.addEventListener("mousedown", (event) => event.preventDefault());
     latest.addEventListener("click", (event) => {
       event.stopPropagation();
+      onUserControl?.();
       throttle.cancel();
       ws.sendScrollControl({ type: "scroll-latest" });
     });
@@ -15628,6 +15657,7 @@ class TerminalManager {
     handle.addEventListener("pointerdown", (event) => {
       event.stopPropagation();
       event.preventDefault();
+      onUserControl?.();
       const geometry = place(state.position);
       drag = {
         pointerId: event.pointerId,
@@ -16751,6 +16781,8 @@ class TerminalManager {
             this.applyTerminalRuntimeState(id, message),
           onScrollPosition: (state) =>
             this.terminals.get(id)?.touchScroll?.render(state),
+          onHaltTouchScroll: () =>
+            this.terminals.get(id)?.touchScroll?.halt(),
           onInputDropped: () => this.showInputDroppedNotice(id),
           getReconnectBehavior: () => this.reconnectBehavior,
         },
