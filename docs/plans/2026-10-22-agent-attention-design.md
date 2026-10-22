@@ -288,7 +288,25 @@ The fixture suite is the main quality gate, because herdr ships no real Claude o
 
 ## 5. Terminal environment deny-list (S0)
 
-The list of service-only variables removed from terminal environments is recorded here by slice S0 (the operator fills it).
+Shells, the tmux server DeckTerm starts, and user-code subprocesses (git, task checks, agent CLI probes, file search, the broker's sudo calls) get the service environment minus one explicit deny-list (`backend/services/terminal-env.ts`, tested). At startup and before every tmux `new-session`, DeckTerm also removes the denied names from an already-running tmux server's global and per-session environments, tied to that server's identity (pid plus start time); if that cannot be verified, the create is refused with a plain 503 until it can.
+
+**Denied (removed):**
+
+| Name | Kind | Why |
+| --- | --- | --- |
+| `DECKTERM_VAPID_*` | prefix | Web Push key pair and subject; the private key signs pushes to every subscribed device (the original leak). |
+| `CF_ACCESS_*` | prefix | Cloudflare Access JWT settings; service authentication only. |
+| `DECKTERM_*` | prefix | All other DeckTerm service config (bootstrap admin, publish mode, legacy bypass, state dir, runtime env, isolation, broker path, retention and caps). Inherited copies made tests and servers started in a shell pick up the parent's switches and state dir. |
+| `PORT`, `HOST` | exact | DeckTerm's listen port and bind address; an inherited `PORT=4173` pointed servers started in a production shell at the production port. |
+| `TRUSTED_ORIGINS`, `ALLOWED_FILE_ROOTS` | exact | Security config of the service. |
+| `TMUX_BACKEND`, `TMUX_SESSION_NAMESPACE`, `TMUX_REQUIRE_EXTERNAL_SERVER` | exact | tmux ownership; an inherited namespace would point a DeckTerm started from a shell at the parent's tmux socket. |
+| `MAX_TERMINALS_PER_USER`, `TERMINAL_IDLE_TIMEOUT_MS`, `TERMINAL_RATE_LIMIT_*`, `SCROLLBACK_MAX_*`, `OPENCODE_WEB_*`, `AGENT_RESPONDING_IDLE_MS`, `CLAUDE_AGENT_RESPONDING_IDLE_MS` | exact / prefix | Service limits and timings. |
+
+**Never removed (protected in code):** `PATH`, `HOME`, `LANG`, `LANGUAGE`, `LC_*`, `SHELL`, `TERM`, `COLORTERM`, `USER`, `LOGNAME`, `TMPDIR`, `TMUX`, `TMUX_PANE`, `SSH_AUTH_SOCK`, `XDG_RUNTIME_DIR`, `COLUMNS`, `LINES`. Per-terminal variables DeckTerm sets itself are applied after the filter. The owner's own tokens come from `~/.bashrc`, not from the service, and are untouched (there is deliberately no generic `*_TOKEN` pattern). `OPENCODE_URL` is kept: nothing in DeckTerm reads it.
+
+**Out of scope:** the per-user isolated backend (`BrokeredTmuxBackend`, `DECKTERM_OS_ISOLATION=1`, off on dev and production) has no environment gate; its broker builds each child environment from scratch. Shells that were already running keep their inherited copy until they are closed. Rotating the VAPID key is an owner decision (it makes every push subscription re-subscribe).
+
+**Visible side effect:** `scripts/backup-state.sh` run by hand from a dev shell no longer inherits `DECKTERM_STATE_DIR` and defaults to the production state dir; pass the dev path explicitly.
 
 ## 6. One-tap resume (S3)
 
@@ -320,7 +338,7 @@ The list of service-only variables removed from terminal environments is recorde
 - **Marker.** `agent;<name>;start;sid=<uuid>`. The parser (`backend/telemetry.ts:526-545`) accepts exactly one extra field, `sid=`, and only when it matches `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. Anything else is dropped, the start event itself still counts, and no id is recorded. The marker travels in pane output, so any program can forge it. A forged `sid=x;$(id)` leaves no resumable id.
 - **Resume modes.** The server computes them for ended rows as `resume: { agent, mode, cwd } | null` in `/api/terminals`:
   - `exact`: `claude --resume <id>` or `codex resume <id>`;
-  - `last` (Codex without an id): `codex resume --last`. Resume uses Codex's most recent conversation in this folder; a newer Codex run in the same folder that exited normally is not tracked, so `--last` picks that one instead (known limitation, accepted by the operator on 2026-10-22);
+  - `last` (Codex without an id): `codex resume --last`. Resume uses Codex's most recent conversation in this folder; a newer Codex run in the same folder that exited normally is not tracked, so `--last` picks that one instead (known limitation, accepted by the operator on 2026-10-22). Likewise, `codex -C <dir>` without a session id records the pane's folder, not `<dir>`, so `--last` looks in the wrong folder (known limitation);
   - `pick`: `claude --resume` or `codex resume`, which open the agent's own picker. It is used without a Claude id, and for Codex when another resumable or live Codex row shares the same `agent_cwd`, because `--last` would pick the same conversation for both.
 - **Action.** `POST /api/terminals/:id/resume`:
   - checks the actor owns the ended row and validates the stored id again;
