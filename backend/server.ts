@@ -68,18 +68,23 @@ import { assertPortAvailable } from "./port-probe";
 import { cpus } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  applyAgentAttention,
   applyTerminalNotificationEvents,
   classifyAgentOutputPhase,
   createAttentionTracker,
   createGitWorktreeDetector,
+  createOscTitleParseState,
   createTerminalNotificationParseState,
+  detectTitleAttention,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
   nextAgentMarkerActive,
+  parseLatestOscTitle,
   parseShellIntegrationChunk,
   parseTerminalNotifications,
   resolveAgentOutputState,
   type AttentionTracker,
+  type OscTitleParseState,
   type TerminalNotificationParseState,
 } from "./telemetry";
 import { isCloudflareAudienceAllowed } from "./cloudflare-access-guards";
@@ -350,6 +355,12 @@ type Terminal = {
   notificationParse: TerminalNotificationParseState;
   attention: AttentionTracker;
   lastCompletionPushAt?: number;
+  // Last `input` push for this terminal (agent notification or title/screen).
+  lastInputPushAt?: number;
+  // Latest OSC 0/2 window title from the same raw source as notifications;
+  // sanitized, capped at 256 characters, cleared when the agent changes.
+  agentOscTitle: string;
+  oscTitleParse: OscTitleParseState;
   tmuxPipeRead?: Promise<string>;
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
@@ -800,6 +811,7 @@ function applyParsedShellIntegrationState(
       clearAgentRespondingTimer(term);
     }
     term.agentName = parsed.state.agentName;
+    onTerminalAgentChanged(term);
     if (parsed.state.agentName) {
       term.agentHasUserPrompt = false;
     }
@@ -909,6 +921,7 @@ function processTerminalNotifications(
 ) {
   const expectedSource = term.tmuxPipePath ? "pipe" : "live";
   if (source !== expectedSource) return;
+  processTerminalTitle(term, chunk);
   const parsed = parseTerminalNotifications(chunk, term.notificationParse);
   term.notificationParse = parsed.state;
   if (parsed.events.length === 0) return;
@@ -925,6 +938,34 @@ function processTerminalNotifications(
       notifyCompletionPush(term, "agent");
     }
   }
+}
+
+// The window title belongs to the agent that set it.
+function onTerminalAgentChanged(term: Terminal) {
+  term.agentOscTitle = "";
+}
+
+// S1a: the latest OSC 0/2 title. A Codex title that turns to
+// "Action Required" raises needs-input and sends the input push.
+function processTerminalTitle(term: Terminal, chunk: string) {
+  const parsed = parseLatestOscTitle(chunk, term.oscTitleParse);
+  term.oscTitleParse = parsed.state;
+  if (parsed.title === null) return;
+  const previousTitle = term.agentOscTitle;
+  term.agentOscTitle = parsed.title;
+  const edge = detectTitleAttention({
+    agentName: term.agentName,
+    previousTitle,
+    nextTitle: parsed.title,
+  });
+  if (!edge) return;
+  const applied = applyAgentAttention(term.attention, edge.kind, {
+    now: Date.now(),
+    source: "title",
+    rule: edge.rule,
+  });
+  term.attention = applied.tracker;
+  notifyCompletionPush(term, "input");
 }
 
 function clearAgentRespondingTimer(term: Terminal) {
@@ -1463,6 +1504,8 @@ type TmuxPipeResume = {
   offset: number;
   shellIntegrationCarry: string;
   notificationParse: TerminalNotificationParseState;
+  oscTitleParse: OscTitleParseState;
+  agentOscTitle: string;
 };
 const tmuxPipeResume = new Map<string, TmuxPipeResume>();
 
@@ -1473,6 +1516,8 @@ function rememberTmuxPipeResume(term: Terminal) {
     offset: term.tmuxPipeOffset,
     shellIntegrationCarry: term.shellIntegrationCarry,
     notificationParse: term.notificationParse,
+    oscTitleParse: term.oscTitleParse,
+    agentOscTitle: term.agentOscTitle,
   });
 }
 
@@ -1610,6 +1655,7 @@ function notifyCompletionPush(
     return;
   }
   term.lastCompletionPushAt = now;
+  if (kind === "input") term.lastInputPushAt = now;
   void getFoundationState()
     .then((state) =>
       dispatchCompletionPush({
@@ -5667,7 +5713,10 @@ async function syncTmuxRuntimeState(
 
   term.running = nextRuntimeState.running;
   term.lastExitCode = nextRuntimeState.lastExitCode;
-  term.agentName = nextRuntimeState.agentName;
+  if (term.agentName !== nextRuntimeState.agentName) {
+    term.agentName = nextRuntimeState.agentName;
+    onTerminalAgentChanged(term);
+  }
   term.agentState = nextRuntimeState.agentState;
   term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
   if (!nextRuntimeState.agentName) {
@@ -5945,6 +5994,8 @@ async function createManagedTerminal({
     notificationParse:
       resumePipe?.notificationParse ?? createTerminalNotificationParseState(),
     attention: createAttentionTracker(),
+    agentOscTitle: resumePipe?.agentOscTitle ?? "",
+    oscTitleParse: resumePipe?.oscTitleParse ?? createOscTitleParseState(),
     shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,

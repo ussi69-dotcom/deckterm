@@ -1,4 +1,6 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   classifyAgentOutputPhase,
   inferRecoveredTmuxRuntimeState,
@@ -8,8 +10,12 @@ import {
   parseShellIntegrationChunk,
   resolveAgentOutputState,
   toSummaryLine,
+  applyAgentAttention,
   applyTerminalNotificationEvents,
   classifyAttentionText,
+  detectTitleAttention,
+  parseLatestOscTitle,
+  sanitizeOscTitle,
   createAttentionTracker,
   createTerminalNotificationParseState,
   parseTerminalNotifications,
@@ -912,4 +918,155 @@ test("applyTerminalNotificationEvents tracks and clears progress without rate li
     { now: 1_100, agentName: null },
   );
   expect(result.tracker.progress).toBe(null);
+});
+
+// ---------------------------------------------------------------------------
+// S1a: Codex "Action Required" title -> needs-input
+// ---------------------------------------------------------------------------
+
+function fixtureHeaderValue(file: string, key: string): string {
+  const text = readFileSync(
+    join(import.meta.dir, "fixtures/agent-screens", file),
+    "utf8",
+  );
+  const header = text.split("\n---\n")[0];
+  const line = header
+    .split("\n")
+    .find((row: string) => row.startsWith(`${key}: `));
+  if (!line) throw new Error(`fixture ${file} has no ${key}`);
+  return line.slice(key.length + 2);
+}
+
+const CODEX_APPROVAL_TITLE = fixtureHeaderValue(
+  "codex-0.163-blocked-approval.txt",
+  "title",
+);
+const CODEX_WORKING_TITLE = fixtureHeaderValue(
+  "codex-0.163-working-timer.txt",
+  "title",
+);
+
+test("parseLatestOscTitle returns the latest OSC 0/2 title with BEL or ST", () => {
+  expect(parseLatestOscTitle("plain output").title).toBe(null);
+  const both = parseLatestOscTitle(
+    "a\x1b]0;first\x07b\x1b]2;second\x1b\\c",
+  );
+  expect(both.title).toBe("second");
+  expect(both.state.carry).toBe("");
+  // OSC 9 notifications and other OSC numbers are not titles.
+  expect(parseLatestOscTitle("\x1b]9;hello\x07\x1b]10;x\x07").title).toBe(
+    null,
+  );
+});
+
+test("parseLatestOscTitle carries an unterminated title into the next chunk", () => {
+  const first = parseLatestOscTitle("out\x1b]0;[ . ] Action Req");
+  expect(first.title).toBe(null);
+  expect(first.state.carry).toBe("\x1b]0;[ . ] Action Req");
+  const second = parseLatestOscTitle("uired | x1\x07", first.state);
+  expect(second.title).toBe("[ . ] Action Required | x1");
+  // A split ST (ESC at the end of one chunk, backslash in the next).
+  const splitSt = parseLatestOscTitle("\x1b]2;title\x1b");
+  expect(splitSt.state.carry).toBe("\x1b]2;title\x1b");
+  expect(parseLatestOscTitle("\\", splitSt.state).title).toBe("title");
+});
+
+test("sanitizeOscTitle strips control and bidi characters and caps at 256", () => {
+  expect(sanitizeOscTitle("a\tb\u202ec\u0000")).toBe("a bc");
+  expect(Array.from(sanitizeOscTitle("✳".repeat(400)))).toHaveLength(256);
+});
+
+test("S1a: the captured Codex approval title fires needs-input once", () => {
+  expect(CODEX_APPROVAL_TITLE).toContain("Action Required");
+  const first = detectTitleAttention({
+    agentName: "codex",
+    previousTitle: CODEX_WORKING_TITLE,
+    nextTitle: CODEX_APPROVAL_TITLE,
+  });
+  expect(first).toEqual({ kind: "needs-input", rule: "osc_title_blocked" });
+
+  // The title blinks between "[ . ]" and "[ ! ]" while the approval is open;
+  // a repeated Action Required title does not fire again.
+  expect(
+    detectTitleAttention({
+      agentName: "codex",
+      previousTitle: CODEX_APPROVAL_TITLE,
+      nextTitle: CODEX_APPROVAL_TITLE.replace("[ . ]", "[ ! ]"),
+    }),
+  ).toBe(null);
+});
+
+test("S1a: a non-Codex agent and a spinner title never fire", () => {
+  expect(
+    detectTitleAttention({
+      agentName: "claude",
+      previousTitle: "",
+      nextTitle: CODEX_APPROVAL_TITLE,
+    }),
+  ).toBe(null);
+  expect(
+    detectTitleAttention({
+      agentName: null,
+      previousTitle: "",
+      nextTitle: CODEX_APPROVAL_TITLE,
+    }),
+  ).toBe(null);
+  expect(
+    detectTitleAttention({
+      agentName: "codex",
+      previousTitle: "",
+      nextTitle: CODEX_WORKING_TITLE,
+    }),
+  ).toBe(null);
+});
+
+test("S1a: the raised attention carries source title and rule osc_title_blocked", () => {
+  const edge = detectTitleAttention({
+    agentName: "codex",
+    previousTitle: "",
+    nextTitle: CODEX_APPROVAL_TITLE,
+  })!;
+  const applied = applyAgentAttention(createAttentionTracker(), edge.kind, {
+    now: 50_000,
+    source: "title",
+    rule: edge.rule,
+  });
+  expect(applied.accepted).toMatchObject({
+    kind: "needs-input",
+    source: "title",
+    rule: "osc_title_blocked",
+    title: "",
+    body: "",
+    at: 50_000,
+  });
+  expect(applied.tracker.attention).toBe(applied.accepted);
+});
+
+test("applyAgentAttention keeps the seq and 2 s priority-window rules", () => {
+  let applied = applyAgentAttention(createAttentionTracker(), "done", {
+    now: 10_000,
+    source: "screen",
+    rule: "live_prompt_box",
+  });
+  const firstSeq = applied.accepted!.seq;
+  // Same priority inside the window: dropped.
+  let next = applyAgentAttention(applied.tracker, "done", {
+    now: 11_000,
+    source: "screen",
+  });
+  expect(next.accepted).toBe(null);
+  expect(next.tracker).toBe(applied.tracker);
+  // Higher priority inside the window: accepted with a larger seq.
+  next = applyAgentAttention(applied.tracker, "needs-input", {
+    now: 11_000,
+    source: "screen",
+    rule: "live_blocked_form",
+  });
+  expect(next.accepted!.seq).toBeGreaterThan(firstSeq);
+  // After the window anything is accepted again, with a strictly larger seq.
+  applied = applyAgentAttention(next.tracker, "done", {
+    now: 20_000,
+    source: "screen",
+  });
+  expect(applied.accepted!.seq).toBeGreaterThan(next.accepted!.seq);
 });

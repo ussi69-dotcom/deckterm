@@ -781,12 +781,19 @@ export type TerminalNotificationParseState = {
   kitty: KittyPending | null;
 };
 
+// Where an attention came from: the agent's own notification (OSC 9/777/99),
+// DeckTerm's screen rules, or the agent's window title.
+export type AttentionSource = "notification" | "screen" | "title";
+
 export type TerminalAttention = {
   kind: AttentionKind;
   title: string;
   body: string;
   at: number;
   seq: number;
+  source?: AttentionSource;
+  /** Rule id when `source` is `screen` or `title`. */
+  rule?: string;
 };
 
 export type TerminalProgress = {
@@ -1179,6 +1186,7 @@ export function applyTerminalNotificationEvents(
       body: event.body,
       at: now,
       seq: Math.max(previousSeq + 1, now),
+      source: "notification",
     };
     next.attention = attention;
     next.lastAcceptedAt = now;
@@ -1186,4 +1194,140 @@ export function applyTerminalNotificationEvents(
     accepted.push(attention);
   }
   return { tracker: next, accepted };
+}
+
+// ---------------------------------------------------------------------------
+// Agent attention raised by DeckTerm itself (window title, screen rules).
+// Same seq rule (wall clock, strictly increasing) and the same 2 s priority
+// window as applyTerminalNotificationEvents. Title and body stay empty so
+// toasts and pushes use their generic text.
+// ---------------------------------------------------------------------------
+
+export function applyAgentAttention(
+  tracker: AttentionTracker,
+  kind: AttentionKind,
+  {
+    now = Date.now(),
+    source,
+    rule,
+  }: { now?: number; source: AttentionSource; rule?: string | null },
+): { tracker: AttentionTracker; accepted: TerminalAttention | null } {
+  const withinWindow =
+    tracker.lastAcceptedKind !== null &&
+    now - tracker.lastAcceptedAt < ATTENTION_RATE_WINDOW_MS;
+  if (
+    withinWindow &&
+    ATTENTION_PRIORITY[kind] <= ATTENTION_PRIORITY[tracker.lastAcceptedKind!]
+  ) {
+    return { tracker, accepted: null };
+  }
+  const previousSeq = tracker.attention?.seq || 0;
+  const attention: TerminalAttention = {
+    kind,
+    title: "",
+    body: "",
+    at: now,
+    seq: Math.max(previousSeq + 1, now),
+    source,
+  };
+  if (rule) attention.rule = rule;
+  return {
+    tracker: {
+      ...tracker,
+      attention,
+      lastAcceptedAt: now,
+      lastAcceptedKind: kind,
+    },
+    accepted: attention,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Window title (OSC 0 / OSC 2). Read from the same raw source as the
+// notifications (the tmux pipe log, or the raw PTY stream). Untrusted in-band
+// text: control and bidi characters removed, capped at 256 characters.
+// ---------------------------------------------------------------------------
+
+export const OSC_TITLE_MAX_CHARS = 256;
+const OSC_TITLE_CARRY_MAX = 1024;
+const OSC_TITLE_RE = /\x1b\]([02]);([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+// A possibly unterminated title sequence at the end of a chunk.
+const OSC_TITLE_PARTIAL_RE = /^\x1b\](?:[02](?:;[^\x07\x1b]*\x1b?)?)?$/;
+
+export type OscTitleParseState = { carry: string };
+
+export function createOscTitleParseState(): OscTitleParseState {
+  return { carry: "" };
+}
+
+export function sanitizeOscTitle(input: string): string {
+  const cleaned = String(input || "")
+    .replace(/[\t\n\r\v\f]/g, " ")
+    .replace(NOTIFICATION_CONTROL_RE, "");
+  const chars = Array.from(cleaned);
+  return chars.length > OSC_TITLE_MAX_CHARS
+    ? chars.slice(0, OSC_TITLE_MAX_CHARS).join("")
+    : cleaned;
+}
+
+/**
+ * Returns the latest complete OSC 0/2 title in `chunk` (BEL or ST ended),
+ * sanitized, or `null` when the chunk sets none. An unterminated title at the
+ * end is carried into the next chunk (bounded).
+ */
+export function parseLatestOscTitle(
+  chunk: string,
+  state: OscTitleParseState = createOscTitleParseState(),
+): { title: string | null; state: OscTitleParseState } {
+  const input = `${state.carry || ""}${chunk || ""}`;
+  if (input.indexOf("\x1b") === -1) {
+    return { title: null, state: { carry: "" } };
+  }
+  let latest: string | null = null;
+  let lastEnd = 0;
+  for (const match of input.matchAll(OSC_TITLE_RE)) {
+    latest = match[2] ?? "";
+    lastEnd = (match.index ?? 0) + match[0].length;
+  }
+  let carry = "";
+  const oscStart = input.lastIndexOf("\x1b]");
+  const oscTail = oscStart >= lastEnd ? input.slice(oscStart) : "";
+  if (
+    oscTail &&
+    oscTail.length <= OSC_TITLE_CARRY_MAX &&
+    OSC_TITLE_PARTIAL_RE.test(oscTail)
+  ) {
+    carry = oscTail;
+  } else if (input.endsWith("\x1b") && input.length - 1 >= lastEnd) {
+    carry = "\x1b";
+  }
+  return {
+    title: latest === null ? null : sanitizeOscTitle(latest),
+    state: { carry },
+  };
+}
+
+export const CODEX_ACTION_REQUIRED_TEXT = "Action Required";
+
+/**
+ * S1a: Codex puts "Action Required" in its window title while an approval is
+ * open. Fires only on the edge into such a title, and only for Codex.
+ */
+export function detectTitleAttention({
+  agentName,
+  previousTitle,
+  nextTitle,
+}: {
+  agentName: AgentName | null;
+  previousTitle: string | null;
+  nextTitle: string | null;
+}): { kind: "needs-input"; rule: "osc_title_blocked" } | null {
+  if (agentName !== "codex") return null;
+  if (!nextTitle || !nextTitle.includes(CODEX_ACTION_REQUIRED_TEXT)) {
+    return null;
+  }
+  if (previousTitle && previousTitle.includes(CODEX_ACTION_REQUIRED_TEXT)) {
+    return null;
+  }
+  return { kind: "needs-input", rule: "osc_title_blocked" };
 }
