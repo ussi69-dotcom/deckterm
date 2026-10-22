@@ -678,6 +678,78 @@ test("barrier flag: a read that raced a scroll cannot clear it", async () => {
   expect(controller.mayBeScrolledBack).toBe(true);
 });
 
+test("barrier flag: a read that ran while a scroll was in flight (before it reached copy-mode) cannot clear it", async () => {
+  const fake = fakeTarget();
+  fake.subscribers.length = 0; // no frame read after the run re-raises it
+  let started!: () => void;
+  const mutationStarted = new Promise<void>((resolve) => (started = resolve));
+  let enterCopyMode!: () => void;
+  fake.target.scrollHistory = (direction, lines) =>
+    new Promise((resolve) => {
+      fake.log.push(`history:${direction}:${lines}`);
+      started();
+      enterCopyMode = () => {
+        fake.setState({ ...SHELL, inMode: true, position: lines });
+        resolve(true);
+      };
+    });
+  fake.target.readState = async () => ({ ...SHELL }); // instant, out of mode
+  const controller = new TerminalScrollController(fake.target);
+  const scrolling = controller.scrollRelative("up", 3);
+  await mutationStarted;
+  // The read starts after the scroll started but before tmux entered
+  // copy-mode, and returns "not in copy-mode" while the scroll is in flight.
+  const seen: string[] = [];
+  await controller.emit({ send: (f) => seen.push(f) });
+  expect(JSON.parse(seen[0]!)).toMatchObject({ inMode: false });
+  expect(controller.mayBeScrolledBack).toBe(true);
+  enterCopyMode();
+  await scrolling;
+  // The scroll settled: the barrier is still up, and typing leaves first.
+  expect(controller.mayBeScrolledBack).toBe(true);
+  fake.log.length = 0;
+  fake.target.readState = async () => ({ ...SHELL, inMode: false });
+  controller.input("x", { scroll: true });
+  expect(fake.log).toEqual(["exit"]);
+  await Bun.sleep(30);
+  expect(fake.log).toEqual(["exit", 'input:"x"']);
+});
+
+test("barrier flag: a read that started during a scroll and returned after it settled cannot clear it", async () => {
+  const fake = fakeTarget();
+  fake.subscribers.length = 0;
+  let started!: () => void;
+  const mutationStarted = new Promise<void>((resolve) => (started = resolve));
+  let enterCopyMode!: () => void;
+  fake.target.scrollHistory = (direction, lines) =>
+    new Promise((resolve) => {
+      fake.log.push(`history:${direction}:${lines}`);
+      started();
+      enterCopyMode = () => {
+        fake.setState({ ...SHELL, inMode: true, position: lines });
+        resolve(true);
+      };
+    });
+  // The read snapshots the pane when it starts, returns when told to.
+  let returnRead!: () => void;
+  fake.target.readState = () => {
+    const snapshot = { ...SHELL };
+    return new Promise((resolve) => (returnRead = () => resolve(snapshot)));
+  };
+  const controller = new TerminalScrollController(fake.target);
+  const scrolling = controller.scrollRelative("up", 3);
+  await mutationStarted;
+  const emitting = controller.emit({ send: () => {} });
+  await Bun.sleep(1);
+  enterCopyMode();
+  // The scroll settles (the drain then waits for the frame read behind ours).
+  await Bun.sleep(5);
+  expect((controller as any).inFlight).toBeNull();
+  returnRead(); // the stale "not in copy-mode" arrives after the scroll
+  await Promise.all([emitting, scrolling]);
+  expect(controller.mayBeScrolledBack).toBe(true);
+});
+
 test("barrier: scroll-latest from the page plus the typed keys queue a single exit", async () => {
   const fake = fakeTarget({ state: { ...SHELL, inMode: true, position: 40 } });
   const controller = new TerminalScrollController(fake.target);
@@ -775,19 +847,81 @@ test("confirmed exit: a pane that stays in copy-mode drops the held input after 
   await controller.scrollTo(9);
   fake.log.length = 0;
   fake.frames.length = 0;
-  const started = Date.now();
+  const started = performance.now();
   controller.input("secret-password\r", { scroll: true });
   await Bun.sleep(5);
   // A later scroll op is kept; only the input behind the stuck exit goes.
   void controller.scrollRelative("down", 2);
   await Bun.sleep(400);
-  expect(Date.now() - started).toBeGreaterThanOrEqual(40);
-  expect(fake.log.filter((l) => l === "exit")).toHaveLength(5);
+  expect(performance.now() - started).toBeGreaterThanOrEqual(40);
+  // Retried while time was left (the count depends on call durations).
+  expect(fake.log.filter((l) => l === "exit").length).toBeGreaterThanOrEqual(2);
   expect(fake.log.some((l) => l.startsWith("input:"))).toBe(false);
   expect(fake.log.at(-1)).toBe("history:down:2");
   expect(notes.join("\n")).toContain("dropped 16 held input bytes");
   expect(notes.join("\n")).not.toContain("secret");
   expect(fake.frames.some((f) => f.frame.inMode === true)).toBe(true);
+});
+
+test("confirmed exit: one absolute deadline covers slow tmux calls, not a retry count", async () => {
+  const fake = fakeTarget({
+    state: { ...SHELL, inMode: true, position: 9 },
+    exitStuck: true,
+    opDelayMs: 30, // every tmux call takes 30 ms; the pane never leaves
+  });
+  const notes: Array<{ at: number; note: string }> = [];
+  const controller = new TerminalScrollController(fake.target, {
+    exitRetryMs: 10,
+    exitGiveUpMs: 100,
+    log: (note) => notes.push({ at: performance.now(), note }),
+  });
+  await controller.scrollTo(9);
+  fake.log.length = 0;
+  const started = performance.now();
+  const done = controller.scrollTo(0);
+  controller.input("pw\r", { scroll: true });
+  await done;
+  const dropped = notes.find((n) => n.note.includes("dropped 3 held input bytes"));
+  expect(dropped).toBeDefined();
+  // A retry count (100 / 10 = 10 more attempts of 4 calls x 30 ms) would
+  // take over a second; the deadline ends it at 100 ms plus a small margin.
+  const elapsed = dropped!.at - started;
+  expect(elapsed).toBeGreaterThanOrEqual(95);
+  expect(elapsed).toBeLessThan(250);
+  expect(fake.log.some((l) => l.startsWith("input:"))).toBe(false);
+});
+
+test("confirmed exit: a call hanging past the deadline is cut at the time left, not at opTimeoutMs", async () => {
+  const fake = fakeTarget({ state: { ...SHELL, inMode: true, position: 9 } });
+  fake.subscribers.length = 0;
+  const timeouts: number[] = [];
+  // copy-mode -q hangs until it is aborted (killed).
+  fake.target.exitScroll = (signal) => {
+    const at = performance.now();
+    return new Promise((resolve) =>
+      signal.addEventListener("abort", () => {
+        timeouts.push(performance.now() - at);
+        resolve(false);
+      }),
+    );
+  };
+  const notes: string[] = [];
+  const controller = new TerminalScrollController(fake.target, {
+    opTimeoutMs: 3_000,
+    exitGiveUpMs: 80,
+    log: (m) => notes.push(m),
+  });
+  const started = performance.now();
+  const done = controller.scrollTo(0);
+  controller.input("q", { scroll: true });
+  await done;
+  expect(performance.now() - started).toBeLessThan(80 + 150);
+  expect(timeouts).toHaveLength(1);
+  expect(timeouts[0]!).toBeLessThan(80 + 150);
+  expect(notes.join("\n")).toContain("dropped 1 held input bytes");
+  expect(fake.log).toEqual([]);
+  // The killed exit may still have reached tmux: the barrier stays up.
+  expect(controller.mayBeScrolledBack).toBe(true);
 });
 
 test("confirmed exit: an unreadable state writes the input (pre-M0 behaviour) and logs it", async () => {
@@ -843,7 +977,7 @@ test("bounds: at most maxQueuedOps queued ops; further scrolls are dropped and l
   );
 });
 
-test("bounds: alternating touch-scroll and scrollback still coalesce", async () => {
+test("bounds: alternating touch-scroll and scrollback do not merge across each other; the op cap bounds them", async () => {
   const fake = fakeTarget();
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
@@ -852,20 +986,66 @@ test("bounds: alternating touch-scroll and scrollback still coalesce", async () 
     await gate;
     return history(direction, lines, signal);
   };
-  const controller = new TerminalScrollController(fake.target);
+  const notes: string[] = [];
+  const controller = new TerminalScrollController(fake.target, {
+    log: (m) => notes.push(m),
+  });
   const first = controller.scrollRelative("up", 1);
   for (let i = 0; i < 500; i += 1) {
     void controller.handle({ type: "touch-scroll", direction: "up", lines: 1 });
     void controller.scrollRelative("up", 1);
   }
   const queued = (controller as any).queue as Array<{ kind: string }>;
-  expect(queued.map((op) => op.kind)).toEqual(["touch", "relative"]);
+  expect(queued).toHaveLength(128);
+  queued.forEach((op, i) =>
+    expect(op.kind).toBe(i % 2 === 0 ? "touch" : "relative"),
+  );
+  expect(notes.filter((n) => n.includes("scroll queue full"))).toHaveLength(1);
+  // Once full, the touches in between are dropped, so the later relatives
+  // are adjacent to the queued tail and coalesce into it (clamped to 100).
+  expect(queued.at(-1) as unknown).toEqual({ kind: "relative", lines: 100 });
+  // Do not run 128 ops: a closed terminal drops the queue.
+  fake.deactivate();
   release();
   await first;
+  expect(fake.log).toEqual(["history:up:1"]);
+});
+
+test("ordering: touch up, relative up, touch up stay in that order for a mouse app", async () => {
+  const MOUSE_APP = { ...SHELL, altScreen: true, mouseApp: true, mouseSgr: true };
+  const fake = fakeTarget({ state: { ...MOUSE_APP } });
+  fake.subscribers.length = 0;
+  // Hold the queue behind a confirmed exit so all three scrolls queue up.
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const exit = fake.target.exitScroll;
+  fake.target.exitScroll = async (signal) => {
+    await gate;
+    return exit(signal);
+  };
+  // Real tmux: a history scroll opens copy-mode on the alternate screen too.
+  fake.target.scrollHistory = async (direction, lines) => {
+    fake.log.push(`history:${direction}:${lines}`);
+    fake.setState({ ...MOUSE_APP, inMode: true, position: lines });
+    return true;
+  };
+  const controller = new TerminalScrollController(fake.target);
+  const done = controller.scrollTo(0);
+  const touch = { type: "touch-scroll", direction: "up", lines: 1, col: 2, row: 3 } as const;
+  void controller.handle(touch);
+  void controller.scrollRelative("up", 1);
+  void controller.handle(touch);
+  const queued = (controller as any).queue as Array<{ kind: string }>;
+  expect(queued.map((op) => op.kind)).toEqual(["touch", "relative", "touch"]);
+  release();
+  await done;
+  // First touch: one wheel turn to the app. Relative: copy-mode opens.
+  // Second touch: the pane is in copy-mode now, so it scrolls history.
   expect(fake.log).toEqual([
+    "exit",
+    `input:${JSON.stringify("\x1b[<64;2;3M")}`,
     "history:up:1",
-    "history:up:100",
-    "history:up:100",
+    "history:up:1",
   ]);
 });
 

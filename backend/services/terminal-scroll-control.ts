@@ -289,7 +289,10 @@ export type ScrollControllerOptions = {
   opTimeoutMs?: number;
   /** A confirmed exit that still finds copy-mode retries this often... */
   exitRetryMs?: number;
-  /** ...for this long, then drops the input held behind it. */
+  /**
+   * ...until this absolute deadline from its start (tmux call time
+   * included), then drops the input held behind it.
+   */
   exitGiveUpMs?: number;
   maxQueuedOps?: number;
   maxHeldInputBytes?: number;
@@ -343,12 +346,15 @@ export class TerminalScrollController {
   private heldBytes = 0;
   private cache: { state: TmuxScrollState | null; at: number } | null = null;
   private lastInMode = false;
-  // Server barrier: true from the moment a history scroll or scroll-to ran
-  // (or a read saw copy-mode) until a confirmed exit or a read that saw the
-  // pane out of it. `modeEpoch` changes whenever an op may have changed the
-  // mode, so a read that started before is not allowed to overwrite it.
+  // Server barrier: true from the moment a history scroll or scroll-to
+  // starts (and again when it settles), or a read saw copy-mode, until a
+  // state read proves the pane out of it. Only a read that started with no
+  // mutating tmux call in flight, and saw none start or settle before it
+  // returned, may change the flag: anything else may describe the pane from
+  // before a mutation really reached tmux.
   private mayBeInCopyMode = false;
-  private modeEpoch = 0;
+  private mutatingCalls = 0;
+  private mutationSeq = 0;
   private seq = 0;
   private emitChain: Promise<void> = Promise.resolve();
   private broadcastQueued = false;
@@ -570,19 +576,19 @@ export class TerminalScrollController {
   }
 
   /**
-   * The op of `kind` in the trailing run of relative/touch scrolls, so
-   * alternating wheel/PgUp (`scrollback`) and touch drags still coalesce:
-   * the run never grows beyond one op of each kind.
+   * The last queued op when it is a scroll of `kind`: only adjacent scrolls
+   * of the same kind coalesce. Merging across an op of the other kind would
+   * reorder them (`touch, relative, touch` must not become `touch x2,
+   * relative`: a mouse app would get both wheel turns before copy-mode
+   * opens). Alternating kinds are bounded by `maxQueuedOps` instead.
    */
   private trailingScroll<K extends "relative" | "touch">(
     kind: K,
   ): Extract<ScrollOp, { kind: K }> | undefined {
-    for (let i = this.queue.length - 1; i >= 0; i -= 1) {
-      const op = this.queue[i]!;
-      if (op.kind !== "relative" && op.kind !== "touch") return undefined;
-      if (op.kind === kind) return op as Extract<ScrollOp, { kind: K }>;
-    }
-    return undefined;
+    const tail = this.queue[this.queue.length - 1];
+    return tail?.kind === kind
+      ? (tail as Extract<ScrollOp, { kind: K }>)
+      : undefined;
   }
 
   private removeOp(op: ScrollOp): void {
@@ -681,18 +687,12 @@ export class TerminalScrollController {
 
   // --- running ops -------------------------------------------------------------
 
-  private markMayEnterCopyMode(): void {
-    this.mayBeInCopyMode = true;
-    this.modeEpoch += 1;
-  }
-
   /** Runs one scroll op; true when it went to tmux copy-mode. */
   private async runScrollOp(
     op: Exclude<ScrollOp, { kind: "input" }>,
   ): Promise<boolean> {
     switch (op.kind) {
       case "relative":
-        this.markMayEnterCopyMode();
         await this.call(
           (signal) =>
             this.target.scrollHistory(
@@ -701,7 +701,7 @@ export class TerminalScrollController {
               signal,
             ),
           false,
-          true,
+          "enter",
         );
         return true;
       case "absolute":
@@ -709,11 +709,10 @@ export class TerminalScrollController {
           await this.confirmedExit();
           return true;
         }
-        this.markMayEnterCopyMode();
         await this.call(
           (signal) => this.target.scrollToPosition(op.position, signal),
           false,
-          true,
+          "enter",
         );
         return true;
       case "touch": {
@@ -725,12 +724,11 @@ export class TerminalScrollController {
           this.target.paneSize(),
         );
         if (route.kind === "history") {
-          this.markMayEnterCopyMode();
           await this.call(
             (signal) =>
               this.target.scrollHistory(direction, Math.abs(op.lines), signal),
             false,
-            true,
+            "enter",
           );
           return true;
         }
@@ -743,37 +741,50 @@ export class TerminalScrollController {
   /**
    * "Back to latest", confirmed: `copy-mode -q`, then an uncached read; if
    * the pane is still in copy-mode, `send -X cancel` and read again; still
-   * in a mode, retry every `exitRetryMs` for up to `exitGiveUpMs`, then drop
-   * the input held behind this exit (it would be eaten by copy-mode) and
-   * tell the scroll=1 sockets where the pane really is. A state that cannot
-   * be read at all lets the input through, as before M0.
+   * in a mode, retry every `exitRetryMs`. The whole exit has one absolute
+   * deadline, `exitGiveUpMs` from its start: every tmux call gets at most
+   * the time left as its timeout and the waits between retries are cut to
+   * it. Past the deadline the input held behind this exit is dropped (it
+   * would be eaten by copy-mode) and the scroll=1 sockets learn where the
+   * pane really is. A state read that fails before the deadline (the pane
+   * cannot be read at all) lets the input through, as before M0.
    */
   private async confirmedExit(): Promise<void> {
-    this.modeEpoch += 1;
-    const retries = Math.max(
-      0,
-      Math.floor(this.exitGiveUpMs / Math.max(1, this.exitRetryMs)),
-    );
-    for (let attempt = 0; ; attempt += 1) {
-      await this.call((signal) => this.target.exitScroll(signal), false, true);
-      let state = await this.readFresh();
-      if (state && state.inMode) {
+    const deadline = performance.now() + this.exitGiveUpMs;
+    const left = () => deadline - performance.now();
+    // undefined: no time left to read at all.
+    const read = async () =>
+      left() > 0 ? this.readFresh(left()) : undefined;
+    for (;;) {
+      if (left() <= 0) break;
+      await this.call(
+        (signal) => this.target.exitScroll(signal),
+        false,
+        "exit",
+        left(),
+      );
+      let state = await read();
+      if (state?.inMode && left() > 0) {
         await this.call(
           (signal) => this.target.cancelScroll(signal),
           false,
-          true,
+          "exit",
+          left(),
         );
-        state = await this.readFresh();
+        state = await read();
       }
-      if (!state) {
+      if (state && !state.inMode) return;
+      if (state === null && left() > 0) {
         this.log(
           `pane state unreadable after leaving scrollback: writing ${this.heldInputAfterHead()} held input bytes unconfirmed`,
         );
         return;
       }
-      if (!state.inMode) return;
-      if (attempt >= retries || !this.target.isActive()) break;
-      await new Promise((resolve) => setTimeout(resolve, this.exitRetryMs));
+      // Still in copy-mode, or the deadline cut the exit short.
+      if (left() <= 0 || !this.target.isActive()) break;
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(this.exitRetryMs, left())),
+      );
     }
     const dropped = this.dropHeldInputAtHead();
     this.log(
@@ -805,38 +816,60 @@ export class TerminalScrollController {
     return this.readFresh();
   }
 
-  private async readFresh(): Promise<TmuxScrollState | null> {
-    const epoch = this.modeEpoch;
+  private async readFresh(
+    timeoutMs = this.opTimeoutMs,
+  ): Promise<TmuxScrollState | null> {
+    const seq = this.mutationSeq;
+    const startedSettled = this.mutatingCalls === 0;
     const state = await this.call(
       (signal) => this.target.readState(signal),
       null,
       false,
+      timeoutMs,
     );
     this.cache = { state, at: this.now() };
     if (state) {
       this.lastInMode = state.inMode;
-      // A read that raced an op which may have changed the mode says
-      // nothing about the mode now.
-      if (epoch === this.modeEpoch) this.mayBeInCopyMode = state.inMode;
+      // A read that overlapped a mutating call (in flight when it started,
+      // or started / settled while it ran) may describe the pane from before
+      // that call reached tmux: it says nothing about the mode now.
+      const quiet =
+        startedSettled && this.mutatingCalls === 0 && seq === this.mutationSeq;
+      if (quiet) this.mayBeInCopyMode = state.inMode;
     }
     return state;
   }
 
   /**
-   * Runs one tmux call with a deadline. At the deadline the call is aborted
-   * (the backend kills its tmux client) and this waits until it really
-   * settled, so a late command can never run after the next queued op.
-   * A mutating call that timed out may still have reached tmux: the barrier
+   * Runs one tmux call with a deadline (`timeoutMs`, at most `opTimeoutMs`).
+   * At the deadline the call is aborted (the backend kills its tmux client)
+   * and this waits until it really settled, so a late command can never run
+   * after the next queued op.
+   *
+   * `mutating`: "enter" for calls that may put the pane into copy-mode
+   * (history scroll, scroll-to), "exit" for the calls of a confirmed exit.
+   * An "enter" call raises the barrier when it starts and again when it
+   * settles, so a read that raced it cannot leave the barrier down. Any
+   * mutating call that timed out may still have reached tmux: the barrier
    * then assumes copy-mode until a read says otherwise.
    */
   private async call<T>(
     run: (signal: AbortSignal) => Promise<T>,
     fallback: T,
-    mutating: boolean,
+    mutating: false | "enter" | "exit",
+    timeoutMs = this.opTimeoutMs,
   ): Promise<T> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.opTimeoutMs);
+    const timer = setTimeout(
+      () => controller.abort(),
+      Math.max(0, Math.min(this.opTimeoutMs, timeoutMs)),
+    );
     (timer as any)?.unref?.();
+    if (mutating) {
+      this.mutatingCalls += 1;
+      this.mutationSeq += 1;
+      if (mutating === "enter") this.mayBeInCopyMode = true;
+    }
     try {
       const result = await run(controller.signal);
       return controller.signal.aborted ? fallback : result;
@@ -845,7 +878,13 @@ export class TerminalScrollController {
       return fallback;
     } finally {
       clearTimeout(timer);
-      if (controller.signal.aborted && mutating) this.markMayEnterCopyMode();
+      if (mutating) {
+        this.mutatingCalls -= 1;
+        this.mutationSeq += 1;
+        if (mutating === "enter" || controller.signal.aborted) {
+          this.mayBeInCopyMode = true;
+        }
+      }
     }
   }
 }
