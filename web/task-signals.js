@@ -59,7 +59,9 @@ function diffTaskTransitions(prevTasks, nextTasks) {
 // The server reports each session's last agent notification as
 // `attention: {kind, title, body, at, seq}` (OSC 9/777/99) and OSC 9;4
 // `progress: {state, percent}`. The browser remembers the last seq it has
-// shown per session (localStorage) so a dot/app badge marks only unseen ones.
+// shown per session (the server-side `attention.seen` setting, shared by every
+// device of the actor) so a dot/app badge marks only unseen ones. The old
+// per-browser localStorage key below is only read once, for the legacy import.
 
 const ATTENTION_PRIORITY = { info: 1, done: 2, error: 3, "needs-input": 4 };
 const PROGRESS_STATES = new Set(["normal", "error", "indeterminate", "paused"]);
@@ -190,33 +192,28 @@ function sessionActivityAt(session) {
   return Number.isFinite(created) && created > 0 ? created : 0;
 }
 
-function sessionPanelRank(session, seenMap) {
-  if (
-    session?.attention?.kind === "needs-input" &&
-    hasUnseenAttention(session, (seenMap || {})[session.id])
-  ) {
-    return 0;
+// The Sessions list order is the Agents overview order (web/agent-overview.js,
+// design 2.4): needs you > done (unseen) > working > idle > no agent > ended.
+// Resolved at call time: agent-overview.js is a separate classic script.
+function resolveAgentOverview() {
+  if (typeof window !== "undefined" && window.AgentOverview) {
+    return window.AgentOverview;
   }
-  const agentState = String(session?.agentState || "").toLowerCase();
-  if (
-    session?.running === true ||
-    agentState === "thinking" ||
-    agentState === "responding"
-  ) {
-    return 1;
+  if (typeof require === "function") {
+    try {
+      return require("./agent-overview.js");
+    } catch {
+      return null;
+    }
   }
-  return 2;
+  return null;
 }
 
-function orderSessionsForPanel(sessions, seenMap) {
-  return (Array.isArray(sessions) ? sessions : [])
-    .map((session, index) => ({
-      session,
-      index,
-      rank: sessionPanelRank(session, seenMap),
-    }))
-    .sort((a, b) => a.rank - b.rank || a.index - b.index)
-    .map((entry) => entry.session);
+function orderSessionsForPanel(sessions, seenMap, options = {}) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  const overview = resolveAgentOverview();
+  if (!overview?.orderSessions) return [...list];
+  return overview.orderSessions(list, seenMap || {}, options);
 }
 
 // --- Toast descriptions (rendered by web/toast-service.js) ------------------

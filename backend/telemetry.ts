@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { hardenGitInvocation } from "./git-readonly";
 import { sanitizeTerminalEnv } from "./services/terminal-env";
 
 const BUSY_ACTIVITY_WINDOW_MS = 30_000;
@@ -6,6 +7,9 @@ const BUSY_BOOTSTRAP_WINDOW_MS = 10_000;
 const MAX_SCROLLBACK_CHUNKS = 200;
 const GIT_COMMAND_TIMEOUT_MS = 3_000;
 const WORKTREE_CACHE_TTL_MS = 5_000;
+// projectRoot (the git top level of a session's cwd) changes rarely; every
+// /api/terminals poll reuses it for this long per cwd.
+export const PROJECT_ROOT_CACHE_TTL_MS = 60_000;
 const SHELL_MARKER_PREFIX = "\x1b]9;9;deckterm;";
 const SHELL_MARKER_SUFFIX = "\x07";
 const TOOL_MARKER_MAX_PAYLOAD_LENGTH = 2048;
@@ -58,6 +62,7 @@ export type TerminalTelemetry = {
   agentState: AgentState | null;
   ports: number[];
   isWorktree: boolean;
+  projectRoot: string | null;
   backendMode: BackendMode;
 };
 
@@ -89,10 +94,12 @@ export type ShellIntegrationEvent =
   | { type: "tool-used"; name: string; summary: string };
 
 type WorktreeDetector = (cwd: string) => Promise<boolean>;
+type ProjectRootDetector = (cwd: string) => Promise<string | null>;
 
 type GetTerminalTelemetryOptions = {
   now?: number;
   detectWorktree?: WorktreeDetector;
+  detectProjectRoot?: ProjectRootDetector;
 };
 
 type GitCommandResult = {
@@ -100,6 +107,12 @@ type GitCommandResult = {
   stdout: string;
   stderr: string;
 };
+
+type GitRunner = (
+  cwd: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+) => Promise<GitCommandResult>;
 
 type WorktreeCacheEntry = {
   expiresAt: number;
@@ -443,12 +456,20 @@ export async function getTerminalTelemetry(
     ageMs <= BUSY_BOOTSTRAP_WINDOW_MS &&
     terminal.scrollback.length > 0;
   let isWorktree = false;
+  let projectRoot: string | null = null;
 
   if (options.detectWorktree) {
     try {
       isWorktree = await options.detectWorktree(terminal.cwd);
     } catch {
       isWorktree = false;
+    }
+  }
+  if (options.detectProjectRoot) {
+    try {
+      projectRoot = await options.detectProjectRoot(terminal.cwd);
+    } catch {
+      projectRoot = null;
     }
   }
 
@@ -464,6 +485,7 @@ export async function getTerminalTelemetry(
     agentState: terminal.agentState || null,
     ports: extractPortsFromScrollback(terminal.scrollback),
     isWorktree,
+    projectRoot,
     backendMode,
   };
 }
@@ -638,6 +660,52 @@ export function createGitWorktreeDetector(options: {
   };
 }
 
+// The Agents panel groups sessions by project: the git top level of the
+// session's cwd (`git rev-parse --show-toplevel`, hardened read-only). Runs
+// only for a cwd inside the allowed roots, and reports the top level only when
+// it is inside them too; null otherwise (the panel then groups by cwd).
+// Cached per cwd for PROJECT_ROOT_CACHE_TTL_MS, misses included, and
+// concurrent polls share one git run.
+export function createGitProjectRootDetector(options: {
+  resolveAllowedPath: (inputPath: string) => Promise<string | null>;
+  now?: () => number;
+  cacheTtlMs?: number;
+  runGit?: GitRunner;
+}): ProjectRootDetector {
+  const now = options.now ?? Date.now;
+  const cacheTtlMs = options.cacheTtlMs ?? PROJECT_ROOT_CACHE_TTL_MS;
+  const runGit = options.runGit ?? runGitCommand;
+  const cache = new Map<
+    string,
+    { expiresAt: number; value: Promise<string | null> }
+  >();
+
+  async function detect(cwd: string): Promise<string | null> {
+    const resolvedCwd = await options.resolveAllowedPath(cwd);
+    if (!resolvedCwd) return null;
+    const { argv, env } = hardenGitInvocation(["rev-parse", "--show-toplevel"]);
+    const result = await runGit(resolvedCwd, argv, env);
+    if (result.exitCode !== 0) return null;
+    const topLevel = result.stdout.trim();
+    if (!topLevel || topLevel.includes("\n")) return null;
+    return (await options.resolveAllowedPath(topLevel)) ? topLevel : null;
+  }
+
+  return (cwd: string) => {
+    const key = String(cwd || "");
+    if (!key) return Promise.resolve(null);
+    const at = now();
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > at) return cached.value;
+    for (const [entryKey, entry] of cache) {
+      if (entry.expiresAt <= at) cache.delete(entryKey);
+    }
+    const value = detect(key).catch(() => null);
+    cache.set(key, { expiresAt: at + cacheTtlMs, value });
+    return value;
+  };
+}
+
 function extractPortsFromScrollback(scrollback: string[]): number[] {
   const sample = scrollback.slice(-MAX_SCROLLBACK_CHUNKS).join("");
   if (!sample) return [];
@@ -709,13 +777,14 @@ function detectRecoveredAgentName(values: string[]): AgentName | null {
 async function runGitCommand(
   cwd: string,
   args: string[],
+  extraEnv: Record<string, string> = {},
 ): Promise<GitCommandResult> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
     // git runs in a user's repo (config, hooks, fsmonitor): no service secrets.
-    env: sanitizeTerminalEnv(process.env),
+    env: { ...sanitizeTerminalEnv(process.env), ...extraEnv },
   });
 
   const timeoutId = setTimeout(() => proc.kill(), GIT_COMMAND_TIMEOUT_MS);

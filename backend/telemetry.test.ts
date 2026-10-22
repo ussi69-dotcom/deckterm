@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   classifyAgentOutputPhase,
+  createGitProjectRootDetector,
+  getTerminalTelemetry,
+  PROJECT_ROOT_CACHE_TTL_MS,
   inferRecoveredTmuxRuntimeState,
   inferTmuxRuntimeState,
   nextAgentMarkerActive,
@@ -1115,4 +1118,100 @@ test("applyAgentAttention keeps the seq and 2 s priority-window rules", () => {
     source: "screen",
   });
   expect(applied.accepted!.seq).toBeGreaterThan(next.accepted!.seq);
+});
+
+// --- projectRoot (Agents panel grouping, S2) --------------------------------
+
+function projectRootHarness(
+  topLevelByCwd: Record<string, string | null>,
+  allowed = ["/w"],
+) {
+  const calls: Array<{ cwd: string; args: string[]; env?: Record<string, string> }> = [];
+  let clock = 1_000;
+  const detect = createGitProjectRootDetector({
+    resolveAllowedPath: async (p) =>
+      allowed.some((root) => p === root || p.startsWith(`${root}/`)) ? p : null,
+    now: () => clock,
+    runGit: async (cwd, args, env) => {
+      calls.push({ cwd, args, env });
+      const top = topLevelByCwd[cwd];
+      return top
+        ? { exitCode: 0, stdout: `${top}\n`, stderr: "" }
+        : { exitCode: 128, stdout: "", stderr: "not a git repository" };
+    },
+  });
+  return { detect, calls, advance: (ms: number) => (clock += ms) };
+}
+
+test("projectRoot is the hardened git top level of an allowed cwd", async () => {
+  const h = projectRootHarness({ "/w/app/src": "/w/app" });
+  expect(await h.detect("/w/app/src")).toBe("/w/app");
+  expect(h.calls).toHaveLength(1);
+  // hardenGitInvocation: fsmonitor and hooks off, no optional locks.
+  expect(h.calls[0].args).toEqual([
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "rev-parse",
+    "--show-toplevel",
+  ]);
+  expect(h.calls[0].env).toEqual({ GIT_OPTIONAL_LOCKS: "0" });
+});
+
+test("projectRoot never runs git outside the allowed roots", async () => {
+  const h = projectRootHarness({ "/etc": "/etc" });
+  expect(await h.detect("/etc")).toBe(null);
+  expect(h.calls).toHaveLength(0);
+});
+
+test("projectRoot is null for a top level outside the allowed roots or no repo", async () => {
+  const h = projectRootHarness({ "/w/sub": "/" , "/w/plain": null });
+  expect(await h.detect("/w/sub")).toBe(null);
+  expect(await h.detect("/w/plain")).toBe(null);
+});
+
+test("projectRoot is cached per cwd for 60 s, misses included", async () => {
+  expect(PROJECT_ROOT_CACHE_TTL_MS).toBe(60_000);
+  const h = projectRootHarness({ "/w/app": "/w/app" });
+  await Promise.all([h.detect("/w/app"), h.detect("/w/app")]);
+  await h.detect("/w/none");
+  await h.detect("/w/none");
+  expect(h.calls.map((c) => c.cwd)).toEqual(["/w/app", "/w/none"]);
+  h.advance(59_000);
+  await h.detect("/w/app");
+  expect(h.calls).toHaveLength(2);
+  h.advance(2_000);
+  await h.detect("/w/app");
+  expect(h.calls).toHaveLength(3);
+});
+
+test("getTerminalTelemetry reports projectRoot (null without a detector)", async () => {
+  const terminal = {
+    cwd: "/w/app",
+    createdAt: 0,
+    lastActivityAt: 0,
+    scrollback: [],
+  };
+  expect(
+    (await getTerminalTelemetry(terminal, "tmux", { now: 1 })).projectRoot,
+  ).toBe(null);
+  expect(
+    (
+      await getTerminalTelemetry(terminal, "tmux", {
+        now: 1,
+        detectProjectRoot: async () => "/w/app",
+      })
+    ).projectRoot,
+  ).toBe("/w/app");
+  expect(
+    (
+      await getTerminalTelemetry(terminal, "tmux", {
+        now: 1,
+        detectProjectRoot: async () => {
+          throw new Error("boom");
+        },
+      })
+    ).projectRoot,
+  ).toBe(null);
 });

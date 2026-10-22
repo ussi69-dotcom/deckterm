@@ -33,6 +33,7 @@ import {
   type ProcessSnapshot,
 } from "./services/runtime-sync-cache";
 import { createCpuUsageMeter } from "./services/cpu-usage";
+import { ATTENTION_SEEN_KEY, mergeSeenMaps } from "./services/attention-seen";
 import {
   NO_STORE_CACHE_CONTROL,
   createBuildFingerprint,
@@ -72,6 +73,7 @@ import {
   applyTerminalNotificationEvents,
   classifyAgentOutputPhase,
   createAttentionTracker,
+  createGitProjectRootDetector,
   createGitWorktreeDetector,
   createOscTitleParseState,
   createTerminalNotificationParseState,
@@ -4420,6 +4422,9 @@ async function getDefaultBrowseRoot(): Promise<string> {
 const detectGitWorktree = createGitWorktreeDetector({
   resolveAllowedPath,
 });
+const detectGitProjectRoot = createGitProjectRootDetector({
+  resolveAllowedPath,
+});
 
 let accessVerifier: ReturnType<typeof cloudflareAccess> | undefined;
 function getAccessVerifier() {
@@ -8624,6 +8629,7 @@ export function createWebApp() {
             ...serializeTerminal(restoredTerm, requestingClientId),
             ...(await getTerminalTelemetry(restoredTerm, backendMode, {
               detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
             })),
           };
         }
@@ -8655,7 +8661,10 @@ export function createWebApp() {
               agentState: null,
             },
             backendMode,
-            { detectWorktree: detectGitWorktree },
+            {
+              detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
+            },
           )),
           active: serialized.active,
           status: serialized.status,
@@ -8680,6 +8689,7 @@ export function createWebApp() {
             ...serializeTerminal(t, requestingClientId),
             ...(await getTerminalTelemetry(t, backendMode, {
               detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
             })),
           };
         }),
@@ -10122,6 +10132,17 @@ export function createWebApp() {
       }
     }
     const state = await getFoundationState();
+    // `attention.seen` merges per id by max against the stored value, so a
+    // stale page cannot undo another device's "seen" (null still deletes).
+    if (
+      Object.prototype.hasOwnProperty.call(record, ATTENTION_SEEN_KEY) &&
+      record[ATTENTION_SEEN_KEY] !== null
+    ) {
+      record[ATTENTION_SEEN_KEY] = mergeSeenMaps(
+        getUserSettings(state.db, actor.id)[ATTENTION_SEEN_KEY],
+        record[ATTENTION_SEEN_KEY],
+      );
+    }
     setUserSettings(state.db, actor.id, record);
     return c.json({ settings: getUserSettings(state.db, actor.id) });
   });
