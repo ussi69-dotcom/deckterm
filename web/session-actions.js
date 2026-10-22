@@ -11,6 +11,7 @@
 //   - resume:    ended, and the server says its agent was alive when the
 //                session died (`resume: { agent, mode, cwd }`, slice S3) →
 //                one tap reopens the agent conversation in a new terminal.
+//                Wins over focus: a crashed session's open tab is dead.
 //                Label "Resume", or "Resume (pick)" when the agent's own
 //                picker opens (no exact conversation id). Never automatic.
 //
@@ -45,7 +46,10 @@ function planSessionRowAction(session, options) {
   const live = isSessionLive(session);
   const statusClass = live ? "active" : "ended";
 
-  if (isLocallyOpen) {
+  // An ended row the server can resume wins even over a locally open tab:
+  // after a tmux crash that tab is dead, and Resume is the useful tap.
+  const resume = live ? null : resumeInfo(session);
+  if (isLocallyOpen && !resume) {
     return { kind: "focus", label: "Focus", statusClass };
   }
   if (live) {
@@ -55,7 +59,6 @@ function planSessionRowAction(session, options) {
       statusClass,
     };
   }
-  const resume = resumeInfo(session);
   if (resume) {
     return {
       kind: "resume",

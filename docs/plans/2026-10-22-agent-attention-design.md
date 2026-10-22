@@ -320,7 +320,7 @@ The list of service-only variables removed from terminal environments is recorde
 - **Marker.** `agent;<name>;start;sid=<uuid>`. The parser (`backend/telemetry.ts:526-545`) accepts exactly one extra field, `sid=`, and only when it matches `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`. Anything else is dropped, the start event itself still counts, and no id is recorded. The marker travels in pane output, so any program can forge it. A forged `sid=x;$(id)` leaves no resumable id.
 - **Resume modes.** The server computes them for ended rows as `resume: { agent, mode, cwd } | null` in `/api/terminals`:
   - `exact`: `claude --resume <id>` or `codex resume <id>`;
-  - `last` (Codex without an id): `codex resume --last`;
+  - `last` (Codex without an id): `codex resume --last`. Resume uses Codex's most recent conversation in this folder; a newer Codex run in the same folder that exited normally is not tracked, so `--last` picks that one instead (known limitation, accepted by the operator on 2026-10-22);
   - `pick`: `claude --resume` or `codex resume`, which open the agent's own picker. It is used without a Claude id, and for Codex when another resumable or live Codex row shares the same `agent_cwd`, because `--last` would pick the same conversation for both.
 - **Action.** `POST /api/terminals/:id/resume`:
   - checks the actor owns the ended row and validates the stored id again;

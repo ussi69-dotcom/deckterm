@@ -316,10 +316,12 @@
       resume.mode === "exact"
         ? "the same conversation"
         : resume.mode === "last"
-          ? "the latest Codex conversation in this folder"
+          ? "Resume uses Codex's most recent conversation in this folder"
           : `opens ${resume.agent}'s conversation picker`;
     const where = resume.cwd ? ` in ${resume.cwd}` : "";
-    return `Resume ${resume.agent}${where}: ${what}`;
+    // `last` is a whole sentence (the known Codex limitation, design 6).
+    const joiner = resume.mode === "last" ? ". " : ": ";
+    return `Resume ${resume.agent}${where}${joiner}${what}`;
   }
 
   // Row tooltip: "Needs your answer · rule live_blocked_form

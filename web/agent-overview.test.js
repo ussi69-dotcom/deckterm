@@ -422,7 +422,9 @@ describe("resumable rows", () => {
     expect(resumeTooltip(exact)).toBe(
       "Resume claude in /w/app: the same conversation",
     );
-    expect(resumeTooltip(last)).toContain("latest Codex conversation");
+    expect(resumeTooltip(last)).toBe(
+      "Resume codex in /w/app. Resume uses Codex's most recent conversation in this folder",
+    );
     expect(resumeTooltip(pick)).toContain("conversation picker");
     expect(tooltipFor(pick, TIER_RESUMABLE)).toBe(resumeTooltip(pick));
   });

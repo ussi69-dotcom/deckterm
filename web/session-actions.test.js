@@ -131,15 +131,30 @@ test("an unknown resume shape falls back to Open here", () => {
   }
 });
 
-test("a live or locally open row never becomes Resume", () => {
+test("a live row never becomes Resume", () => {
   const resume = { agent: "claude", mode: "exact", cwd: "/p" };
   expect(
     planSessionRowAction({ id: "abc", sessionStatus: "active", resume }).kind,
   ).toBe("attach");
   expect(
     planSessionRowAction(
-      { id: "abc", sessionStatus: "ended", resume },
+      { id: "abc", sessionStatus: "active", resume },
       { isLocallyOpen: true },
     ).kind,
   ).toBe("focus");
+});
+
+test("Resume beats Focus on a dead tab that is still open here", () => {
+  // After a tmux crash the page keeps the exited tab; focusing it shows a
+  // dead terminal, so the row offers the one-tap Resume instead.
+  const action = planSessionRowAction(
+    {
+      id: "abc",
+      sessionStatus: "ended",
+      resume: { agent: "claude", mode: "exact", cwd: "/p" },
+    },
+    { isLocallyOpen: true },
+  );
+  expect(action.kind).toBe("resume");
+  expect(action.statusClass).toBe("ended");
 });
