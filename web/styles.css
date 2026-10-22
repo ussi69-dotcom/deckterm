@@ -10926,3 +10926,95 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
 }
 
 /* ===== end TERMINAL RELIABILITY ===== */
+
+/* =============================================================================
+   TOUCH SCROLLING (slice M0): one-finger drags over a tmux terminal on touch
+   layouts go to the server (web/touch-scroll.js); while the pane is scrolled
+   back a right-edge handle and a "Jump to latest" pill show where you are
+   (web/scroll-indicator.js). Only touch-layout tiles carry these elements.
+   ============================================================================= */
+
+/* The page owns vertical drags on the terminal: no native pan or
+   pull-to-refresh. Sideways swipes (session switching) and pinch stay native. */
+.terminal-wrapper[data-touch-scroll="on"] {
+  touch-action: pan-x pinch-zoom;
+}
+
+/* Above the tile resize edges (z-index 20) and the size warning (25), below
+   the pane controls (30). Only the handle and the pill take touches. */
+.touch-scroll-indicator {
+  position: absolute;
+  inset: 0;
+  z-index: 28;
+  pointer-events: none;
+}
+
+.touch-scroll-indicator[hidden] {
+  display: none;
+}
+
+/* Starts below the 44px pane controls (top: 8px) so they stay reachable. */
+.touch-scroll-track {
+  position: absolute;
+  top: 60px;
+  right: 0;
+  bottom: 8px;
+  width: 44px;
+}
+
+.touch-scroll-handle {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 44px;
+  min-height: 44px;
+  pointer-events: auto;
+  touch-action: none;
+  cursor: grab;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.touch-scroll-thumb {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  bottom: 4px;
+  width: 6px;
+  border-radius: 3px;
+  background: var(--accent-blue);
+  opacity: 0.75;
+  box-shadow: 0 0 0 1px rgba(13, 17, 23, 0.6);
+}
+
+.touch-scroll-handle.dragging .touch-scroll-thumb {
+  width: 10px;
+  opacity: 1;
+}
+
+.touch-scroll-latest {
+  position: absolute;
+  right: 52px;
+  bottom: 12px;
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0 14px;
+  border: 1px solid var(--accent-blue);
+  border-radius: 22px;
+  background: rgba(22, 27, 34, 0.94);
+  color: var(--text-primary);
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1;
+  pointer-events: auto;
+  touch-action: manipulation;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.touch-scroll-latest:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
