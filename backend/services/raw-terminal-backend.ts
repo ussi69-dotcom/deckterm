@@ -120,6 +120,19 @@ export class RawTerminalBackend implements TerminalBackend {
     return false;
   }
 
+  // A raw PTY has no server-side history: the browser's own scrollback is it.
+  async readScrollState(): Promise<null> {
+    return null;
+  }
+
+  async scrollToPosition(): Promise<boolean> {
+    return false;
+  }
+
+  async exitScroll(): Promise<boolean> {
+    return false;
+  }
+
   async kill(sessionName: string): Promise<void> {
     if (this.brokered.has(sessionName)) {
       // Tear down the broker-created transient scope (which reaps the shell),

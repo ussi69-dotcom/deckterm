@@ -156,6 +156,13 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
       .filter((c) => c.fn === "brokerExec")
       .map((c) => c.opts.profileArgs),
   ).toEqual([
+    [
+      "display-message",
+      "-t",
+      "deckterm_decktermdev_s1",
+      "-p",
+      "#{alternate_on}",
+    ],
     ["copy-mode", "-e", "-t", "deckterm_decktermdev_s1"],
     [
       "send-keys",
@@ -172,7 +179,7 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
   expect(
     await b.scrollHistory("deckterm_decktermdev_s1", "down", 12),
   ).toBe(true);
-  expect(calls[0]?.opts.profileArgs).toEqual([
+  expect(calls[1]?.opts.profileArgs).toEqual([
     "send-keys",
     "-X",
     "-N",
@@ -181,6 +188,81 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
     "deckterm_decktermdev_s1",
     "scroll-down",
   ]);
+});
+
+test("scrollHistory refuses copy-mode on the alternate screen", async () => {
+  const b = backend();
+  execResult = { code: 0, stdout: "1\n", stderr: "" };
+  expect(await b.scrollHistory("deckterm_decktermdev_s1", "up", 5)).toBe(
+    false,
+  );
+  expect(
+    calls.filter((c) => c.opts.profileArgs?.[0] === "copy-mode"),
+  ).toHaveLength(0);
+
+  // An unreadable state keeps today's behaviour (scroll) rather than refusing.
+  calls.length = 0;
+  execResult = { code: 71, stdout: "", stderr: "not permitted" };
+  await b.scrollHistory("deckterm_decktermdev_s1", "up", 5);
+  expect(
+    calls.filter((c) => c.opts.profileArgs?.[0] === "copy-mode"),
+  ).toHaveLength(1);
+});
+
+test("readScrollState reads the pane through an allowlisted display-message", async () => {
+  const b = backend();
+  execResult = {
+    code: 0,
+    stdout: "1|copy-mode|6|191|191|10|0|0|0|0|0\n",
+    stderr: "",
+  };
+  expect(await b.readScrollState("deckterm_decktermdev_s1")).toMatchObject({
+    inMode: true,
+    position: 6,
+    total: 191,
+  });
+  const args = calls[0]!.opts.profileArgs as string[];
+  expect(args.slice(0, 4)).toEqual([
+    "display-message",
+    "-t",
+    "deckterm_decktermdev_s1",
+    "-p",
+  ]);
+  // The broker refuses `#(` (shell) in formats; ours never has one.
+  expect(args[4]).not.toContain("#(");
+
+  execResult = { code: 1, stdout: "", stderr: "no session" };
+  expect(await b.readScrollState("deckterm_decktermdev_s1")).toBeNull();
+});
+
+test("brokered absolute jumps are refused; exitScroll scrolls down to leave copy-mode", async () => {
+  const b = backend();
+  execResult = {
+    code: 0,
+    stdout: "1|copy-mode|250|300|300|10|0|0|0|0|0\n",
+    stderr: "",
+  };
+  expect(await b.scrollToPosition("deckterm_decktermdev_s1", 40)).toBe(false);
+  expect(calls).toHaveLength(0);
+
+  // Still reported in copy-mode after the scroll-downs: not a success.
+  expect(await b.exitScroll("deckterm_decktermdev_s1")).toBe(false);
+  const scrolls = calls.filter((c) => c.opts.profileArgs?.[0] === "send-keys");
+  expect(scrolls).toHaveLength(4);
+  expect(scrolls[0]!.opts.profileArgs).toEqual([
+    "send-keys",
+    "-X",
+    "-N",
+    "100",
+    "-t",
+    "deckterm_decktermdev_s1",
+    "scroll-down",
+  ]);
+
+  calls.length = 0;
+  execResult = { code: 0, stdout: "0||||300|10|0|0|0|0|0\n", stderr: "" };
+  expect(await b.exitScroll("deckterm_decktermdev_s1")).toBe(true);
+  expect(calls).toHaveLength(1);
 });
 
 test("cache returns one backend instance per uid", () => {

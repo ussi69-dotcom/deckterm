@@ -11,6 +11,11 @@ import {
   buildTmuxSessionName,
   getTmuxSessionPrefix,
 } from "../tmux-session-names";
+import {
+  parseTmuxScrollState,
+  TMUX_SCROLL_STATE_FORMAT,
+  type TmuxScrollState,
+} from "./tmux-scroll-state";
 import type {
   TerminalBackend,
   TerminalBackendAttachOptions,
@@ -424,6 +429,54 @@ export class TmuxTerminalBackend implements TerminalBackend {
     return (await scrollProc.exited) === 0;
   }
 
+  async readScrollState(sessionName: string): Promise<TmuxScrollState | null> {
+    const proc = await this.spawnTmux(
+      ["display-message", "-p", "-t", sessionName, TMUX_SCROLL_STATE_FORMAT],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const output = await new Response((proc as any).stdout).text();
+    if ((await proc.exited) !== 0) return null;
+    return parseTmuxScrollState(output);
+  }
+
+  // `goto-line N` puts the view N lines above the live bottom (tmux clamps it
+  // to the history), as long as copy-mode-line-numbers stays off (pinned in
+  // ensureServerOptions). It never leaves copy-mode itself, even at 0, so 0
+  // exits explicitly.
+  async scrollToPosition(
+    sessionName: string,
+    position: number,
+  ): Promise<boolean> {
+    const target = Math.trunc(position);
+    if (!Number.isFinite(target) || target <= 0) {
+      return this.exitScroll(sessionName);
+    }
+    const state = await this.readScrollState(sessionName);
+    // Same dead end as scrollHistory: no copy-mode on the alternate screen.
+    if (!state || state.altScreen) return false;
+    const proc = await this.spawnTmux([
+      "copy-mode",
+      "-e",
+      "-t",
+      sessionName,
+      ";",
+      "send-keys",
+      "-X",
+      "-t",
+      sessionName,
+      "goto-line",
+      String(target),
+    ]);
+    return (await proc.exited) === 0;
+  }
+
+  // `copy-mode -q` exits every mode and returns 0 when there is none, unlike
+  // `send -X cancel` (rc 1 "not in a mode").
+  async exitScroll(sessionName: string): Promise<boolean> {
+    const proc = await this.spawnTmux(["copy-mode", "-q", "-t", sessionName]);
+    return (await proc.exited) === 0;
+  }
+
   async kill(sessionName: string): Promise<void> {
     const killProc = await this.spawnTmux(["kill-session", "-t", sessionName]);
     const exitCode = await killProc.exited;
@@ -619,6 +672,9 @@ export class TmuxTerminalBackend implements TerminalBackend {
   //   (including completed Codex/Claude responses).
   // - mouse off: tmux 3.8 turned mouse on by default, which sends wheel and
   //   drag to tmux copy mode instead of DeckTerm's own scrollback/selection.
+  // - copy-mode-line-numbers off: tmux 3.8 can number copy-mode lines from
+  //   the top of history instead, which changes what `goto-line` (the scroll
+  //   indicator's absolute jump) means. -q: tmux < 3.8 has no such option.
   // - theme terminal: tmux 3.8 re-colours its own UI by default; -q keeps
   //   tmux < 3.8 (no such option) quiet. Last in the chain on purpose.
   private async ensureServerOptions(): Promise<void> {
@@ -631,6 +687,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
       "set-option",
       "-g",
       "mouse",
+      "off",
+      ";",
+      "set-option",
+      "-gq",
+      "copy-mode-line-numbers",
       "off",
       ";",
       "set-option",

@@ -100,6 +100,14 @@ import type {
 } from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
 import {
+  isReadOnlyAllowedMessageType,
+  isScrollControlMessageType,
+  parseScrollControlMessage,
+  selectScrollSubscribers,
+  socketWantsScrollFrames,
+  TerminalScrollController,
+} from "./services/terminal-scroll-control";
+import {
   TaskRunnerError,
   buildJudgeCommand,
   buildWorkerCommand,
@@ -346,8 +354,6 @@ type Terminal = {
   // to the same broker path instead of the legacy service-account backend.
   exec?: BrokeredExecContext;
   backend?: TerminalBackend;
-  scrollHistoryPending?: number;
-  scrollHistoryRunning?: Promise<void>;
 };
 
 type TerminalWsData = {
@@ -359,6 +365,9 @@ type TerminalWsData = {
   protocol: "legacy" | "v2";
   clientId: string | null;
   lastEventId: number | null;
+  // `scroll=1` in the socket URL: this page understands `scroll-position`
+  // frames. Older pages would print them into the terminal as text.
+  scroll?: boolean;
 };
 export type WsData = TerminalWsData;
 
@@ -851,6 +860,9 @@ function applyParsedShellIntegrationState(
     term.lastOutputAt = Date.now();
     appendScrollback(term.id, parsed.output);
     broadcastTerminalOutput(term.id, parsed.output);
+    // While scrolled back, output can end copy-mode (-e at the bottom, `q`,
+    // another viewer): refresh the indicator on a trailing throttle.
+    terminalScrollControllers.get(term)?.onOutput();
   }
 }
 
@@ -5301,42 +5313,79 @@ function requestTerminalResize(
   return run({ cols, rows });
 }
 
+// Scroll control (slice M0): one ordered scroll queue per tmux-backed
+// terminal. It coalesces wheel/PgUp history scrolls (±100), routes touch
+// drags from tmux's live pane state, holds input behind a pending "back to
+// latest" and sends `scroll-position` frames to `scroll=1` sockets. Keyed by
+// the handle, so a re-attach (new Terminal object) starts clean.
+const terminalScrollControllers = new WeakMap<
+  Terminal,
+  TerminalScrollController
+>();
+
+function scrollSubscribers(term: Terminal): ServerWebSocket<WsData>[] {
+  const sockets = terminalSockets.get(term.id);
+  if (!sockets) return [];
+  return selectScrollSubscribers(sockets, (ws) => {
+    const reconnectState = socketReconnectState.get(ws);
+    return Boolean(reconnectState?.pendingReady || reconnectState?.replaying);
+  });
+}
+
+function writeTerminalInputNow(term: Terminal, data: string) {
+  try {
+    term.terminal.write(data);
+  } catch (err) {
+    debug(`Write error for ${term.id}:`, err);
+  }
+}
+
+function getScrollController(term: Terminal): TerminalScrollController | null {
+  if (!TMUX_BACKEND || !term.sessionName) return null;
+  const existing = terminalScrollControllers.get(term);
+  if (existing) return existing;
+  const backend = term.backend ?? tmuxTerminalBackend;
+  if (!backend) return null;
+  const sessionName = term.sessionName;
+  const controller = new TerminalScrollController(
+    {
+      readState: () => backend.readScrollState(sessionName),
+      scrollHistory: (direction, lines) =>
+        backend.scrollHistory(sessionName, direction, lines),
+      scrollToPosition: (position) =>
+        backend.scrollToPosition(sessionName, position),
+      exitScroll: () => backend.exitScroll(sessionName),
+      writeInput: (data) => writeTerminalInputNow(term, data),
+      paneSize: () => ({ cols: term.cols, rows: term.rows }),
+      subscribers: () => scrollSubscribers(term),
+      isActive: () => terminals.get(term.id) === term,
+    },
+    {
+      onError: (err) =>
+        debug(`[tmux] scroll control failed for ${term.id}:`, err),
+    },
+  );
+  terminalScrollControllers.set(term, controller);
+  return controller;
+}
+
+// Every input path (JSON `input`, raw text, binary) goes through here so
+// input never overtakes a pending "back to latest".
+function writeTerminalInput(term: Terminal, data: string) {
+  const controller = terminalScrollControllers.get(term);
+  if (controller) {
+    controller.input(data);
+    return;
+  }
+  writeTerminalInputNow(term, data);
+}
+
 async function scrollTmuxSessionHistory(
   term: Terminal,
   direction: "up" | "down",
   lines: number,
 ): Promise<void> {
-  if (!TMUX_BACKEND || !term.sessionName) return;
-  const backend = term.backend ?? tmuxTerminalBackend;
-  if (!backend) return;
-  const count = Math.max(1, Math.min(100, Math.trunc(lines)));
-  const signedCount = direction === "up" ? count : -count;
-  term.scrollHistoryPending = Math.max(
-    -100,
-    Math.min(100, (term.scrollHistoryPending ?? 0) + signedCount),
-  );
-  if (term.scrollHistoryRunning) {
-    await term.scrollHistoryRunning;
-    return;
-  }
-
-  const running = (async () => {
-    while (term.scrollHistoryPending) {
-      const pending = term.scrollHistoryPending;
-      term.scrollHistoryPending = 0;
-      await backend.scrollHistory(
-        term.sessionName!,
-        pending > 0 ? "up" : "down",
-        Math.abs(pending),
-      );
-    }
-  })();
-  term.scrollHistoryRunning = running;
-  await term.scrollHistoryRunning.finally(() => {
-    if (term.scrollHistoryRunning === running) {
-      delete term.scrollHistoryRunning;
-    }
-  });
+  await getScrollController(term)?.scrollRelative(direction, lines);
 }
 
 async function sendTmuxPaneCapture(
@@ -5459,6 +5508,15 @@ async function completeTmuxReconnectReplay(
   } finally {
     reconnectState.replaying = false;
     reconnectState.pendingReady = false;
+    // Copy-mode lives in tmux and survives the reconnect: tell this socket
+    // where the pane is before it starts handling output again.
+    if (ws.data.scroll && ws.readyState === 1) {
+      try {
+        await getScrollController(term)?.emit(ws);
+      } catch (err) {
+        debug(`[reconnect] scroll position failed for ${terminalId}`, err);
+      }
+    }
     sendReconnectLifecycle(ws, "ready");
     socketReconnectState.delete(ws);
   }
@@ -11398,6 +11456,7 @@ async function startOwnedWebServer(
             protocol: isV2 ? "v2" : "legacy",
             clientId,
             lastEventId: Number.isFinite(lastEventId) ? lastEventId : null,
+            scroll: socketWantsScrollFrames(url),
           },
         });
         if (success) return undefined;
@@ -11511,7 +11570,7 @@ async function startOwnedWebServer(
             if (typeof message === "string") {
               try {
                 const parsed = JSON.parse(message);
-                if (parsed.type !== "ping" && parsed.type !== "resume-ready") {
+                if (!isReadOnlyAllowedMessageType(parsed.type)) {
                   debug(
                     `[ws-security] Blocked message type "${parsed.type}" for read-only actor ${data.actorUserId} on terminal ${terminalId}`,
                   );
@@ -11548,6 +11607,21 @@ async function startOwnedWebServer(
                 ws.send(JSON.stringify({ type: "pong" }));
                 return;
               }
+              if (isScrollControlMessageType(parsed.type)) {
+                const scrollMessage = parseScrollControlMessage(parsed);
+                const controller = scrollMessage
+                  ? getScrollController(term)
+                  : null;
+                if (scrollMessage && controller) {
+                  void controller.handle(scrollMessage).catch((err) => {
+                    debug(
+                      `[tmux] ${scrollMessage.type} failed for ${terminalId}:`,
+                      err,
+                    );
+                  });
+                }
+                return;
+              }
               if (parsed.type === "scrollback") {
                 const direction =
                   parsed.direction === "up" || parsed.direction === "down"
@@ -11576,7 +11650,9 @@ async function startOwnedWebServer(
                 debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
                 term.cols = parsed.cols;
                 term.rows = parsed.rows;
-                void requestTerminalResize(term, parsed.cols, parsed.rows);
+                void requestTerminalResize(term, parsed.cols, parsed.rows).then(
+                  () => terminalScrollControllers.get(term)?.onResize(),
+                );
                 return;
               }
               if (parsed.type === "input") {
@@ -11590,11 +11666,7 @@ async function startOwnedWebServer(
                     broadcastTerminalState(term);
                   }
                 }
-                try {
-                  term.terminal.write(parsed.data);
-                } catch (err) {
-                  debug(`Write error for ${terminalId}:`, err);
-                }
+                writeTerminalInput(term, parsed.data);
                 return;
               }
               if (parsed.type === "resume-ready") {
@@ -11611,21 +11683,13 @@ async function startOwnedWebServer(
             } catch {
               debug(`Raw input ${terminalId}`);
               term.lastActivityAt = Date.now();
-              try {
-                term.terminal.write(message);
-              } catch (err) {
-                debug(`Write error for ${terminalId}:`, err);
-              }
+              writeTerminalInput(term, message);
             }
           } else {
             const buf = message as unknown as Uint8Array;
             debug(`Binary input ${terminalId}: ${buf.byteLength} bytes`);
             term.lastActivityAt = Date.now();
-            try {
-              term.terminal.write(new TextDecoder().decode(buf));
-            } catch (err) {
-              debug(`Binary write error for ${terminalId}:`, err);
-            }
+            writeTerminalInput(term, new TextDecoder().decode(buf));
           }
         } catch (err) {
           console.error("[WebSocket] Message handler error:", err);
