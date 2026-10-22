@@ -37,6 +37,7 @@ import { ATTENTION_SEEN_KEY, mergeSeenMaps } from "./services/attention-seen";
 import {
   isAgentSessionId,
   planAgentResume,
+  typeAgentResumeCommand,
   type AgentResumeDecision,
 } from "./agent-resume";
 import {
@@ -221,10 +222,13 @@ import {
   listTerminalSessionsForActor,
   listWildcardGrantPrincipals,
   clearAgentSession,
+  listCodexAgentRowsInFolder,
   markTerminalSessionEnded,
   markUserReviewed,
   recordAgentSession,
   recordTerminalSession,
+  releaseAgentResume,
+  reserveAgentResume,
   resolveUserForActor,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
@@ -461,6 +465,8 @@ const MAX_TERMINALS_PER_USER = parseInt(
 // S3: gap between the typed resume command and its separate Enter, the
 // same 300 ms Task Runner uses for its pointer line (POINTER_SUBMIT_DELAY_MS).
 const AGENT_RESUME_SUBMIT_DELAY_MS = 300;
+// S3: ended rows a resume request in THIS process is handing over right now.
+const agentResumesInProgress = new Set<string>();
 const TERMINAL_LIST_ENDED_LIMIT = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TERMINAL_LIST_ENDED_LIMIT || "10",
@@ -4994,61 +5000,61 @@ type AgentResumeSummary = {
   cwd: string;
 };
 
-// Codex rows by agent folder (design 6): another resumable or live Codex row
-// in the same folder makes `codex resume --last` ambiguous, so that row
-// opens Codex's own picker instead.
-function collectCodexAgentCwds(
-  recordedSessions: RecordedTerminalSession[],
+// Design 6: another resumable or live Codex row of this owner in the same
+// agent folder makes `codex resume --last` ambiguous, so that row opens
+// Codex's own picker instead. Asked per row against the WHOLE table (an
+// indexed lookup), not the capped catalog: a resumable row the listing no
+// longer shows still counts.
+function codexFolderShared(
+  db: FoundationState["db"],
   ownerId: string,
-): Map<string, Set<string>> {
-  const byCwd = new Map<string, Set<string>>();
-  const add = (cwd: string | null | undefined, id: string) => {
-    if (!cwd) return;
-    let ids = byCwd.get(cwd);
-    if (!ids) {
-      ids = new Set();
-      byCwd.set(cwd, ids);
-    }
-    ids.add(id);
-  };
-  for (const row of recordedSessions) {
-    if (row.agentName === "codex") add(row.agentCwd, row.id);
-  }
+  session: RecordedTerminalSession,
+): boolean {
+  if (session.agentName !== "codex" || !session.agentCwd) return false;
+  const cwd = session.agentCwd;
   for (const term of terminals.values()) {
-    if (term.ownerId === ownerId && term.agentName === "codex") {
-      add(term.cwd, term.id);
+    if (
+      term.id !== session.id &&
+      term.ownerId === ownerId &&
+      term.agentName === "codex" &&
+      term.cwd === cwd
+    ) {
+      return true;
     }
   }
-  return byCwd;
+  return listCodexAgentRowsInFolder(db, ownerId, cwd, session.id).some(
+    (row) =>
+      row.status !== "ended" ||
+      planAgentResume({
+        agentName: row.agentName,
+        agentSessionId: row.agentSessionId,
+        agentCwd: row.agentCwd,
+      }).ok,
+  );
 }
 
 function decideAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
   session: RecordedTerminalSession,
-  codexCwds: Map<string, Set<string>>,
 ): AgentResumeDecision {
-  const sameFolder =
-    session.agentName === "codex" && session.agentCwd
-      ? codexCwds.get(session.agentCwd)
-      : undefined;
-  const codexCwdShared = Boolean(
-    sameFolder && [...sameFolder].some((id) => id !== session.id),
-  );
   return planAgentResume(
     {
       agentName: session.agentName,
       agentSessionId: session.agentSessionId,
       agentCwd: session.agentCwd,
     },
-    { codexCwdShared },
+    { codexCwdShared: codexFolderShared(db, ownerId, session) },
   );
 }
 
 function summarizeAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
   session: RecordedTerminalSession,
-  codexCwds: Map<string, Set<string>>,
 ): AgentResumeSummary | null {
   if (session.status !== "ended" || terminals.has(session.id)) return null;
-  const decision = decideAgentResume(session, codexCwds);
+  const decision = decideAgentResume(db, ownerId, session);
   if (!decision.ok) return null;
   const { agent, mode, cwd } = decision.plan;
   return { agent, mode, cwd };
@@ -8845,7 +8851,6 @@ export function createWebApp() {
       throw err;
     }
     const recordedSessions = listCatalogSessions(state.db, ownerId);
-    const codexCwds = collectCodexAgentCwds(recordedSessions, ownerId);
     const seenIds = new Set<string>();
     // One `ps` snapshot per request, taken only if some session needs a
     // fresh runtime sync (cached syncs reuse their earlier result).
@@ -8890,7 +8895,7 @@ export function createWebApp() {
                 recordedSession
             : recordedSession;
         const serialized = serializeRecordedTerminalSession(effectiveSession, {
-          resume: summarizeAgentResume(effectiveSession, codexCwds),
+          resume: summarizeAgentResume(state.db, ownerId, effectiveSession),
         });
         return {
           ...serialized,
@@ -8974,7 +8979,8 @@ export function createWebApp() {
       throw err;
     }
     const row = getTerminalSession(state.db, id);
-    // Another actor's row answers exactly like a missing one.
+    // Another actor's row answers exactly like a missing one; both refusals
+    // are audited, so probing for other sessions is traceable.
     if (
       !row ||
       row.actorUserId !== ownerId ||
@@ -8985,6 +8991,14 @@ export function createWebApp() {
         env: process.env,
       })
     ) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.resume",
+        resourceType: "terminal",
+        resourceId: id.slice(0, 128),
+        decision: "deny",
+        reason: row ? "foreign_session" : "not_found",
+      });
       return c.json({ error: "Terminal not found" }, 404);
     }
     if (row.status !== "ended" || terminals.has(id)) {
@@ -8997,10 +9011,7 @@ export function createWebApp() {
       );
     }
     // The stored values are validated again here, whatever wrote them.
-    const decision = decideAgentResume(
-      row,
-      collectCodexAgentCwds(listCatalogSessions(state.db, ownerId), ownerId),
-    );
+    const decision = decideAgentResume(state.db, ownerId, row);
     if (!decision.ok) {
       if (decision.reason === "invalid_resume_data") {
         writeAuditEvent(state.db, {
@@ -9032,50 +9043,103 @@ export function createWebApp() {
     if (!routeCapability) {
       return c.json({ error: "Missing route capability" }, 500);
     }
-    const created = await createTerminalThroughCreatePath(
-      c,
-      { cwd: plan.cwd, cols: body?.cols, rows: body?.rows },
-      routeCapability,
-    );
-    if (!created.ok) return created.response;
-    const terminal = created.terminal;
-    // The create path may fall back to a parent folder when the agent's
-    // folder is gone. Codex `resume --last` would then pick another
-    // folder's conversation, so nothing is typed there.
-    const typed = terminal.cwd === plan.cwd;
-    if (typed) {
-      // Typed through the shell functions (Codex keeps --no-alt-screen and
-      // the new run reports its id again), then a SEPARATE deferred Enter:
-      // agent TUIs read text plus a newline in one chunk as a paste.
-      terminal.terminal.write(plan.command);
-      setTimeout(() => {
-        try {
-          terminal.terminal.write("\r");
-        } catch {
-          // PTY closed before the Enter: nothing to submit.
+    // One hand-over per row: an in-process reservation (this server) plus a
+    // conditional DB update that only one request can win (any process).
+    // Both are taken before anything is created, so two taps, two browsers
+    // or two direct calls never start two agents on one conversation.
+    const inProgress = () =>
+      c.json(
+        {
+          error: "This session is already being resumed",
+          reason: "resume_in_progress",
+        },
+        409,
+      );
+    if (agentResumesInProgress.has(id)) return inProgress();
+    agentResumesInProgress.add(id);
+    try {
+      if (
+        !reserveAgentResume(state.db, id, {
+          agentName: plan.agent,
+          sessionId: row.agentSessionId,
+          cwd: plan.cwd,
+        })
+      ) {
+        return inProgress();
+      }
+      let handedOver = false;
+      try {
+        const created = await createTerminalThroughCreatePath(
+          c,
+          { cwd: plan.cwd, cols: body?.cols, rows: body?.rows },
+          routeCapability,
+        );
+        if (!created.ok) return created.response;
+        const terminal = created.terminal;
+        // The create path may fall back to a parent folder when the agent's
+        // folder is gone. Codex `resume --last` would then pick another
+        // folder's conversation, so nothing is typed there.
+        const typeIt = terminal.cwd === plan.cwd;
+        // Typed through the shell functions (Codex keeps --no-alt-screen and
+        // the new run reports its id again), then a separate deferred Enter.
+        const typed =
+          typeIt &&
+          (await typeAgentResumeCommand(
+            (data) => terminal.terminal.write(data),
+            plan.command,
+            { delayMs: AGENT_RESUME_SUBMIT_DELAY_MS },
+          ));
+        if (typeIt && !typed) {
+          writeAuditEvent(state.db, {
+            actorUserId: created.ownerId,
+            action: "terminal.resume",
+            resourceType: "terminal",
+            resourceId: terminal.id,
+            decision: "deny",
+            reason: "resume_write_failed",
+            data: { from: id, agent: plan.agent, mode: plan.mode },
+          });
+          return c.json(
+            {
+              error:
+                "The new terminal closed before the resume command was sent; nothing ran, try again",
+              reason: "resume_write_failed",
+            },
+            500,
+          );
         }
-      }, AGENT_RESUME_SUBMIT_DELAY_MS);
-      // The ended row is resumed: it is not offered a second time.
-      clearAgentSession(state.db, id);
+        if (typed) {
+          // The command and its Enter reached the shell: hand the row over.
+          // The new terminal's own start marker records the new state.
+          clearAgentSession(state.db, id);
+          handedOver = true;
+        }
+        writeAuditEvent(state.db, {
+          actorUserId: created.ownerId,
+          action: "terminal.resume",
+          resourceType: "terminal",
+          resourceId: terminal.id,
+          decision: "allow",
+          data: {
+            from: id,
+            agent: plan.agent,
+            mode: plan.mode,
+            cwd: plan.cwd,
+            typed,
+          },
+        });
+        return c.json({
+          ...serializeTerminal(terminal),
+          resumed: { from: id, agent: plan.agent, mode: plan.mode, typed },
+        });
+      } finally {
+        // Nothing was handed over (refused, failed or not typed): the row
+        // stays resumable and a retry can reserve it again.
+        if (!handedOver) releaseAgentResume(state.db, id);
+      }
+    } finally {
+      agentResumesInProgress.delete(id);
     }
-    writeAuditEvent(state.db, {
-      actorUserId: created.ownerId,
-      action: "terminal.resume",
-      resourceType: "terminal",
-      resourceId: terminal.id,
-      decision: "allow",
-      data: {
-        from: id,
-        agent: plan.agent,
-        mode: plan.mode,
-        cwd: plan.cwd,
-        typed,
-      },
-    });
-    return c.json({
-      ...serializeTerminal(terminal),
-      resumed: { from: id, agent: plan.agent, mode: plan.mode, typed },
-    });
   });
 
   // Closing a browser tab first schedules termination instead of immediately

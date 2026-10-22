@@ -5,6 +5,7 @@ import {
   isAgentSessionId,
   isPlausibleAgentCwd,
   planAgentResume,
+  typeAgentResumeCommand,
 } from "./agent-resume";
 
 const U = "0f0e0d0c-1111-2222-3333-444455556666";
@@ -102,4 +103,46 @@ test("planAgentResume refuses rows without an agent or with tampered values", ()
   }
   expect(isPlausibleAgentCwd(`/${"a".repeat(5000)}`)).toBe(false);
   expect(isPlausibleAgentCwd("/home/u/my project")).toBe(true);
+});
+
+test("typeAgentResumeCommand writes the command, waits, then a separate Enter", async () => {
+  const written: string[] = [];
+  const waits: number[] = [];
+  const ok = await typeAgentResumeCommand(
+    (data: string) => {
+      written.push(data);
+    },
+    `claude --resume ${U}`,
+    { delayMs: 300, sleep: async (ms: number) => void waits.push(ms) },
+  );
+  expect(ok).toBe(true);
+  expect(written).toEqual([`claude --resume ${U}`, "\r"]);
+  expect(waits).toEqual([300]);
+});
+
+test("typeAgentResumeCommand reports a failed write instead of ignoring it", async () => {
+  const noSleep = { sleep: async () => {} };
+  // The PTY is gone before the command.
+  expect(
+    await typeAgentResumeCommand(
+      () => {
+        throw new Error("Terminal is closed");
+      },
+      "codex resume --last",
+      noSleep,
+    ),
+  ).toBe(false);
+  // The PTY dies between the command and the Enter.
+  const written: string[] = [];
+  expect(
+    await typeAgentResumeCommand(
+      (data: string) => {
+        if (data === "\r") throw new Error("Terminal is closed");
+        written.push(data);
+      },
+      "codex resume --last",
+      noSleep,
+    ),
+  ).toBe(false);
+  expect(written).toEqual(["codex resume --last"]);
 });

@@ -115,3 +115,27 @@ export function planAgentResume(
     },
   };
 }
+
+// Types a resume command into a new terminal the way Task Runner submits its
+// pointer line: the text, a pause, then a SEPARATE Enter (agent TUIs read
+// text plus a newline in one chunk as a paste). Reports whether both writes
+// went through, so the caller hands the ended row over only when the
+// command really reached the shell, and keeps it resumable otherwise.
+export async function typeAgentResumeCommand(
+  write: (data: string) => void,
+  command: string,
+  {
+    delayMs = 300,
+    sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms)),
+  }: { delayMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<boolean> {
+  try {
+    write(command);
+    await sleep(delayMs);
+    write("\r");
+    return true;
+  } catch {
+    // The PTY closed (the terminal died) before the command or the Enter.
+    return false;
+  }
+}

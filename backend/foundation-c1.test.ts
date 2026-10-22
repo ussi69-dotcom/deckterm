@@ -174,6 +174,7 @@ test("foundation C1 records and ends terminal session metadata", async () => {
     agentSessionId: null,
     agentCwd: null,
     agentSessionUpdatedAt: null,
+    agentResumeReservedAt: null,
   });
 
   scheduleTerminalSessionTermination(

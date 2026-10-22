@@ -18,6 +18,8 @@ import {
   markTerminalSessionEnded,
   recordAgentSession,
   recordTerminalSession,
+  releaseAgentResume,
+  reserveAgentResume,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
   setUserRole,
@@ -150,6 +152,17 @@ function shellLines(): string[] {
     : [];
 }
 
+function resumeDenials(): Array<{ resource_id: string; reason: string }> {
+  return withDb(
+    (db) =>
+      db
+        .query(
+          "SELECT resource_id, reason FROM audit_events WHERE action = 'terminal.resume' AND decision = 'deny' ORDER BY rowid",
+        )
+        .all() as Array<{ resource_id: string; reason: string }>,
+  );
+}
+
 // Simulates a crash: SIGKILL to the fake shell that started in `folder`.
 function killFakeShellIn(folder: string) {
   const line = shellLines().find((l) => l.endsWith(` cwd=${folder}`));
@@ -192,6 +205,8 @@ beforeAll(async () => {
       "#!/bin/sh",
       `log='${shellLog}'`,
       'printf \'%s cwd=%s\\n\' "$$" "$PWD" >> "$log"',
+      // A folder holding `.fake-exit` gets a shell that dies at once.
+      'if [ -f "$PWD/.fake-exit" ]; then exit 0; fi',
       'if [ -f "$PWD/.fake-markers" ]; then',
       "  while IFS= read -r step; do",
       '    case "$step" in',
@@ -269,6 +284,7 @@ const AGENT_COLUMNS = [
   "agent_session_id",
   "agent_cwd",
   "agent_session_updated_at",
+  "agent_resume_reserved_at",
 ];
 
 function sessionColumns(db: Database): string[] {
@@ -316,6 +332,7 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       status: "ended",
     });
     // Make it a version-10 database: no agent columns, no marker 11.
+    first.db.exec("DROP INDEX IF EXISTS idx_terminal_sessions_agent_cwd");
     for (const column of AGENT_COLUMNS) {
       first.db.exec(`ALTER TABLE terminal_sessions DROP COLUMN ${column}`);
     }
@@ -355,7 +372,14 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
     });
     expect(
       sessionColumns(third.db).filter((c) => c.startsWith("agent_")),
-    ).toHaveLength(4);
+    ).toHaveLength(AGENT_COLUMNS.length);
+    // The same-folder Codex lookup has its own index.
+    const indexes = (
+      third.db.query("PRAGMA index_list(terminal_sessions)").all() as Array<{
+        name: string;
+      }>
+    ).map((row) => row.name);
+    expect(indexes).toContain("idx_terminal_sessions_agent_cwd");
     third.db.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -470,6 +494,102 @@ test("a session whose close the user scheduled ends without resume data", async 
       status: "ended",
       agentName: "claude",
       agentSessionId: U1,
+    });
+    db.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("only one resume can reserve a row; release and a stale reservation free it", async () => {
+  const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
+  try {
+    const { db } = await initializeFoundationState({
+      stateDir: dir,
+      allowedFileRoots: [],
+      env: {},
+    });
+    recordTerminalSession(db, {
+      id: "r1",
+      actorUserId: "u1",
+      cwd: "/w",
+      status: "active",
+    });
+    recordAgentSession(db, "r1", {
+      agentName: "claude",
+      sessionId: U1,
+      cwd: "/w/p",
+    });
+    const expected = { agentName: "claude", sessionId: U1, cwd: "/w/p" };
+    // A live row is never reserved.
+    expect(reserveAgentResume(db, "r1", expected)).toBe(false);
+    markTerminalSessionEnded(db, "r1");
+    const t0 = new Date("2026-10-22T10:00:00Z");
+    expect(reserveAgentResume(db, "r1", expected, { now: t0 })).toBe(true);
+    // The second request loses while the first holds the row.
+    expect(reserveAgentResume(db, "r1", expected, { now: t0 })).toBe(false);
+    // Data that changed since the request read it never matches.
+    releaseAgentResume(db, "r1");
+    expect(
+      reserveAgentResume(db, "r1", { ...expected, sessionId: U2 }, { now: t0 }),
+    ).toBe(false);
+    expect(reserveAgentResume(db, "r1", expected, { now: t0 })).toBe(true);
+    // A reservation left by a process that died frees itself after the TTL.
+    expect(
+      reserveAgentResume(db, "r1", expected, {
+        now: new Date(t0.getTime() + 10_000),
+      }),
+    ).toBe(false);
+    expect(
+      reserveAgentResume(db, "r1", expected, {
+        now: new Date(t0.getTime() + 61_000),
+      }),
+    ).toBe(true);
+    // Completing the hand-over clears the data and the reservation.
+    clearAgentSession(db, "r1");
+    expect(getTerminalSession(db, "r1")).toMatchObject({
+      agentName: null,
+      agentResumeReservedAt: null,
+    });
+    db.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("a late agent start never writes resume data onto an ended row", async () => {
+  // The interleaving: a start marker's write waits (on tmux) while the user's
+  // scheduled close ends the session; the late write must not restore it.
+  const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
+  try {
+    const { db } = await initializeFoundationState({
+      stateDir: dir,
+      allowedFileRoots: [],
+      env: {},
+    });
+    recordTerminalSession(db, {
+      id: "late",
+      actorUserId: "u1",
+      cwd: "/w",
+      status: "active",
+    });
+    scheduleTerminalSessionTermination(
+      db,
+      "late",
+      new Date(Date.now() + 15 * 60_000),
+    );
+    markTerminalSessionEnded(db, "late");
+    expect(
+      recordAgentSession(db, "late", {
+        agentName: "claude",
+        sessionId: U1,
+        cwd: "/w",
+      }),
+    ).toBe(false);
+    expect(getTerminalSession(db, "late")).toMatchObject({
+      status: "ended",
+      agentName: null,
+      agentSessionId: null,
     });
     db.close();
   } finally {
@@ -748,12 +868,23 @@ test("another actor's row, a missing row and a plain ended row are refused", asy
     { agentName: "claude", sessionId: U1, cwd: join(allowedRoot, "proj-a") },
     "someone-else",
   );
+  const deniesBefore = resumeDenials();
   for (const body of [{ dryRun: true }, {}]) {
     const other = await post("/api/terminals/other-actor/resume", body);
     expect(other.status).toBe(404);
     const missing = await post("/api/terminals/no-such-row/resume", body);
     expect(missing.status).toBe(404);
+    // The same answer for both: no existence oracle.
+    expect(await json(other)).toEqual(await json(missing));
   }
+  // Both refusals are audited as terminal.resume denials.
+  const denies = resumeDenials().slice(deniesBefore.length);
+  expect(denies).toEqual([
+    { resource_id: "other-actor", reason: "foreign_session" },
+    { resource_id: "no-such-row", reason: "not_found" },
+    { resource_id: "other-actor", reason: "foreign_session" },
+    { resource_id: "no-such-row", reason: "not_found" },
+  ]);
   // Not even listed for this actor.
   expect((await listTerminals()).some((r) => r.id === "other-actor")).toBe(
     false,
@@ -909,6 +1040,58 @@ test("a member without terminal.create and root.use grants cannot resume", async
   }
 });
 
+test("two concurrent resumes of one row start exactly one agent", async () => {
+  const folder = join(allowedRoot, "proj-race");
+  mkdirSync(folder);
+  seedEnded("race-row", { agentName: "claude", sessionId: U3, cwd: folder });
+  const results = await Promise.all([
+    post("/api/terminals/race-row/resume", {}),
+    post("/api/terminals/race-row/resume", {}),
+  ]);
+  const statuses = results.map((r) => r.status).sort();
+  expect(statuses).toEqual([200, 409]);
+  const winner = results.find((r) => r.status === 200)!;
+  const loser = results.find((r) => r.status === 409)!;
+  createdTerminalIds.push((await json(winner)).id);
+  expect(["resume_in_progress", "not_resumable"]).toContain(
+    (await json(loser)).reason,
+  );
+  await Bun.sleep(600);
+  // One shell in that folder, one typed resume line.
+  const shells = shellLines().filter((l) => l.endsWith(` cwd=${folder}`));
+  expect(shells).toHaveLength(1);
+  expect(
+    shellLines().filter((l) => l.endsWith(` line=claude --resume ${U3}`)),
+  ).toHaveLength(1);
+  expect(withDb((db) => getTerminalSession(db, "race-row"))).toMatchObject({
+    agentName: null,
+    agentResumeReservedAt: null,
+  });
+});
+
+test("a resume whose terminal dies before the Enter keeps the data for a retry", async () => {
+  const folder = join(allowedRoot, "proj-dies");
+  mkdirSync(folder);
+  writeFileSync(join(folder, ".fake-exit"), "");
+  seedEnded("dies-row", { agentName: "claude", sessionId: U2, cwd: folder });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const res = await post("/api/terminals/dies-row/resume", {});
+    expect(res.status).toBe(500);
+    expect((await json(res)).reason).toBe("resume_write_failed");
+    // Nothing ran, so nothing was handed over: the row is still resumable
+    // and not left reserved, so the retry is not refused as "in progress".
+    expect(withDb((db) => getTerminalSession(db, "dies-row"))).toMatchObject({
+      status: "ended",
+      agentName: "claude",
+      agentSessionId: U2,
+      agentCwd: folder,
+      agentResumeReservedAt: null,
+    });
+  }
+  const dry = await post("/api/terminals/dies-row/resume", { dryRun: true });
+  expect(dry.status).toBe(200);
+});
+
 // Last in the file: it buries every earlier ended row under 205 newer ones.
 test("resumable rows are listed beyond the ended-row cap, newest 50", async () => {
   const folder = join(allowedRoot, "proj-a");
@@ -964,4 +1147,49 @@ test("resumable rows are listed beyond the ended-row cap, newest 50", async () =
   expect([...ids].filter((id) => id.startsWith("cap-p-")).length).toBeLessThan(
     205,
   );
+});
+
+// After the cap test: a resumable Codex row in the same folder that the
+// capped catalog no longer lists must still make the visible one a picker.
+test("the Codex same-folder check sees resumable rows outside the catalog", async () => {
+  const folder = join(allowedRoot, "proj-codex-hidden");
+  mkdirSync(folder);
+  withDb((db) => {
+    recordTerminalSession(db, {
+      id: "codex-hidden",
+      actorUserId: ownerId,
+      cwd: allowedRoot,
+      status: "active",
+    });
+    recordAgentSession(db, "codex-hidden", {
+      agentName: "codex",
+      sessionId: null,
+      cwd: folder,
+    });
+    markTerminalSessionEnded(
+      db,
+      "codex-hidden",
+      new Date(Date.UTC(2025, 0, 1)),
+    );
+  });
+  seedEnded("codex-visible", {
+    agentName: "codex",
+    sessionId: null,
+    cwd: folder,
+  });
+  const rows = await listTerminals();
+  expect(rows.some((row) => row.id === "codex-hidden")).toBe(false);
+  expect(rows.find((row) => row.id === "codex-visible")?.resume).toEqual({
+    agent: "codex",
+    mode: "pick",
+    cwd: folder,
+  });
+  const dry = await post("/api/terminals/codex-visible/resume", {
+    dryRun: true,
+  });
+  expect(await json(dry)).toEqual({
+    command: "codex resume",
+    cwd: folder,
+    mode: "pick",
+  });
 });
