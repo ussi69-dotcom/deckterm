@@ -279,6 +279,39 @@ for (const device of [
       expect(await helperTextareaFocused(page)).toBe(false);
     });
 
+    test("typing while scrolled back reaches the shell", async ({ page }) => {
+      test.setTimeout(90000);
+      await requireTmuxBackend(page);
+      await printSeq(page);
+      await blurTerminal(page);
+
+      // Scroll back with a finger until the pane is in the history.
+      await dragTowardOlder(page);
+      await expect
+        .poll(() => maxVisibleNumber(page), { timeout: 8000 })
+        .toBeLessThan(390);
+      await expect(latestPill(page)).toBeVisible({ timeout: 5000 });
+
+      // Type through the real client path (helper textarea -> xterm onData
+      // -> socket sendInput), not a raw socket message. The arithmetic only
+      // prints 42 when the shell really ran the line, so keys eaten by tmux
+      // copy-mode cannot pass.
+      await page
+        .locator(".tile.active .xterm-helper-textarea")
+        .first()
+        .focus();
+      await page.keyboard.type("echo M0TYPE_$((6*7))");
+      await page.keyboard.press("Enter");
+
+      await expect(latestPill(page)).toBeHidden({ timeout: 5000 });
+      await expect(indicator(page)).toBeHidden();
+      await expect
+        .poll(async () => (await visibleRows(page)).join("\n"), {
+          timeout: 10000,
+        })
+        .toContain("M0TYPE_42");
+    });
+
     test("a mouse app gets wheel reports and less scrolls on a drag", async ({
       page,
     }) => {
@@ -287,8 +320,18 @@ for (const device of [
       await blurTerminal(page);
 
       // Mouse-reporting app: SGR wheel-up reports (button 64) reach it.
-      await sendShell(page, "clear; printf '\\e[?1000h\\e[?1006h'; cat -v\r");
-      await page.waitForTimeout(500);
+      // The marker is printed after the mouse modes are on, so once it is on
+      // screen tmux has seen them (the arithmetic keeps the typed command
+      // line from matching).
+      await sendShell(
+        page,
+        "clear; printf '\\e[?1000h\\e[?1006h'; echo M0READY_$((2*3)); cat -v\r",
+      );
+      await expect
+        .poll(async () => (await visibleRows(page)).join("\n"), {
+          timeout: 10000,
+        })
+        .toContain("M0READY_6");
       await dragTowardOlder(page, 0.4);
       await expect
         .poll(async () => (await visibleRows(page)).join("\n"), {

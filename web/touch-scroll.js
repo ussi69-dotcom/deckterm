@@ -221,6 +221,78 @@
     return { message, rest: lines - Math.sign(lines) * count };
   }
 
+  // Turns tracker output into touch-scroll messages over animation frames:
+  // lines from a drag or a fling are batched per frame and sent as one
+  // message (at most 100 lines each, the rest goes next frame). halt() is the
+  // one way to stop everything still in flight: the fling, the lines not yet
+  // sent and the frame that would send them. The page calls it before it
+  // jumps (Jump to latest, handle drag, scroll-to), before typing leaves
+  // scrollback and when the server says the pane is no longer scrolled back,
+  // so a late batch can never take the pane back into the history.
+  // Frames and the clock are injected so the logic is testable.
+  function createTouchScrollPump({
+    tracker,
+    send,
+    getCell = () => null,
+    requestFrame,
+    cancelFrame,
+    now = () => 0,
+  } = {}) {
+    let pendingLines = 0;
+    let flushFrame = 0;
+    let momentumFrame = 0;
+
+    const flush = () => {
+      flushFrame = 0;
+      const { message, rest } = takeTouchScrollMessage(pendingLines, getCell());
+      pendingLines = rest;
+      if (message) send?.(message);
+      if (pendingLines && !flushFrame) flushFrame = requestFrame(flush);
+    };
+
+    const queue = (lines) => {
+      if (!lines) return;
+      pendingLines += lines;
+      if (!flushFrame) flushFrame = requestFrame(flush);
+    };
+
+    const stopMomentum = () => {
+      tracker?.stopMomentum();
+      if (momentumFrame) cancelFrame(momentumFrame);
+      momentumFrame = 0;
+    };
+
+    const runMomentum = () => {
+      momentumFrame = 0;
+      const step = tracker.stepMomentum(now());
+      queue(step.linesDelta);
+      if (!step.done) momentumFrame = requestFrame(runMomentum);
+    };
+
+    return {
+      queue,
+      stopMomentum,
+      // Finger lifted with momentum: advance it one frame at a time.
+      startMomentum() {
+        if (momentumFrame) cancelFrame(momentumFrame);
+        momentumFrame = requestFrame(runMomentum);
+      },
+      halt() {
+        stopMomentum();
+        pendingLines = 0;
+        if (flushFrame) cancelFrame(flushFrame);
+        flushFrame = 0;
+      },
+      get pendingLines() {
+        return pendingLines;
+      },
+      // Anything that could still send a touch-scroll message.
+      isBusy() {
+        return Boolean(flushFrame || momentumFrame || pendingLines);
+      },
+    };
+  }
+
   const TouchScroll = {
     TOUCH_SCROLL_DEFAULTS,
     MAX_LINES_PER_MESSAGE,
@@ -228,6 +300,7 @@
     directionForLines,
     cellFromPoint,
     takeTouchScrollMessage,
+    createTouchScrollPump,
   };
 
   if (typeof window !== "undefined") {
