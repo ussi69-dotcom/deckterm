@@ -11018,3 +11018,23 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
+
+/* ===== M0 TOUCH FOCUS: helper textarea pin =====
+   xterm moves its hidden input textarea to the cursor row. On touch layouts
+   that is where the soft keyboard attaches, and iOS pans the whole page to
+   keep that caret visible above the keyboard. Pinning the textarea to the
+   top-left of its terminal keeps it always in view, so the keyboard never
+   needs to pan the page. Touch layouts only (phones by chrome-mobile,
+   tablets by a coarse pointer); the textarea is invisible either way. */
+body.touch-input-mode.chrome-mobile .xterm .xterm-helper-textarea {
+  top: 0 !important;
+  left: 0 !important;
+}
+
+@media (pointer: coarse) {
+  body.touch-input-mode .xterm .xterm-helper-textarea {
+    top: 0 !important;
+    left: 0 !important;
+  }
+}
+/* ===== end M0 TOUCH FOCUS ===== */

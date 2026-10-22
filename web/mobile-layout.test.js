@@ -5,6 +5,7 @@ import {
   computeViewportLayout,
   getOrientation,
   getRowOverflowFade,
+  getViewportPassDecision,
 } from "./mobile-layout.js";
 
 const base = {
@@ -269,5 +270,88 @@ describe("getRowOverflowFade", () => {
         clientWidth: 300,
       }),
     ).toEqual({ start: true, end: false });
+  });
+});
+
+describe("getViewportPassDecision", () => {
+  const closed = {
+    appHeight: 844,
+    appTop: 0,
+    keyboardOpen: false,
+    phoneLandscape: false,
+    chipsHidden: true,
+    inputFocused: false,
+  };
+  const open = {
+    ...closed,
+    appHeight: 464,
+    keyboardOpen: true,
+    inputFocused: true,
+  };
+
+  test("the refit key ignores appTop so an iOS pan does not re-fit", () => {
+    const panned = getViewportPassDecision(open, { ...open, appTop: 37 });
+    expect(panned.refitKey).toBe(getViewportPassDecision(null, open).refitKey);
+    expect(panned.keyboardOpened).toBe(false);
+    expect(panned.keyboardResize).toBe(false);
+  });
+
+  test("the refit key follows height, keyboard, landscape and chips", () => {
+    const key = getViewportPassDecision(null, closed).refitKey;
+    for (const change of [
+      { appHeight: 800 },
+      { keyboardOpen: true },
+      { phoneLandscape: true },
+      { chipsHidden: false },
+    ]) {
+      expect(
+        getViewportPassDecision(closed, { ...closed, ...change }).refitKey,
+      ).not.toBe(key);
+    }
+  });
+
+  test("only a closed-to-open keyboard transition scrolls to the prompt", () => {
+    expect(getViewportPassDecision(closed, open).keyboardOpened).toBe(true);
+    // Keyboard height change (suggestion bar), keyboard closing, the first
+    // pass and a plain URL-bar resize keep the reader's position.
+    expect(
+      getViewportPassDecision(open, { ...open, appHeight: 430 }).keyboardOpened,
+    ).toBe(false);
+    expect(getViewportPassDecision(open, closed).keyboardOpened).toBe(false);
+    expect(getViewportPassDecision(null, open).keyboardOpened).toBe(false);
+    expect(
+      getViewportPassDecision(closed, { ...closed, appHeight: 790 })
+        .keyboardOpened,
+    ).toBe(false);
+  });
+
+  test("keyboard and touch-chrome resizes are flagged for the size badge", () => {
+    expect(getViewportPassDecision(closed, open).keyboardResize).toBe(true);
+    expect(getViewportPassDecision(open, closed).keyboardResize).toBe(true);
+    expect(
+      getViewportPassDecision(open, { ...open, appHeight: 430 }).keyboardResize,
+    ).toBe(true);
+    // A keyboard still animating in (focused, not yet past the threshold).
+    expect(
+      getViewportPassDecision(
+        { ...closed, inputFocused: true },
+        { ...closed, appHeight: 760, inputFocused: true },
+      ).keyboardResize,
+    ).toBe(true);
+    // Extra-keys row, chips and action bar call the pass directly.
+    expect(
+      getViewportPassDecision(closed, closed, { direct: true }).keyboardResize,
+    ).toBe(true);
+    // An input losing focus dismisses the keyboard; the growth follows.
+    expect(
+      getViewportPassDecision({ ...closed, inputFocused: true }, closed)
+        .keyboardResize,
+    ).toBe(true);
+    // Rotation or a URL bar with nothing focused is a real resize.
+    expect(
+      getViewportPassDecision(closed, { ...closed, appHeight: 390 })
+        .keyboardResize,
+    ).toBe(false);
+    expect(getViewportPassDecision(closed, closed).keyboardResize).toBe(false);
   });
 });

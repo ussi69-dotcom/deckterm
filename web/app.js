@@ -1551,12 +1551,15 @@ class TileManager {
   }
 
   ensureTileVisible(terminalId) {
+    // Mobile tiles are a full-size stack that is always in view; a
+    // scrollIntoView there only panned the page (iOS) under the keyboard.
+    if (this.isMobile) return;
     const tile = this.tiles.get(terminalId);
     if (!tile || tile.element.style.display === "none") return;
     tile.element.scrollIntoView({
       block: "nearest",
       inline: "nearest",
-      behavior: "smooth",
+      behavior: "auto",
     });
   }
 
@@ -2332,10 +2335,17 @@ class ExtraKeysManager {
     // past EK_SWIPE_SLOP_PX turns the touch into a row scroll, not a key.
     const EK_SWIPE_SLOP_PX = 8;
     let swipe = null;
+    // Whether the terminal had focus (keyboard up) when the finger landed.
+    // On touch layouts only then does touchend hand focus back: a tap with
+    // the keyboard closed must not open it. Other layouts always refocus.
+    let refocusOnTouchEnd = false;
 
     extraKeys.addEventListener(
       "touchstart",
       (e) => {
+        refocusOnTouchEnd =
+          !this.tm?.isTouchLayout?.() ||
+          Boolean(this.tm?.isTerminalInputFocused?.());
         const btn = e.target.closest(".ek-btn, .ek-toggle");
         dbg("[ExtraKeys] touchstart, btn:", btn?.dataset?.key || btn?.id);
         if (btn) {
@@ -2391,7 +2401,10 @@ class ExtraKeysManager {
           }
           touchedKey = null;
         }
-        setTimeout(() => this.refocusTerminal(), 10);
+        if (refocusOnTouchEnd) {
+          refocusOnTouchEnd = false;
+          setTimeout(() => this.refocusTerminal(), 10);
+        }
       },
       { passive: false, capture: true },
     );
@@ -6603,7 +6616,7 @@ class TerminalManager {
       requestAnimationFrame(() => {
         this.performReconnectLayoutSync(this.activeId, {
           forceResize: true,
-          scrollToPrompt: platformDetector.hasTouch,
+          scrollToPrompt: this.getReconnectScrollToPrompt(),
         });
       });
     };
@@ -15103,6 +15116,10 @@ class TerminalManager {
 
       const finalData = this.applyExtraKeyModifiers(data);
       ws.sendInput(finalData);
+      // Typing returns the view to the prompt. This path bypasses xterm's
+      // own scrollOnUserInput (it never reaches triggerDataEvent), and the
+      // viewport passes no longer snap to the bottom on touch.
+      if (this.isTouchLayout()) this.scrollActiveTerminalToPrompt();
 
       if (DEBUG) {
         dbg("[ExtraKeys] mobile input fallback:", {
@@ -16246,7 +16263,7 @@ class TerminalManager {
 
       this.performReconnectLayoutSync(id, {
         forceResize: true,
-        scrollToPrompt: platformDetector.hasTouch,
+        scrollToPrompt: this.getReconnectScrollToPrompt(),
       });
     } else if (waitingForReplay) {
       dbg(`[reconnect] Transport connected for ${id}, waiting for ready`);
@@ -16291,6 +16308,22 @@ class TerminalManager {
     });
   }
 
+  // Touch layouts keep a reader who scrolled back where they are on
+  // reconnect and tab return; only a view already at the prompt is pinned
+  // there. Other layouts keep the old rule (touch-capable: always snap).
+  getReconnectScrollToPrompt() {
+    if (this.isTouchLayout()) return "if-at-bottom";
+    return platformDetector.hasTouch;
+  }
+
+  isTerminalAtBottom(t) {
+    const buffer = t?.terminal?.buffer?.active;
+    if (!buffer) return true;
+    return buffer.viewportY >= buffer.baseY;
+  }
+
+  // scrollToPrompt: true, false, or "if-at-bottom" (decided before the
+  // re-fit, which can move the viewport).
   performReconnectLayoutSync(
     id,
     { forceResize = false, scrollToPrompt = false } = {},
@@ -16301,6 +16334,9 @@ class TerminalManager {
     requestAnimationFrame(() => {
       if (t.disposed) return;
       try {
+        if (scrollToPrompt === "if-at-bottom") {
+          scrollToPrompt = this.isTerminalAtBottom(t);
+        }
         this.fitTerminalState(t);
         this.sendResize(id, t.terminal.cols, t.terminal.rows, {
           force: forceResize,
@@ -16345,6 +16381,19 @@ class TerminalManager {
     if (message.phase === "ready") {
       t.awaitingReconnectReady = false;
       if (id === this.activeId) {
+        if (this.isTouchLayout()) {
+          // On touch, focus means the keyboard: a reconnect never opens it.
+          // Re-assert focus only when this terminal already had it, and keep
+          // a reader who scrolled back where they are.
+          if (this.getTerminalTextarea(t) === document.activeElement) {
+            this.focusTerminal(id, {
+              syncSize: false,
+              scrollToPrompt: this.isTerminalAtBottom(t),
+              ensureVisible: false,
+            });
+          }
+          return;
+        }
         this.focusTerminal(id, {
           syncSize: false,
           scrollToPrompt: platformDetector.hasTouch,
@@ -16366,6 +16415,16 @@ class TerminalManager {
   showDimensionOverlay(id) {
     const t = this.terminals.get(id);
     if (!t?.dimensionOverlay || !t.terminal) return;
+    // Touch layouts: the keyboard or the extra-keys row resizing the grid
+    // is expected; a COLSxROWS badge mid-screen there is only noise (the
+    // viewport pass sets this window, see handleViewportResize).
+    if (
+      this.isTouchLayout() &&
+      performance.now() < (this.dimensionOverlaySuppressedUntil || 0)
+    ) {
+      if (this.debugMode) this.updateDebugOverlay(id);
+      return;
+    }
 
     const cols = t.terminal.cols;
     const rows = t.terminal.rows;
@@ -17652,13 +17711,17 @@ class TerminalManager {
   // Layout pass for touch devices. Sizes the app shell from the visual
   // viewport (so the on-screen keyboard really shrinks the terminal instead
   // of covering it), flags keyboard-open / phone-landscape for the compact
-  // chrome CSS, then re-fits the active terminal and keeps its prompt in
-  // view. Pure decisions live in mobile-layout.js (window.MobileLayout).
+  // chrome CSS, then re-fits the active terminal. Pure decisions live in
+  // mobile-layout.js (window.MobileLayout).
   //
-  // fromViewportEvent: viewport/focus listeners pass true and the pass is
+  // fromViewportEvent: viewport/focus listeners pass true and the re-fit is
   // skipped when nothing changed (visualViewport scroll fires often while
   // panning). Direct callers (extra-keys toggles, action-bar changes) omit
   // it: their chrome change needs the re-fit even at the same viewport size.
+  //
+  // On touch layouts a viewport pass never moves focus (focus follows taps
+  // only: pulling it back re-opened the keyboard the user just dismissed)
+  // and scrolls to the prompt only when the keyboard has just opened.
   handleViewportResize({ fromViewportEvent = false } = {}) {
     const helpers = window.MobileLayout;
     if (!helpers) return;
@@ -17672,6 +17735,7 @@ class TerminalManager {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
     });
+    const inputFocused = this.isEditableElementFocused();
     const layout = helpers.computeViewportLayout({
       touch,
       orientation,
@@ -17679,7 +17743,7 @@ class TerminalManager {
       visualHeight: viewport?.height,
       visualOffsetTop: viewport?.offsetTop,
       visualScale: viewport?.scale,
-      inputFocused: this.isEditableElementFocused(),
+      inputFocused,
       baselines: this.viewportBaselines,
     });
     this.viewportBaselines = layout.baselines;
@@ -17699,15 +17763,31 @@ class TerminalManager {
     this.extraKeys?.syncQuickReplies?.({ relayout: false });
     this.syncBottomChromeInset();
 
-    const layoutKey = [
-      layout.appHeight,
-      layout.appTop,
-      layout.keyboardOpen,
-      layout.phoneLandscape,
-      this.extraKeys?.quickRepliesEl?.hidden,
-    ].join("|");
-    const changed = layoutKey !== this.viewportLayoutKey;
-    this.viewportLayoutKey = layoutKey;
+    const sample = {
+      appHeight: layout.appHeight,
+      appTop: layout.appTop,
+      keyboardOpen: layout.keyboardOpen,
+      phoneLandscape: layout.phoneLandscape,
+      chipsHidden: Boolean(this.extraKeys?.quickRepliesEl?.hidden),
+      inputFocused,
+    };
+    const decision = helpers.getViewportPassDecision(
+      this.viewportLayoutSample || null,
+      sample,
+      { direct: !fromViewportEvent },
+    );
+    this.viewportLayoutSample = sample;
+    const changed = decision.refitKey !== this.viewportLayoutKey;
+    this.viewportLayoutKey = decision.refitKey;
+    if (touch) {
+      // The keyboard (or the key row) changing the grid is not news to the
+      // user: keep the COLSxROWS badge hidden while it settles.
+      if (decision.keyboardResize) {
+        this.dimensionOverlaySuppressedUntil = performance.now() + 1000;
+      }
+      if (decision.keyboardOpened) this.viewportScrollToPromptPending = true;
+      if (!layout.keyboardOpen) this.viewportScrollToPromptPending = false;
+    }
     if (fromViewportEvent && !changed) return;
 
     // Mobile tiles use pixel geometry from the container rect; refresh it so
@@ -17728,6 +17808,17 @@ class TerminalManager {
         this.viewportFocusTimer = null;
         const active = this.terminals.get(activeId);
         if (!active || activeId !== this.activeId) return;
+        if (this.isTouchLayout()) {
+          // Re-fit only. Focus stays where the user put it, and the view
+          // moves to the prompt only because the keyboard just opened.
+          const scrollToPrompt = Boolean(this.viewportScrollToPromptPending);
+          this.viewportScrollToPromptPending = false;
+          this.fitTerminalState(active);
+          this.syncTerminalSize(activeId);
+          if (scrollToPrompt) this.scrollActiveTerminalToPrompt();
+          this.disableMobileKeyboardFeatures(active.element);
+          return;
+        }
         const scrollToPrompt = layout.keyboardOpen || platformDetector.hasTouch;
         if (
           this.isEditableElementFocused() &&

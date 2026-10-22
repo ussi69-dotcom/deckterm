@@ -143,3 +143,20 @@ test("Setup and Sessions lose their overlay chrome inside a desktop window", () 
     ),
   ).toBe("none");
 });
+
+test("touch layouts pin the xterm helper textarea to the terminal's top-left", () => {
+  const coarse = (media) => media.includes("(pointer: coarse)");
+  const tablet = "body.touch-input-mode .xterm .xterm-helper-textarea";
+  const phone =
+    "body.touch-input-mode.chrome-mobile .xterm .xterm-helper-textarea";
+  for (const [selector, media] of [
+    [tablet, coarse],
+    [phone, () => false],
+  ]) {
+    expect(resolve(selector, "top", media)).toBe("0 !important");
+    expect(resolve(selector, "left", media)).toBe("0 !important");
+  }
+  // Desktop (fine pointer, no phone chrome) leaves xterm's own positioning.
+  expect(resolve(tablet, "top")).toBeUndefined();
+  expect(resolve(".xterm .xterm-helper-textarea", "top")).toBeUndefined();
+});
