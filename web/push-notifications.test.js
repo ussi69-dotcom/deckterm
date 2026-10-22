@@ -287,12 +287,15 @@ describe("push service worker", () => {
     ]);
   });
 
-  test("only a same-origin path is accepted", async () => {
+  const ORIGIN = "https://deckterm.example.test";
+
+  test("only a same-origin URL is accepted, stored as an absolute URL", async () => {
     const { handlers, shown, opened } = await loadWorker({ clients: [] });
     for (const url of [
       "//evil.example/",
       "/\\evil.example/",
       "https://evil.example/",
+      "javascript:alert(1)",
       42,
     ]) {
       let pushPromise;
@@ -306,10 +309,121 @@ describe("push service worker", () => {
       await click(handlers, url);
     }
     for (const [, options] of shown) {
-      expect(options.data.url).toBe("/");
+      expect(options.data.url).toBe(`${ORIGIN}/`);
     }
-    expect(opened.every((url) => url === "https://deckterm.example.test/")).toBe(
-      true,
-    );
+    expect(opened.length).toBe(5);
+    expect(opened.every((url) => url === `${ORIGIN}/`)).toBe(true);
+  });
+
+  test("a path that normalizes to //host stays on the origin (push and click)", async () => {
+    const tricky = [
+      "/x/..//evil.example/",
+      "/x/../\\evil.example/",
+      "/%2e%2e//evil.example/",
+      "/./x/../..//evil.example/?session=abc",
+    ];
+    const navigations = [];
+    const { handlers, shown, opened } = await loadWorker({ clients: [] });
+    for (const url of tricky) {
+      let pushPromise;
+      handlers.get("push")({
+        data: { json: () => ({ data: { url } }) },
+        waitUntil: (promise) => {
+          pushPromise = promise;
+        },
+      });
+      await pushPromise;
+      // An older notification whose data never went through the push
+      // handler: the click path must check the final URL itself.
+      await click(handlers, url);
+    }
+    for (const [, options] of shown) {
+      expect(new URL(options.data.url).origin).toBe(ORIGIN);
+    }
+    expect(opened.length).toBe(tricky.length);
+    for (const url of opened) expect(new URL(url).origin).toBe(ORIGIN);
+
+    // The same with an open app window that gets navigated.
+    const app = await loadWorker({
+      clients: [
+        {
+          url: `${ORIGIN}/`,
+          focused: true,
+          focus: async () => {},
+          navigate: async (url) => navigations.push(url),
+          postMessage: () => {},
+        },
+      ],
+    });
+    for (const url of tricky) await click(app.handlers, url);
+    expect(navigations.length).toBeGreaterThan(0);
+    for (const url of navigations) expect(new URL(url).origin).toBe(ORIGIN);
+    expect(app.opened).toEqual([]);
+  });
+
+  function windowClient(url, extra = {}) {
+    const client = {
+      url,
+      focused: false,
+      visibilityState: "hidden",
+      focusCalls: 0,
+      messages: [],
+      navigations: [],
+      focus: async () => {
+        client.focusCalls += 1;
+      },
+      navigate: async (to) => client.navigations.push(to),
+      postMessage: (message) => client.messages.push(message),
+      ...extra,
+    };
+    return client;
+  }
+
+  test("the deep link goes to the focused DeckTerm app window, not the first same-origin page", async () => {
+    const helpPage = windowClient(`${ORIGIN}/help.html`, { focused: true });
+    const otherOrigin = windowClient("https://other.example/", {
+      focused: true,
+    });
+    const background = windowClient(`${ORIGIN}/`);
+    const visible = windowClient(`${ORIGIN}/?debug=1`, {
+      visibilityState: "visible",
+    });
+    const focused = windowClient(`${ORIGIN}/index.html`, { focused: true });
+    const { handlers, opened } = await loadWorker({
+      clients: [helpPage, otherOrigin, background, visible, focused],
+    });
+    await click(handlers, `/?session=${SESSION}`);
+    expect(focused.messages).toEqual([
+      { type: "deckterm-open-session", terminalId: SESSION },
+    ]);
+    expect(focused.focusCalls).toBe(1);
+    for (const client of [helpPage, otherOrigin, background, visible]) {
+      expect(client.messages).toEqual([]);
+      expect(client.focusCalls).toBe(0);
+    }
+    expect(opened).toEqual([]);
+  });
+
+  test("without a focused app window a visible one wins, then any app window", async () => {
+    const background = windowClient(`${ORIGIN}/`);
+    const visible = windowClient(`${ORIGIN}/`, { visibilityState: "visible" });
+    let worker = await loadWorker({ clients: [background, visible] });
+    await click(worker.handlers, `/?session=${SESSION}`);
+    expect(visible.messages.length).toBe(1);
+    expect(background.messages.length).toBe(0);
+
+    const only = windowClient(`${ORIGIN}/`);
+    worker = await loadWorker({ clients: [only] });
+    await click(worker.handlers, `/?session=${SESSION}`);
+    expect(only.messages.length).toBe(1);
+  });
+
+  test("same-origin pages that are not the app get no message; the deep link opens instead", async () => {
+    const helpPage = windowClient(`${ORIGIN}/help.html`, { focused: true });
+    const { handlers, opened } = await loadWorker({ clients: [helpPage] });
+    await click(handlers, `/?session=${SESSION}`);
+    expect(helpPage.messages).toEqual([]);
+    expect(helpPage.focusCalls).toBe(0);
+    expect(opened).toEqual([`${ORIGIN}/?session=${SESSION}`]);
   });
 });
