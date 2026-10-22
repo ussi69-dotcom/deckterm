@@ -1,0 +1,5 @@
+agent: claude
+state: working
+manifest: bundled 2026.10.11.1
+rule: osc_title_working (region=osc_title priority=1100)
+evidence: "⠂ Claude Code"

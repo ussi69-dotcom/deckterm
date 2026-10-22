@@ -1,0 +1,7 @@
+claude --resume 11111111-2222-3333-4444-555555555555
+To run a command as administrator (user "root"), use "sudo <command>".
+See "man sudo_root" for details.
+
+user@host:~/proj-beta$ claude --resume 11111111-2222-3333-4444-555555555555
+claude: command not found
+user@host:~/proj-beta$

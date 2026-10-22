@@ -1,0 +1,5 @@
+agent: claude
+state: blocked
+manifest: bundled 2026.10.11.1
+rule: bash_permission_prompt (region=whole_recent priority=850)
+evidence: " ▐▛███▜▌   Claude Code (fake, review only)\n\n────────────────────────────────────────────────────────────\n Bash command\n\n   rm -rf build/\n   Remove build output\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again for: rm\n   3...."

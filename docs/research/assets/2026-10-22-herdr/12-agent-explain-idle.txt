@@ -1,0 +1,5 @@
+agent: claude
+state: idle
+manifest: bundled 2026.10.11.1
+rule: live_prompt_box (region=prompt_box_body priority=950)
+evidence: "❯\n"

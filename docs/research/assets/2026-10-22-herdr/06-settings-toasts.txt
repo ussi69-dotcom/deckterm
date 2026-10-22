@@ -1,0 +1,50 @@
+ spaces                  │   1      +
+                         │To run a command as administrator (user "root"), use "sudo <command>".
+ · proj-alpha            │See "man sudo_root" for details.
+   master                │
+                         │user@host:~/proj-alpha$
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │                                    ┌──────────────────────────────────────────────────────────────────────────┐
+                         │                                    │ settings                                                                 │
+                         │                                    │ theme   indicators   sound   toasts   integrations                       │
+                         │                                    │──────────────────────────────────────────────────────────────────────────│
+                         │                                    │                                                                          │
+                         │                                    │notification popups                                                       │
+                         │                                    │choose where background popup notifications should appear                 │
+                         │                                    │                                                                          │
+                         │                                    │ ▸ off                                                                    │
+                         │                                    │                                                                          │
+ new                 menu│                                    │   inside herdr                                                           │
+─────────────────────────│                                    │                                                                          │
+ agents           grouped│                                    │   via terminal                                                           │
+                         │                                    │                                                                          │
+                         │                                    │   via system                                                             │
+                         │                                    │                                                                          │
+                         │                                    │                                                                          │
+                         │                                    │                                                                          │
+                         │                                    │                                                                          │
+                         │                                    │ ↑↓ select  tab section                                                   │
+                         │                                    │                          ↵ apply     esc close                           │
+                         │                                    └──────────────────────────────────────────────────────────────────────────┘
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                        «│
