@@ -5,12 +5,20 @@ import { tmpdir } from "node:os";
 import {
   TERMINAL_ENV_DENY_LIST,
   TERMINAL_ENV_PROTECTED_NAMES,
+  TmuxEnvironmentGuard,
+  TmuxEnvironmentUnverifiedError,
   buildTmuxGlobalEnvUnsetArgs,
+  buildTmuxSessionEnvUnsetArgs,
   isDeniedTerminalEnvName,
+  isTmuxNoServerError,
   listDeniedTerminalEnvNames,
   parseTmuxEnvironmentNames,
   sanitizeTerminalEnv,
-  scrubTmuxGlobalEnvironment,
+  scrubTmuxEnvironment,
+  scrubTmuxEnvironmentWithRetry,
+  terminalEnvironmentErrorResponse,
+  type TmuxCommandResult,
+  type TmuxScrubResult,
 } from "./terminal-env";
 import { RawTerminalBackend } from "./raw-terminal-backend";
 import { launchTmuxServer } from "../tmux-server-launch";
@@ -145,7 +153,49 @@ describe("deny-list", () => {
   });
 });
 
-describe("tmux global environment scrub (pure)", () => {
+// Fake tmux: a global env, per-session envs, and optional failures keyed by
+// the first argv words. Records every call.
+function fakeTmux(options: {
+  global?: string;
+  sessions?: Record<string, string>;
+  fail?: Record<string, TmuxCommandResult>;
+}) {
+  const calls: string[][] = [];
+  const run = async (args: string[]): Promise<TmuxCommandResult> => {
+    calls.push(args);
+    for (const [prefix, result] of Object.entries(options.fail ?? {})) {
+      if (args.join(" ").startsWith(prefix)) return result;
+    }
+    if (args[0] === "show-environment" && args[1] === "-g") {
+      return { code: 0, stdout: options.global ?? "" };
+    }
+    if (args[0] === "list-sessions") {
+      return {
+        code: 0,
+        stdout: Object.keys(options.sessions ?? {}).join("\n") + "\n",
+      };
+    }
+    if (args[0] === "show-environment" && args[1] === "-t") {
+      const name = args[2].replace(/^=/, "");
+      return { code: 0, stdout: options.sessions?.[name] ?? "" };
+    }
+    return { code: 0, stdout: "" };
+  };
+  return { calls, run };
+}
+
+const NO_SERVER: TmuxCommandResult = {
+  code: 1,
+  stdout: "",
+  stderr: "error connecting to /tmp/x/t.sock (No such file or directory)\n",
+};
+const PERMISSION_DENIED: TmuxCommandResult = {
+  code: 1,
+  stdout: "",
+  stderr: "error connecting to /tmp/x/t.sock (Permission denied)\n",
+};
+
+describe("tmux environment scrub (pure)", () => {
   test("parses show-environment output, skipping removed markers", () => {
     expect(
       parseTmuxEnvironmentNames(
@@ -167,45 +217,281 @@ describe("tmux global environment scrub (pure)", () => {
       "-u",
       "B",
     ]);
+    expect(buildTmuxSessionEnvUnsetArgs("s1", ["A", "B"])).toEqual([
+      "set-environment",
+      "-t",
+      "=s1",
+      "-u",
+      "A",
+      ";",
+      "set-environment",
+      "-t",
+      "=s1",
+      "-u",
+      "B",
+    ]);
   });
 
-  test("unsets only denied names, in one tmux call", async () => {
-    const calls: string[][] = [];
-    const removed = await scrubTmuxGlobalEnvironment(async (args) => {
-      calls.push(args);
-      if (args[0] === "show-environment") {
-        return {
-          code: 0,
-          stdout: "PATH=/bin\nDECKTERM_VAPID_PRIVATE_KEY=x\nPORT=4173\nHOME=/h\n",
-        };
-      }
-      return { code: 0, stdout: "" };
+  test("only a missing socket or 'no server running' counts as no server", () => {
+    expect(isTmuxNoServerError(NO_SERVER.stderr)).toBe(true);
+    expect(isTmuxNoServerError("no server running on /tmp/x/t.sock")).toBe(
+      true,
+    );
+    expect(isTmuxNoServerError(PERMISSION_DENIED.stderr)).toBe(false);
+    expect(isTmuxNoServerError("server exited unexpectedly")).toBe(false);
+    expect(isTmuxNoServerError("")).toBe(false);
+    expect(isTmuxNoServerError(undefined)).toBe(false);
+  });
+
+  test("unsets only denied names, global in one call, each session in one call", async () => {
+    const tmux = fakeTmux({
+      global: "PATH=/bin\nDECKTERM_VAPID_PRIVATE_KEY=x\nPORT=4173\nHOME=/h\n",
+      sessions: {
+        seed: "-DISPLAY\nDECKTERM_VAPID_PRIVATE_KEY=y\nLANG=C.UTF-8\nTMUX_PANE=%1\n",
+        clean: "SSH_AUTH_SOCK=/tmp/agent\n",
+      },
     });
-    expect(removed).toEqual(["DECKTERM_VAPID_PRIVATE_KEY", "PORT"]);
-    expect(calls).toHaveLength(2);
-    expect(calls[1]).toEqual(
+    const result = await scrubTmuxEnvironment(tmux.run);
+    expect(result).toEqual({
+      ok: true,
+      serverPresent: true,
+      removed: ["DECKTERM_VAPID_PRIVATE_KEY", "PORT"],
+      sessions: [{ session: "seed", removed: ["DECKTERM_VAPID_PRIVATE_KEY"] }],
+    });
+    expect(tmux.calls).toContainEqual(
       buildTmuxGlobalEnvUnsetArgs(["DECKTERM_VAPID_PRIVATE_KEY", "PORT"]),
     );
+    expect(tmux.calls).toContainEqual(
+      buildTmuxSessionEnvUnsetArgs("seed", ["DECKTERM_VAPID_PRIVATE_KEY"]),
+    );
+    // Protected and user variables are never unset; the clean session gets
+    // no unset call at all.
+    const unsetNames = tmux.calls
+      .filter((c) => c[0] === "set-environment")
+      .flatMap((c) => c.filter((_, i) => c[i - 1] === "-u"));
+    expect(unsetNames).not.toContain("LANG");
+    expect(unsetNames).not.toContain("TMUX_PANE");
+    expect(unsetNames).not.toContain("SSH_AUTH_SOCK");
+    expect(
+      tmux.calls.some((c) => c[0] === "set-environment" && c[2] === "=clean"),
+    ).toBe(false);
   });
 
-  test("no server answering is not an error and changes nothing", async () => {
-    const calls: string[][] = [];
-    const removed = await scrubTmuxGlobalEnvironment(async (args) => {
-      calls.push(args);
-      return { code: 1, stdout: "" };
+  test("an absent server is verified-absent, not a failure", async () => {
+    const tmux = fakeTmux({ fail: { "show-environment -g": NO_SERVER } });
+    const result = await scrubTmuxEnvironment(tmux.run);
+    expect(result).toMatchObject({ ok: true, serverPresent: false });
+    expect(tmux.calls).toHaveLength(1);
+  });
+
+  test("a communication error is NOT treated as no server", async () => {
+    const tmux = fakeTmux({ fail: { "show-environment -g": PERMISSION_DENIED } });
+    const result = await scrubTmuxEnvironment(tmux.run);
+    expect(result.ok).toBe(false);
+    expect(result.serverPresent).toBe(true);
+    expect(result.error).toContain("Permission denied");
+  });
+
+  test("a failed global unset is reported (not thrown, not swallowed)", async () => {
+    const result = await scrubTmuxEnvironment(
+      fakeTmux({
+        global: "CF_ACCESS_AUD=x\n",
+        fail: {
+          "set-environment -g": { code: 1, stdout: "", stderr: "boom" },
+        },
+      }).run,
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain("CF_ACCESS_AUD");
+    expect(result.error).toContain("boom");
+    // Names only, never values.
+    expect(result.error).not.toContain("=x");
+  });
+
+  test("a failed session read or unset is a failure; a vanished session is skipped", async () => {
+    const readFail = await scrubTmuxEnvironment(
+      fakeTmux({
+        sessions: { seed: "DECKTERM_X=1\n" },
+        fail: {
+          "show-environment -t": { code: 1, stdout: "", stderr: "lost server" },
+        },
+      }).run,
+    );
+    expect(readFail.ok).toBe(false);
+
+    const unsetFail = await scrubTmuxEnvironment(
+      fakeTmux({
+        sessions: { seed: "DECKTERM_X=1\n" },
+        fail: {
+          "set-environment -t": { code: 1, stdout: "", stderr: "lost server" },
+        },
+      }).run,
+    );
+    expect(unsetFail.ok).toBe(false);
+    expect(unsetFail.error).toContain("DECKTERM_X");
+
+    const vanished = await scrubTmuxEnvironment(
+      fakeTmux({
+        sessions: { gone: "DECKTERM_X=1\n" },
+        fail: {
+          "show-environment -t": {
+            code: 1,
+            stdout: "",
+            stderr: "no such session: =gone",
+          },
+        },
+      }).run,
+    );
+    expect(vanished).toMatchObject({ ok: true, serverPresent: true });
+  });
+
+  test("startup retry: stops at the first success, returns the last failure otherwise", async () => {
+    const sleeps: number[] = [];
+    const sleep = async (ms: number) => {
+      sleeps.push(ms);
+    };
+    const bad: TmuxScrubResult = {
+      ok: false,
+      serverPresent: true,
+      removed: [],
+      sessions: [],
+      error: "busy",
+    };
+    const good: TmuxScrubResult = {
+      ok: true,
+      serverPresent: true,
+      removed: ["PORT"],
+      sessions: [],
+    };
+    const sequence = [bad, good];
+    const healed = await scrubTmuxEnvironmentWithRetry(
+      async () => sequence.shift()!,
+      { attempts: 3, delayMs: 7, sleep },
+    );
+    expect(healed).toEqual({ result: good, attempts: 2 });
+    expect(sleeps).toEqual([7]);
+
+    let thrown = 0;
+    const failing = await scrubTmuxEnvironmentWithRetry(
+      async () => {
+        thrown += 1;
+        throw new Error("spawn failed");
+      },
+      { attempts: 3, delayMs: 1, sleep },
+    );
+    expect(thrown).toBe(3);
+    expect(failing.attempts).toBe(3);
+    expect(failing.result.ok).toBe(false);
+    expect(failing.result.error).toBe("spawn failed");
+  });
+});
+
+describe("tmux environment guard (create gate)", () => {
+  function scripted(results: TmuxScrubResult[]) {
+    let runs = 0;
+    const guard = new TmuxEnvironmentGuard(async () => {
+      runs += 1;
+      const next = results.shift();
+      if (!next) throw new Error("unexpected extra scrub");
+      return next;
     });
-    expect(removed).toEqual([]);
-    expect(calls).toHaveLength(1);
+    return { guard, runs: () => runs };
+  }
+  const OK: TmuxScrubResult = {
+    ok: true,
+    serverPresent: true,
+    removed: [],
+    sessions: [],
+  };
+  const ABSENT: TmuxScrubResult = {
+    ok: true,
+    serverPresent: false,
+    removed: [],
+    sessions: [],
+  };
+  const FAILED: TmuxScrubResult = {
+    ok: false,
+    serverPresent: true,
+    removed: [],
+    sessions: [],
+    error: "tmux show-environment -g failed (exit 1): Permission denied",
+  };
+
+  test("a scrub failure refuses the create instead of silently continuing", async () => {
+    const { guard } = scripted([FAILED]);
+    await expect(guard.ensureVerified()).rejects.toBeInstanceOf(
+      TmuxEnvironmentUnverifiedError,
+    );
+    expect(guard.isVerified).toBe(false);
   });
 
-  test("a failed unset is reported, not swallowed", async () => {
-    await expect(
-      scrubTmuxGlobalEnvironment(async (args) =>
-        args[0] === "show-environment"
-          ? { code: 0, stdout: "CF_ACCESS_AUD=x\n" }
-          : { code: 1, stdout: "" },
-      ),
-    ).rejects.toThrow("CF_ACCESS_AUD");
+  test("a later successful scrub allows creates again, then stops scrubbing", async () => {
+    const { guard, runs } = scripted([FAILED, FAILED, OK]);
+    await expect(guard.ensureVerified()).rejects.toThrow();
+    await expect(guard.ensureVerified()).rejects.toThrow();
+    await guard.ensureVerified();
+    expect(guard.isVerified).toBe(true);
+    // Verified: further creates cost no scrub at all.
+    await guard.ensureVerified();
+    await guard.ensureVerified();
+    expect(runs()).toBe(3);
+  });
+
+  test("a failed startup scrub (run) leaves creates gated until one succeeds", async () => {
+    const { guard, runs } = scripted([FAILED, OK]);
+    expect((await guard.run()).ok).toBe(false);
+    expect(guard.isVerified).toBe(false);
+    await guard.ensureVerified();
+    expect(guard.isVerified).toBe(true);
+    expect(runs()).toBe(2);
+  });
+
+  test("an absent server lets the create through but is re-checked next time", async () => {
+    const { guard, runs } = scripted([ABSENT, OK]);
+    await guard.ensureVerified();
+    expect(guard.isVerified).toBe(false);
+    await guard.ensureVerified();
+    expect(guard.isVerified).toBe(true);
+    expect(runs()).toBe(2);
+  });
+
+  test("a throwing scrub is a refusal, and concurrent creates share one scrub", async () => {
+    let runs = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const guard = new TmuxEnvironmentGuard(async () => {
+      runs += 1;
+      await gate;
+      if (runs === 1) throw new Error("spawn EAGAIN");
+      return OK;
+    });
+    const both = Promise.allSettled([
+      guard.ensureVerified(),
+      guard.ensureVerified(),
+    ]);
+    release();
+    for (const settled of await both) {
+      expect(settled.status).toBe("rejected");
+      expect((settled as PromiseRejectedResult).reason).toBeInstanceOf(
+        TmuxEnvironmentUnverifiedError,
+      );
+    }
+    expect(runs).toBe(1);
+    await guard.ensureVerified();
+    expect(runs).toBe(2);
+  });
+
+  test("the refusal maps to a 503 with a plain message; other errors do not", () => {
+    const refusal = new TmuxEnvironmentUnverifiedError(
+      "tmux show-environment -g failed (exit 1): Permission denied",
+    );
+    const response = terminalEnvironmentErrorResponse(refusal);
+    expect(response?.status).toBe(503);
+    expect(response?.body.reason).toBe("terminal_environment_unverified");
+    expect(response?.body.error).toContain("did not open a new terminal");
+    // tmux's raw error stays in the log, not in the HTTP answer.
+    expect(response?.body.error).not.toContain("Permission denied");
+    expect(terminalEnvironmentErrorResponse(new Error("other"))).toBeNull();
   });
 });
 

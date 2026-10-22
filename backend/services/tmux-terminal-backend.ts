@@ -3,7 +3,9 @@ import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   sanitizeTerminalEnv,
-  scrubTmuxGlobalEnvironment,
+  scrubTmuxEnvironment,
+  TmuxEnvironmentGuard,
+  type TmuxScrubResult,
 } from "./terminal-env";
 import {
   parseTmuxWindowSize,
@@ -105,6 +107,11 @@ export type TmuxTerminalBackendOptions = {
   // When true, refuse to let tmux start the server implicitly. See
   // assertExternalServerRunning() for why that matters in production.
   requireExternalServer?: boolean;
+  // tmux config file passed as `-f` to every tmux call (only the call that
+  // starts the server reads it). Unset in production, which keeps tmux's
+  // default config lookup; tests pass /dev/null so a private server never
+  // loads the developer's own ~/.tmux.conf.
+  configFile?: string;
 };
 
 export class TmuxServerUnavailableError extends Error {
@@ -131,7 +138,24 @@ export class TmuxTerminalBackend implements TerminalBackend {
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly requireExternalServer: boolean;
+  private readonly configFile: string | undefined;
   private socketDirectoryReady: Promise<void> | null = null;
+  // Gate in front of new-session: refuses to create a shell while the
+  // server's environment has not been verified free of service secrets.
+  private readonly environmentGuard = new TmuxEnvironmentGuard(() =>
+    scrubTmuxEnvironment(async (args) => {
+      const proc = await this.spawnTmux(args, {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+      });
+      const [stdout, stderr] = await Promise.all([
+        new Response((proc as any).stdout).text(),
+        new Response((proc as any).stderr).text(),
+      ]);
+      return { code: await proc.exited, stdout, stderr };
+    }),
+  );
 
   constructor(options: TmuxTerminalBackendOptions) {
     this.namespace = options.namespace;
@@ -140,6 +164,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     this.shellCommandResolver = options.shellCommandResolver;
     this.baseEnv = options.env || process.env;
     this.requireExternalServer = options.requireExternalServer === true;
+    this.configFile = options.configFile;
   }
 
   /**
@@ -192,6 +217,9 @@ export class TmuxTerminalBackend implements TerminalBackend {
     });
     const shellCommand = await this.shellCommandResolver();
     await this.assertExternalServerRunning();
+    // Throws TmuxEnvironmentUnverifiedError (HTTP 503) when the server may
+    // still hold service secrets; the next create tries again.
+    await this.environmentGuard.ensureVerified();
     const createProc = await this.spawnTmux(
       [
         "new-session",
@@ -601,21 +629,20 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   /**
    * Removes the service-only variables (terminal-env.ts) from this tmux
-   * server's global environment, so panes created from now on do not inherit
-   * them. Needed for a server started before environment hygiene existed —
-   * tmux keeps the environment it was started with. Returns the removed
-   * names; empty when no server is running.
+   * server's global environment and from every session's own environment, so
+   * panes created from now on do not inherit them. Needed for a server started
+   * before environment hygiene existed — tmux keeps the environment it was
+   * started with. Never throws: `ok: false` means the server could not be
+   * verified, and createSession then re-runs the scrub and refuses until it
+   * succeeds.
    */
-  async scrubServerEnvironment(): Promise<string[]> {
-    return scrubTmuxGlobalEnvironment(async (args) => {
-      const proc = await this.spawnTmux(args, {
-        stdout: "pipe",
-        stderr: "ignore",
-        stdin: "ignore",
-      });
-      const stdout = await new Response((proc as any).stdout).text();
-      return { code: await proc.exited, stdout };
-    });
+  scrubServerEnvironment(): Promise<TmuxScrubResult> {
+    return this.environmentGuard.run();
+  }
+
+  /** True once a scrub verified a running server clean. */
+  get environmentVerified(): boolean {
+    return this.environmentGuard.isVerified;
   }
 
   private async spawnTmux(args: string[], options?: any): Promise<Subprocess> {
@@ -625,7 +652,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
     // server start) must not hand them to the server.
     const spawnOptions =
       options && options.env ? options : { ...options, env: this.shellEnv };
-    return Bun.spawn(["tmux", "-S", this.socketPath, ...args], spawnOptions);
+    const config = this.configFile ? ["-f", this.configFile] : [];
+    return Bun.spawn(
+      ["tmux", ...config, "-S", this.socketPath, ...args],
+      spawnOptions,
+    );
   }
 
   private async ensureSocketDirectory(): Promise<void> {

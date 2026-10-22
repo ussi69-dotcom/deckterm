@@ -90,7 +90,12 @@ import {
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
-import { sanitizeTerminalEnv } from "./services/terminal-env";
+import {
+  sanitizeTerminalEnv,
+  scrubTmuxEnvironmentWithRetry,
+  terminalEnvironmentErrorResponse,
+  TmuxEnvironmentUnverifiedError,
+} from "./services/terminal-env";
 import {
   TmuxTerminalBackend,
   type TmuxSessionLiveness,
@@ -4899,6 +4904,14 @@ async function resolveShellCommand(): Promise<string[]> {
     : [shell, "-il"];
 }
 
+function logTerminalEnvironmentRefusal(err: unknown) {
+  const detail =
+    err instanceof TmuxEnvironmentUnverifiedError ? err.detail : String(err);
+  console.error(
+    `[tmux] environment: refused a new terminal, environment unverified (${detail})`,
+  );
+}
+
 function createTerminalHandle(id: string, cols: number, rows: number) {
   return new BunTerminal({
     cols,
@@ -5767,14 +5780,27 @@ async function createManagedTerminal({
   let tmuxPipeOffset = 0;
 
   if (createTmuxSession || !TMUX_BACKEND) {
-    const backendSession = await backend.createSession(
-      id,
-      cwd,
-      cols,
-      rows,
-      ownerId,
-      ownerEmail,
-    );
+    let backendSession: Awaited<ReturnType<TerminalBackend["createSession"]>>;
+    try {
+      backendSession = await backend.createSession(
+        id,
+        cwd,
+        cols,
+        rows,
+        ownerId,
+        ownerEmail,
+      );
+    } catch (err) {
+      // Nothing was registered yet: release the PTY handle so a refused
+      // create (e.g. an unverified tmux environment) leaks nothing.
+      markHandleSettled();
+      try {
+        terminal.close();
+      } catch {
+        // already closed
+      }
+      throw err;
+    }
     if (TMUX_BACKEND) {
       activeSessionName = backendSession.sessionName;
     }
@@ -6158,6 +6184,11 @@ export function createWebApp() {
   app.onError((err, c) => {
     if (err instanceof UnauthorizedRequestError) {
       return c.text(err.message, err.status);
+    }
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
     }
     console.error("[Hono] Route error:", err);
     const response: { error: string; message?: string } = {
@@ -7377,6 +7408,11 @@ export function createWebApp() {
   });
 
   function taskErrorResponse(c: any, err: unknown) {
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
+    }
     if (err instanceof TaskRunnerError) {
       return c.json({ error: err.message }, err.status as never);
     }
@@ -11198,18 +11234,28 @@ async function startOwnedWebServer(
     // service secrets in its global environment and would hand them to every
     // new pane. Remove them now (names only are logged, never values).
     // Running shells keep their copy until they are restarted.
+    // A failure is retried a few times; if it still cannot be verified the
+    // service keeps running, and every terminal creation re-runs the scrub
+    // and is refused (HTTP 503) until one succeeds.
     if (tmuxTerminalBackend) {
-      try {
-        const scrubbed = await tmuxTerminalBackend.scrubServerEnvironment();
-        if (scrubbed.length > 0) {
-          console.log(
-            `[tmux] Removed ${scrubbed.length} service variable(s) from the tmux global environment: ${scrubbed.join(", ")}`,
-          );
-        }
-      } catch (err) {
+      const backend = tmuxTerminalBackend;
+      const { result, attempts } = await scrubTmuxEnvironmentWithRetry(
+        () => backend.scrubServerEnvironment(),
+        { attempts: 3, delayMs: 500 },
+      );
+      if (result.removed.length > 0) {
+        console.log(
+          `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
+        );
+      }
+      for (const { session, removed } of result.sessions) {
+        console.log(
+          `[tmux] environment: removed ${removed.length} service variable(s) from session ${session}: ${removed.join(", ")}`,
+        );
+      }
+      if (!result.ok) {
         console.error(
-          "[tmux] Failed to scrub the tmux global environment:",
-          err,
+          `[tmux] environment: UNVERIFIED after ${attempts} attempt(s) (${result.error}). New terminals are refused until a scrub succeeds; each creation retries it.`,
         );
       }
     }

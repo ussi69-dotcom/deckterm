@@ -11,8 +11,11 @@
 // The tmux server matters as much as the shell: tmux copies the environment
 // of the process that started the server into its *global* environment and
 // gives that to every pane it ever creates. So the server launch path is
-// sanitized too, and `scrubTmuxGlobalEnvironment` cleans a server that was
-// started before this module existed.
+// sanitized too, and `scrubTmuxEnvironment` cleans a server that was started
+// before this module existed — its global environment and every session's
+// own environment, which overrides the global one for new panes. The
+// `TmuxEnvironmentGuard` refuses to create a terminal while that clean-up has
+// not been verified (see its comment).
 //
 // The rule is ONE explicit deny-list (exact names and prefixes) rather than an
 // allow-list: shells legitimately need an open-ended set of variables
@@ -189,8 +192,10 @@ export function listDeniedTerminalEnvNames(env: TerminalEnv): string[] {
 }
 
 /**
- * Parses `tmux show-environment -g` output into variable names. Lines are
- * `NAME=value` for set variables and `-NAME` for ones marked removed.
+ * Parses `tmux show-environment [-g | -t session]` output into variable
+ * names. Lines are `NAME=value` for set variables and `-NAME` for ones marked
+ * removed. A value containing a newline can make a later line look like
+ * `NAME=…`; that only adds a harmless unset of a name that does not exist.
  */
 export function parseTmuxEnvironmentNames(output: string): string[] {
   const names: string[] = [];
@@ -201,6 +206,14 @@ export function parseTmuxEnvironmentNames(output: string): string[] {
     if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) names.push(name);
   }
   return names;
+}
+
+/** Parses `list-sessions -F '#{session_name}'` output (one name per line). */
+export function parseTmuxSessionNames(output: string): string[] {
+  return output
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
 }
 
 /**
@@ -216,30 +229,314 @@ export function buildTmuxGlobalEnvUnsetArgs(names: string[]): string[] {
   return args;
 }
 
-export type TmuxCommandRunner = (
-  args: string[],
-) => Promise<{ code: number; stdout: string }>;
+/**
+ * Builds ONE tmux client argv tail that unsets each name from one session's
+ * own environment (`set-environment -t =SESSION -u NAME ; …`). `=` makes the
+ * target an exact session name, never a prefix match. Empty input → [].
+ */
+export function buildTmuxSessionEnvUnsetArgs(
+  session: string,
+  names: string[],
+): string[] {
+  const args: string[] = [];
+  for (const name of names) {
+    if (args.length > 0) args.push(";");
+    args.push("set-environment", "-t", `=${session}`, "-u", name);
+  }
+  return args;
+}
+
+export type TmuxCommandResult = {
+  code: number;
+  stdout: string;
+  stderr?: string;
+};
+
+export type TmuxCommandRunner = (args: string[]) => Promise<TmuxCommandResult>;
 
 /**
- * Removes every denied variable from a running tmux server's global
- * environment, so panes created from now on no longer inherit them. Shells
- * that are already running keep their copy — only a new shell is clean.
- * Returns the names removed (empty when no server answers).
+ * True when tmux's error says no server exists on the socket: the socket file
+ * is missing ("error connecting to … (No such file or directory)") or nothing
+ * listens on it ("no server running on …", also printed for a stale socket).
+ * Anything else — permission denied, a server that exits or hangs up, an
+ * unknown error — is a communication failure, NOT proof that no server holds
+ * the secrets. Checked against tmux 3.4 and 3.8.
  */
-export async function scrubTmuxGlobalEnvironment(
+export function isTmuxNoServerError(stderr: string | undefined): boolean {
+  if (!stderr) return false;
+  return (
+    /no server running on /.test(stderr) ||
+    /error connecting to .*\(No such file or directory\)/.test(stderr)
+  );
+}
+
+/** True when tmux says the target session does not exist (it went away). */
+export function isTmuxNoSuchSessionError(stderr: string | undefined): boolean {
+  if (!stderr) return false;
+  return /no such session|can't find session|session not found/i.test(stderr);
+}
+
+export type TmuxScrubResult = {
+  /**
+   * true: the server is verified free of denied variables (global and every
+   * session), or provably absent. false: it could not be verified.
+   */
+  ok: boolean;
+  /** false only when tmux proved no server exists on the socket. */
+  serverPresent: boolean;
+  /** Denied names removed from the global environment (names only). */
+  removed: string[];
+  /** Denied names removed per session (names only, never values). */
+  sessions: Array<{ session: string; removed: string[] }>;
+  /** Why verification failed; tmux's own error text, never a value. */
+  error?: string;
+};
+
+function describeTmuxFailure(step: string, result: TmuxCommandResult): string {
+  const detail = (result.stderr || "").trim().slice(0, 300);
+  return `${step} failed (exit ${result.code})${detail ? `: ${detail}` : ""}`;
+}
+
+/**
+ * Removes every denied variable from a running tmux server: first its global
+ * environment, then each existing session's own environment (a session entry
+ * overrides the global one for new panes in that session). Panes created from
+ * now on no longer inherit them; shells that are already running keep their
+ * copy until restarted. Protected names are never touched (the deny check
+ * excludes them).
+ *
+ * Never throws for a tmux failure: it returns `ok: false` with the reason, so
+ * the caller decides (TmuxEnvironmentGuard refuses new terminals). A server
+ * that is absent — or vanishes mid-scrub — is `ok: true, serverPresent:
+ * false`: the next new-session starts a fresh server from the sanitized env.
+ */
+export async function scrubTmuxEnvironment(
   runTmux: TmuxCommandRunner,
-): Promise<string[]> {
+): Promise<TmuxScrubResult> {
+  const removed: string[] = [];
+  const sessions: Array<{ session: string; removed: string[] }> = [];
+  const absent = (): TmuxScrubResult => ({
+    ok: true,
+    serverPresent: false,
+    removed,
+    sessions,
+  });
+  const failed = (error: string): TmuxScrubResult => ({
+    ok: false,
+    serverPresent: true,
+    removed,
+    sessions,
+    error,
+  });
+
   const shown = await runTmux(["show-environment", "-g"]);
-  if (shown.code !== 0) return [];
-  const denied = parseTmuxEnvironmentNames(shown.stdout).filter(
+  if (shown.code !== 0) {
+    return isTmuxNoServerError(shown.stderr)
+      ? absent()
+      : failed(describeTmuxFailure("tmux show-environment -g", shown));
+  }
+  const globalDenied = parseTmuxEnvironmentNames(shown.stdout).filter(
     isDeniedTerminalEnvName,
   );
-  if (denied.length === 0) return [];
-  const unset = await runTmux(buildTmuxGlobalEnvUnsetArgs(denied));
-  if (unset.code !== 0) {
-    throw new Error(
-      `tmux set-environment -g -u failed (${unset.code}) for ${denied.join(", ")}`,
-    );
+  if (globalDenied.length > 0) {
+    const unset = await runTmux(buildTmuxGlobalEnvUnsetArgs(globalDenied));
+    if (unset.code !== 0) {
+      if (isTmuxNoServerError(unset.stderr)) return absent();
+      return failed(
+        describeTmuxFailure(
+          `tmux set-environment -g -u (${globalDenied.join(", ")})`,
+          unset,
+        ),
+      );
+    }
+    removed.push(...globalDenied);
   }
-  return denied;
+
+  const listed = await runTmux(["list-sessions", "-F", "#{session_name}"]);
+  if (listed.code !== 0) {
+    return isTmuxNoServerError(listed.stderr)
+      ? absent()
+      : failed(describeTmuxFailure("tmux list-sessions", listed));
+  }
+  for (const session of parseTmuxSessionNames(listed.stdout)) {
+    const sessionShown = await runTmux([
+      "show-environment",
+      "-t",
+      `=${session}`,
+    ]);
+    if (sessionShown.code !== 0) {
+      if (isTmuxNoSuchSessionError(sessionShown.stderr)) continue;
+      if (isTmuxNoServerError(sessionShown.stderr)) return absent();
+      return failed(
+        describeTmuxFailure(
+          `tmux show-environment -t ${session}`,
+          sessionShown,
+        ),
+      );
+    }
+    const denied = parseTmuxEnvironmentNames(sessionShown.stdout).filter(
+      isDeniedTerminalEnvName,
+    );
+    if (denied.length === 0) continue;
+    const unset = await runTmux(buildTmuxSessionEnvUnsetArgs(session, denied));
+    if (unset.code !== 0) {
+      if (isTmuxNoSuchSessionError(unset.stderr)) continue;
+      if (isTmuxNoServerError(unset.stderr)) return absent();
+      return failed(
+        describeTmuxFailure(
+          `tmux set-environment -t ${session} -u (${denied.join(", ")})`,
+          unset,
+        ),
+      );
+    }
+    sessions.push({ session, removed: denied });
+  }
+
+  return { ok: true, serverPresent: true, removed, sessions };
+}
+
+/**
+ * Runs the scrub up to `attempts` times, waiting `delayMs` between tries,
+ * until one verifies. Returns the last result (a thrown runner error becomes
+ * `ok: false`). Used at startup so a transient tmux hiccup does not leave the
+ * environment unverified.
+ */
+export async function scrubTmuxEnvironmentWithRetry(
+  scrub: () => Promise<TmuxScrubResult>,
+  options: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<{ result: TmuxScrubResult; attempts: number }> {
+  const attempts = Math.max(1, options.attempts ?? 3);
+  const delayMs = options.delayMs ?? 500;
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  let result: TmuxScrubResult = {
+    ok: false,
+    serverPresent: true,
+    removed: [],
+    sessions: [],
+    error: "scrub not run",
+  };
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      result = await scrub();
+    } catch (err) {
+      result = {
+        ok: false,
+        serverPresent: true,
+        removed: [],
+        sessions: [],
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+    if (result.ok) return { result, attempts: attempt };
+    if (attempt < attempts) await sleep(delayMs);
+  }
+  return { result, attempts };
+}
+
+export const TERMINAL_ENVIRONMENT_UNVERIFIED_REASON =
+  "terminal_environment_unverified";
+
+/**
+ * Thrown instead of creating a tmux session while the server's environment
+ * could not be verified clean. The HTTP layer answers 503 with the message.
+ */
+export class TmuxEnvironmentUnverifiedError extends Error {
+  readonly reason = TERMINAL_ENVIRONMENT_UNVERIFIED_REASON;
+  readonly status = 503;
+  /** tmux's error text for the log; not part of the HTTP answer. */
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super(
+      "DeckTerm could not confirm that the terminal server is free of " +
+        "service secrets, so it did not open a new terminal. Try again in a " +
+        "moment; if this keeps happening, the operator should check the " +
+        "DeckTerm log for '[tmux] environment'.",
+    );
+    this.name = "TmuxEnvironmentUnverifiedError";
+    this.detail = detail;
+  }
+}
+
+/** HTTP answer for a refused terminal creation, or null for other errors. */
+export function terminalEnvironmentErrorResponse(
+  err: unknown,
+): { status: 503; body: { error: string; reason: string } } | null {
+  if (!(err instanceof TmuxEnvironmentUnverifiedError)) return null;
+  return {
+    status: 503,
+    body: { error: err.message, reason: err.reason },
+  };
+}
+
+/**
+ * Gate in front of every tmux new-session (the only call that creates shells
+ * or starts the server).
+ *
+ * - Verified once the scrub succeeded against a PRESENT server; after that
+ *   creation costs nothing extra.
+ * - Until then, every create re-runs the scrub first. An absent server passes
+ *   (new-session will start a clean one) but stays unverified, so the next
+ *   create checks the server that now exists.
+ * - A failed scrub refuses the create with TmuxEnvironmentUnverifiedError.
+ *   Nothing is latched: the next create tries again, so a transient failure
+ *   heals itself and the service is never bricked.
+ * - Concurrent creates share one in-flight scrub.
+ */
+export class TmuxEnvironmentGuard {
+  private verified = false;
+  private inFlight: Promise<TmuxScrubResult> | null = null;
+  private last: TmuxScrubResult | null = null;
+
+  constructor(private readonly scrub: () => Promise<TmuxScrubResult>) {}
+
+  get isVerified(): boolean {
+    return this.verified;
+  }
+
+  get lastResult(): TmuxScrubResult | null {
+    return this.last;
+  }
+
+  /** Runs (or joins) a scrub and records whether it verified the server. */
+  run(): Promise<TmuxScrubResult> {
+    if (!this.inFlight) {
+      this.inFlight = (async () => {
+        let result: TmuxScrubResult;
+        try {
+          result = await this.scrub();
+        } catch (err) {
+          result = {
+            ok: false,
+            serverPresent: true,
+            removed: [],
+            sessions: [],
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        this.verified = result.ok && result.serverPresent;
+        this.last = result;
+        return result;
+      })().finally(() => {
+        this.inFlight = null;
+      });
+    }
+    return this.inFlight;
+  }
+
+  /** Resolves when creating a session is safe; throws when it is not. */
+  async ensureVerified(): Promise<void> {
+    if (this.verified) return;
+    const result = await this.run();
+    if (!result.ok) {
+      throw new TmuxEnvironmentUnverifiedError(
+        result.error || "tmux environment scrub failed",
+      );
+    }
+  }
 }
