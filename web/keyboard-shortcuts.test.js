@@ -179,3 +179,18 @@ test("compactCombos folds alternatives that share their modifiers", () => {
   expect(compactCombos([["F1"], ["F2"]])).toBeNull();
   expect(compactCombos(null)).toBeNull();
 });
+
+test("the Agents panel and Next agent shortcuts work everywhere and name their actions", () => {
+  const byId = new Map(KEYBOARD_SHORTCUTS.map((s) => [s.id, s]));
+  const panel = byId.get("agents-panel");
+  const next = byId.get("next-agent");
+  expect(panel.keys.map(formatCombo)).toEqual(["Ctrl+Shift+L"]);
+  expect(next.keys.map(formatCombo)).toEqual(["Ctrl+Shift+X"]);
+  // Ctrl+Shift+letter never reaches the shell, so no scope note.
+  expect(panel.scope).toBeUndefined();
+  expect(next.scope).toBeUndefined();
+  expect(shortcutForAction("agents")).toBe("Ctrl+Shift+L");
+  expect(shortcutForAction("next-agent")).toBe("Ctrl+Shift+X");
+  expect(panel.label).toMatch(/Agents panel/);
+  expect(next.label).toMatch(/Next agent/);
+});

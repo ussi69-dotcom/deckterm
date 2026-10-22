@@ -84,7 +84,9 @@ function quickReplyAttentionBaseline({
  * signal), the latest one from this session decides: a "needs your input"
  * keeps the chips up for as long as the agent is not responding (no fixed
  * cutoff: the agent asks once and waits), any other kind hides them.
- * Without that signal agentState cannot tell "working" from "waiting", so
+ * A screen-rule agentStatus, when the server has one, wins: chips only while
+ * it is "blocked". Without that signal agentState cannot tell "working" from
+ * "waiting", so
  * the row stays for the whole session (which also avoids re-fitting the
  * terminal on every output burst). Attention at or below
  * `attentionBaselineSeq` predates the session and is ignored.
@@ -93,6 +95,7 @@ function shouldShowQuickReplies({
   touchLayout = false,
   agentName = null,
   agentState = null,
+  agentStatus = null,
   attention = null,
   attentionBaselineSeq = null,
 } = {}) {
@@ -100,6 +103,10 @@ function shouldShowQuickReplies({
   if (!(typeof agentName === "string" && agentName.trim().length > 0)) {
     return false;
   }
+  // The server reads the agent's screen (agentStatus, design 1.4): when it
+  // has a status, the chips show only while the agent waits for an answer.
+  if (agentStatus === "working" || agentStatus === "idle") return false;
+  if (agentStatus === "blocked") return true;
   if (!attention?.kind) return true;
   const baseline = Number(attentionBaselineSeq);
   if (

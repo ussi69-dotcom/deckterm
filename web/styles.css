@@ -7907,12 +7907,351 @@ body.chrome-mobile .compose-sheet-history-item {
    SURFACE WINDOWS — floating, snappable windows for Files/Git/Tasks/Editor
    ============================================================================= */
 
+/* The workspace row holds the desktop Agents panel, its sash and the
+   workspace area. The work area stays #workspace-area's own box, so
+   terminals, surface windows and the sessions dock never overlap the panel. */
+#workspace-row {
+  flex: 1;
+  display: flex;
+  flex-direction: row;
+  min-height: 0;
+  min-width: 0;
+}
+
 #workspace-area {
   flex: 1;
   position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
+}
+
+/* =============================================================================
+   AGENTS PANEL — desktop default view (web/agent-overview.js)
+   ============================================================================= */
+
+.agents-panel {
+  flex: 0 0 auto;
+  width: var(--agents-panel-width, 240px);
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border-primary);
+  overflow: hidden;
+}
+
+.agents-panel[hidden],
+.agents-panel-sash[hidden],
+body.ide-mode .agents-panel,
+body.ide-mode .agents-panel-sash,
+body.chrome-mobile .agents-panel,
+body.chrome-mobile .agents-panel-sash,
+body.fullscreen .agents-panel,
+body.fullscreen .agents-panel-sash {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .agents-panel,
+  .agents-panel-sash {
+    display: none;
+  }
+}
+
+.agents-panel-sash {
+  flex: 0 0 5px;
+  width: 5px;
+  cursor: col-resize;
+  background: var(--bg-tertiary);
+  touch-action: none;
+}
+
+.agents-panel-sash:hover,
+.agents-panel-sash.dragging {
+  background: var(--accent-blue);
+}
+
+.agents-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 6px 6px 12px;
+  border-bottom: 1px solid var(--border-primary);
+  flex: 0 0 auto;
+}
+
+.agents-panel-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+}
+
+.agents-panel-close {
+  width: 28px;
+  height: 28px;
+}
+
+.agents-panel-body,
+.agents-ide-view {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  font-size: 13px;
+}
+
+.agents-ide-view {
+  height: 100%;
+}
+
+.agents-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 10px 10px 12px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.agents-summary {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-primary);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.agents-next-btn {
+  flex: 0 0 auto;
+  min-width: 56px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid rgba(240, 180, 41, 0.55);
+  border-radius: 6px;
+  background: rgba(240, 180, 41, 0.16);
+  color: #f7d27a;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.agents-next-btn:hover:not(:disabled) {
+  background: rgba(240, 180, 41, 0.26);
+}
+
+.agents-next-btn:disabled {
+  border-color: var(--border-primary);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.agents-empty {
+  padding: 12px;
+  color: var(--text-muted);
+}
+
+.agents-group {
+  padding: 6px 0 4px;
+}
+
+.agents-group + .agents-group {
+  border-top: 1px solid var(--border-primary);
+}
+
+.agents-group-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 0;
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+}
+
+.agents-group-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agents-group-count {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.agents-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 8px;
+  row-gap: 1px;
+  width: 100%;
+  padding: 6px 10px 6px 12px;
+  border: 0;
+  border-left: 2px solid transparent;
+  background: transparent;
+  color: var(--text-primary);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+
+.agents-row:hover {
+  background: var(--bg-tertiary);
+}
+
+.agents-row.active {
+  border-left-color: var(--accent-blue);
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.agents-row:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.agents-row-status {
+  grid-row: 1 / 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: start;
+  box-sizing: border-box;
+  width: 88px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.agents-row-icon {
+  width: 10px;
+  text-align: center;
+}
+
+.agents-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agents-row-meta {
+  grid-column: 2;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+[data-tier="0"].agents-row-status,
+.agent-tier-icon[data-tier="0"] {
+  border-color: rgba(240, 180, 41, 0.55);
+  background: rgba(240, 180, 41, 0.14);
+  color: #f7d27a;
+}
+
+[data-tier="1"].agents-row-status,
+.agent-tier-icon[data-tier="1"] {
+  border-color: rgba(63, 185, 80, 0.45);
+  background: rgba(63, 185, 80, 0.12);
+  color: #9be7a9;
+}
+
+[data-tier="2"].agents-row-status,
+.agent-tier-icon[data-tier="2"] {
+  border-color: rgba(88, 166, 255, 0.45);
+  background: rgba(88, 166, 255, 0.1);
+  color: #a5d0ff;
+}
+
+/* Phone and tablet: the summary chip next to the Sessions button. */
+.agents-summary-chip {
+  display: inline-flex;
+  align-items: center;
+  height: 32px;
+  max-width: 132px;
+  margin-left: 4px;
+  padding: 0 10px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+
+.agents-summary-chip[hidden] {
+  display: none;
+}
+
+.agents-summary-chip[data-attention="needs-you"] {
+  border-color: rgba(240, 180, 41, 0.6);
+  background: rgba(240, 180, 41, 0.16);
+  color: #f7d27a;
+}
+
+.agents-summary-chip[data-attention="done"] {
+  border-color: rgba(63, 185, 80, 0.5);
+  background: rgba(63, 185, 80, 0.12);
+  color: #9be7a9;
+}
+
+/* Sessions sheet: agents summary and Next above the sorted list. */
+.sessions-agents-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-primary);
+}
+
+.sessions-agents-bar[hidden] {
+  display: none;
+}
+
+.sessions-agents-summary {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.agent-tier-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  margin-right: 4px;
+  padding: 0 4px;
+  border: 1px solid var(--border-primary);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: middle;
 }
 
 #surface-windows-layer {

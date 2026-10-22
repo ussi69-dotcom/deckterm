@@ -185,6 +185,29 @@ describe("extra keys bar visibility per device class", () => {
     );
   });
 
+  test("the Agents overview has one toggle per device class, on by default", () => {
+    const desktop = byKey("agents.panelVisible");
+    const touch = byKey("agents.summaryVisibleTouch");
+    for (const def of [desktop, touch]) {
+      expect(def).toBeDefined();
+      expect(def.type).toBe("toggle");
+      expect(def.default).toBe(true);
+      expect(def.category).toBe("Agents");
+    }
+    expect(desktop.deviceClass).toBe("desktop");
+    expect(touch.deviceClass).toBe("touch");
+    const desktopKeys = schemaForDevice(SETTINGS_SCHEMA, "desktop").map(
+      (d) => d.key,
+    );
+    const touchKeys = schemaForDevice(SETTINGS_SCHEMA, "touch").map(
+      (d) => d.key,
+    );
+    expect(desktopKeys).toContain("agents.panelVisible");
+    expect(desktopKeys).not.toContain("agents.summaryVisibleTouch");
+    expect(touchKeys).toContain("agents.summaryVisibleTouch");
+    expect(touchKeys).not.toContain("agents.panelVisible");
+  });
+
   test("schemaForDevice tolerates a missing schema", () => {
     expect(schemaForDevice(null, "touch")).toEqual([]);
   });
@@ -196,6 +219,7 @@ describe("categoriesOf", () => {
       "Appearance",
       "Terminal",
       "Windows & Layout",
+      "Agents",
       "Git",
       "Files",
       "Tasks",

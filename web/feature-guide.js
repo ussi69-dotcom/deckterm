@@ -21,6 +21,12 @@
   // actions but still deserve a line: the Sessions and IDE buttons, terminal
   // search, quick replies and the attention dot on tabs.
   const ACTION_DESCRIPTIONS = Object.freeze({
+    agents:
+      "Show or hide the Agents panel: every session by project, the ones that need you first",
+    "next-agent":
+      "Jump to the next session that needs your answer or finished while you were away",
+    "agents-chip":
+      "Counts the sessions that need you (●), are done (✓) or are working (◐); tap for the list",
     files:
       "Browse and edit files on the server; the list follows the terminal's current folder",
     git: "Review changes, stage and commit, switch branches and browse history of the current repo",
@@ -68,6 +74,8 @@
   // are the same feature as a toolbar button reuse its words.
   const PALETTE_DESCRIPTIONS = Object.freeze({
     "new-terminal": ACTION_DESCRIPTIONS["new-terminal"],
+    agents: ACTION_DESCRIPTIONS.agents,
+    "next-agent": ACTION_DESCRIPTIONS["next-agent"],
     "split-workspace": "Put a second terminal beside this one in the same tab",
     "detach-terminal-pane": "Take this pane out of the split and give it its own tab",
     "new-task-workspace":
@@ -103,6 +111,8 @@
   // Toolbar action id -> id of the row in keyboard-shortcuts.js that opens it.
   // Only features whose shortcut is real and documented in the Help modal.
   const ACTION_SHORTCUT_IDS = Object.freeze({
+    agents: "agents-panel",
+    "next-agent": "next-agent",
     palette: "command-palette",
     help: "help",
     fullscreen: "fullscreen",
@@ -116,6 +126,8 @@
     { title: "Compose", featureId: "compose" },
     { title: "Tasks", featureId: "tasks" },
     { title: "Sessions", featureId: "sessions" },
+    { title: "Agents panel", featureId: "agents" },
+    { title: "Next agent", featureId: "next-agent" },
     { title: "Files", featureId: "files" },
     { title: "Git", featureId: "git" },
     { title: "Search", featureId: "search" },

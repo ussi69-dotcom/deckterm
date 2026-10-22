@@ -59,6 +59,20 @@
       actionId: "search-terminal",
     },
     {
+      id: "agents-panel",
+      section: "General",
+      keys: [["Ctrl", "Shift", "L"]],
+      label: "Show or hide the Agents panel",
+      actionId: "agents",
+    },
+    {
+      id: "next-agent",
+      section: "General",
+      keys: [["Ctrl", "Shift", "X"]],
+      label: "Next agent that needs you",
+      actionId: "next-agent",
+    },
+    {
       id: "help",
       section: "General",
       keys: [["Ctrl", "Shift", "?"]],
