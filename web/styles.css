@@ -1519,12 +1519,24 @@ body.touch-input-mode .xterm .xterm-helper-textarea {
   text-shadow: none !important;
 }
 
-body.touch-input-mode .xterm .composition-view,
-body.touch-input-mode .xterm .composition-view.active {
+body.touch-input-mode .xterm .composition-view {
   color: transparent !important;
   background: transparent !important;
   opacity: 0 !important;
   pointer-events: none;
+}
+
+/* While an IME composes (Gboard suggestions, glide typing, accents, CJK)
+   nothing is sent until the commit, so the composing text is shown here at
+   the cursor, underlined like a native composing word. */
+body.touch-input-mode .xterm .composition-view.active {
+  color: var(--text-primary) !important;
+  background: var(--bg-tertiary) !important;
+  opacity: 1 !important;
+  text-decoration: underline;
+  text-decoration-color: var(--accent-blue);
+  text-underline-offset: 2px;
+  z-index: 5;
 }
 
 /* =============================================================================

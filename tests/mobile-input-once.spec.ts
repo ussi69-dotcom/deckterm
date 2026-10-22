@@ -19,6 +19,9 @@ import {
 // keypress never fires beforeinput on its own): keypress only when keydown
 // was not cancelled, beforeinput only when keypress was not cancelled, text
 // insertion plus input only when beforeinput was not cancelled.
+//
+// IME compositions are sent once, at commit (never streamed with DELs); the
+// composing text is shown locally in xterm's composition view meanwhile.
 
 const BASE_URL = process.env.PW_BASE_URL || "http://localhost:4174";
 
@@ -68,6 +71,13 @@ test.describe("Touch input reaches the shell once", () => {
       .toBe(true);
     return frames.slice(mark).join("");
   }
+
+  const helperValue = (page: Page) =>
+    page.evaluate(() => {
+      const tm = (window as any).terminalManager;
+      const active = tm.terminals.get(tm.activeId);
+      return active.element.querySelector(".xterm-helper-textarea").value;
+    });
 
   test("Playwright typing (real Chromium key events) sends each character once", async ({
     page,
@@ -135,33 +145,108 @@ test.describe("Touch input reaches the shell once", () => {
     expect(await sentSince(mark)).toBe("Hello");
   });
 
-  test("a real Chromium IME composition streams each change once", async ({
-    page,
-  }) => {
-    // Input.imeSetComposition / Input.insertText drive Blink's own IME path,
-    // so the composition events and textarea updates are the browser's.
-    const cdp = await page.context().newCDPSession(page);
-    const mark = frames.length;
-    try {
-      for (const text of ["H", "He", "Hel", "He"]) {
-        await cdp.send("Input.imeSetComposition", {
-          text,
-          selectionStart: text.length,
-          selectionEnd: text.length,
-        });
+  // Input.imeSetComposition / Input.insertText drive Blink's own IME path,
+  // so the composition events and textarea updates are the browser's.
+  // Nothing is sent while composing; the committed text is sent once.
+  for (const scenario of [
+    {
+      name: "a composed word",
+      steps: ["H", "He", "Hel", "He", "Help"],
+      commit: "Help",
+    },
+    { name: "a word corrected at commit", steps: ["t", "te", "teh"], commit: "the" },
+    {
+      name: "a picked suggestion",
+      steps: ["h", "he", "hel"],
+      commit: "hello ",
+    },
+    { name: "an accented letter", steps: ["e"], commit: "é" },
+    {
+      name: "a combining mark",
+      steps: ["e", "é"],
+      commit: "é",
+    },
+  ]) {
+    test(`real Chromium IME: ${scenario.name} is sent once, at commit`, async ({
+      page,
+    }) => {
+      const cdp = await page.context().newCDPSession(page);
+      const mark = frames.length;
+      try {
+        for (const text of scenario.steps) {
+          await cdp.send("Input.imeSetComposition", {
+            text,
+            selectionStart: text.length,
+            selectionEnd: text.length,
+          });
+        }
+        await page.waitForTimeout(300);
+        expect(frames.slice(mark).join("")).toBe("");
+        await cdp.send("Input.insertText", { text: scenario.commit });
+      } finally {
+        await cdp.detach().catch(() => {});
       }
-      // The keyboard commits a corrected word.
-      await cdp.send("Input.insertText", { text: "Help" });
+      expect(await sentSince(mark)).toBe(scenario.commit);
+      expect(await helperValue(page)).toBe("");
+    });
+  }
+
+  test("the composing text is visible while composing", async ({ page }) => {
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      await cdp.send("Input.imeSetComposition", {
+        text: "Hel",
+        selectionStart: 3,
+        selectionEnd: 3,
+      });
+      const view = page.locator(".tile.active .composition-view.active");
+      await expect(view).toBeVisible();
+      await expect(view).toHaveText("Hel");
+      const style = await view.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        return { opacity: cs.opacity, color: cs.color };
+      });
+      expect(style.opacity).toBe("1");
+      expect(style.color).not.toBe("rgba(0, 0, 0, 0)");
+      await test.info().attach("composing-390x844", {
+        body: await page.screenshot(),
+        contentType: "image/png",
+      });
+      await cdp.send("Input.insertText", { text: "Hel" });
+      await expect(
+        page.locator(".tile.active .composition-view.active"),
+      ).toHaveCount(0);
     } finally {
       await cdp.detach().catch(() => {});
     }
-    expect(await sentSince(mark)).toBe("Hel\x7flp");
-    const helper = await page.evaluate(() => {
-      const tm = (window as any).terminalManager;
-      const active = tm.terminals.get(tm.activeId);
-      return active.element.querySelector(".xterm-helper-textarea").value;
+  });
+
+  for (const order of ["compositionend first", "insertFromComposition first"]) {
+    test(`Safari-style commit (${order}) is sent once`, async ({ page }) => {
+      const mark = frames.length;
+      await page.evaluate(
+        (endFirst) => (window as any).__kbd.safariCompose(["e", "é"], endFirst),
+        order === "compositionend first",
+      );
+      expect(await sentSince(mark)).toBe("é");
+      // Nothing else trails in once xterm's deferred composition read ran.
+      await page.waitForTimeout(300);
+      expect(frames.slice(mark).join("")).toBe("é");
+      expect(await helperValue(page)).toBe("");
     });
-    expect(helper).toBe("");
+  }
+
+  test("a Gboard A then a physical A within a second both arrive once", async ({
+    page,
+  }) => {
+    const mark = frames.length;
+    await page.evaluate(() => {
+      const kbd = (window as any).__kbd;
+      kbd.gboard("A");
+      kbd.hardware("A");
+      kbd.gboard("A");
+    });
+    expect(await sentSince(mark)).toBe("AAA");
   });
 
   test("an extra-keys Ctrl modifier with a hardware C sends one Ctrl+C", async ({
@@ -225,6 +310,11 @@ async function installKeyboardEmulator(page: Page) {
         composed: true,
         ...init,
       });
+      // Chromium blanks inputTypes it does not implement itself (WebKit's
+      // insertFromComposition / deleteCompositionText); keep the real one.
+      if (init.inputType && event.inputType !== init.inputType) {
+        Object.defineProperty(event, "inputType", { value: init.inputType });
+      }
       textarea.dispatchEvent(event);
       return event;
     };
@@ -317,45 +407,40 @@ async function installKeyboardEmulator(page: Page) {
       }
     };
 
+    const compositionEvent = (type: string, data: string) =>
+      textarea.dispatchEvent(
+        new CompositionEvent(type, { bubbles: true, data }),
+      );
+
+    // Replaces the composition range [start, start + composed.length) the
+    // way the browser does, and returns the new composed text.
+    const replaceComposition = (start: number, composed: string, next: string) => {
+      textarea.value =
+        textarea.value.slice(0, start) +
+        next +
+        textarea.value.slice(start + composed.length);
+      textarea.selectionStart = textarea.selectionEnd = start + next.length;
+      return next;
+    };
+
     // A keyboard that composes the word (Gboard with suggestions, glide
-    // typing, Samsung keyboard): each update replaces the composition with
-    // the whole word so far; compositionend commits it.
+    // typing, Samsung keyboard), Chromium order: each update replaces the
+    // composition with the whole word so far; compositionend commits it.
     const compose = (word: string) => {
       const init = { key: "Unidentified", keyCode: 229, which: 229 };
-      textarea.dispatchEvent(
-        new CompositionEvent("compositionstart", { bubbles: true, data: "" }),
-      );
-      let start = textarea.selectionStart ?? textarea.value.length;
+      compositionEvent("compositionstart", "");
+      const start = textarea.selectionStart ?? textarea.value.length;
       let composed = "";
       for (let i = 1; i <= word.length; i++) {
         const next = word.slice(0, i);
         key("keydown", init);
-        const before = input("beforeinput", {
+        compositionEvent("compositionupdate", next);
+        input("beforeinput", {
           inputType: "insertCompositionText",
           data: next,
           isComposing: true,
         });
-        if (!before.defaultPrevented) {
-          // The browser replaces its composition range. If the page cleared
-          // the textarea meanwhile, the range collapses to the start.
-          if (textarea.value.length < start + composed.length) {
-            start = Math.min(start, textarea.value.length);
-            composed = textarea.value.slice(start);
-          }
-          textarea.value =
-            textarea.value.slice(0, start) +
-            next +
-            textarea.value.slice(start + composed.length);
-          composed = next;
-          textarea.selectionStart = textarea.selectionEnd =
-            start + next.length;
-        }
-        textarea.dispatchEvent(
-          new CompositionEvent("compositionupdate", {
-            bubbles: true,
-            data: next,
-          }),
-        );
+        composed = replaceComposition(start, composed, next);
         input("input", {
           inputType: "insertCompositionText",
           data: next,
@@ -363,12 +448,57 @@ async function installKeyboardEmulator(page: Page) {
         });
         key("keyup", init);
       }
-      textarea.dispatchEvent(
-        new CompositionEvent("compositionend", { bubbles: true, data: word }),
-      );
+      compositionEvent("compositionend", word);
     };
 
-    (window as any).__kbd = { hardware, special, gboard, compose };
+    // WebKit (Safari) commit: deleteCompositionText + insertFromComposition,
+    // with compositionend either before or after insertFromComposition.
+    const safariCompose = (updates: string[], endFirst: boolean) => {
+      compositionEvent("compositionstart", "");
+      const start = textarea.selectionStart ?? textarea.value.length;
+      let composed = "";
+      for (const next of updates) {
+        compositionEvent("compositionupdate", next);
+        input("beforeinput", {
+          inputType: "insertCompositionText",
+          data: next,
+          isComposing: true,
+        });
+        composed = replaceComposition(start, composed, next);
+        input("input", {
+          inputType: "insertCompositionText",
+          data: next,
+          isComposing: true,
+        });
+      }
+      const word = updates[updates.length - 1];
+      if (endFirst) compositionEvent("compositionend", word);
+      input("beforeinput", {
+        inputType: "deleteCompositionText",
+        isComposing: !endFirst,
+      });
+      // The composing text leaves the textarea (if the page left it there).
+      const from = Math.min(start, textarea.value.length);
+      textarea.value = textarea.value.slice(0, from);
+      input("input", {
+        inputType: "deleteCompositionText",
+        isComposing: !endFirst,
+      });
+      input("beforeinput", {
+        inputType: "insertFromComposition",
+        data: word,
+        isComposing: !endFirst,
+      });
+      replaceComposition(Math.min(start, textarea.value.length), "", word);
+      input("input", {
+        inputType: "insertFromComposition",
+        data: word,
+        isComposing: !endFirst,
+      });
+      if (!endFirst) compositionEvent("compositionend", word);
+    };
+
+    (window as any).__kbd = { hardware, special, gboard, compose, safariCompose };
   });
 }
 
