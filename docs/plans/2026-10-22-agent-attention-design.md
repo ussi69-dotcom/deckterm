@@ -73,6 +73,8 @@ The existing `attention` object (`backend/telemetry.ts:781-787`) gains two optio
   - `\A` becomes `(?<![\s\S])` and `\z` becomes `(?![\s\S])`.
 
   An inline flag anywhere else is a load error. A unit test compiles every vendored pattern.
+- **Bounded cost (S1 review fix).** herdr's Rust regex engine runs in linear time; JavaScript backtracks. So: every vendored pattern that backtracked super-linearly is rewritten into an equivalent linear form in the TOML (listed in each header), or, for Codex `screen_working_fallback`, evaluated by an equivalent line scan keyed by its exact text; the screen, title and progress are normalized so that only `\n` breaks lines (CRLF to LF; a lone CR, U+2028 and U+2029 to a space, as Rust sees them); every region is cut to its last 200 lines of at most 512 characters; client terminal sizes are clamped to 1000 x 500. `backend/agent-screen-perf.test.ts` checks each rewrite against the upstream text and every pattern against adversarial 300 x 400 screens (under 50 ms each).
+- **Scheduling (S1 review fix).** The pump only schedules the evaluation; captures run off the pump, at most 4 at once and one per terminal, so a wedged tmux cannot stall pipe processing. A capture that fails or is discarded leaves the "printed something" flag set, so the next tick retries. A re-attach of the same tmux session hands the record (blocked episode, whether it pushed), the attention and the last push times to the new handle when the same agent still runs.
 - **Raw backend.** It has no screen to capture, so `agentStatus` stays `null` there and everything falls back to today's behaviour. Deployed instances run the tmux backend.
 
 ### 1.3 Hysteresis
@@ -346,7 +348,7 @@ The list of service-only variables removed from terminal environments is recorde
 - The procedure runs by hand:
   1. In a herdr clone that a person updated on purpose, read as data only (never run its scripts or build), compare `git diff 2ecf19a <new tag> -- src/detect/manifests/claude.toml src/detect/manifests/codex.toml src/detect/manifest.rs`.
   2. Apply the relevant changes to `backend/agent-rules/*.toml`, and update the header's commit and version.
-  3. Run the regex-compile test and the fixture suite.
+  3. Re-apply the linear-time rewrites listed in each TOML header (and update `CODEX_WORKING_FALLBACK_PATTERN` if that pattern changed), then run the regex-compile test, `backend/agent-screen-perf.test.ts` and the fixture suite.
   4. Capture new fixtures for the agent version that changed (section 4).
   5. Update the commit in `THIRD_PARTY_NOTICES.md`, and commit with the upstream commit in the message.
 

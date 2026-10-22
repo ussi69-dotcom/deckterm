@@ -43,10 +43,21 @@ export type ScreenRuleResult = {
   manifestVersion: string;
 };
 
+/**
+ * A compiled `regex` / `line_regex` entry. Usually a RegExp; a vendored
+ * pattern a backtracking engine would run in super-linear time is replaced by
+ * an equivalent linear scan (see LINEAR_PATTERN_MATCHERS).
+ */
+export type PatternMatcher = {
+  /** The pattern text as written in the manifest. */
+  pattern: string;
+  test(text: string): boolean;
+};
+
 type CompiledGate = {
   contains: string[];
-  regex: RegExp[];
-  lineRegex: RegExp[];
+  regex: PatternMatcher[];
+  lineRegex: PatternMatcher[];
   all: CompiledGate[];
   any: CompiledGate[];
   not: CompiledGate[];
@@ -216,6 +227,316 @@ export function compileRustRegex(pattern: string): RegExp {
   }
 }
 
+/**
+ * Compiles a manifest pattern: the linear matcher when one replaces it,
+ * otherwise the translated RegExp.
+ */
+export function compilePattern(pattern: string): PatternMatcher {
+  const linear = LINEAR_PATTERN_MATCHERS.get(pattern);
+  if (linear) return { pattern, test: linear };
+  const regex = compileRustRegex(pattern);
+  return { pattern, test: (text) => regex.test(text) };
+}
+
+// ---------------------------------------------------------------------------
+// Bounded cost. herdr runs these patterns on the Rust `regex` crate, which
+// matches in linear time. JavaScript backtracks, so the port bounds the cost
+// itself (review findings 2026-10-22):
+// - every pattern that backtracks super-linearly is rewritten in the vendored
+//   TOML into an equivalent linear form (listed in each TOML header), or,
+//   where no regex form is linear, replaced here by an equivalent line scan;
+// - the input is normalized so that "\n" is the only line break, as in Rust;
+// - every region is cut to its last 200 lines of at most 512 characters.
+// backend/agent-screen-perf.test.ts checks every vendored pattern against
+// adversarial 300 x 400 screens.
+// ---------------------------------------------------------------------------
+
+export const MAX_REGION_LINES = 200;
+export const MAX_REGION_LINE_CHARS = 512;
+
+/**
+ * CRLF becomes LF; a lone CR, U+2028 and U+2029 become a space. Rust's
+ * `(?m)^`/`$` and `.` treat only "\n" as a line break, JavaScript also treats
+ * these three, so after this both engines see the same lines (and no extra
+ * line starts an attacker could multiply).
+ */
+export function normalizeScreenText(text: string): string {
+  const crlf = text.includes("\r") ? text.replace(/\r\n/g, "\n") : text;
+  return /[\r\u2028\u2029]/.test(crlf)
+    ? crlf.replace(/[\r\u2028\u2029]/g, " ")
+    : crlf;
+}
+
+function clipLine(line: string): string {
+  if (line.length <= MAX_REGION_LINE_CHARS) return line;
+  let end = MAX_REGION_LINE_CHARS;
+  // Never leave half of a surrogate pair at the cut.
+  const last = line.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return line.slice(0, end);
+}
+
+/**
+ * The last MAX_REGION_LINES lines of a region, each cut to
+ * MAX_REGION_LINE_CHARS. Captures are pane-sized, so this only changes the
+ * text of very tall or very wide panes.
+ */
+export function boundRegionText(text: string): string {
+  if (text.length <= MAX_REGION_LINE_CHARS) {
+    let breaks = 0;
+    for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
+      breaks++;
+    }
+    if (breaks <= MAX_REGION_LINES) return text;
+  }
+  const trailingBreak = text.endsWith("\n");
+  let lines = text.split("\n");
+  if (trailingBreak) lines.pop();
+  if (lines.length > MAX_REGION_LINES) lines = lines.slice(-MAX_REGION_LINES);
+  return lines.map(clipLine).join("\n") + (trailingBreak ? "\n" : "");
+}
+
+const JS_WHITESPACE = /\s/u;
+
+function isWhitespace(ch: string | undefined): boolean {
+  return ch !== undefined && JS_WHITESPACE.test(ch);
+}
+
+/**
+ * codex.toml screen_working_fallback, unchanged upstream. Its tail
+ * `(?:\r?\n(…)?)*\s*\z` is re-scanned to the end of the screen from every
+ * timer line, which backtracks in O(rows^2 x cols). codexWorkingFallbackMatches
+ * below decides the same language in one backward pass.
+ */
+// A plain string: Bun can re-escape non-ASCII inside String.raw templates.
+export const CODEX_WORKING_FALLBACK_PATTERN =
+  "(?m)^(?:[•◦][ \\t]+)?[^\\s›•◦■✗✓─][^\\r\\n]* \\((?:[0-9]+[hm] )*[0-9]+s(?: • [^\\r\\n]+? to interrupt)?\\)(?: · [^\\r\\n]*)?(?:\\r?\\n(?:[^•◦›■✗✓─\\r\\n][^\\r\\n]*|•[ \\t]+(?:Queued\\s+follow-up\\s+inputs|Messages\\s+to\\s+be\\s+submitted\\s+after\\s+next\\s+tool\\s+call(?:\\s+\\(press\\s+[^\\r\\n]+?\\s+to\\s+interrupt\\s+and\\s+send\\s+immediately\\))?|Messages\\s+to\\s+be\\s+submitted\\s+at\\s+end\\s+of\\s+turn)|›[⠁⠂⠄⠈⠐⠠⡀⢀][^\\r\\n]*)?)*\\s*\\z";
+
+const CODEX_SPARKLES = new Set(["⠁", "⠂", "⠄", "⠈", "⠐", "⠠", "⡀", "⢀"]);
+const CODEX_QUEUED_Y = /•[ \t]+Queued\s+follow-up\s+inputs/uy;
+const CODEX_AT_END_Y =
+  /•[ \t]+Messages\s+to\s+be\s+submitted\s+at\s+end\s+of\s+turn/uy;
+const CODEX_AFTER_TOOL_Y =
+  /•[ \t]+Messages\s+to\s+be\s+submitted\s+after\s+next\s+tool\s+call/uy;
+const CODEX_INTERRUPT_CLOSE = " to interrupt)";
+
+/**
+ * Linear equivalent of CODEX_WORKING_FALLBACK_PATTERN on normalized text.
+ *
+ * The regex matches when some line is a "head" (an optional bullet, a status
+ * text and a ` (…Ns…)` timer suffix) and everything after the head, up to the
+ * end, is "tail": line breaks, each followed by nothing, a plain line, a
+ * sparkle prompt line or one of three queued-input messages (whose `\s+` may
+ * cross lines), then only whitespace. One backward pass computes, for every
+ * line end, whether the tail can start there (D) and, for every line start,
+ * whether the tail can continue there after a line break (L); each head line
+ * is then checked once against D of its own line end.
+ */
+export function codexWorkingFallbackMatches(raw: string): boolean {
+  const s = normalizeScreenText(raw);
+  const n = s.length;
+  // `\s*\z` from e holds exactly when e >= wsEnd (trimEnd strips the same
+  // WhiteSpace + LineTerminator set as JavaScript's \s).
+  const wsEnd = s.trimEnd().length;
+  const starts: number[] = [];
+  const ends: number[] = [];
+  for (let pos = 0; ; ) {
+    const nl = s.indexOf("\n", pos);
+    starts.push(pos);
+    if (nl === -1) {
+      ends.push(n);
+      break;
+    }
+    ends.push(nl);
+    pos = nl + 1;
+  }
+  const lineCount = starts.length;
+  const tailFromEnd = new Array<boolean>(lineCount).fill(false); // D
+  const tailAfterBreak = new Array<boolean>(lineCount).fill(false); // L
+
+  const lineIndexOfEnd = (pos: number) => {
+    let lo = 0;
+    let hi = lineCount - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (ends[mid] < pos) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  // The tail may start at an arbitrary position g (after a message).
+  const tailFrom = (g: number) => {
+    if (g >= wsEnd) return true;
+    return s[g] === "\n" && tailFromEnd[lineIndexOfEnd(g)];
+  };
+  const skipWhitespace = (from: number) => {
+    let i = from;
+    while (i < n && isWhitespace(s[i])) i++;
+    return i;
+  };
+  // `\s+to\s+interrupt\s+and\s+send\s+immediately\)` after its leading
+  // whitespace, from "to" at b. Returns the end, or -1.
+  const interruptAndSendEnd = (b: number) => {
+    let i = b;
+    const words = ["to", "interrupt", "and", "send", "immediately)"];
+    for (let w = 0; w < words.length; w++) {
+      if (w > 0) {
+        const next = skipWhitespace(i);
+        if (next === i) return -1;
+        i = next;
+      }
+      if (!s.startsWith(words[w], i)) return -1;
+      i += words[w].length;
+    }
+    return i;
+  };
+  // Ends of `\s+\(press\s+[^\r\n]+?\s+to\s+interrupt…\)` after g0.
+  const pressClauseEnds = (g0: number): number[] => {
+    const open = skipWhitespace(g0);
+    if (open === g0 || !s.startsWith("(press", open)) return [];
+    const pressEnd = open + "(press".length;
+    const afterPress = skipWhitespace(pressEnd);
+    if (afterPress === pressEnd) return [];
+    const ends: number[] = [];
+    // The lazy text (at least one character, no line break) sits between
+    // the whitespace after "(press" and the whitespace before "to".
+    if (s.startsWith("to", afterPress)) {
+      // Both runs are one: the lazy text is one non-break character in it.
+      for (let x = pressEnd + 1; x <= afterPress - 2; x++) {
+        if (s[x] !== "\n") {
+          const end = interruptAndSendEnd(afterPress);
+          if (end !== -1) ends.push(end);
+          break;
+        }
+      }
+    }
+    if (afterPress < n) {
+      // The lazy text runs from afterPress to a whitespace run that starts
+      // on the same line; "to" follows that run.
+      let lineEnd = s.indexOf("\n", afterPress);
+      if (lineEnd === -1) lineEnd = n;
+      for (let a = afterPress + 1; a <= lineEnd && a < n; a++) {
+        if (!isWhitespace(s[a]) || isWhitespace(s[a - 1])) continue;
+        const b = skipWhitespace(a);
+        if (s.startsWith("to", b)) {
+          const end = interruptAndSendEnd(b);
+          if (end !== -1) ends.push(end);
+        }
+        a = b - 1;
+      }
+    }
+    return ends;
+  };
+  // `•[ \t]+(?:Queued…|Messages…call(?:<press clause>)?|Messages…turn)`.
+  const queuedMessageThenTail = (f: number) => {
+    const candidates: number[] = [];
+    for (const re of [CODEX_QUEUED_Y, CODEX_AT_END_Y]) {
+      re.lastIndex = f;
+      if (re.test(s)) candidates.push(re.lastIndex);
+    }
+    CODEX_AFTER_TOOL_Y.lastIndex = f;
+    if (CODEX_AFTER_TOOL_Y.test(s)) {
+      const g0 = CODEX_AFTER_TOOL_Y.lastIndex;
+      candidates.push(g0, ...pressClauseEnds(g0));
+    }
+    return candidates.some(tailFrom);
+  };
+
+  for (let k = lineCount - 1; k >= 0; k--) {
+    const f = starts[k];
+    const le = ends[k];
+    tailFromEnd[k] = le >= wsEnd || (le < n && tailAfterBreak[k + 1]);
+    if (f === le) {
+      tailAfterBreak[k] = tailFromEnd[k];
+      continue;
+    }
+    const c = s[f];
+    let ok = f >= wsEnd;
+    if (!ok && !"•◦›■✗✓─".includes(c)) ok = tailFromEnd[k];
+    if (!ok && c === "›" && CODEX_SPARKLES.has(s[f + 1])) ok = tailFromEnd[k];
+    if (!ok && c === "•") ok = queuedMessageThenTail(f);
+    tailAfterBreak[k] = ok;
+  }
+
+  for (let k = 0; k < lineCount; k++) {
+    if (codexHeadLineThenTail(s, starts[k], ends[k], wsEnd, tailFromEnd[k])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** The head part of CODEX_WORKING_FALLBACK_PATTERN on one line, then the tail. */
+function codexHeadLineThenTail(
+  s: string,
+  f: number,
+  le: number,
+  wsEnd: number,
+  tailFromLineEnd: boolean,
+): boolean {
+  // Line-local indexes: every search stays inside this line.
+  const line = s.slice(f, le);
+  const len = line.length;
+  let p = 0;
+  if (line[0] === "•" || line[0] === "◦") {
+    let j = 1;
+    while (j < len && (line[j] === " " || line[j] === "\t")) j++;
+    if (j === 1) return false;
+    p = j;
+  }
+  if (p >= len || isWhitespace(line[p]) || "›•◦■✗✓─".includes(line[p])) {
+    return false;
+  }
+  // After the closing parenthesis: ` · …` to the line end, or the tail.
+  const endOk = (e: number) => {
+    if (line.startsWith(" · ", e)) return tailFromLineEnd;
+    return e === len ? tailFromLineEnd : f + e >= wsEnd;
+  };
+  // The last " to interrupt)" whose end is acceptable.
+  let lastInterrupt = -1;
+  for (
+    let t = line.indexOf(CODEX_INTERRUPT_CLOSE, p);
+    t !== -1;
+    t = line.indexOf(CODEX_INTERRUPT_CLOSE, t + 1)
+  ) {
+    if (endOk(t + CODEX_INTERRUPT_CLOSE.length)) lastInterrupt = t;
+  }
+  for (
+    let q = line.indexOf(" (", p + 1);
+    q !== -1;
+    q = line.indexOf(" (", q + 1)
+  ) {
+    // `(?:[0-9]+[hm] )*[0-9]+s`: each digit run is maximal, then h/m + space
+    // continues and s ends.
+    let i = q + 2;
+    let r = -1;
+    for (;;) {
+      const digits = i;
+      while (i < len && line[i] >= "0" && line[i] <= "9") i++;
+      if (i === digits) break;
+      if (line[i] === "s") {
+        r = i + 1;
+        break;
+      }
+      if ((line[i] === "h" || line[i] === "m") && line[i + 1] === " ") {
+        i += 2;
+        continue;
+      }
+      break;
+    }
+    if (r === -1) continue;
+    if (line[r] === ")" && endOk(r + 1)) return true;
+    if (line.startsWith(" • ", r) && lastInterrupt >= r + 4) return true;
+  }
+  return false;
+}
+
+/** Patterns replaced by a linear matcher, keyed by their exact TOML text. */
+export const LINEAR_PATTERN_MATCHERS: ReadonlyMap<
+  string,
+  (text: string) => boolean
+> = new Map([[CODEX_WORKING_FALLBACK_PATTERN, codexWorkingFallbackMatches]]);
+
 // ---------------------------------------------------------------------------
 // Manifest loading
 // ---------------------------------------------------------------------------
@@ -332,9 +653,9 @@ function compileGate(value: unknown, context: string): CompiledGate {
     contains: stringList(gate.contains, `${context}.contains`).map((needle) =>
       needle.toLowerCase(),
     ),
-    regex: stringList(gate.regex, `${context}.regex`).map(compileRustRegex),
+    regex: stringList(gate.regex, `${context}.regex`).map(compilePattern),
     lineRegex: stringList(gate.line_regex, `${context}.line_regex`).map(
-      compileRustRegex,
+      compilePattern,
     ),
     all: nested("all"),
     any: nested("any"),
@@ -670,8 +991,33 @@ export function ruleMatches(
   rule: CompiledScreenRule,
   input: { screen: string; title: string; progress: string },
 ): boolean {
-  const text = regionText(rule.region, input);
+  const text = boundRegionText(regionText(rule.region, input));
   return gateMatches(rule.gate, text, text.toLowerCase());
+}
+
+/** Every regex and line_regex of a rule, nested gates included. */
+export function rulePatternMatchers(
+  rule: CompiledScreenRule,
+): Array<PatternMatcher & { kind: "regex" | "line_regex" }> {
+  const out: Array<PatternMatcher & { kind: "regex" | "line_regex" }> = [];
+  const walk = (gate: CompiledGate) => {
+    for (const matcher of gate.regex) out.push({ ...matcher, kind: "regex" });
+    for (const matcher of gate.lineRegex) {
+      out.push({ ...matcher, kind: "line_regex" });
+    }
+    for (const nested of [...gate.all, ...gate.any, ...gate.not]) walk(nested);
+  };
+  walk(rule.gate);
+  return out;
+}
+
+/** How a gate applies one matcher to a region: regex whole, line_regex per line. */
+export function patternMatchesRegion(
+  matcher: PatternMatcher & { kind: "regex" | "line_regex" },
+  text: string,
+): boolean {
+  if (matcher.kind === "regex") return matcher.test(text);
+  return rustLines(text).some((line) => matcher.test(line));
 }
 
 // ---------------------------------------------------------------------------
@@ -683,9 +1029,9 @@ export function evaluateManifest(
   input: ScreenRuleInput,
 ): ScreenRuleResult {
   const normalized = {
-    screen: String(input.screen || "").replace(/\r\n/g, "\n"),
-    title: String(input.title || ""),
-    progress: String(input.progress || ""),
+    screen: normalizeScreenText(String(input.screen || "")),
+    title: normalizeScreenText(String(input.title || "")),
+    progress: normalizeScreenText(String(input.progress || "")),
   };
   let best: CompiledScreenRule | null = null;
   for (const rule of manifest.rules) {

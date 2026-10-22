@@ -12,6 +12,27 @@
 #
 # DeckTerm edits (everything else is byte-for-byte upstream):
 #   1. This header comment.
+#   2. Linear-time rewrites. herdr matches with the Rust regex crate (linear
+#      time); JavaScript backtracks, and these upstream patterns backtracked
+#      super-linearly on adversarial pane text. Each rewrite matches exactly
+#      the same strings (backend/agent-screen-perf.test.ts compares them with
+#      the upstream text on generated input). Re-apply after every re-sync:
+#      - startup_update: `(?m)^\s*Update` became `(?m)^[^\S\n]*Update` (`\s`
+#        crossed line breaks, so every line start re-scanned all following
+#        blank lines).
+#      - weak_blocker: in the `not` pattern every later line must not itself
+#        be a sparkle prompt line (`(?!›[⠁⠂⠄⠈⠐⠠⡀⢀])`), so the scan from one
+#        prompt line stops at the next instead of re-scanning to the end; the
+#        match then starts at the last such line, which matches whenever an
+#        earlier one does.
+#      - screen_working_fallback: the regex text is unchanged, but DeckTerm
+#        does not run it as a JavaScript regex. backend/agent-screen-rules.ts
+#        (LINEAR_PATTERN_MATCHERS, keyed by this exact text) evaluates it
+#        with the equivalent line scan codexWorkingFallbackMatches: from
+#        every timer line the regex tail re-scanned to the end of the screen,
+#        O(rows^2 x cols). If a re-sync changes this text, update
+#        CODEX_WORKING_FALLBACK_PATTERN and the scan with it (a test fails
+#        until then).
 
 id = "codex"
 version = "2026.10.11.1"
@@ -84,7 +105,7 @@ any = [
     { regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z'] },
   ] },
   { all = [
-    { regex = ['(?m)^\s*Update\s+available\s+·'] },
+    { regex = ['(?m)^[^\S\n]*Update\s+available\s+·'] },
     { regex = ['enter\s+continue\s+·\s+esc\s+skip\s*\z'] },
   ] },
 ]
@@ -109,7 +130,7 @@ state = "blocked"
 priority = 600
 region = "whole_recent_without_current_prompt_marker"
 # Sparkles can replace the space after ›. A later response marker makes that prompt stale.
-not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀][^\n]*(?:\n(?:[^•■✗✓\n][^\n]*)?)*\z'] }]
+not = [{ regex = ['(?m)^›[⠁⠂⠄⠈⠐⠠⡀⢀][^\n]*(?:\n(?:(?!›[⠁⠂⠄⠈⠐⠠⡀⢀])[^•■✗✓\n][^\n]*)?)*\z'] }]
 any = [
   { contains = ["[y/n]"] },
   { contains = ["yes (y)"] },
