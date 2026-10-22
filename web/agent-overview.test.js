@@ -486,6 +486,8 @@ describe("focus keeping across a re-render", () => {
     expect(html).toContain("data-agents-next");
     // The same model renders the same HTML (the app skips the DOM write).
     expect(renderAgentListHtml(sessions, {})).toBe(html);
+  });
+});
 
 // S3: the Agents panel's "Resume" group.
 describe("resumable rows", () => {
