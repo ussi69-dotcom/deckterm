@@ -122,6 +122,39 @@ test("settings API stores and merges per-actor settings", async () => {
   expect(merged.settings["dock.enabled"]).toBeUndefined();
   expect(merged.settings["windows.layout"]).toBeDefined();
 
+  // attention.seen merges per id by max: an older map PUT after a newer one
+  // keeps the newer values, invalid entries are dropped, the cap holds and
+  // null still deletes the whole key.
+  const putSeen = (value: unknown) =>
+    app.fetch(
+      new Request("http://localhost/api/settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ settings: { "attention.seen": value } }),
+      }),
+    );
+  const seenOf = async (res: Response) =>
+    ((await res.json()) as { settings: Record<string, unknown> }).settings[
+      "attention.seen"
+    ] as Record<string, number> | undefined;
+  const idA = "0f8fad5b-d9cb-469f-a165-70867728950e";
+  const idB = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+  expect(await seenOf(await putSeen({ [idA]: 300, [idB]: 200 }))).toEqual({
+    [idA]: 300,
+    [idB]: 200,
+  });
+  expect(
+    await seenOf(await putSeen({ [idA]: 100, [idB]: 250, bad: "x" })),
+  ).toEqual({ [idA]: 300, [idB]: 250 });
+  const many: Record<string, number> = {};
+  for (let i = 1; i <= 210; i += 1) many[`id-${i}`] = 1000 + i;
+  const capped = (await seenOf(await putSeen(many))) || {};
+  expect(Object.keys(capped)).toHaveLength(200);
+  expect(capped["id-210"]).toBe(1210);
+  // The two lower stored seqs fell out under the 200 highest.
+  expect(capped[idA]).toBeUndefined();
+  expect(await seenOf(await putSeen(null))).toBeUndefined();
+
   // validation: non-object body rejected
   const badRes = await app.fetch(
     new Request("http://localhost/api/settings", {

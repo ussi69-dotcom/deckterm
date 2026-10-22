@@ -138,6 +138,35 @@ const SETTINGS_SCHEMA = [
     searchText: "window snap snapping edges grid layout tiling align",
   },
 
+  // ── Agents ────────────────────────────────────────────────────────────────
+  // The Agents overview is remembered per device class like the extra-keys
+  // bar: a desktop shows the left panel, a phone or tablet the summary chip.
+  // Each reads only its own key (never the other device's value).
+  {
+    key: "agents.panelVisible",
+    category: "Agents",
+    label: "Show the Agents panel",
+    description:
+      "List every session by project on the left of the workspace, the ones that need you first. Drag its right edge to resize.",
+    type: "toggle",
+    default: true,
+    deviceClass: "desktop",
+    searchText:
+      "agents panel left sidebar overview sessions projects needs you next done working desktop",
+  },
+  {
+    key: "agents.summaryVisibleTouch",
+    category: "Agents",
+    label: "Show the agents summary chip",
+    description:
+      "A small chip in the top bar counts the sessions that need you, are done or are working on this phone or tablet; tap it for the sorted list.",
+    type: "toggle",
+    default: true,
+    deviceClass: "touch",
+    searchText:
+      "agents summary chip phone tablet touch needs you done working top bar sessions",
+  },
+
   // ── Git ───────────────────────────────────────────────────────────────────
   {
     key: "git.diffMode",

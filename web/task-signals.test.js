@@ -192,26 +192,43 @@ test("sessionActivityAt prefers live activity, then updatedAt, then createdAt", 
   expect(sessionActivityAt({})).toBe(0);
 });
 
-test("orderSessionsForPanel puts needs-input first, then running, then the rest (stable)", () => {
+test("orderSessionsForPanel delegates to the Agents overview order", () => {
   const sessions = [
     { id: "idle1" },
     { id: "run1", running: true },
     { id: "ask", attention: att("needs-input", 9) },
-    { id: "agent", agentState: "thinking" },
+    { id: "agent", agentName: "codex", agentState: "thinking" },
     { id: "askSeen", attention: att("needs-input", 4) },
+    { id: "doneUnseen", agentName: "claude", attention: att("done", 6) },
     { id: "idle2" },
   ];
   const ordered = orderSessionsForPanel(sessions, { askSeen: 4 });
+  // needs you > done (unseen) > working (agents only) > no agent; ties:
+  // most recent attention first, then the original order. A running command
+  // without an agent (run1) is a plain shell row.
   expect(ordered.map((s) => s.id)).toEqual([
     "ask",
-    "run1",
+    "doneUnseen",
     "agent",
-    "idle1",
     "askSeen",
+    "idle1",
+    "run1",
     "idle2",
   ]);
   // Input array is not mutated.
   expect(sessions[0].id).toBe("idle1");
+});
+
+test("orderSessionsForPanel never treats the active, visible session as unseen", () => {
+  const sessions = [
+    { id: "a", agentName: "claude", running: true },
+    { id: "b", attention: att("needs-input", 9) },
+  ];
+  expect(
+    orderSessionsForPanel(sessions, {}, { activeVisibleId: "b" }).map(
+      (s) => s.id,
+    ),
+  ).toEqual(["a", "b"]);
 });
 
 test("describeTaskTransitionToast maps each transition to a toast kind", () => {

@@ -1,0 +1,49 @@
+---
+agent: claude
+version: 2.1.308
+state: blocked
+rule: deckterm_blocked_form_wrapped
+title: ✳ Colour preference question
+size: 44×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-10-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines); user name -> user
+notes: Same AskUserQuestion request at phone width (44 cols). The footer wraps as "Enter to select · ↑/↓ to navigate · Esc to" / "cancel", so a contains("esc to cancel") check on the region text likely fails and herdr live_blocked_form may not match; no rule expectation was given at capture time (true state is blocked); S1 added the DeckTerm rule deckterm_blocked_form_wrapped for it (header edit only, capture unchanged). Claude answered in Czech.
+---
+
+ ▐▛███▛█   Claude Code v2.1.308
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /…/scratch
+
+
+❯ Use your AskUserQuestion tool to ask me
+  one multiple-choice question: which
+  colour do I like, red, green or blue?
+────────────────────────────────────────────
+ ☐ Barva
+
+Jakou barvu máte rád: červenou, zelenou,
+nebo modrou?
+
+❯ 1. Červená
+     Červená barva
+  2. Zelená
+     Zelená barva
+  3. Modrá
+     Modrá barva
+  4. Type something.
+────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to
+cancel
+
+
+
+
+
+
+
+
+

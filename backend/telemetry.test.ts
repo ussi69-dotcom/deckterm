@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   classifyAgentOutputPhase,
+  createGitProjectRootDetector,
+  getTerminalTelemetry,
+  PROJECT_ROOT_CACHE_TTL_MS,
   inferRecoveredTmuxRuntimeState,
   inferTmuxRuntimeState,
   nextAgentMarkerActive,
@@ -8,8 +13,11 @@ import {
   parseShellIntegrationChunk,
   resolveAgentOutputState,
   toSummaryLine,
+  applyAgentAttention,
   applyTerminalNotificationEvents,
   classifyAttentionText,
+  parseLatestOscTitle,
+  sanitizeOscTitle,
   createAttentionTracker,
   createTerminalNotificationParseState,
   parseTerminalNotifications,
@@ -18,6 +26,13 @@ import {
   type ShellIntegrationParseState,
   type TerminalNotificationEvent,
 } from "./telemetry";
+import { evaluate } from "./agent-screen-rules";
+import {
+  applyAgentStatusEvaluation,
+  createAgentStatusRecord,
+  syncAgentStatusAgent,
+  type AgentStatusRecord,
+} from "./agent-status";
 
 const START = "\x1b]9;9;deckterm;running;start\x07";
 const DONE = (code: number) => `\x1b]9;9;deckterm;running;done;${code}\x07`;
@@ -912,4 +927,291 @@ test("applyTerminalNotificationEvents tracks and clears progress without rate li
     { now: 1_100, agentName: null },
   );
   expect(result.tracker.progress).toBe(null);
+});
+
+// ---------------------------------------------------------------------------
+// S1a: Codex "Action Required" title -> needs-input
+// ---------------------------------------------------------------------------
+
+function fixtureHeaderValue(file: string, key: string): string {
+  const text = readFileSync(
+    join(import.meta.dir, "fixtures/agent-screens", file),
+    "utf8",
+  );
+  const header = text.split("\n---\n")[0];
+  const line = header
+    .split("\n")
+    .find((row: string) => row.startsWith(`${key}: `));
+  if (!line) throw new Error(`fixture ${file} has no ${key}`);
+  return line.slice(key.length + 2);
+}
+
+const CODEX_APPROVAL_TITLE = fixtureHeaderValue(
+  "codex-0.163-blocked-approval.txt",
+  "title",
+);
+const CODEX_WORKING_TITLE = fixtureHeaderValue(
+  "codex-0.163-working-timer.txt",
+  "title",
+);
+
+test("parseLatestOscTitle returns the latest OSC 0/2 title with BEL or ST", () => {
+  expect(parseLatestOscTitle("plain output").title).toBe(null);
+  const both = parseLatestOscTitle(
+    "a\x1b]0;first\x07b\x1b]2;second\x1b\\c",
+  );
+  expect(both.title).toBe("second");
+  expect(both.state.carry).toBe("");
+  // OSC 9 notifications and other OSC numbers are not titles.
+  expect(parseLatestOscTitle("\x1b]9;hello\x07\x1b]10;x\x07").title).toBe(
+    null,
+  );
+});
+
+test("parseLatestOscTitle carries an unterminated title into the next chunk", () => {
+  const first = parseLatestOscTitle("out\x1b]0;[ . ] Action Req");
+  expect(first.title).toBe(null);
+  expect(first.state.carry).toBe("\x1b]0;[ . ] Action Req");
+  const second = parseLatestOscTitle("uired | x1\x07", first.state);
+  expect(second.title).toBe("[ . ] Action Required | x1");
+  // A split ST (ESC at the end of one chunk, backslash in the next).
+  const splitSt = parseLatestOscTitle("\x1b]2;title\x1b");
+  expect(splitSt.state.carry).toBe("\x1b]2;title\x1b");
+  expect(parseLatestOscTitle("\\", splitSt.state).title).toBe("title");
+});
+
+test("sanitizeOscTitle strips control and bidi characters and caps at 256", () => {
+  expect(sanitizeOscTitle("a\tb\u202ec\u0000")).toBe("a bc");
+  expect(Array.from(sanitizeOscTitle("✳".repeat(400)))).toHaveLength(256);
+});
+
+// S1 retired the S1a title edge detector: the vendored codex.toml rule
+// osc_title_blocked does the same through the screen-rule evaluator and the
+// agent-status state machine. These are the S1a cases, run against that path.
+
+const CODEX_APPROVAL_SCREEN = (() => {
+  const text = readFileSync(
+    join(import.meta.dir, "fixtures/agent-screens/codex-0.163-blocked-approval.txt"),
+    "utf8",
+  );
+  return text.slice(text.indexOf("\n---\n", 4) + 5);
+})();
+
+function runningAgent(agent: AgentName, now: number): AgentStatusRecord {
+  // Past the 3 s start grace, committed as working.
+  let record = syncAgentStatusAgent(createAgentStatusRecord(), agent, now)
+    .record;
+  record = applyAgentStatusEvaluation(
+    record,
+    evaluate(agent as "claude" | "codex", {
+      screen: "",
+      title: agent === "codex" ? CODEX_WORKING_TITLE : "\u2810 thinking",
+    }),
+    { now: now + 3_000 },
+  ).record;
+  return record;
+}
+
+test("S1a: the captured Codex approval title fires needs-input once", () => {
+  expect(CODEX_APPROVAL_TITLE).toContain("Action Required");
+  const titleOnly = evaluate("codex", {
+    screen: "",
+    title: CODEX_APPROVAL_TITLE,
+  });
+  expect(titleOnly).toMatchObject({
+    state: "blocked",
+    ruleId: "osc_title_blocked",
+    region: "osc_title",
+  });
+
+  let record = runningAgent("codex", 0);
+  expect(record.status).toBe("working");
+  const first = applyAgentStatusEvaluation(record, titleOnly, { now: 4_000 });
+  expect(first.record.status).toBe("blocked");
+  expect(first.effects).toContainEqual({ type: "push", kind: "input" });
+  record = first.record;
+
+  // The title blinks between "[ . ]" and "[ ! ]" while the approval is open;
+  // a repeated Action Required title does not fire again.
+  const repeat = applyAgentStatusEvaluation(
+    record,
+    evaluate("codex", {
+      screen: CODEX_APPROVAL_SCREEN,
+      title: CODEX_APPROVAL_TITLE.replace("[ . ]", "[ ! ]"),
+    }),
+    { now: 6_000 },
+  );
+  expect(repeat.effects).toEqual([]);
+  expect(repeat.record.status).toBe("blocked");
+});
+
+test("S1a: a non-Codex agent and a spinner title never fire", () => {
+  // Claude's rules have no title blocker: the Codex title alone is no_match.
+  const claude = evaluate("claude", { screen: "", title: CODEX_APPROVAL_TITLE });
+  expect(claude.state).not.toBe("blocked");
+  // No agent: nothing is evaluated or raised.
+  const none = applyAgentStatusEvaluation(
+    createAgentStatusRecord(),
+    evaluate("codex", { screen: "", title: CODEX_APPROVAL_TITLE }),
+    { now: 10_000 },
+  );
+  expect(none.effects).toEqual([]);
+  expect(none.record.status).toBe(null);
+  // A spinner title is working, not blocked.
+  const spinner = evaluate("codex", { screen: "", title: CODEX_WORKING_TITLE });
+  expect(spinner).toMatchObject({ state: "working", ruleId: "osc_title_working" });
+});
+
+test("S1a: the raised attention carries source title and rule osc_title_blocked", () => {
+  const step = applyAgentStatusEvaluation(
+    runningAgent("codex", 0),
+    evaluate("codex", { screen: "", title: CODEX_APPROVAL_TITLE }),
+    { now: 4_000 },
+  );
+  const raise = step.effects.find((effect) => effect.type === "raise");
+  expect(raise).toEqual({
+    type: "raise",
+    kind: "needs-input",
+    source: "title",
+    rule: "osc_title_blocked",
+  });
+  const applied = applyAgentAttention(createAttentionTracker(), "needs-input", {
+    now: 50_000,
+    source: "title",
+    rule: "osc_title_blocked",
+  });
+  expect(applied.accepted).toMatchObject({
+    kind: "needs-input",
+    source: "title",
+    rule: "osc_title_blocked",
+    title: "",
+    body: "",
+    at: 50_000,
+  });
+  expect(applied.tracker.attention).toBe(applied.accepted);
+});
+
+test("applyAgentAttention keeps the seq and 2 s priority-window rules", () => {
+  let applied = applyAgentAttention(createAttentionTracker(), "done", {
+    now: 10_000,
+    source: "screen",
+    rule: "live_prompt_box",
+  });
+  const firstSeq = applied.accepted!.seq;
+  // Same priority inside the window: dropped.
+  let next = applyAgentAttention(applied.tracker, "done", {
+    now: 11_000,
+    source: "screen",
+  });
+  expect(next.accepted).toBe(null);
+  expect(next.tracker).toBe(applied.tracker);
+  // Higher priority inside the window: accepted with a larger seq.
+  next = applyAgentAttention(applied.tracker, "needs-input", {
+    now: 11_000,
+    source: "screen",
+    rule: "live_blocked_form",
+  });
+  expect(next.accepted!.seq).toBeGreaterThan(firstSeq);
+  // After the window anything is accepted again, with a strictly larger seq.
+  applied = applyAgentAttention(next.tracker, "done", {
+    now: 20_000,
+    source: "screen",
+  });
+  expect(applied.accepted!.seq).toBeGreaterThan(next.accepted!.seq);
+});
+
+// --- projectRoot (Agents panel grouping, S2) --------------------------------
+
+function projectRootHarness(
+  topLevelByCwd: Record<string, string | null>,
+  allowed = ["/w"],
+) {
+  const calls: Array<{ cwd: string; args: string[]; env?: Record<string, string> }> = [];
+  let clock = 1_000;
+  const detect = createGitProjectRootDetector({
+    resolveAllowedPath: async (p) =>
+      allowed.some((root) => p === root || p.startsWith(`${root}/`)) ? p : null,
+    now: () => clock,
+    runGit: async (cwd, args, env) => {
+      calls.push({ cwd, args, env });
+      const top = topLevelByCwd[cwd];
+      return top
+        ? { exitCode: 0, stdout: `${top}\n`, stderr: "" }
+        : { exitCode: 128, stdout: "", stderr: "not a git repository" };
+    },
+  });
+  return { detect, calls, advance: (ms: number) => (clock += ms) };
+}
+
+test("projectRoot is the hardened git top level of an allowed cwd", async () => {
+  const h = projectRootHarness({ "/w/app/src": "/w/app" });
+  expect(await h.detect("/w/app/src")).toBe("/w/app");
+  expect(h.calls).toHaveLength(1);
+  // hardenGitInvocation: fsmonitor and hooks off, no optional locks.
+  expect(h.calls[0].args).toEqual([
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "rev-parse",
+    "--show-toplevel",
+  ]);
+  expect(h.calls[0].env).toEqual({ GIT_OPTIONAL_LOCKS: "0" });
+});
+
+test("projectRoot never runs git outside the allowed roots", async () => {
+  const h = projectRootHarness({ "/etc": "/etc" });
+  expect(await h.detect("/etc")).toBe(null);
+  expect(h.calls).toHaveLength(0);
+});
+
+test("projectRoot is null for a top level outside the allowed roots or no repo", async () => {
+  const h = projectRootHarness({ "/w/sub": "/" , "/w/plain": null });
+  expect(await h.detect("/w/sub")).toBe(null);
+  expect(await h.detect("/w/plain")).toBe(null);
+});
+
+test("projectRoot is cached per cwd for 60 s, misses included", async () => {
+  expect(PROJECT_ROOT_CACHE_TTL_MS).toBe(60_000);
+  const h = projectRootHarness({ "/w/app": "/w/app" });
+  await Promise.all([h.detect("/w/app"), h.detect("/w/app")]);
+  await h.detect("/w/none");
+  await h.detect("/w/none");
+  expect(h.calls.map((c) => c.cwd)).toEqual(["/w/app", "/w/none"]);
+  h.advance(59_000);
+  await h.detect("/w/app");
+  expect(h.calls).toHaveLength(2);
+  h.advance(2_000);
+  await h.detect("/w/app");
+  expect(h.calls).toHaveLength(3);
+});
+
+test("getTerminalTelemetry reports projectRoot (null without a detector)", async () => {
+  const terminal = {
+    cwd: "/w/app",
+    createdAt: 0,
+    lastActivityAt: 0,
+    scrollback: [],
+  };
+  expect(
+    (await getTerminalTelemetry(terminal, "tmux", { now: 1 })).projectRoot,
+  ).toBe(null);
+  expect(
+    (
+      await getTerminalTelemetry(terminal, "tmux", {
+        now: 1,
+        detectProjectRoot: async () => "/w/app",
+      })
+    ).projectRoot,
+  ).toBe("/w/app");
+  expect(
+    (
+      await getTerminalTelemetry(terminal, "tmux", {
+        now: 1,
+        detectProjectRoot: async () => {
+          throw new Error("boom");
+        },
+      })
+    ).projectRoot,
+  ).toBe(null);
 });

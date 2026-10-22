@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { hardenGitInvocation } from "./git-readonly";
 import { sanitizeTerminalEnv } from "./services/terminal-env";
 
 const BUSY_ACTIVITY_WINDOW_MS = 30_000;
@@ -6,6 +7,9 @@ const BUSY_BOOTSTRAP_WINDOW_MS = 10_000;
 const MAX_SCROLLBACK_CHUNKS = 200;
 const GIT_COMMAND_TIMEOUT_MS = 3_000;
 const WORKTREE_CACHE_TTL_MS = 5_000;
+// projectRoot (the git top level of a session's cwd) changes rarely; every
+// /api/terminals poll reuses it for this long per cwd.
+export const PROJECT_ROOT_CACHE_TTL_MS = 60_000;
 const SHELL_MARKER_PREFIX = "\x1b]9;9;deckterm;";
 const SHELL_MARKER_SUFFIX = "\x07";
 const TOOL_MARKER_MAX_PAYLOAD_LENGTH = 2048;
@@ -58,6 +62,7 @@ export type TerminalTelemetry = {
   agentState: AgentState | null;
   ports: number[];
   isWorktree: boolean;
+  projectRoot: string | null;
   backendMode: BackendMode;
 };
 
@@ -89,10 +94,12 @@ export type ShellIntegrationEvent =
   | { type: "tool-used"; name: string; summary: string };
 
 type WorktreeDetector = (cwd: string) => Promise<boolean>;
+type ProjectRootDetector = (cwd: string) => Promise<string | null>;
 
 type GetTerminalTelemetryOptions = {
   now?: number;
   detectWorktree?: WorktreeDetector;
+  detectProjectRoot?: ProjectRootDetector;
 };
 
 type GitCommandResult = {
@@ -100,6 +107,12 @@ type GitCommandResult = {
   stdout: string;
   stderr: string;
 };
+
+type GitRunner = (
+  cwd: string,
+  args: string[],
+  extraEnv?: Record<string, string>,
+) => Promise<GitCommandResult>;
 
 type WorktreeCacheEntry = {
   expiresAt: number;
@@ -443,12 +456,20 @@ export async function getTerminalTelemetry(
     ageMs <= BUSY_BOOTSTRAP_WINDOW_MS &&
     terminal.scrollback.length > 0;
   let isWorktree = false;
+  let projectRoot: string | null = null;
 
   if (options.detectWorktree) {
     try {
       isWorktree = await options.detectWorktree(terminal.cwd);
     } catch {
       isWorktree = false;
+    }
+  }
+  if (options.detectProjectRoot) {
+    try {
+      projectRoot = await options.detectProjectRoot(terminal.cwd);
+    } catch {
+      projectRoot = null;
     }
   }
 
@@ -464,6 +485,7 @@ export async function getTerminalTelemetry(
     agentState: terminal.agentState || null,
     ports: extractPortsFromScrollback(terminal.scrollback),
     isWorktree,
+    projectRoot,
     backendMode,
   };
 }
@@ -638,6 +660,52 @@ export function createGitWorktreeDetector(options: {
   };
 }
 
+// The Agents panel groups sessions by project: the git top level of the
+// session's cwd (`git rev-parse --show-toplevel`, hardened read-only). Runs
+// only for a cwd inside the allowed roots, and reports the top level only when
+// it is inside them too; null otherwise (the panel then groups by cwd).
+// Cached per cwd for PROJECT_ROOT_CACHE_TTL_MS, misses included, and
+// concurrent polls share one git run.
+export function createGitProjectRootDetector(options: {
+  resolveAllowedPath: (inputPath: string) => Promise<string | null>;
+  now?: () => number;
+  cacheTtlMs?: number;
+  runGit?: GitRunner;
+}): ProjectRootDetector {
+  const now = options.now ?? Date.now;
+  const cacheTtlMs = options.cacheTtlMs ?? PROJECT_ROOT_CACHE_TTL_MS;
+  const runGit = options.runGit ?? runGitCommand;
+  const cache = new Map<
+    string,
+    { expiresAt: number; value: Promise<string | null> }
+  >();
+
+  async function detect(cwd: string): Promise<string | null> {
+    const resolvedCwd = await options.resolveAllowedPath(cwd);
+    if (!resolvedCwd) return null;
+    const { argv, env } = hardenGitInvocation(["rev-parse", "--show-toplevel"]);
+    const result = await runGit(resolvedCwd, argv, env);
+    if (result.exitCode !== 0) return null;
+    const topLevel = result.stdout.trim();
+    if (!topLevel || topLevel.includes("\n")) return null;
+    return (await options.resolveAllowedPath(topLevel)) ? topLevel : null;
+  }
+
+  return (cwd: string) => {
+    const key = String(cwd || "");
+    if (!key) return Promise.resolve(null);
+    const at = now();
+    const cached = cache.get(key);
+    if (cached && cached.expiresAt > at) return cached.value;
+    for (const [entryKey, entry] of cache) {
+      if (entry.expiresAt <= at) cache.delete(entryKey);
+    }
+    const value = detect(key).catch(() => null);
+    cache.set(key, { expiresAt: at + cacheTtlMs, value });
+    return value;
+  };
+}
+
 function extractPortsFromScrollback(scrollback: string[]): number[] {
   const sample = scrollback.slice(-MAX_SCROLLBACK_CHUNKS).join("");
   if (!sample) return [];
@@ -709,13 +777,14 @@ function detectRecoveredAgentName(values: string[]): AgentName | null {
 async function runGitCommand(
   cwd: string,
   args: string[],
+  extraEnv: Record<string, string> = {},
 ): Promise<GitCommandResult> {
   const proc = Bun.spawn(["git", ...args], {
     cwd,
     stdout: "pipe",
     stderr: "pipe",
     // git runs in a user's repo (config, hooks, fsmonitor): no service secrets.
-    env: sanitizeTerminalEnv(process.env),
+    env: { ...sanitizeTerminalEnv(process.env), ...extraEnv },
   });
 
   const timeoutId = setTimeout(() => proc.kill(), GIT_COMMAND_TIMEOUT_MS);
@@ -781,12 +850,19 @@ export type TerminalNotificationParseState = {
   kitty: KittyPending | null;
 };
 
+// Where an attention came from: the agent's own notification (OSC 9/777/99),
+// DeckTerm's screen rules, or the agent's window title.
+export type AttentionSource = "notification" | "screen" | "title";
+
 export type TerminalAttention = {
   kind: AttentionKind;
   title: string;
   body: string;
   at: number;
   seq: number;
+  source?: AttentionSource;
+  /** Rule id when `source` is `screen` or `title`. */
+  rule?: string;
 };
 
 export type TerminalProgress = {
@@ -907,6 +983,25 @@ function parseProgressPayload(
     state,
     percent: parsed === null ? null : Math.max(0, Math.min(100, parsed)),
   };
+}
+
+const PROGRESS_STATE_CODES: Record<TerminalProgressState, string> = {
+  normal: "1",
+  error: "2",
+  indeterminate: "3",
+  paused: "4",
+};
+
+/**
+ * Rebuilds a parsed OSC 9;4 progress event as `4;<state>[;<percent>]`, the
+ * input of herdr's `osc_progress` screen-rule region (`4;0` = cleared).
+ */
+export function formatProgressPayload(
+  event: Extract<TerminalNotificationEvent, { type: "progress" }>,
+): string {
+  if (!event.state) return "4;0";
+  const code = PROGRESS_STATE_CODES[event.state];
+  return event.percent === null ? `4;${code}` : `4;${code};${event.percent}`;
 }
 
 function capRaw(value: string): string {
@@ -1179,6 +1274,7 @@ export function applyTerminalNotificationEvents(
       body: event.body,
       at: now,
       seq: Math.max(previousSeq + 1, now),
+      source: "notification",
     };
     next.attention = attention;
     next.lastAcceptedAt = now;
@@ -1186,4 +1282,115 @@ export function applyTerminalNotificationEvents(
     accepted.push(attention);
   }
   return { tracker: next, accepted };
+}
+
+// ---------------------------------------------------------------------------
+// Agent attention raised by DeckTerm itself (window title, screen rules).
+// Same seq rule (wall clock, strictly increasing) and the same 2 s priority
+// window as applyTerminalNotificationEvents. Title and body stay empty so
+// toasts and pushes use their generic text.
+// ---------------------------------------------------------------------------
+
+export function applyAgentAttention(
+  tracker: AttentionTracker,
+  kind: AttentionKind,
+  {
+    now = Date.now(),
+    source,
+    rule,
+  }: { now?: number; source: AttentionSource; rule?: string | null },
+): { tracker: AttentionTracker; accepted: TerminalAttention | null } {
+  const withinWindow =
+    tracker.lastAcceptedKind !== null &&
+    now - tracker.lastAcceptedAt < ATTENTION_RATE_WINDOW_MS;
+  if (
+    withinWindow &&
+    ATTENTION_PRIORITY[kind] <= ATTENTION_PRIORITY[tracker.lastAcceptedKind!]
+  ) {
+    return { tracker, accepted: null };
+  }
+  const previousSeq = tracker.attention?.seq || 0;
+  const attention: TerminalAttention = {
+    kind,
+    title: "",
+    body: "",
+    at: now,
+    seq: Math.max(previousSeq + 1, now),
+    source,
+  };
+  if (rule) attention.rule = rule;
+  return {
+    tracker: {
+      ...tracker,
+      attention,
+      lastAcceptedAt: now,
+      lastAcceptedKind: kind,
+    },
+    accepted: attention,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Window title (OSC 0 / OSC 2). Read from the same raw source as the
+// notifications (the tmux pipe log, or the raw PTY stream). Untrusted in-band
+// text: control and bidi characters removed, capped at 256 characters.
+// ---------------------------------------------------------------------------
+
+export const OSC_TITLE_MAX_CHARS = 256;
+const OSC_TITLE_CARRY_MAX = 1024;
+const OSC_TITLE_RE = /\x1b\]([02]);([^\x07\x1b]*)(?:\x07|\x1b\\)/g;
+// A possibly unterminated title sequence at the end of a chunk.
+const OSC_TITLE_PARTIAL_RE = /^\x1b\](?:[02](?:;[^\x07\x1b]*\x1b?)?)?$/;
+
+export type OscTitleParseState = { carry: string };
+
+export function createOscTitleParseState(): OscTitleParseState {
+  return { carry: "" };
+}
+
+export function sanitizeOscTitle(input: string): string {
+  const cleaned = String(input || "")
+    .replace(/[\t\n\r\v\f]/g, " ")
+    .replace(NOTIFICATION_CONTROL_RE, "");
+  const chars = Array.from(cleaned);
+  return chars.length > OSC_TITLE_MAX_CHARS
+    ? chars.slice(0, OSC_TITLE_MAX_CHARS).join("")
+    : cleaned;
+}
+
+/**
+ * Returns the latest complete OSC 0/2 title in `chunk` (BEL or ST ended),
+ * sanitized, or `null` when the chunk sets none. An unterminated title at the
+ * end is carried into the next chunk (bounded).
+ */
+export function parseLatestOscTitle(
+  chunk: string,
+  state: OscTitleParseState = createOscTitleParseState(),
+): { title: string | null; state: OscTitleParseState } {
+  const input = `${state.carry || ""}${chunk || ""}`;
+  if (input.indexOf("\x1b") === -1) {
+    return { title: null, state: { carry: "" } };
+  }
+  let latest: string | null = null;
+  let lastEnd = 0;
+  for (const match of input.matchAll(OSC_TITLE_RE)) {
+    latest = match[2] ?? "";
+    lastEnd = (match.index ?? 0) + match[0].length;
+  }
+  let carry = "";
+  const oscStart = input.lastIndexOf("\x1b]");
+  const oscTail = oscStart >= lastEnd ? input.slice(oscStart) : "";
+  if (
+    oscTail &&
+    oscTail.length <= OSC_TITLE_CARRY_MAX &&
+    OSC_TITLE_PARTIAL_RE.test(oscTail)
+  ) {
+    carry = oscTail;
+  } else if (input.endsWith("\x1b") && input.length - 1 >= lastEnd) {
+    carry = "\x1b";
+  }
+  return {
+    title: latest === null ? null : sanitizeOscTitle(latest),
+    state: { carry },
+  };
 }

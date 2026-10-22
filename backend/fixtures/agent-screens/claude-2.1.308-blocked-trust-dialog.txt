@@ -1,0 +1,49 @@
+---
+agent: claude
+version: 2.1.308
+state: blocked
+rule: live_blocked_form
+title: host
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-10-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines); user name -> user
+notes: Trust dialog for a new folder (first start in a fresh scratch folder); default selection is "No, exit". Title is still the shell title (host name) because Claude has not set one yet.
+---
+user@host:/tmp/scratch$ claude --model claude-haiku-5-5 --permission-mode default
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/scratch
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

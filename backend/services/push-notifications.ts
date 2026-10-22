@@ -182,7 +182,9 @@ export async function dispatchCompletionPush({
           ? "Agent turn finished"
           : "Command finished",
     tag: `deckterm-${compactHash(terminalId)}`,
-    data: { url: "/" },
+    // Deep link to the session. The payload is encrypted end to end; the
+    // topic header the push service can read stays a hash.
+    data: { url: `/?session=${encodeURIComponent(terminalId)}` },
     silent: false,
   });
 

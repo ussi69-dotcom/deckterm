@@ -206,3 +206,103 @@ test("an automatic scheduled flush serializes behind an explicit flush", async (
     { "git.autoFetchInterval": 0 },
   ]);
 });
+
+// --- refresh(key, merge) (Agents overview: attention.seen) -----------------
+
+function createServerFake(initial = {}) {
+  const server = { ...initial };
+  const puts = [];
+  const fetchImpl = async (url, options = {}) => {
+    if (options.method === "PUT") {
+      const body = JSON.parse(options.body).settings;
+      puts.push(body);
+      for (const [key, value] of Object.entries(body)) {
+        if (value === null) delete server[key];
+        else server[key] = value;
+      }
+    }
+    return new Response(JSON.stringify({ settings: { ...server } }), {
+      status: 200,
+    });
+  };
+  return { server, puts, fetchImpl };
+}
+
+test("refresh takes the server value of one key when nothing is pending", async () => {
+  const fake = createServerFake({ "attention.seen": { a: 1 }, other: 1 });
+  const store = createSettingsStore({
+    fetchImpl: fake.fetchImpl,
+    storage: createFakeStorage(),
+    scheduler: createFakeScheduler(),
+  });
+  await store.load();
+  fake.server["attention.seen"] = { a: 4 };
+  fake.server.other = 2;
+  expect(await store.refresh("attention.seen")).toEqual({ a: 4 });
+  // Only the requested key is refreshed.
+  expect(store.get("other")).toBe(1);
+  delete fake.server["attention.seen"];
+  expect(await store.refresh("attention.seen")).toBeUndefined();
+});
+
+test("refresh keeps a pending local write without a merge function", async () => {
+  const fake = createServerFake({ key: "server-old" });
+  const scheduler = createFakeScheduler();
+  const store = createSettingsStore({
+    fetchImpl: fake.fetchImpl,
+    storage: createFakeStorage(),
+    scheduler,
+  });
+  await store.load();
+  store.set("key", "local-new");
+  fake.server.key = "server-newer";
+  expect(await store.refresh("key")).toBe("local-new");
+  await scheduler.runAll();
+  expect(fake.puts.at(-1)).toEqual({ key: "local-new" });
+});
+
+test("refresh merges with the given function and keeps the merge pending", async () => {
+  const fake = createServerFake({ "attention.seen": { a: 1, b: 1 } });
+  const scheduler = createFakeScheduler();
+  const store = createSettingsStore({
+    fetchImpl: fake.fetchImpl,
+    storage: createFakeStorage(),
+    scheduler,
+  });
+  await store.load();
+  store.set("attention.seen", { a: 5, b: 1 });
+  fake.server["attention.seen"] = { a: 2, b: 7, c: 3 };
+  const max = (local, server) => {
+    const out = { ...(local || {}) };
+    for (const [id, seq] of Object.entries(server || {})) {
+      out[id] = Math.max(out[id] || 0, seq);
+    }
+    return out;
+  };
+  expect(await store.refresh("attention.seen", max)).toEqual({
+    a: 5,
+    b: 7,
+    c: 3,
+  });
+  await scheduler.runAll();
+  expect(fake.puts.at(-1)).toEqual({
+    "attention.seen": { a: 5, b: 7, c: 3 },
+  });
+});
+
+test("refresh leaves the cache alone when the fetch fails", async () => {
+  let fail = false;
+  const store = createSettingsStore({
+    fetchImpl: async () => {
+      if (fail) throw new Error("offline");
+      return new Response(JSON.stringify({ settings: { k: 1 } }), {
+        status: 200,
+      });
+    },
+    storage: createFakeStorage(),
+    scheduler: createFakeScheduler(),
+  });
+  await store.load();
+  fail = true;
+  expect(await store.refresh("k")).toBe(1);
+});

@@ -212,3 +212,24 @@ test("planLauncherTips resolves exactly three tips with their shortcuts", () => 
   for (const tip of tips) expect(tip.text.length).toBeGreaterThan(0);
   expect(planLauncherTips(null, null)).toEqual([]);
 });
+
+test("the Agents overview has its lines, shortcuts and Help entries", () => {
+  for (const id of ["agents", "next-agent", "agents-chip"]) {
+    const text = describeAction(id);
+    expect(text.length).toBeGreaterThan(0);
+    expect(text.length).toBeLessThanOrEqual(MAX_DESCRIPTION_LENGTH);
+  }
+  expect(PALETTE_DESCRIPTIONS.agents).toBe(ACTION_DESCRIPTIONS.agents);
+  expect(PALETTE_DESCRIPTIONS["next-agent"]).toBe(
+    ACTION_DESCRIPTIONS["next-agent"],
+  );
+  expect(shortcutLabelForAction("agents", KEYBOARD_SHORTCUTS)).toBe(
+    "Ctrl+Shift+L",
+  );
+  expect(shortcutLabelForAction("next-agent", KEYBOARD_SHORTCUTS)).toBe(
+    "Ctrl+Shift+X",
+  );
+  const titles = buildWhatsWhat(KEYBOARD_SHORTCUTS).map((row) => row.title);
+  expect(titles).toContain("Agents panel");
+  expect(titles).toContain("Next agent");
+});

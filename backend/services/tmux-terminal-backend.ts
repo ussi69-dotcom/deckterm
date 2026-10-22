@@ -336,6 +336,18 @@ export class TmuxTerminalBackend implements TerminalBackend {
     return output;
   }
 
+  // Bounded like the scroll commands: a wedged tmux server must not stall the
+  // pipe pump that calls this every tick.
+  async captureVisible(sessionName: string): Promise<string | null> {
+    const res = await this.runScrollTmux([
+      "capture-pane",
+      "-p",
+      "-t",
+      sessionName,
+    ]);
+    return res.code === 0 ? res.stdout : null;
+  }
+
   async resize(
     sessionName: string,
     cols: number,

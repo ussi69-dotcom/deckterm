@@ -384,6 +384,15 @@ const describeFeature = (actionId) =>
   window.FeatureGuide?.describeAction?.(actionId) || "";
 
 const ACTION_BUTTON_CONFIG = Object.freeze({
+  agents: Object.freeze({
+    label: "Agents",
+    icon: "bot",
+    action: "agents",
+    desktopId: "desktop-agents-btn",
+    toolsId: "tools-sheet-agents",
+    desktopTone: "secondary",
+    description: describeFeature("agents"),
+  }),
   files: Object.freeze({
     label: "Files",
     icon: "folder-open",
@@ -653,6 +662,12 @@ class ReconnectingWebSocket {
         }
         if (data.type === "terminal_state") {
           this.callbacks.onTerminalState?.(data);
+          return;
+        }
+        if (data.type === "agents_changed") {
+          // Content-free (agents=1 sockets only): an agent's screen-rule
+          // status changed, so the page refetches /api/terminals now.
+          window.dispatchEvent(new Event("deckterm:agents-changed"));
           return;
         }
         if (data.type === "scroll-position") {
@@ -2754,6 +2769,7 @@ class ExtraKeysManager {
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
       agentState: active?.agentState ?? null,
+      agentStatus: active?.agentStatus ?? null,
       attention: active?.attention ?? null,
       attentionBaselineSeq: active?.quickReplyAttentionBaseline ?? null,
     });
@@ -6115,6 +6131,7 @@ class TerminalManager {
     this.initSessionsDock();
     this.initSettingsRuntime();
     this.initIdeShell();
+    this.initAgentsOverview();
 
     // Button handlers
     document
@@ -6472,6 +6489,8 @@ class TerminalManager {
     // Bootstrap may end with zero terminals (nothing to restore and the
     // create failed): show the launcher instead of a blank canvas.
     if (!isPending) this.syncWorkspaceLauncher();
+    // The session the page settled on is the one the user sees.
+    if (!isPending && this.agentsRenderedHtml) this.syncAttentionIndicators();
   }
 
   // --- Zero-terminal launcher -------------------------------------------------
@@ -7476,6 +7495,10 @@ class TerminalManager {
       } else if (actionId === "ide") {
         button.classList.toggle("active", ideMode);
         button.setAttribute("aria-pressed", ideMode ? "true" : "false");
+      } else if (actionId === "agents") {
+        const agentsShown = this.isAgentsOverviewShown();
+        button.classList.toggle("active", agentsShown);
+        button.setAttribute("aria-pressed", agentsShown ? "true" : "false");
       }
       // Files/Git toolbar buttons are toggles: announce the state too.
       if (
@@ -7510,6 +7533,7 @@ class TerminalManager {
     else if (action === "wrap-lines") this.toggleWrapLines();
     else if (action === "dock-sessions") this.toggleSessionsDock();
     else if (action === "toggle-ide") this.toggleIdeMode();
+    else if (action === "agents") this.toggleAgentsPanel();
     else if (action === "help") this.openHelp();
     else if (action === "palette") this.toggleCommandPalette();
 
@@ -7826,6 +7850,13 @@ class TerminalManager {
       event.preventDefault();
       void this.handleSessionRowActivate(row.dataset.sessionId);
     });
+    panel
+      .querySelector("#sessions-next-agent")
+      ?.addEventListener("click", () => {
+        void this.goToNextAgent().then((went) => {
+          if (went) this.closeSessionsPanel({ restoreFocus: false });
+        });
+      });
   }
 
   getSessionsFocusableElements() {
@@ -8031,6 +8062,7 @@ class TerminalManager {
       // Keep the catalog so the click handler can resolve cwd/flags per row.
       this._sessionCatalog = sessions;
       this.updateSessionsAvailableBadge(sessions);
+      this.renderAgentsOverview();
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
         return "empty";
@@ -8039,8 +8071,11 @@ class TerminalManager {
       const signals = window.TaskSignals;
       const seen = this.getAttentionSeenMap();
       const now = Date.now();
+      // Agents overview order (needs you > done > working > idle > shell).
+      const overview = window.AgentOverview;
+      const tierOptions = { activeVisibleId: this.getActiveVisibleTerminalId() };
       const ordered = signals?.orderSessionsForPanel
-        ? signals.orderSessionsForPanel(sessions, seen)
+        ? signals.orderSessionsForPanel(sessions, seen, tierOptions)
         : sessions;
       list.innerHTML = ordered
         .map((s) => {
@@ -8058,6 +8093,11 @@ class TerminalManager {
             : "";
           const title =
             signals?.sessionDisplayTitle?.(s) || s.cwd || "Terminal";
+          const tier = overview?.statusTier?.(s, seen, tierOptions) ?? null;
+          const tierIcon =
+            tier !== null && tier <= overview.TIER_IDLE
+              ? `<span class="agent-tier-icon" data-tier="${tier}" role="img" aria-label="${esc(overview.TIER_LABELS[tier])}" title="${esc(overview.tooltipFor(s, tier))}">${overview.TIER_ICONS[tier]}</span>`
+              : "";
           const unseen = signals?.hasUnseenAttention?.(s, seen[s.id], {
             isActiveVisible: s.id === this.getActiveVisibleTerminalId(),
           });
@@ -8075,11 +8115,22 @@ class TerminalManager {
             attentionAt > 0 &&
             String(s.agentState || "").toLowerCase() !== "responding" &&
             (Number(s.lastActivityAt) || 0) <= attentionAt + 15_000;
-          const agentState = !freshNeedsInput
-            ? String(s.agentState || "").toLowerCase()
-            : attentionKind === "needs-input"
-              ? "" // the attention chip already says "Needs your input"
-              : "needs input";
+          // The screen-rule status, when the server has one, wins over
+          // agentState (which only says whether output is flowing).
+          const statusWord = {
+            blocked: "needs you",
+            working: "working",
+            idle: "idle",
+          }[s.agentStatus];
+          const agentState = statusWord
+            ? attentionKind === "needs-input" && s.agentStatus === "blocked"
+              ? ""
+              : statusWord
+            : !freshNeedsInput
+              ? String(s.agentState || "").toLowerCase()
+              : attentionKind === "needs-input"
+                ? "" // the attention chip already says "Needs your input"
+                : "needs input";
           const agentChip = s.agentName
             ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
             : s.running
@@ -8101,9 +8152,9 @@ class TerminalManager {
           ]
             .filter(Boolean)
             .join(" · ");
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" data-tier="${tier ?? ""}" title="${esc(`Session ${s.id}`)}">
           <div class="session-row-main">
-            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> <span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
+            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> ${tierIcon}<span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
             ${attentionText ? `<div class="session-row-attention">${esc(attentionText)}</div>` : ""}
             <small>${meta}</small>
@@ -8334,6 +8385,9 @@ class TerminalManager {
         // the desktop default (nor shows a desktop's via the touch default).
         ...this.createExtraKeysVisibilitySideEffects(),
         "tasks.view": (value) => this.applyTaskView(value),
+        // Agents overview: each device class reads only its own key.
+        "agents.panelVisible": () => this.syncAgentsPanelVisibility(),
+        "agents.summaryVisibleTouch": () => this.renderAgentsOverview(),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
         "terminal.renderer": (value) => this.applyRendererSetting(value),
@@ -10884,6 +10938,24 @@ class TerminalManager {
         run: () => this.createTerminal(),
       },
       {
+        id: "agents",
+        title: "Agents Panel",
+        group: "Views",
+        icon: "bot",
+        keywords: ["agents", "overview", "sessions", "projects", "needs you"],
+        priority: 46,
+        run: () => this.toggleAgentsPanel(),
+      },
+      {
+        id: "next-agent",
+        title: "Next Agent",
+        group: "Actions",
+        icon: "skip-forward",
+        keywords: ["agent", "needs you", "attention", "done", "next"],
+        priority: 47,
+        run: () => this.goToNextAgent(),
+      },
+      {
         id: "split-workspace",
         title: "Split Workspace",
         group: "Actions",
@@ -11749,11 +11821,12 @@ class TerminalManager {
   // /ws/terminals/:id socket URL. Touch-layout pages add `scroll=1` so the
   // server sends them scroll-position frames for the touch scroll indicator.
   // Desktop pages never do (a page without the handler would print the
-  // frames as terminal text).
+  // frames as terminal text). Every page that knows `agents_changed` adds
+  // `agents=1` (same opt-in mechanism, design 1.8).
   terminalSocketUrl(id) {
     const protocol = location.protocol === "https:" ? "wss:" : "ws:";
     const scroll = this.isTouchLayout() ? "&scroll=1" : "";
-    return `${protocol}//${location.host}/ws/terminals/${id}?clientId=${encodeURIComponent(this.clientInstanceId)}${scroll}`;
+    return `${protocol}//${location.host}/ws/terminals/${id}?clientId=${encodeURIComponent(this.clientInstanceId)}${scroll}&agents=1`;
   }
 
   bindTerminalActivation(id, element) {
@@ -11973,6 +12046,7 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
+          terminal.agentStatus = next.agentStatus ?? null;
           this.applyTerminalAttention(terminal, next, id);
           // Under tmux the server reads the pane's live cwd on every poll, so
           // it is authoritative (bash emits no OSC 7 and tmux would not
@@ -12472,34 +12546,79 @@ class TerminalManager {
     }
   }
 
+  // Seen map (terminal id -> highest attention seq seen), shared by every
+  // device of the actor through the server setting `attention.seen`, which
+  // the server merges per id by max (design section 3). Kept in memory here;
+  // writes go through settingsStore (debounced PUT).
   getAttentionSeenMap() {
     if (!this._attentionSeen) {
-      let raw = null;
-      try {
-        raw = localStorage.getItem(
-          window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
-            "deckterm.attention.seen.v1",
-        );
-      } catch {
-        raw = null;
-      }
-      this._attentionSeen = window.TaskSignals?.parseSeenMap?.(raw) || {};
+      this._attentionSeen =
+        window.AgentOverview?.sanitizeSeenMap?.(
+          this.settingsStore?.get?.("attention.seen", null),
+        ) || {};
     }
     return this._attentionSeen;
   }
 
   saveAttentionSeenMap() {
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    const value = merge
+      ? merge(this._attentionSeen || {}, {})
+      : this._attentionSeen || {};
+    this.settingsStore?.set?.("attention.seen", value);
+  }
+
+  // One-time import of the old per-browser seen map (localStorage
+  // deckterm.attention.seen.v1) into the server setting, then the local key
+  // is removed. Runs once settings have loaded.
+  importLegacyAttentionSeen() {
+    const key =
+      window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+      "deckterm.attention.seen.v1";
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    // Anything marked before the settings arrived joins the loaded value.
+    const early = this._attentionSeen || {};
+    this._attentionSeen = null;
+    if (merge) {
+      this._attentionSeen = merge(this.getAttentionSeenMap(), early);
+    }
+    let raw = null;
     try {
-      localStorage.setItem(
-        window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
-          "deckterm.attention.seen.v1",
-        JSON.stringify(this._attentionSeen || {}),
-      );
+      raw = localStorage.getItem(key);
     } catch {
-      // Private mode / quota: unseen state just stays in memory.
+      return;
+    }
+    if (!raw) return;
+    const legacy = window.TaskSignals?.parseSeenMap?.(raw) || {};
+    if (Object.keys(legacy).length && merge) {
+      this._attentionSeen = merge(this.getAttentionSeenMap(), legacy);
+      this.saveAttentionSeenMap();
+    }
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Private mode: the import simply runs again next time.
     }
   }
 
+  // Coming back to the page: fold the server's seen map (another device may
+  // have viewed a session meanwhile) into ours by max, then re-render.
+  async refreshAttentionSeenFromServer() {
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    if (!this.settingsStore?.refresh || !merge) return;
+    const local = this.getAttentionSeenMap();
+    const merged = await this.settingsStore.refresh(
+      "attention.seen",
+      (cached, server) => merge(merge(cached, server), local),
+    );
+    this._attentionSeen = window.AgentOverview.sanitizeSeenMap(merged);
+    this.updateTabGroups();
+    this.renderAgentsOverview();
+  }
+
+  // Ids the catalog no longer lists are dropped from memory only: the server
+  // keeps the 200 most recent entries itself, and a write could not remove
+  // them anyway (it merges by max).
   pruneAttentionSeen(catalog) {
     if (!Array.isArray(catalog) || catalog.length === 0) return;
     const seen = this.getAttentionSeenMap();
@@ -12509,7 +12628,6 @@ class TerminalManager {
     );
     if (pruned && Object.keys(pruned).length !== Object.keys(seen).length) {
       this._attentionSeen = pruned;
-      this.saveAttentionSeenMap();
     }
   }
 
@@ -12540,7 +12658,13 @@ class TerminalManager {
   // Marks the active, visible session as seen and refreshes the app badge.
   syncAttentionIndicators() {
     const activeVisibleId = this.getActiveVisibleTerminalId();
-    if (activeVisibleId) this.markAttentionSeen(activeVisibleId);
+    // While the page attaches its sessions one by one at load, each becomes
+    // active for a moment; only the one it settles on counts as seen.
+    if (activeVisibleId && !this.bootstrapPending) {
+      this.markAttentionSeen(activeVisibleId);
+    }
+    // Seen and "active, visible" both feed the Agents overview tiers.
+    this.renderAgentsOverview();
     const signals = window.TaskSignals;
     if (typeof signals?.countUnseenAttention !== "function") return;
     const sessions = new Map();
@@ -13308,6 +13432,435 @@ class TerminalManager {
     this.settingsStore?.set("ide.sidebarWidth", null);
   }
 
+  // --- Agents overview (S2): desktop panel, IDE view, phone chip -----------
+  // Design docs/plans/2026-10-22-agent-attention-design.md section 2. The
+  // view model is web/agent-overview.js; this wires it to the DOM, the
+  // settings (agents.panelVisible desktop, agents.summaryVisibleTouch touch,
+  // agents.panelWidth, attention.seen) and the IDE sidebar sash contract.
+
+  initAgentsOverview() {
+    this.agentsPanel = document.getElementById("agents-panel");
+    this.agentsPanelBody = document.getElementById("agents-panel-body");
+    this.agentsPanelSash = document.getElementById("agents-panel-sash");
+    this.agentsSummaryChip = document.getElementById("agents-summary-chip");
+    // Agents panel width in px; null = the CSS default (240 px).
+    this.agentsPanelWidthPx = null;
+    this.agentsIdeContainer = null;
+    this.agentsPanelShown = false;
+    this.agentsRenderedHtml = new WeakMap();
+
+    this.agentsPanelSash?.addEventListener("pointerdown", (e) =>
+      this.startAgentsPanelSashDrag(e),
+    );
+    this.agentsPanelSash?.addEventListener("dblclick", () =>
+      this.resetAgentsPanelSash(),
+    );
+    document
+      .getElementById("agents-panel-close")
+      ?.addEventListener("click", () => this.setAgentsPanelVisible(false));
+    const onListClick = (event) => {
+      if (event.target.closest("[data-agents-next]")) {
+        void this.goToNextAgent();
+        return;
+      }
+      const row = event.target.closest("[data-agent-session-id]");
+      if (row) void this.activateAgentSession(row.dataset.agentSessionId);
+    };
+    this.agentsPanelBody?.addEventListener("click", onListClick);
+    this.onAgentsListClick = onListClick;
+    this.agentsSummaryChip?.addEventListener("click", () => {
+      void this.openSessionsPanel();
+    });
+
+    window.addEventListener("deckterm:agents-changed", () =>
+      this.queueTelemetryRefresh(0),
+    );
+    window.addEventListener("resize", () => {
+      // Re-clamp (not saved) so the panel never exceeds half of a shrunken
+      // window, and re-check the 768 px breakpoint.
+      if (Number.isFinite(this.agentsPanelWidthPx)) this.applyAgentsPanelWidth();
+      this.syncAgentsPanelVisibility();
+    });
+    platformDetector.onChange(() => {
+      this.syncAgentsPanelVisibility();
+      this.renderAgentsOverview();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      void this.refreshAttentionSeenFromServer();
+    });
+    // Push deep link: the service worker posts the session to an open window.
+    navigator.serviceWorker?.addEventListener?.("message", (event) => {
+      if (event.data?.type !== "deckterm-open-session") return;
+      void this.openSessionFromDeepLink(event.data.terminalId);
+    });
+
+    void this.settingsReady.then(() => {
+      this.agentsPanelWidthPx = window.AgentOverview?.storedPanelWidth?.(
+        this.settingsStore?.get("agents.panelWidth", null),
+      );
+      this.applyAgentsPanelWidth();
+      this.importLegacyAttentionSeen();
+      this.syncAgentsPanelVisibility({ refit: false });
+      this.renderAgentsOverview();
+    });
+    // A boot URL `/?session=<id>` (push deep link with no window open).
+    void (this.bootstrapPromise || Promise.resolve()).then(() =>
+      this.consumeSessionBootParam(),
+    );
+  }
+
+  isAgentsPanelEligible() {
+    return (
+      !platformDetector.isMobile &&
+      window.innerWidth >= 768 &&
+      !document.body.classList.contains("ide-mode") &&
+      !document.body.classList.contains("chrome-mobile")
+    );
+  }
+
+  // desktop reads only agents.panelVisible (never the touch key), with its
+  // own default, so a cleared store shows the panel.
+  readAgentsPanelSetting() {
+    return this.settingsStore?.get("agents.panelVisible", true) !== false;
+  }
+
+  readAgentsChipSetting() {
+    return this.settingsStore?.get("agents.summaryVisibleTouch", true) !== false;
+  }
+
+  // Panel or IDE view currently on screen (toolbar button state).
+  isAgentsOverviewShown() {
+    if (this.isIdeModeActive?.() && this.ideShell) {
+      return (
+        this.ideShell.activeView?.() === "agents" &&
+        !this.ideShell.isSidebarCollapsed?.()
+      );
+    }
+    return Boolean(this.agentsPanelShown);
+  }
+
+  syncAgentsPanelVisibility({ refit = true } = {}) {
+    const panel = this.agentsPanel;
+    if (!panel) return;
+    const show = this.isAgentsPanelEligible() && this.readAgentsPanelSetting();
+    panel.hidden = !show;
+    if (this.agentsPanelSash) this.agentsPanelSash.hidden = !show;
+    const changed = show !== this.agentsPanelShown;
+    this.agentsPanelShown = show;
+    if (show && changed) this.renderAgentsOverview();
+    if (changed) {
+      this.syncSurfaceButtonState();
+      if (refit) this.refitVisibleTerminalsForAgentsPanel();
+    }
+  }
+
+  // Same settle as the IDE sidebar sash drag end: a synthetic resize, then
+  // an explicit refit of every visible terminal.
+  refitVisibleTerminalsForAgentsPanel() {
+    window.dispatchEvent(new Event("resize"));
+    requestAnimationFrame(() => {
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    });
+  }
+
+  setAgentsPanelVisible(visible) {
+    const value = Boolean(visible);
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("agents.panelVisible", value);
+    } else {
+      this.settingsStore?.set("agents.panelVisible", value);
+      this.syncAgentsPanelVisibility();
+    }
+    // A deliberate layout choice: save it now, not after the debounce, so a
+    // reload right after the toggle keeps it.
+    void this.settingsStore?.flush?.().catch(() => {});
+    if (!value) this.focusActiveTerminalSoft?.();
+  }
+
+  // Toolbar button, palette action and Ctrl+Shift+L. Desktop default view:
+  // flip agents.panelVisible. IDE mode: show or collapse the Agents activity
+  // view. Phones and narrow windows (no panel there): the sorted Sessions
+  // sheet.
+  toggleAgentsPanel() {
+    if (this.isIdeModeActive?.() && this.ideShell) {
+      this.ideShell.onActivityClick?.("agents");
+      this.syncSurfaceButtonState();
+      return;
+    }
+    if (!this.isAgentsPanelEligible()) {
+      void this.openSessionsPanel();
+      return;
+    }
+    this.setAgentsPanelVisible(!this.readAgentsPanelSetting());
+  }
+
+  agentsOverviewOptions() {
+    return { activeVisibleId: this.getActiveVisibleTerminalId() };
+  }
+
+  // Render the panel, the IDE view, the phone chip and the Sessions bar from
+  // the last /api/terminals catalog. Cheap: DOM is touched only on change.
+  renderAgentsOverview() {
+    const overview = window.AgentOverview;
+    if (!overview || !this.agentsRenderedHtml) return;
+    const sessions = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    const seen = this.getAttentionSeenMap();
+    const opts = this.agentsOverviewOptions();
+    const signals = window.TaskSignals;
+    const now = Date.now();
+    const listOptions = {
+      ...opts,
+      getTitle: (s) =>
+        signals?.sessionDisplayTitle?.(s) || s?.cwd || "Terminal",
+      getAge: (s) => {
+        const at = signals?.sessionActivityAt?.(s) || 0;
+        return at ? signals?.formatActivityAge?.(now - at) || "" : "";
+      },
+    };
+    const targets = [];
+    if (this.agentsPanelShown && this.agentsPanelBody) {
+      targets.push(this.agentsPanelBody);
+    }
+    if (this.agentsIdeContainer?.isConnected) targets.push(this.agentsIdeContainer);
+    if (targets.length) {
+      const html = overview.renderAgentListHtml(sessions, seen, listOptions);
+      for (const el of targets) {
+        if (this.agentsRenderedHtml.get(el) === html) continue;
+        this.agentsRenderedHtml.set(el, html);
+        el.innerHTML = html;
+      }
+    }
+
+    const counts = overview.summaryCounts(sessions, seen, opts);
+    const next = overview.nextTarget(sessions, seen, opts);
+
+    const chip = this.agentsSummaryChip;
+    if (chip) {
+      const showChip =
+        platformDetector.isMobile &&
+        this.readAgentsChipSetting() &&
+        counts.agents > 0;
+      chip.hidden = !showChip;
+      if (showChip) {
+        const phone = overview.summaryText(counts, "phone");
+        if (chip.textContent !== phone.text) chip.textContent = phone.text;
+        chip.setAttribute("aria-label", `${phone.label}. Open Sessions`);
+        chip.title = phone.label;
+        chip.dataset.attention =
+          counts.needsYou > 0 ? "needs-you" : counts.done > 0 ? "done" : "";
+      }
+    }
+
+    const bar = document.getElementById("sessions-agents-bar");
+    if (bar) {
+      const summary = document.getElementById("sessions-agents-summary");
+      if (summary) summary.textContent = overview.summaryText(counts).text;
+      const nextBtn = document.getElementById("sessions-next-agent");
+      if (nextBtn) {
+        nextBtn.disabled = !next;
+        const label = next
+          ? `Go to ${listOptions.getTitle(next)}`
+          : "Nothing needs you";
+        nextBtn.title = label;
+        nextBtn.setAttribute(
+          "aria-label",
+          next ? `Next agent: ${label}` : `Next agent: ${label}`,
+        );
+      }
+    }
+  }
+
+  // Focus a session from the panel, Next or a deep link: switch to an open
+  // tab, or attach a live session that is not open here. Ended rows are
+  // never re-created from here.
+  async activateAgentSession(sessionId) {
+    if (!sessionId) return false;
+    if (this.terminals.has(sessionId)) {
+      this.switchTo(sessionId);
+      this.markAttentionSeen(sessionId);
+      this.renderAgentsOverview();
+      return true;
+    }
+    const session = (this._sessionCatalog || []).find(
+      (s) => s?.id === sessionId,
+    );
+    if (!session) return false;
+    const action = window.SessionActions?.planSessionRowAction?.(session, {
+      isLocallyOpen: false,
+    });
+    if (action?.kind !== "attach") return false;
+    await this.cancelScheduledTerminalClose(sessionId);
+    await this.reconnectToTerminal(
+      sessionId,
+      session.cwd,
+      this.sessionRegistry.get(sessionId),
+      {
+        backendMode: session.backendMode || null,
+        supportsLinkedView: Boolean(session.supportsLinkedView),
+      },
+    );
+    this.switchTo(sessionId);
+    this.updateSessionsAvailableBadge();
+    this.queueTelemetryRefresh(0);
+    return true;
+  }
+
+  // "Next": needs you first, then done-unseen, skipping the active, visible
+  // session. Visiting a done session marks it seen, so the next press moves
+  // on. Returns whether it went somewhere.
+  async goToNextAgent() {
+    const overview = window.AgentOverview;
+    if (!overview) return false;
+    const target = overview.nextTarget(
+      this._sessionCatalog || [],
+      this.getAttentionSeenMap(),
+      this.agentsOverviewOptions(),
+    );
+    if (!target) {
+      this.notify?.({
+        key: "agents-next",
+        kind: "info",
+        title: "Nothing needs you",
+        body: "No agent is waiting for an answer or finished unseen.",
+      });
+      return false;
+    }
+    const went = await this.activateAgentSession(target.id);
+    if (went) this.focusActiveTerminalSoft?.();
+    return went;
+  }
+
+  // Push deep link (service-worker message or boot `?session=`): only a UUID
+  // that is in this actor's own /api/terminals list is acted on.
+  async openSessionFromDeepLink(rawId) {
+    const id = window.AgentOverview?.sessionIdFromDeepLink?.(rawId);
+    if (!id) return false;
+    try {
+      const res = await fetch("/api/terminals", {
+        headers: { "x-deckterm-client-id": this.clientInstanceId },
+      });
+      if (!res.ok) return false;
+      const sessions = await res.json();
+      if (!Array.isArray(sessions)) return false;
+      this._sessionCatalog = sessions;
+    } catch {
+      return false;
+    }
+    if (!(this._sessionCatalog || []).some((s) => s?.id === id)) return false;
+    return this.activateAgentSession(id);
+  }
+
+  consumeSessionBootParam() {
+    let url;
+    try {
+      url = new URL(window.location.href);
+    } catch {
+      return;
+    }
+    if (!url.searchParams.has("session")) return;
+    const raw = url.searchParams.get("session");
+    url.searchParams.delete("session");
+    try {
+      history.replaceState(
+        history.state,
+        "",
+        `${url.pathname}${url.search}${url.hash}`,
+      );
+    } catch {
+      // Keep going: the parameter is harmless if it stays.
+    }
+    void this.openSessionFromDeepLink(raw);
+  }
+
+  // --- Agents panel width (right-edge sash, IDE sidebar sash contract) ------
+
+  clampAgentsPanelWidth(px) {
+    return (
+      window.AgentOverview?.clampPanelWidth?.(px, window.innerWidth) ??
+      this.clampIdeSidebarWidth(px)
+    );
+  }
+
+  applyAgentsPanelWidth() {
+    const root = document.documentElement;
+    if (Number.isFinite(this.agentsPanelWidthPx)) {
+      root.style.setProperty(
+        "--agents-panel-width",
+        `${this.clampAgentsPanelWidth(this.agentsPanelWidthPx)}px`,
+      );
+    } else {
+      root.style.removeProperty("--agents-panel-width");
+    }
+  }
+
+  startAgentsPanelSashDrag(e) {
+    e.preventDefault();
+    const panel = this.agentsPanel;
+    if (!panel || panel.hidden) return;
+    const rect = panel.getBoundingClientRect();
+    const sash = this.agentsPanelSash;
+    sash?.classList.add("dragging");
+    const apply = (clientX) => {
+      this.agentsPanelWidthPx = this.clampAgentsPanelWidth(clientX - rect.left);
+      this.applyAgentsPanelWidth();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientX);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("agents.panelWidth", this.agentsPanelWidthPx);
+      void this.settingsStore?.flush?.().catch(() => {});
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+  }
+
+  resetAgentsPanelSash() {
+    this.agentsPanelWidthPx = null;
+    this.applyAgentsPanelWidth();
+    this.settingsStore?.set("agents.panelWidth", null);
+    void this.settingsStore?.flush?.().catch(() => {});
+    this.refitVisibleTerminalsForAgentsPanel();
+  }
+
+  // IDE mode: the same list as an activity-bar view (design 2.5). It uses the
+  // IDE sidebar and its width; agents.panelVisible does not affect it.
+  initAgentsIdeView() {
+    if (!this.ideShell) return;
+    this.ideShell.addView({
+      id: "agents",
+      icon: "bot",
+      title: "Agents",
+      mount: (container) => {
+        const view = document.createElement("div");
+        view.className = "agents-ide-view";
+        view.addEventListener("click", (event) => this.onAgentsListClick?.(event));
+        container.replaceChildren(view);
+        this.agentsIdeContainer = view;
+        this.renderAgentsOverview();
+      },
+      unmount: () => {
+        this.agentsIdeContainer?.remove();
+        this.agentsIdeContainer = null;
+      },
+      resize: () => this.renderAgentsOverview(),
+    });
+  }
+
   applyDockState({ persist = true } = {}) {
     const enabled = this.dockState.enabled && this.isWindowedSurfaces();
     document.body.classList.toggle("sessions-docked", enabled);
@@ -13470,6 +14023,7 @@ class TerminalManager {
     this.initScmView();
     this.initTasksView();
     this.initSearchView();
+    this.initAgentsIdeView();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -14073,6 +14627,7 @@ class TerminalManager {
     this.closeTerminalSearch();
     this.applyIdeDockHeight();
     this.ensureIdeExplorerLoaded();
+    this.syncAgentsPanelVisibility({ refit: false });
   }
 
   // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
@@ -14084,6 +14639,8 @@ class TerminalManager {
     // TileManager layout, so any open search overlay must be disposed rather
     // than left bound to a container it's about to leave.
     this.closeTerminalSearch();
+    // The Agents panel returns according to its setting.
+    this.syncAgentsPanelVisibility({ refit: false });
   }
 
   // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
@@ -14493,6 +15050,17 @@ class TerminalManager {
       if (e.ctrlKey && e.shiftKey && e.key === "D") {
         e.preventDefault();
         this.splitWorkspace();
+      }
+      // Agents panel (Ctrl+Shift+L) and Next agent (Ctrl+Shift+X): like every
+      // Ctrl+Shift+letter they produce no terminal input, so they work inside
+      // a terminal too.
+      if (e.ctrlKey && e.shiftKey && !e.altKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        this.toggleAgentsPanel();
+      }
+      if (e.ctrlKey && e.shiftKey && !e.altKey && e.key.toLowerCase() === "x") {
+        e.preventDefault();
+        void this.goToNextAgent();
       }
       if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
         e.preventDefault();

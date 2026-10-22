@@ -7,9 +7,12 @@ const ACTION_RECENT_WORKSPACES_STORAGE_KEY = "deckterm.recentWorkspaces.v1";
 const ACTION_RECENT_WORKSPACES_MAX_ENTRIES = 10;
 
 const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
-  desktopPrimary: Object.freeze(["files", "git", "palette", "more"]),
+  // "agents" (show/hide the Agents panel) is pinned first on desktop and also
+  // listed in More, so saved custom layouts without it still reach it.
+  desktopPrimary: Object.freeze(["agents", "files", "git", "palette", "more"]),
   mobilePrimary: Object.freeze(["files", "git", "paste", "compose", "more"]),
   overflow: Object.freeze([
+    "agents",
     "palette",
     "compose",
     "setup",

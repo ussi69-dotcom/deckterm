@@ -331,8 +331,9 @@ test("pinLayoutAction treats the combined font stepper as one desktop item", () 
   const next = pinLayoutAction(state, "desktop", "font-size", 1);
 
   expect(next.desktopPinned).toEqual([
-    "files",
+    "agents",
     "font-size",
+    "files",
     "git",
     "palette",
   ]);
@@ -355,7 +356,13 @@ test("pinLayoutAction inserts available actions into the pinned list", () => {
     1,
   );
 
-  expect(next.desktopPinned).toEqual(["files", "clipboard", "git", "palette"]);
+  expect(next.desktopPinned).toEqual([
+    "agents",
+    "clipboard",
+    "files",
+    "git",
+    "palette",
+  ]);
   expect(next.mobilePinned).toEqual(["files", "git", "paste", "compose"]);
 });
 
@@ -365,7 +372,7 @@ test("unpinLayoutAction removes an action from the pinned list", () => {
   );
   const next = unpinLayoutAction(
     {
-      desktopPinned: ["files", "clipboard", "git", "palette"],
+      desktopPinned: ["agents", "files", "clipboard", "git", "palette"],
       mobilePinned: getMobilePrimaryActionIds().filter(
         (actionId) => actionId !== "more",
       ),
@@ -601,7 +608,10 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(12);
+  expect(overflow).toHaveLength(13);
+  // The Agents panel toggle is pinned on desktop and always reachable in More.
+  expect(overflow[0]).toBe("agents");
+  expect(getDesktopPrimaryActionIds()[0]).toBe("agents");
   expect(overflow).toContain("palette");
   expect(overflow).toContain("compose");
   expect(overflow).toContain("setup");

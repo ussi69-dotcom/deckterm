@@ -55,7 +55,13 @@ test("IDE Tasks view mounts, tears down on switch-away, re-mounts on switch-back
     };
   });
   expect(registered.hasTasksView).toBe(true);
-  expect(registered.viewIds).toEqual(["explorer", "scm", "tasks", "search"]);
+  expect(registered.viewIds).toEqual([
+    "explorer",
+    "scm",
+    "tasks",
+    "search",
+    "agents",
+  ]);
 
   // Enter IDE mode (real toolbar path).
   await page.evaluate(() => {

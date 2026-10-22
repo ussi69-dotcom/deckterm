@@ -275,3 +275,61 @@ describe("quickReplyAttentionBaseline", () => {
     ).toBeNull();
   });
 });
+
+describe("shouldShowQuickReplies with a screen-rule agentStatus", () => {
+  const base = { touchLayout: true, agentName: "claude" };
+  const needsInput = { kind: "needs-input", seq: 9 };
+
+  test("shows only while the agent is blocked", () => {
+    expect(shouldShowQuickReplies({ ...base, agentStatus: "blocked" })).toBe(
+      true,
+    );
+    expect(shouldShowQuickReplies({ ...base, agentStatus: "working" })).toBe(
+      false,
+    );
+    expect(shouldShowQuickReplies({ ...base, agentStatus: "idle" })).toBe(
+      false,
+    );
+  });
+
+  test("the status wins over a stale needs-input attention", () => {
+    expect(
+      shouldShowQuickReplies({
+        ...base,
+        agentStatus: "working",
+        attention: needsInput,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowQuickReplies({
+        ...base,
+        agentStatus: "blocked",
+        agentState: "responding",
+        attention: { kind: "done", seq: 10 },
+      }),
+    ).toBe(true);
+  });
+
+  test("a null status keeps today's attention logic", () => {
+    expect(
+      shouldShowQuickReplies({ ...base, agentStatus: null, attention: needsInput }),
+    ).toBe(true);
+    expect(shouldShowQuickReplies({ ...base, agentStatus: null })).toBe(true);
+    expect(
+      shouldShowQuickReplies({
+        ...base,
+        agentStatus: null,
+        attention: { kind: "done", seq: 4 },
+      }),
+    ).toBe(false);
+  });
+
+  test("never on desktop or without an agent", () => {
+    expect(
+      shouldShowQuickReplies({ ...base, touchLayout: false, agentStatus: "blocked" }),
+    ).toBe(false);
+    expect(
+      shouldShowQuickReplies({ touchLayout: true, agentName: null, agentStatus: "blocked" }),
+    ).toBe(false);
+  });
+});

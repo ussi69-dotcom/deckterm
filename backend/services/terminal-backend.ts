@@ -87,6 +87,14 @@ export interface TerminalBackend {
 
   capture(sessionName: string): Promise<string>;
 
+  /**
+   * The visible screen only, as plain text (`capture-pane -p -t <session>`:
+   * no escapes, no history, wrapped lines kept as separate rows). Input for
+   * the agent screen rules. Null when the backend has no screen to read
+   * (raw PTY) or the capture failed.
+   */
+  captureVisible(sessionName: string): Promise<string | null>;
+
   resize(sessionName: string, cols: number, rows: number): Promise<void>;
 
   scrollHistory(
