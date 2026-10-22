@@ -18,6 +18,11 @@ import type {
   TerminalScrollDirection,
 } from "./terminal-backend";
 import type { TmuxPipeDelta, TmuxSessionInfo } from "./tmux-terminal-backend";
+import {
+  parseTmuxScrollState,
+  TMUX_SCROLL_STATE_FORMAT,
+  type TmuxScrollState,
+} from "./tmux-scroll-state";
 
 /**
  * B2 brokered tmux backend (design §5). A per-uid `TerminalBackend` whose every
@@ -221,6 +226,19 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     lines: number,
   ): Promise<boolean> {
     const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    // Same guard as TmuxTerminalBackend.scrollHistory: the alternate screen
+    // has no tmux history, and an empty copy-mode there steals input. Unlike
+    // there, an unreadable state does not refuse: the broker's display-message
+    // parser currently rejects every format operand, and refusing on that
+    // would take away the scrolling brokered terminals have today.
+    const altState = await this.control(sessionName, [
+      "display-message",
+      "-t",
+      sessionName,
+      "-p",
+      "#{alternate_on}",
+    ]);
+    if (altState.code === 0 && altState.stdout.trim() === "1") return false;
     if (direction === "up") {
       const copyMode = await this.control(sessionName, [
         "copy-mode",
@@ -241,6 +259,53 @@ export class BrokeredTmuxBackend implements TerminalBackend {
       direction === "up" ? "scroll-up" : "scroll-down",
     ]);
     return scroll.code === 0;
+  }
+
+  async readScrollState(sessionName: string): Promise<TmuxScrollState | null> {
+    const res = await this.control(sessionName, [
+      "display-message",
+      "-t",
+      sessionName,
+      "-p",
+      TMUX_SCROLL_STATE_FORMAT,
+    ]);
+    if (res.code !== 0) return null;
+    return parseTmuxScrollState(res.stdout);
+  }
+
+  // The broker's tmux profile allows no `goto-line` (only bounded
+  // scroll-up/scroll-down), so an absolute jump is refused here. The client
+  // keeps working with relative scrolls.
+  async scrollToPosition(
+    sessionName: string,
+    position: number,
+  ): Promise<boolean> {
+    if (Math.trunc(position) <= 0) return this.exitScroll(sessionName);
+    return false;
+  }
+
+  // No `copy-mode -q` in the broker allowlist either. Copy-mode is only ever
+  // entered here with `-e`, which leaves it when a scroll-down reaches the
+  // bottom, so scroll down by the current position (in allowed steps of 100).
+  async exitScroll(sessionName: string): Promise<boolean> {
+    const state = await this.readScrollState(sessionName);
+    if (!state) return false;
+    if (!state.inMode) return true;
+    const steps = Math.min(101, Math.ceil(state.position / 100) + 1);
+    for (let step = 0; step < steps; step += 1) {
+      const scroll = await this.control(sessionName, [
+        "send-keys",
+        "-X",
+        "-N",
+        "100",
+        "-t",
+        sessionName,
+        "scroll-down",
+      ]);
+      if (scroll.code !== 0) break;
+    }
+    const after = await this.readScrollState(sessionName);
+    return Boolean(after && !after.inMode);
   }
 
   async kill(sessionName: string): Promise<void> {

@@ -1,4 +1,5 @@
 import type { Subprocess } from "bun";
+import type { TmuxScrollState } from "./tmux-scroll-state";
 
 export type TerminalBackendMode = "raw" | "tmux";
 export type TerminalScrollDirection = "up" | "down";
@@ -77,6 +78,19 @@ export interface TerminalBackend {
     direction: TerminalScrollDirection,
     lines: number,
   ): Promise<boolean>;
+
+  /** The pane's live scroll state, or null when it cannot be read. */
+  readScrollState(sessionName: string): Promise<TmuxScrollState | null>;
+
+  /**
+   * Shows the history `position` lines above the live bottom (tmux copy-mode,
+   * clamped by tmux to the available history). 0 or less leaves copy-mode.
+   * Refused (false) on the alternate screen, which has no history.
+   */
+  scrollToPosition(sessionName: string, position: number): Promise<boolean>;
+
+  /** Leaves copy-mode; succeeds when the pane was not scrolled back either. */
+  exitScroll(sessionName: string): Promise<boolean>;
 
   kill(sessionName: string): Promise<void>;
 }
