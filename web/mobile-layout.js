@@ -131,6 +131,44 @@ function computeViewportLayout({
 }
 
 /**
+ * What one touch-layout viewport pass should do, given the previous pass's
+ * layout (null on the first pass) and this one's.
+ *
+ * - refitKey: the geometry the terminal re-fits on. It leaves out appTop:
+ *   an iOS pan moves offsetTop on every frame without changing the room the
+ *   terminal has, and re-fitting on it chased the pan.
+ * - keyboardOpened: the keyboard went from closed to open. This is the only
+ *   viewport change that may scroll the terminal to its prompt; any other
+ *   change (keyboard height, URL bar, rotation) keeps the reader's position.
+ * - keyboardResize: the change came from the keyboard or from the touch
+ *   chrome (direct: extra-keys row, chips, action bar), so the COLSxROWS
+ *   badge should stay hidden for it. An input losing focus counts too: on
+ *   touch that dismisses the keyboard, and the viewport grows right after.
+ * A viewport pass never decides focus: focus follows the user's taps only.
+ */
+function getViewportPassDecision(previous, next, { direct = false } = {}) {
+  const refitKey = [
+    next?.appHeight ?? null,
+    Boolean(next?.keyboardOpen),
+    Boolean(next?.phoneLandscape),
+    Boolean(next?.chipsHidden),
+  ].join("|");
+  const wasOpen = Boolean(previous?.keyboardOpen);
+  const isOpen = Boolean(next?.keyboardOpen);
+  const heightChanged =
+    Boolean(previous) && previous.appHeight !== (next?.appHeight ?? null);
+  return {
+    refitKey,
+    keyboardOpened: Boolean(previous) && !wasOpen && isOpen,
+    keyboardResize:
+      Boolean(direct) ||
+      wasOpen !== isOpen ||
+      (Boolean(previous?.inputFocused) && !next?.inputFocused) ||
+      (heightChanged && (wasOpen || isOpen || Boolean(next?.inputFocused))),
+  };
+}
+
+/**
  * Which edges of a horizontally scrolling row hide content (for the fade).
  */
 function getRowOverflowFade({
@@ -150,6 +188,7 @@ const MobileLayout = {
   PHONE_LANDSCAPE_MAX_HEIGHT_PX,
   getOrientation,
   computeViewportLayout,
+  getViewportPassDecision,
   getRowOverflowFade,
 };
 

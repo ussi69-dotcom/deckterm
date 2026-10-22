@@ -351,7 +351,7 @@ class ComposeSheet {
     clearHistory.setAttribute("aria-label", "Clear recent messages");
     clearHistory.addEventListener("click", () => {
       this.clearHistory();
-      input.focus();
+      input.focus({ preventScroll: true });
     });
     historyHeader.append(historyTitle, clearHistory);
     const list = doc.createElement("ul");
@@ -363,7 +363,7 @@ class ComposeSheet {
       if (typeof text !== "string") return;
       input.value = text;
       this.syncButtons();
-      input.focus();
+      input.focus({ preventScroll: true });
       const end = input.value.length;
       input.setSelectionRange?.(end, end);
     });
@@ -421,8 +421,9 @@ class ComposeSheet {
     this.syncButtons();
     this.root.classList.remove("hidden");
     this.root.setAttribute("aria-hidden", "false");
-    // Focus synchronously inside the user gesture so iOS opens the keyboard.
-    this.els.input.focus();
+    // Focus synchronously inside the user gesture so iOS opens the keyboard;
+    // preventScroll keeps iOS from panning the page to the text box.
+    this.els.input.focus({ preventScroll: true });
   }
 
   close({ restoreFocus = true } = {}) {
