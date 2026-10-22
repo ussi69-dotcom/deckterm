@@ -298,6 +298,57 @@ describe("agent wrapper argument table", () => {
     }
   });
 
+  // Codex global options (codex 0.163 --help) come before the subcommand;
+  // their values must not be mistaken for it.
+  test("codex options before resume still report the id", () => {
+    for (const args of [
+      ["--model", "gpt-5.6-luna", "resume", U],
+      ["-m", "gpt-5.6-luna", "resume", U],
+      ["-mgpt-5.6-luna", "resume", U],
+      ["--model=gpt-5.6-luna", "resume", U],
+      ["-c", "model_reasoning_effort=low", "-p", "work", "resume", U],
+      ["--search", "--enable", "x", "-s", "read-only", "resume", U],
+      ["-C", "/tmp", "--add-dir", "/w", "-a", "never", "resume", U],
+      ["resume", "-m", "gpt-5.6-luna", U],
+      ["resume", "--model=x", "-c", "k=v", U, "continue please"],
+    ]) {
+      const r = run("codex", args);
+      expect(r.args).toEqual(["--no-alt-screen", ...args]);
+      expect(r.start).toEqual({ sid: U });
+    }
+  });
+
+  test("codex resume --last or without an id reports nothing, whatever the options", () => {
+    for (const args of [
+      ["-m", "x", "resume", "--last"],
+      ["resume", "--last", U],
+      ["resume", "-m", "x", "--last"],
+      ["--model", "x", "resume"],
+      ["--model", "x", "resume", "--all"],
+      ["-m", "x", "explain this repo"],
+      ["--model", "resume"],
+    ]) {
+      const r = run("codex", args);
+      expect(r.args).toEqual(["--no-alt-screen", ...args]);
+      expect(r.start).toEqual({ sid: null });
+    }
+  });
+
+  test("codex subcommands after options record nothing", () => {
+    for (const args of [
+      ["-m", "x", "exec", "hi"],
+      ["--model", "x", "e", "hi"],
+      ["-c", "k=v", "review"],
+      ["-C", "/tmp", "exec", "hi"],
+      ["--search", "exec", "hi"],
+      ["-m", "x", "--help"],
+    ]) {
+      const r = run("codex", args);
+      expect(r.args).toEqual(["--no-alt-screen", ...args]);
+      expect(r.markers).toEqual([]);
+    }
+  });
+
   test("the wrapper's start marker parses to the same validated id", () => {
     const r = run("claude", ["--resume", U]);
     const startMarker = r.markers.find((m) => m.includes(";start"))!;

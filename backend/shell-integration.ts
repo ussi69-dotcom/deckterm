@@ -18,6 +18,32 @@ export const AGENT_UUID_SOURCE = "/proc/sys/kernel/random/uuid";
 const BASH_UUID_RE =
   "^[0123456789abcdef]{8}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{4}-[0123456789abcdef]{12}$";
 
+// Codex 0.163 options that take a value (`codex --help`, `codex resume
+// --help`), as a bash case pattern. Used to skip option values before the
+// subcommand and before resume's SESSION_ID.
+const CODEX_VALUE_OPTIONS = [
+  "-c",
+  "--config",
+  "--enable",
+  "--disable",
+  "--remote",
+  "--remote-auth-token-env",
+  "-i",
+  "--image",
+  "-m",
+  "--model",
+  "--local-provider",
+  "-p",
+  "--profile",
+  "-s",
+  "--sandbox",
+  "-C",
+  "--cd",
+  "--add-dir",
+  "-a",
+  "--ask-for-approval",
+].join("|");
+
 // The agent wrapper (slice S3, design 6). `claude` and `codex` run through
 // __deckterm_run_agent, which classifies the user's arguments:
 //
@@ -29,11 +55,12 @@ const BASH_UUID_RE =
 //     --from-pr, --cloud, --desktop, --bg           -> reports nothing
 //   claude -p/--print, -h/--help, -v/--version      -> no start record
 //   claude <prompt or subcommand>                   -> reports nothing
-//   codex resume <u>                                -> reports <u> if a UUID
+//   codex [options] resume [options] <u>            -> reports <u> if a UUID
 //   codex, codex <prompt>, codex resume [--last], codex fork
 //                                                   -> reports nothing
-//   codex exec|review|login|... (subcommands), -h/--help, -V/--version
-//                                                   -> no start record
+//   codex [options] exec|review|login|... (subcommands), -h/--help,
+//     -V/--version                                  -> no start record
+//   (codex options with a value, e.g. -m X, are skipped with that value)
 //
 // The id travels in the start marker `agent;<name>;start;sid=<uuid>`, which
 // the server accepts only as a lowercase UUID (backend/telemetry.ts).
@@ -109,12 +136,40 @@ export function buildAgentWrapperShell({
     "      -h|--help|-V|--version) __dt_plan=none; return 0 ;;",
     "    esac",
     "  done",
-    '  local first="${args[0]-}"',
-    // Plain start: no arguments, or options first.
-    '  [[ -z "$first" || "$first" == -* ]] && return 0',
+    // Skip the global options (codex 0.163 --help) and their values, so
+    // `codex -m X resume <u>` and `codex -m X exec` are read correctly.
+    // `--opt=value`, `-mVALUE` and flags take one argument; unknown options
+    // count as flags (a misread then degrades to a plain start, no id).
+    "  i=0",
+    "  while (( i < n )); do",
+    '    a="${args[i]}"',
+    '    case "$a" in',
+    // Everything after `--` is a prompt: a plain start.
+    "      --) return 0 ;;",
+    `      ${CODEX_VALUE_OPTIONS}) i=$((i + 2)) ;;`,
+    "      -*) i=$((i + 1)) ;;",
+    "      *) break ;;",
+    "    esac",
+    "  done",
+    '  local first="${args[i]-}"',
+    // Plain start: no subcommand and no prompt.
+    '  [[ -z "$first" ]] && return 0',
     '  case "$first" in',
     "    resume)",
-    '      __deckterm_is_uuid "${args[1]-}" && __dt_sid="${args[1]}"',
+    // resume's own options (the global ones plus --last/--all/...), then
+    // SESSION_ID; with --last the positional is a prompt, not an id.
+    '      local j=$((i + 1)) last=0 id="" have_id=0',
+    "      while (( j < n )); do",
+    '        a="${args[j]}"',
+    '        case "$a" in',
+    "          --) break ;;",
+    "          --last) last=1; j=$((j + 1)) ;;",
+    `          ${CODEX_VALUE_OPTIONS}) j=$((j + 2)) ;;`,
+    "          -*) j=$((j + 1)) ;;",
+    '          *) (( have_id )) || { id="$a"; have_id=1; }; j=$((j + 1)) ;;',
+    "        esac",
+    "      done",
+    '      (( last )) || { __deckterm_is_uuid "$id" && __dt_sid="$id"; }',
     "      return 0",
     "      ;;",
     "    fork) return 0 ;;",
