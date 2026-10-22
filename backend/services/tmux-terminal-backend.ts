@@ -29,6 +29,7 @@ import type {
   TerminalBackendAttachOptions,
   TerminalBackendAttachResult,
   TerminalBackendSession,
+  TerminalScrollCallOptions,
   TerminalScrollDirection,
 } from "./terminal-backend";
 
@@ -119,7 +120,16 @@ export type TmuxTerminalBackendOptions = {
   // default config lookup; tests pass /dev/null so a private server never
   // loads the developer's own ~/.tmux.conf.
   configFile?: string;
+  // Hard deadline for each tmux call the scroll controller makes; past it the
+  // tmux client is killed (SIGKILL). Default SCROLL_TMUX_TIMEOUT_MS.
+  scrollCommandTimeoutMs?: number;
 };
+
+// A tmux scroll call (display-message, copy-mode, send -X) answers in
+// milliseconds; one that takes seconds is talking to a wedged server.
+export const SCROLL_TMUX_TIMEOUT_MS = 3_000;
+
+type ScrollTmuxResult = { code: number | null; stdout: string };
 
 export class TmuxServerUnavailableError extends Error {
   readonly socketPath: string;
@@ -139,6 +149,7 @@ export class TmuxServerUnavailableError extends Error {
 
 export class TmuxTerminalBackend implements TerminalBackend {
   readonly mode = "tmux" as const;
+  readonly supportsScrollControl = true;
   readonly namespace: string;
   readonly socketPath: string;
   readonly pipeDir: string;
@@ -146,6 +157,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly requireExternalServer: boolean;
   private readonly configFile: string | undefined;
+  private readonly scrollCommandTimeoutMs: number;
   private socketDirectoryReady: Promise<void> | null = null;
   // Gate in front of new-session: refuses to create a shell while the
   // server's environment has not been verified free of service secrets.
@@ -174,6 +186,8 @@ export class TmuxTerminalBackend implements TerminalBackend {
     this.baseEnv = options.env || process.env;
     this.requireExternalServer = options.requireExternalServer === true;
     this.configFile = options.configFile;
+    this.scrollCommandTimeoutMs =
+      options.scrollCommandTimeoutMs ?? SCROLL_TMUX_TIMEOUT_MS;
   }
 
   /**
@@ -440,54 +454,113 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await resizePaneProc.exited;
   }
 
+  /**
+   * One tmux call for the scroll controller, with a hard timeout and the
+   * caller's abort signal: either one kills the tmux client (SIGKILL), and
+   * the result only arrives once the process is gone. A signal that is
+   * already aborted spawns nothing. code null = not run, killed or failed.
+   */
+  private async runScrollTmux(
+    args: string[],
+    options: TerminalScrollCallOptions = {},
+  ): Promise<ScrollTmuxResult> {
+    const { signal } = options;
+    if (signal?.aborted) return { code: null, stdout: "" };
+    let proc: Subprocess;
+    try {
+      proc = await this.spawnTmux(args, {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "ignore",
+        timeout: this.scrollCommandTimeoutMs,
+        killSignal: "SIGKILL",
+        ...(signal ? { signal } : {}),
+      });
+    } catch {
+      return { code: null, stdout: "" };
+    }
+    // The tmux client hands its stdout to the server, so a client killed
+    // while the server is wedged leaves the pipe open: never wait for EOF on
+    // a killed client, and bound the wait after a normal exit too.
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const chunks: Uint8Array[] = [];
+    const reading = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return true;
+        if (value) chunks.push(value);
+      }
+    })().catch(() => false);
+    const exitCode = await proc.exited;
+    if (proc.signalCode != null || signal?.aborted === true) {
+      void reader.cancel().catch(() => {});
+      return { code: null, stdout: "" };
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const finished = await Promise.race([
+      reading,
+      new Promise<false>((resolve) => {
+        graceTimer = setTimeout(
+          () => resolve(false),
+          this.scrollCommandTimeoutMs,
+        );
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (!finished) {
+      void reader.cancel().catch(() => {});
+      return { code: null, stdout: "" };
+    }
+    return { code: exitCode, stdout: Buffer.concat(chunks).toString("utf8") };
+  }
+
   async scrollHistory(
     sessionName: string,
     direction: TerminalScrollDirection,
     lines: number,
+    options: TerminalScrollCallOptions = {},
   ): Promise<boolean> {
     const count = Math.max(1, Math.min(100, Math.trunc(lines)));
     // Alternate-screen panes have no tmux history: copy-mode there is an
     // empty [0/0] dead end that also steals subsequent input. Refuse.
-    const stateProc = await this.spawnTmux([
-      "display-message",
-      "-p",
-      "-t",
-      sessionName,
-      "#{alternate_on}",
-    ]);
-    const stateExit = await stateProc.exited;
-    const paneState = await new Response((stateProc as any).stdout).text();
-    if (stateExit !== 0 || paneState.trim() === "1") return false;
+    const paneState = await this.runScrollTmux(
+      ["display-message", "-p", "-t", sessionName, "#{alternate_on}"],
+      options,
+    );
+    if (paneState.code !== 0 || paneState.stdout.trim() === "1") return false;
     if (direction === "up") {
-      const copyModeProc = await this.spawnTmux([
-        "copy-mode",
-        "-e",
-        "-t",
-        sessionName,
-      ]);
-      if ((await copyModeProc.exited) !== 0) return false;
+      const copyMode = await this.runScrollTmux(
+        ["copy-mode", "-e", "-t", sessionName],
+        options,
+      );
+      if (copyMode.code !== 0) return false;
     }
 
-    const scrollProc = await this.spawnTmux([
-      "send-keys",
-      "-X",
-      "-N",
-      String(count),
-      "-t",
-      sessionName,
-      direction === "up" ? "scroll-up" : "scroll-down",
-    ]);
-    return (await scrollProc.exited) === 0;
+    const scroll = await this.runScrollTmux(
+      [
+        "send-keys",
+        "-X",
+        "-N",
+        String(count),
+        "-t",
+        sessionName,
+        direction === "up" ? "scroll-up" : "scroll-down",
+      ],
+      options,
+    );
+    return scroll.code === 0;
   }
 
-  async readScrollState(sessionName: string): Promise<TmuxScrollState | null> {
-    const proc = await this.spawnTmux(
+  async readScrollState(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<TmuxScrollState | null> {
+    const res = await this.runScrollTmux(
       ["display-message", "-p", "-t", sessionName, TMUX_SCROLL_STATE_FORMAT],
-      { stdout: "pipe", stderr: "pipe" },
+      options,
     );
-    const output = await new Response((proc as any).stdout).text();
-    if ((await proc.exited) !== 0) return null;
-    return parseTmuxScrollState(output);
+    if (res.code !== 0) return null;
+    return parseTmuxScrollState(res.stdout);
   }
 
   // `goto-line N` puts the view N lines above the live bottom (tmux clamps it
@@ -497,35 +570,56 @@ export class TmuxTerminalBackend implements TerminalBackend {
   async scrollToPosition(
     sessionName: string,
     position: number,
+    options: TerminalScrollCallOptions = {},
   ): Promise<boolean> {
     const target = Math.trunc(position);
     if (!Number.isFinite(target) || target <= 0) {
-      return this.exitScroll(sessionName);
+      return this.exitScroll(sessionName, options);
     }
-    const state = await this.readScrollState(sessionName);
+    const state = await this.readScrollState(sessionName, options);
     // Same dead end as scrollHistory: no copy-mode on the alternate screen.
     if (!state || state.altScreen) return false;
-    const proc = await this.spawnTmux([
-      "copy-mode",
-      "-e",
-      "-t",
-      sessionName,
-      ";",
-      "send-keys",
-      "-X",
-      "-t",
-      sessionName,
-      "goto-line",
-      String(target),
-    ]);
-    return (await proc.exited) === 0;
+    const res = await this.runScrollTmux(
+      [
+        "copy-mode",
+        "-e",
+        "-t",
+        sessionName,
+        ";",
+        "send-keys",
+        "-X",
+        "-t",
+        sessionName,
+        "goto-line",
+        String(target),
+      ],
+      options,
+    );
+    return res.code === 0;
   }
 
   // `copy-mode -q` exits every mode and returns 0 when there is none, unlike
   // `send -X cancel` (rc 1 "not in a mode").
-  async exitScroll(sessionName: string): Promise<boolean> {
-    const proc = await this.spawnTmux(["copy-mode", "-q", "-t", sessionName]);
-    return (await proc.exited) === 0;
+  async exitScroll(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<boolean> {
+    const res = await this.runScrollTmux(
+      ["copy-mode", "-q", "-t", sessionName],
+      options,
+    );
+    return res.code === 0;
+  }
+
+  async cancelScroll(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<boolean> {
+    const res = await this.runScrollTmux(
+      ["send-keys", "-X", "-t", sessionName, "cancel"],
+      options,
+    );
+    return res.code === 0;
   }
 
   async kill(sessionName: string): Promise<void> {

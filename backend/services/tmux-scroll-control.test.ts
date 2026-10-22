@@ -43,6 +43,8 @@ afterEach(() => {
     }
     if (fx.serverPid > 0) {
       try {
+        // A test that stopped the server (wedge test) must not leave it so.
+        process.kill(fx.serverPid, "SIGCONT");
         process.kill(fx.serverPid, "SIGTERM");
       } catch {
         // already gone
@@ -90,6 +92,8 @@ async function waitFor<T>(
 async function startPane(
   command: string | ((root: string) => string),
   rows = 20,
+  cols = 80,
+  backendOptions: { scrollCommandTimeoutMs?: number } = {},
 ): Promise<Fixture> {
   const root = mkdtempSync(join(tmpdir(), "dtsc-"));
   const shellCommand = typeof command === "function" ? command(root) : command;
@@ -108,7 +112,7 @@ async function startPane(
       "-s",
       session,
       "-x",
-      "80",
+      String(cols),
       "-y",
       String(rows),
       "sh",
@@ -126,17 +130,18 @@ async function startPane(
     pipeDir: join(root, "pipes"),
     shellCommandResolver: async () => ["/bin/sh"],
     env: tmuxEnv(root),
+    ...backendOptions,
   });
   const fx: Fixture = { root, socket, session, backend, serverPid };
   fixtures.push(fx);
   return fx;
 }
 
-async function attachClient(fx: Fixture, rows = 20) {
-  const pty = new BunTerminal!({ cols: 80, rows, data: () => {} });
+async function attachClient(fx: Fixture, rows = 20, cols = 80) {
+  const pty = new BunTerminal!({ cols, rows, data: () => {} });
   const { proc } = await fx.backend.attach(fx.session, {
     cwd: fx.root,
-    cols: 80,
+    cols,
     rows,
     terminal: pty,
     env: tmuxEnv(fx.root),
@@ -146,19 +151,32 @@ async function attachClient(fx: Fixture, rows = 20) {
   return pty;
 }
 
-function controllerFor(fx: Fixture, writeInput: (data: string) => void) {
+function controllerFor(
+  fx: Fixture,
+  writeInput: (data: string) => void,
+  paneSize = { cols: 80, rows: 20 },
+) {
   return new TerminalScrollController({
-    readState: () => fx.backend.readScrollState(fx.session),
-    scrollHistory: (direction, lines) =>
-      fx.backend.scrollHistory(fx.session, direction, lines),
-    scrollToPosition: (position) =>
-      fx.backend.scrollToPosition(fx.session, position),
-    exitScroll: () => fx.backend.exitScroll(fx.session),
+    readState: (signal) => fx.backend.readScrollState(fx.session, { signal }),
+    scrollHistory: (direction, lines, signal) =>
+      fx.backend.scrollHistory(fx.session, direction, lines, { signal }),
+    scrollToPosition: (position, signal) =>
+      fx.backend.scrollToPosition(fx.session, position, { signal }),
+    exitScroll: (signal) => fx.backend.exitScroll(fx.session, { signal }),
+    cancelScroll: (signal) => fx.backend.cancelScroll(fx.session, { signal }),
     writeInput,
-    paneSize: () => ({ cols: 80, rows: 20 }),
+    paneSize: () => paneSize,
     subscribers: () => [],
     isActive: () => true,
   });
+}
+
+function readLatin1(path: string): string {
+  try {
+    return readFileSync(path, "latin1");
+  } catch {
+    return "";
+  }
 }
 
 function topLine(fx: Fixture): string {
@@ -349,6 +367,149 @@ test.skipIf(!CAN_ATTACH)(
       (text) => text.includes("WORLD"),
     );
     expect(typed).toBe("HELLO WORLD\n");
+    expect((await fx.backend.readScrollState(fx.session))!.inMode).toBe(false);
+  },
+);
+
+test.skipIf(!CAN_ATTACH)(
+  "a legacy-mouse pane (?1000h, no 1006) gets tmux's own re-encoding of the SGR report, even at col 100",
+  async () => {
+    const fx = await startPane(
+      (root) =>
+        `stty raw -echo; printf '\\033[?1000h'; exec cat > ${root}/in.bin`,
+      20,
+      120,
+    );
+    // As in DeckTerm: tmux mouse off, the report is forwarded to the pane.
+    tmux(fx, ["set-option", "-g", "mouse", "off"]);
+    const out = join(fx.root, "in.bin");
+    const pty = await attachClient(fx, 20, 120);
+    await waitFor(
+      () => fx.backend.readScrollState(fx.session),
+      (s) => s?.mouseApp === true && s.mouseSgr === false,
+    );
+
+    const controller = controllerFor(fx, (data) => pty.write(data), {
+      cols: 120,
+      rows: 20,
+    });
+    await controller.handle({
+      type: "touch-scroll",
+      direction: "up",
+      lines: 2,
+      col: 100,
+      row: 6,
+    });
+    await controller.handle({
+      type: "touch-scroll",
+      direction: "down",
+      lines: 1,
+    });
+    // tmux: ESC [ M, 0x20+button, 0x21+x, 0x21+y (0-based x/y), raw bytes.
+    const legacy = (button: number, col: number, row: number) =>
+      `\x1b[M${String.fromCharCode(0x20 + button, 0x20 + col, 0x20 + row)}`;
+    const expected =
+      legacy(64, 100, 6).repeat(2) + legacy(65, 60, 10); // centre of 120x20
+    const received = await waitFor(
+      () => readLatin1(out),
+      (text) => text.length >= expected.length,
+    );
+    await Bun.sleep(100);
+    // Exactly the reports: no stray bytes from a mangled coordinate.
+    expect(readLatin1(out)).toBe(expected);
+    expect(received.charCodeAt(4)).toBe(0x84);
+  },
+);
+
+test.skipIf(!CAN_ATTACH)(
+  "server barrier: touch-socket typing after a touch scroll reaches the shell without any scroll-latest",
+  async () => {
+    const fx = await startPane(
+      (root) => `seq 1 300; exec cat > ${root}/typed.txt`,
+    );
+    const out = join(fx.root, "typed.txt");
+    const pty = await attachClient(fx);
+    await waitFor(
+      () => fx.backend.readScrollState(fx.session),
+      (s) => (s?.total ?? 0) >= 280,
+    );
+    const controller = controllerFor(fx, (data) => pty.write(data));
+    await controller.handle({
+      type: "touch-scroll",
+      direction: "up",
+      lines: 6,
+    });
+    expect(await fx.backend.readScrollState(fx.session)).toMatchObject({
+      inMode: true,
+      position: 6,
+    });
+
+    // The page still thinks it is at the bottom: no scroll-latest is sent.
+    // A terminal reply first: it must not leave copy-mode.
+    controller.input("\x1b[I", { scroll: true });
+    await Bun.sleep(50);
+    expect((await fx.backend.readScrollState(fx.session))!.inMode).toBe(true);
+    controller.input("HELLO", { scroll: true });
+    controller.input(" WORLD\r", { scroll: true });
+    const typed = await waitFor(
+      () => {
+        try {
+          return readFileSync(out, "utf8");
+        } catch {
+          return "";
+        }
+      },
+      (text) => text.includes("WORLD"),
+    );
+    expect(typed).toBe("HELLO WORLD\n");
+    expect((await fx.backend.readScrollState(fx.session))!.inMode).toBe(false);
+  },
+);
+
+function tmuxClientPids(fx: Fixture, verb: string): number[] {
+  const ps = Bun.spawnSync(["ps", "-eo", "pid=,args="], { stdout: "pipe" });
+  return new TextDecoder()
+    .decode(ps.stdout)
+    .split("\n")
+    .filter((line) => line.includes(fx.socket) && line.includes(verb))
+    .map((line) => Number(line.trim().split(/\s+/)[0]))
+    .filter((pid) => pid > 0 && pid !== fx.serverPid);
+}
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "hard timeout: a call to a wedged tmux server is killed, and a timed-out read stops the sequence",
+  async () => {
+    const fx = await startPane("seq 1 300; exec sleep 60", 20, 80, {
+      scrollCommandTimeoutMs: 300,
+    });
+    await waitFor(
+      () => fx.backend.readScrollState(fx.session),
+      (s) => (s?.total ?? 0) >= 280,
+    );
+    process.kill(fx.serverPid, "SIGSTOP");
+    try {
+      // The backend's own hard timeout, no caller signal.
+      let started = Date.now();
+      expect(await fx.backend.readScrollState(fx.session)).toBeNull();
+      expect(Date.now() - started).toBeLessThan(2_000);
+      expect(tmuxClientPids(fx, "display-message")).toEqual([]);
+
+      // The controller's deadline (abort signal) ends a scroll-to: its state
+      // read is killed and `copy-mode ; goto-line` is never sent.
+      const abort = new AbortController();
+      setTimeout(() => abort.abort(), 100);
+      started = Date.now();
+      expect(
+        await fx.backend.scrollToPosition(fx.session, 40, {
+          signal: abort.signal,
+        }),
+      ).toBe(false);
+      expect(Date.now() - started).toBeLessThan(1_000);
+      expect(tmuxClientPids(fx, fx.session)).toEqual([]);
+    } finally {
+      process.kill(fx.serverPid, "SIGCONT");
+    }
+    await Bun.sleep(100);
     expect((await fx.backend.readScrollState(fx.session))!.inMode).toBe(false);
   },
 );

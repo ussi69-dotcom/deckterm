@@ -16,6 +16,8 @@ export type RawTerminalBackendOptions = {
 
 export class RawTerminalBackend implements TerminalBackend {
   readonly mode = "raw" as const;
+  // No server-side history to read or position (see readScrollState).
+  readonly supportsScrollControl = false;
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly processes = new Map<string, Subprocess>();
@@ -133,6 +135,10 @@ export class RawTerminalBackend implements TerminalBackend {
   }
 
   async exitScroll(): Promise<boolean> {
+    return false;
+  }
+
+  async cancelScroll(): Promise<boolean> {
     return false;
   }
 
