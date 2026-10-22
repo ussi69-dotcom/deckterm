@@ -54,6 +54,8 @@ export const MAX_PANE_CELLS = 1000;
 // Per-terminal queue bounds: a slow or wedged tmux must not let one writer
 // pile up unbounded work or memory.
 export const MAX_QUEUED_SCROLL_OPS = 128;
+/** Time left (ms) under which a failed read counts as cut by the deadline. */
+const EXIT_DEADLINE_MARGIN_MS = 5;
 export const MAX_HELD_INPUT_BYTES = 256 * 1024;
 
 // A "terminal reply" is input the browser terminal generates by itself, not
@@ -774,7 +776,9 @@ export class TerminalScrollController {
         state = await read();
       }
       if (state && !state.inMode) return;
-      if (state === null && left() > 0) {
+      // A read cut off by the deadline also returns null; timers fire on
+      // whole milliseconds, so allow a margin before calling it unreadable.
+      if (state === null && left() > EXIT_DEADLINE_MARGIN_MS) {
         this.log(
           `pane state unreadable after leaving scrollback: writing ${this.heldInputAfterHead()} held input bytes unconfirmed`,
         );
@@ -862,7 +866,7 @@ export class TerminalScrollController {
     const controller = new AbortController();
     const timer = setTimeout(
       () => controller.abort(),
-      Math.max(0, Math.min(this.opTimeoutMs, timeoutMs)),
+      Math.max(0, Math.ceil(Math.min(this.opTimeoutMs, timeoutMs))),
     );
     (timer as any)?.unref?.();
     if (mutating) {
