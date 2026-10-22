@@ -232,7 +232,7 @@ Fix the open backlog finding with it or before it. That finding says shells inhe
 
 - **Running herdr instead of DeckTerm, or inside a DeckTerm pane.** It has no browser or phone client ("works on your phone without a mobile app or web dashboard … install any SSH client", `how-to-work.mdx:49`), and its `ctrl+b` prefix nests inside tmux's. Nothing found here reopens the first pass's decision.
 - **Herdr's workspace → tab → pane hierarchy.** DeckTerm's tabs already carry more state, and an extra level costs taps on a phone.
-- **A permanent left sidebar in the classic layout.** It takes width from the terminals. The summary chip, the Sessions window and the IDE "Agents" view cover the need.
+- ~~**A permanent left sidebar in the classic layout.**~~ Overruled by the owner on 2026-10-22: see "Owner decisions" below.
 - **The agent-control socket API.** It is unauthenticated same-user control of every pane. Task Runner covers the owner's orchestrated runs.
 - **Plugins and the marketplace.** They run unsandboxed, unreviewed code.
 - **The multi-machine view.** Both servers already push to the same phone, and cross-instance auth through Cloudflare Access is L-sized work.
@@ -240,6 +240,19 @@ Fix the open backlog finding with it or before it. That finding says shells inhe
 - **Herdr's sounds and OS toasts.** They play on the machine running the terminal client. DeckTerm already has push and in-page toasts.
 - **Saved scrollback (`pane_history`).** Herdr keeps it off by default because output can contain secrets. tmux already keeps scrollback while it runs.
 - **Hook-based state for Claude and Codex.** Herdr moved away from it (see "How the two detection mechanisms differ"), and it would need `~/myclaude` changes for less coverage.
+
+## Owner decisions (2026-10-22, after the review)
+
+The owner accepted the recommendations for implementation, with one change, verbatim: "jo IDE rezim nakonec moc nepouzivam, tak by ty funkce meli byt i v defaultnim view ale togglovatelny, defaultne zapnuty a resizovatelny tak jak to tu delame". In plain words: IDE mode is rarely used, so the features must also live in the default view, toggleable, on by default, and resizable the way DeckTerm already resizes panels.
+
+This replaces the earlier advice against a permanent left sidebar in the classic layout:
+
+- Desktop gets a left Agents panel in the default view. It is on by default, can be hidden, and is resized with an edge handle like the IDE sidebar's.
+- IDE mode reuses the same list.
+
+A second instruction changed the order, verbatim: "hlavne se ale zamer i na review a opravu soucasne verze. na mobilu je to porad dost nepouzitelne, porad mi oskakuje nekam focuc kdyz pisu naskakuje virtual keyboard, neda se v sessions scrollovat nahoru posuvnik se neda chytit, touch to scrol vubec nejde. zamer se i v jinych software nebo v tom herderu jak to maj resene, jestli bychom nemohli neco ptevzit a pak otestovat pro mobilni device i". In plain words: before the herdr features, review and fix the current version on phones, where focus jumps while typing and touch scrolling does not work, and learn from how other software handles it. The run therefore starts with a phone repair slice. herdr itself has no touch input: on a phone it runs inside an SSH app. Its one transferable idea is three-way routing of scroll input: its own scrollback, mouse reports to the app, or arrow keys for full-screen apps that do not use the mouse.
+
+The implementation run is specified in `docs/handoffs/2026-10-22-herdr-adoption-operator.md`.
 
 ## Sources
 
