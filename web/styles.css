@@ -10976,21 +10976,65 @@ body.ide-mode #file-explorer.ide-hosted .file-explorer-header {
   -webkit-user-select: none;
 }
 
+/* A faint rail along the handle's path, so the handle reads as a scrollbar
+   while the pane is scrolled back (the indicator is hidden otherwise). */
+.touch-scroll-track::before {
+  content: "";
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  bottom: 4px;
+  width: 4px;
+  border-radius: 2px;
+  background: var(--text-secondary);
+  opacity: 0.28;
+}
+
+/* The visible pill inside the 44px touch target: 8px wide, at least 36px
+   tall (handle min-height 44px minus the 4px insets), with grip lines. */
 .touch-scroll-thumb {
   position: absolute;
   top: 4px;
-  right: 4px;
+  right: 6px;
   bottom: 4px;
-  width: 6px;
-  border-radius: 3px;
+  width: 8px;
+  border-radius: 999px;
   background: var(--accent-blue);
-  opacity: 0.75;
-  box-shadow: 0 0 0 1px rgba(13, 17, 23, 0.6);
+  opacity: 0.9;
+  box-shadow:
+    0 0 0 1px rgba(13, 17, 23, 0.7),
+    0 2px 6px rgba(0, 0, 0, 0.45);
+  transition:
+    width 0.12s ease,
+    right 0.12s ease,
+    opacity 0.12s ease;
+}
+
+.touch-scroll-thumb::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 9px;
+  transform: translate(-50%, -50%);
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0.85) 0 1px,
+    transparent 1px 4px
+  );
 }
 
 .touch-scroll-handle.dragging .touch-scroll-thumb {
+  right: 5px;
   width: 10px;
   opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .touch-scroll-thumb {
+    transition: none;
+  }
 }
 
 .touch-scroll-latest {
