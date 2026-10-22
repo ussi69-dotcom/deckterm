@@ -1120,6 +1120,28 @@ test("applyAgentAttention keeps the seq and 2 s priority-window rules", () => {
   expect(applied.accepted!.seq).toBeGreaterThan(next.accepted!.seq);
 });
 
+test("applyAgentAttention: a screen-proven end of a prompt replaces needs-input inside the window", () => {
+  const blocked = applyAgentAttention(createAttentionTracker(), "needs-input", {
+    now: 10_000,
+    source: "screen",
+    rule: "live_blocked_form",
+  });
+  // Without the flag, done cannot replace needs-input within 2 s.
+  expect(
+    applyAgentAttention(blocked.tracker, "done", { now: 11_000, source: "screen" })
+      .accepted,
+  ).toBe(null);
+  // blocked -> idle proved by the screen: done is accepted with a larger seq.
+  const done = applyAgentAttention(blocked.tracker, "done", {
+    now: 11_000,
+    source: "screen",
+    rule: "live_prompt_box",
+    resolvesBlocked: true,
+  });
+  expect(done.accepted?.kind).toBe("done");
+  expect(done.accepted!.seq).toBeGreaterThan(blocked.accepted!.seq);
+});
+
 // --- projectRoot (Agents panel grouping, S2) --------------------------------
 
 function projectRootHarness(

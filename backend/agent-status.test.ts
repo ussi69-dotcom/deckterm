@@ -199,6 +199,15 @@ describe("immediate commits", () => {
     const toIdle = apply(toBlocked.record, NO_MATCH, 7_000);
     expect(toIdle.record.status).toBe("idle");
     expect(types(toIdle.effects)).toEqual(["nudge", "raise:done"]);
+    // The done that ends a blocked episode replaces its needs-input even
+    // inside the attention priority window; a done after working does not.
+    expect(toIdle.effects).toContainEqual(
+      expect.objectContaining({ kind: "done", resolvesBlocked: true }),
+    );
+    const afterWork = apply(toWorking.record, VISIBLE_IDLE, 8_000);
+    expect(afterWork.effects).not.toContainEqual(
+      expect.objectContaining({ resolvesBlocked: true }),
+    );
   });
 
   test("a new rule for the same status updates the rule only", () => {

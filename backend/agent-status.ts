@@ -51,6 +51,11 @@ export type AgentStatusEffect =
       kind: "needs-input" | "done";
       source: AgentStatusAttentionSource;
       rule: string;
+      /**
+       * The screen proved the earlier needs-input is over (blocked -> idle),
+       * so this done replaces it even inside the 2 s priority window.
+       */
+      resolvesBlocked?: boolean;
     }
   | { type: "push"; kind: "input" | "agent" }
   /** A committed change: tell the owner's opted-in pages to refetch. */
@@ -203,6 +208,7 @@ export function applyAgentStatusEvaluation(
         kind: "done",
         source: "screen",
         rule: result.ruleId,
+        ...(previous === "blocked" ? { resolvesBlocked: true } : {}),
       });
       if (next.turnWorkMs >= AGENT_DONE_PUSH_MIN_WORK_MS) {
         effects.push({ type: "push", kind: "agent" });

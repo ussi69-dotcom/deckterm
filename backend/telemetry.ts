@@ -1298,12 +1298,20 @@ export function applyAgentAttention(
     now = Date.now(),
     source,
     rule,
-  }: { now?: number; source: AttentionSource; rule?: string | null },
+    resolvesBlocked = false,
+  }: {
+    now?: number;
+    source: AttentionSource;
+    rule?: string | null;
+    /** A screen-proven end of the prompt: bypass the priority window. */
+    resolvesBlocked?: boolean;
+  },
 ): { tracker: AttentionTracker; accepted: TerminalAttention | null } {
   const withinWindow =
     tracker.lastAcceptedKind !== null &&
     now - tracker.lastAcceptedAt < ATTENTION_RATE_WINDOW_MS;
   if (
+    !resolvesBlocked &&
     withinWindow &&
     ATTENTION_PRIORITY[kind] <= ATTENTION_PRIORITY[tracker.lastAcceptedKind!]
   ) {

@@ -5776,6 +5776,7 @@ function runAgentStatusEffects(term: Terminal, effects: AgentStatusEffect[]) {
         now: Date.now(),
         source: effect.source,
         rule: effect.rule,
+        resolvesBlocked: effect.resolvesBlocked === true,
       });
       term.attention = applied.tracker;
     } else if (effect.type === "push") {
