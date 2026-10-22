@@ -334,6 +334,13 @@ if (!window.TerminalColors) {
   window.TerminalColors = TerminalColors;
 }
 
+// Input types that belong to an IME composition (see the touch fallback).
+const COMPOSITION_INPUT_TYPES = new Set([
+  "insertCompositionText",
+  "deleteCompositionText",
+  "insertFromComposition",
+]);
+
 const inputFallbackHelpers =
   window.InputFallback ||
   (() => {
@@ -14830,22 +14837,18 @@ class TerminalManager {
       if (dbg)
         dbg.textContent = `onData1: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
 
+      // xterm reads an emptied helper textarea as "" (see the touch
+      // fallback); there is nothing to forward.
+      if (!data) return;
+      // What xterm forwards claims the DOM event it came from (F17).
+      inputState.keystroke?.xtermData(data);
+
       if (inputState.pasteDepth > 0) {
-        inputState.lastOnDataAt = performance.now();
-        inputState.lastOnDataValue = data;
         ws.sendInput(data);
         return;
       }
 
-      const dedupedData = this.consumePendingFallbackEcho(inputState, data);
-      if (!dedupedData) {
-        if (dbg) dbg.textContent = "onData1: SKIP (fallback echo)";
-        return;
-      }
-
-      inputState.lastOnDataAt = performance.now();
-      inputState.lastOnDataValue = dedupedData;
-      const finalData = this.applyExtraKeyModifiers(dedupedData);
+      const finalData = this.applyExtraKeyModifiers(data);
       ws.sendInput(finalData);
     });
 
@@ -14976,59 +14979,10 @@ class TerminalManager {
 
   createInputState() {
     return {
-      lastOnDataAt: 0,
-      lastOnDataValue: "",
-      lastFallbackAt: 0,
-      lastFallbackData: "",
-      pendingFallbackEcho: "",
       pasteDepth: 0,
+      // Which path owns the current keystroke on touch layouts (F17).
+      keystroke: inputFallbackHelpers.createKeystrokeArbiter?.() || null,
     };
-  }
-
-  rememberFallbackEcho(inputState, data) {
-    if (!inputState || !data) return;
-
-    inputState.lastFallbackAt = performance.now();
-    inputState.lastFallbackData = data;
-    inputState.pendingFallbackEcho =
-      `${inputState.pendingFallbackEcho || ""}${data}`.slice(-256);
-  }
-
-  consumePendingFallbackEcho(inputState, data) {
-    if (!inputState || !data) return data;
-
-    let pending = inputState.pendingFallbackEcho || "";
-    let remainingData = data;
-
-    while (pending && remainingData) {
-      if (pending.startsWith(remainingData)) {
-        inputState.pendingFallbackEcho = pending.slice(remainingData.length);
-        return "";
-      }
-
-      if (remainingData.startsWith(pending)) {
-        remainingData = remainingData.slice(pending.length);
-        pending = "";
-        break;
-      }
-
-      let overlap = 0;
-      const limit = Math.min(pending.length, remainingData.length);
-      while (
-        overlap < limit &&
-        pending.charCodeAt(overlap) === remainingData.charCodeAt(overlap)
-      ) {
-        overlap += 1;
-      }
-
-      if (!overlap) break;
-
-      pending = pending.slice(overlap);
-      remainingData = remainingData.slice(overlap);
-    }
-
-    inputState.pendingFallbackEcho = pending;
-    return remainingData;
   }
 
   applyExtraKeyModifiers(data, options = {}) {
@@ -15126,8 +15080,10 @@ class TerminalManager {
     }
 
     let lastValue = textarea.value || "";
-    let lastCompositionCommitAt = 0;
-    let lastCompositionCommitData = "";
+    const keystroke = inputState?.keystroke || null;
+    // IME compositions are sent once, at commit; while composing, the text
+    // stays in the helper textarea and xterm's composition view shows it.
+    const composer = inputFallbackHelpers.createCompositionTracker?.() || null;
     const shouldUseFallback = () =>
       inputFallbackHelpers.shouldUseMobileInputFallback({
         isMobile: platformDetector.isMobile,
@@ -15137,13 +15093,19 @@ class TerminalManager {
         ),
       });
 
+    // The fallback always empties the helper textarea in the same event it
+    // sends from. xterm's own deferred readers (CompositionHelper after
+    // compositionend, the keyCode 229 diff) read the textarea on a zero
+    // timeout, so they find nothing and cannot send the text a second time.
+    const clearHelper = () => {
+      textarea.value = "";
+      lastValue = "";
+    };
+
     const sendCommittedData = (source, inputType, data, e) => {
       if (!data) {
         return false;
       }
-
-      // Track fallback-originated input so delayed xterm echoes can be skipped.
-      this.rememberFallbackEcho(inputState, data);
 
       const finalData = this.applyExtraKeyModifiers(data);
       ws.sendInput(finalData);
@@ -15162,10 +15124,7 @@ class TerminalManager {
         });
       }
 
-      textarea.value = "";
-      lastValue = "";
-      lastCompositionCommitAt = performance.now();
-      lastCompositionCommitData = data;
+      clearHelper();
       return true;
     };
 
@@ -15213,6 +15172,9 @@ class TerminalManager {
           data: e?.data,
         });
       }
+      // Did xterm's own input listener already forward this event's text?
+      // (Asked for every event, so the claim never outlives it.)
+      const forwardedByXterm = keystroke?.takeInputEcho() || false;
       // Hybrid touch desktops should ignore the fallback and let xterm own input.
       if (!shouldUseFallback()) {
         lastValue = textarea.value || "";
@@ -15221,25 +15183,33 @@ class TerminalManager {
       if (!e) {
         return;
       }
-      // DON'T skip isComposing! Mobile keyboards use composition for ALL input.
-      // We need to process each character immediately, not wait for composition end.
 
       const inputType = e.inputType || "";
-      if (inputType === "insertText") {
-        const recent = performance.now() - lastCompositionCommitAt < 50;
-        const sameData =
-          typeof e.data === "string" && e.data === lastCompositionCommitData;
-        if (recent && sameData) {
-          return;
-        }
+      const data = typeof e.data === "string" ? e.data : null;
+      if (inputType === "insertCompositionText") {
+        // Composing: nothing is sent until the commit.
+        composer?.update(data ?? "");
+        lastValue = textarea.value || "";
+        return;
       }
-      if (inputType === "insertText" && inputState) {
-        const recent = performance.now() - (inputState.lastOnDataAt || 0) < 30;
-        const sameData =
-          typeof e.data === "string" && e.data === inputState.lastOnDataValue;
-        if (recent && sameData) {
-          return;
-        }
+      if (inputType === "deleteCompositionText") {
+        lastValue = textarea.value || "";
+        return;
+      }
+      if (inputType === "insertFromComposition" && composer) {
+        // WebKit's commit, before or after compositionend: sent once.
+        sendCommittedData(
+          "insertFromComposition",
+          inputType,
+          composer.commitFromInput(data),
+          e,
+        );
+        clearHelper();
+        return;
+      }
+      if (forwardedByXterm) {
+        clearHelper();
+        return;
       }
       commitTextareaValue("input", e);
     };
@@ -15254,9 +15224,65 @@ class TerminalManager {
           value: textarea.value,
         });
       }
-      if (type === "end") {
-        commitTextareaValue("compositionend", e);
+      if (!shouldUseFallback()) return;
+      if (type === "start") {
+        composer?.start();
       }
+      if (type === "end") {
+        if (!composer) {
+          commitTextareaValue("compositionend", e);
+          return;
+        }
+        sendCommittedData("compositionend", "", composer.end(e?.data), e);
+        clearHelper();
+      }
+    };
+
+    // Keystroke bookkeeping for the arbiter. These listeners sit on the
+    // terminal element in the capture phase, so they run before xterm's own
+    // textarea listeners and before any stopPropagation of a handled key.
+    const keydownCapture = (e) => {
+      if (e.target !== textarea) return;
+      keystroke?.keydown();
+      if (!composer || !shouldUseFallback()) return;
+      // A real key (not an IME key, not a lone modifier) ends a composition:
+      // commit its text here and empty the textarea before xterm's
+      // CompositionHelper would send the same text from it. IME keys
+      // (229 / isComposing) leave the composition and its confirmation alone.
+      const wasActive = composer.active;
+      const committed = composer.keydown({
+        keyCode: e.keyCode,
+        isComposing: e.isComposing,
+      });
+      if (wasActive && !composer.active) {
+        sendCommittedData("keydown", "", committed, e);
+        clearHelper();
+      }
+    };
+    const keypressCapture = (e) => {
+      if (e.target === textarea) keystroke?.keypress();
+    };
+    // Runs before xterm's own input listener, which forwards an uncancelled
+    // insertText by itself (after a keyup).
+    const inputCapture = (e) => {
+      if (e.target !== textarea) return;
+      keystroke?.inputEvent();
+      if (!composer || !shouldUseFallback()) return;
+      const inputType = e.inputType || "";
+      if (COMPOSITION_INPUT_TYPES.has(inputType)) return;
+      if (inputType === "insertText" && !e.isComposing) {
+        // A browser repeating the composition it just committed, with no
+        // (or a non-cancelable) beforeinput: stop it before xterm sends it.
+        if (composer.confirmText(typeof e.data === "string" ? e.data : "")) {
+          e.stopPropagation();
+          clearHelper();
+        }
+        return;
+      }
+      composer.edit();
+    };
+    const keyupCapture = (e) => {
+      if (e.target === textarea) keystroke?.keyup();
     };
 
     const beforeInputHandler = (e) => {
@@ -15274,8 +15300,10 @@ class TerminalManager {
       }
 
       const inputType = e.inputType || "";
-      if (inputType !== "insertText" && inputType !== "insertReplacementText") {
-        return;
+      if (inputType !== "insertText") {
+        // Any edit other than a confirmation closes the confirmation window.
+        if (!COMPOSITION_INPUT_TYPES.has(inputType)) composer?.edit();
+        if (inputType !== "insertReplacementText") return;
       }
 
       const data = typeof e.data === "string" ? e.data : "";
@@ -15283,7 +15311,29 @@ class TerminalManager {
         return;
       }
 
+      // Plain text while a composition is still marked active: it ended
+      // without compositionend (the text it carries is sent below).
+      if (composer?.active) composer.abandon();
+
+      // A browser repeating the composition it just committed. If this
+      // beforeinput cannot be cancelled, the input event that follows is the
+      // confirmation and inputCapture stops it before xterm sends it.
+      if (inputType === "insertText" && composer?.matchesConfirmation(data)) {
+        if (e.cancelable) {
+          e.preventDefault();
+          composer.confirmText(data);
+        }
+        return;
+      }
+      if (inputType === "insertText") composer?.confirmText(data);
+
       e.preventDefault();
+      // xterm already sent this keystroke from its keypress handler (A-Z,
+      // space and keys with keyCode < 48 on a hardware keyboard or a soft
+      // keyboard that reports key codes): cancel the insertion, send nothing.
+      if (inputType === "insertText" && keystroke?.takeKeypressEcho()) {
+        return;
+      }
       sendCommittedData("beforeinput", inputType, data, e);
     };
 
@@ -15304,6 +15354,10 @@ class TerminalManager {
     );
     textarea.addEventListener("compositionend", compositionEndHandler, true);
     textarea.addEventListener("beforeinput", beforeInputHandler, true);
+    element.addEventListener("keydown", keydownCapture, true);
+    element.addEventListener("keypress", keypressCapture, true);
+    element.addEventListener("keyup", keyupCapture, true);
+    element.addEventListener("input", inputCapture, true);
 
     return () => {
       textarea.removeEventListener("input", handler, true);
@@ -15323,6 +15377,10 @@ class TerminalManager {
         true,
       );
       textarea.removeEventListener("beforeinput", beforeInputHandler, true);
+      element.removeEventListener("keydown", keydownCapture, true);
+      element.removeEventListener("keypress", keypressCapture, true);
+      element.removeEventListener("keyup", keyupCapture, true);
+      element.removeEventListener("input", inputCapture, true);
     };
   }
 
@@ -16796,26 +16854,20 @@ class TerminalManager {
           debugEl.textContent = `onData: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
         }
 
+        // xterm reads an emptied helper textarea as "" (see the touch
+        // fallback); there is nothing to forward.
+        if (!data) return;
+        // What xterm forwards claims the DOM event it came from (F17).
+        inputState.keystroke?.xtermData(data);
+
         if (inputState.pasteDepth > 0) {
-          inputState.lastOnDataAt = performance.now();
-          inputState.lastOnDataValue = data;
           ws.sendInput(data);
           return;
         }
 
-        const dedupedData = this.consumePendingFallbackEcho(inputState, data);
-        if (!dedupedData) {
-          if (debugEl) {
-            debugEl.textContent = "onData: SKIP (fallback echo)";
-          }
-          return;
-        }
-
         const mods = this.extraKeys?.modifiers;
-        dbg("[ExtraKeys] onData:", JSON.stringify(dedupedData), "mods:", mods);
-        inputState.lastOnDataAt = performance.now();
-        inputState.lastOnDataValue = dedupedData;
-        const finalData = this.applyExtraKeyModifiers(dedupedData, {
+        dbg("[ExtraKeys] onData:", JSON.stringify(data), "mods:", mods);
+        const finalData = this.applyExtraKeyModifiers(data, {
           log: true,
         });
         ws.sendInput(finalData);

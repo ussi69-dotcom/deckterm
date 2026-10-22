@@ -237,6 +237,13 @@ for (const device of [
       const handleBox = (await handle(page).boundingBox()) as Box;
       expect(handleBox.width).toBeGreaterThanOrEqual(44);
       expect(handleBox.height).toBeGreaterThanOrEqual(44);
+      // The visible thumb is a clear pill, not a hairline.
+      const thumbBox = (await handle(page)
+        .locator(".touch-scroll-thumb")
+        .boundingBox()) as Box;
+      expect(thumbBox.width).toBeGreaterThanOrEqual(8);
+      expect(thumbBox.width).toBeLessThanOrEqual(10);
+      expect(thumbBox.height).toBeGreaterThanOrEqual(36);
       const pillBox = (await latestPill(page).boundingBox()) as Box;
       expect(pillBox.height).toBeGreaterThanOrEqual(44);
 
