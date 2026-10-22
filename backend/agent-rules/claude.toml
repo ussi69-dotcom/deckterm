@@ -20,6 +20,23 @@
 #      (including the wrap) between them; same priority, so live_blocked_form
 #      still wins whenever it matches. Fixture:
 #      backend/fixtures/agent-screens/claude-2.1.308-blocked-question-form-phone.txt
+#   3. Linear-time rewrites. herdr matches with the Rust regex crate (linear
+#      time); JavaScript backtracks, and these upstream fragments backtracked
+#      super-linearly on adversarial pane text. Each rewrite matches exactly
+#      the same strings (backend/agent-screen-perf.test.ts compares them with
+#      the upstream text on generated input). Re-apply after every re-sync:
+#      - background_mcp_task_working: `(?:\n[ \t]+[^\n]*?){0,3}` became
+#        `(?:\n[ \t][^\n]*?){0,3}` (the indent could be split between the
+#        two quantifiers in many ways on each of the three lines).
+#      - live_blocked_form_named_session: `─{3,}[^\n]*` became `─{3}[^\n]*`,
+#        and the task rows `[◻◼✔][ \t]+[^\n]+` became `[◻◼✔][ \t][^\n]+`
+#        (exponential in the number of rows).
+#      - mcp_elicitation_prompt, bash_permission_prompt and
+#        generic_permission_prompt: `\s*❯?\s*` (also written `\x{276F}?`)
+#        became `\s*(?:❯\s*)?` (quadratic in leading whitespace).
+#      - legacy_no_prompt_blocker: `(?m)^\s*❯\s*$` became
+#        `(?m)^[^\S\n]*❯[^\S\n]*$` (`\s` crossed line breaks, so every line
+#        start re-scanned all following blank lines).
 
 id = "claude"
 version = "2026.10.11.1"
@@ -63,7 +80,7 @@ region = "bottom_non_empty_lines(12)"
 visible_working = true
 # Claude renders activity summaries at column zero; wrapped continuations are indented.
 # Keeping that shape prevents user prompt text from impersonating this signal.
-regex = ['(?m)^[\x{002A}\x{00B7}\x{2722}\x{2736}\x{273B}\x{273D}][ \t]+\S[^\n]*?(?:\n[ \t]+[^\n]*?){0,3}·(?:[ \t]+|\n[ \t]*)[1-9]\d*(?:[ \t]+|\n[ \t]*)MCP(?:[ \t]+|\n[ \t]*)tasks?(?:[ \t]+|\n[ \t]*)still(?:[ \t]+|\n[ \t]*)running[ \t]*$']
+regex = ['(?m)^[\x{002A}\x{00B7}\x{2722}\x{2736}\x{273B}\x{273D}][ \t]+\S[^\n]*?(?:\n[ \t][^\n]*?){0,3}·(?:[ \t]+|\n[ \t]*)[1-9]\d*(?:[ \t]+|\n[ \t]*)MCP(?:[ \t]+|\n[ \t]*)tasks?(?:[ \t]+|\n[ \t]*)still(?:[ \t]+|\n[ \t]*)running[ \t]*$']
 not = [
   { contains = ["do you want to proceed?"] },
   { contains = ["esc to cancel"] },
@@ -142,7 +159,7 @@ visible_blocker = true
 # Bind every control to the same footer, allowing wrapping between words.
 # After the name divider, accept only a counted task panel with marked rows
 # and optional pending overflow. Free-form activity can be newer output (#4573).
-regex = ['(?i)(?:^|\n)[ \t]*enter\s+to\s+(?:confirm|select\s+·\s+(?:(?:tab/arrow|arrow)\s+keys|arrows|↑/↓|↑↓)\s+to\s+navigate)\s+·\s+esc\s+to\s+cancel[ \t]*\n(?:[ \t]*\n)*[ \t]*─{3,}[^\n]*(?:\n(?:[ \t]*\n)*[ \t]+\d+ tasks? \(\d+ done, (?:\d+ in progress, )?\d+ open\)(?:\n[ \t]+[◻◼✔][ \t]+[^\n]+)+(?:\n[ \t]+…[ \t]+\+\d+[ \t]+pending)?)?(?:\n[ \t]*)*\z']
+regex = ['(?i)(?:^|\n)[ \t]*enter\s+to\s+(?:confirm|select\s+·\s+(?:(?:tab/arrow|arrow)\s+keys|arrows|↑/↓|↑↓)\s+to\s+navigate)\s+·\s+esc\s+to\s+cancel[ \t]*\n(?:[ \t]*\n)*[ \t]*─{3}[^\n]*(?:\n(?:[ \t]*\n)*[ \t]+\d+ tasks? \(\d+ done, (?:\d+ in progress, )?\d+ open\)(?:\n[ \t]+[◻◼✔][ \t][^\n]+)+(?:\n[ \t]+…[ \t]+\+\d+[ \t]+pending)?)?(?:\n[ \t]*)*\z']
 
 [[rules]]
 id = "dynamic_workflow_prompt"
@@ -166,8 +183,8 @@ contains = ["esc to cancel"]
 line_regex = ['(?i)^\s*MCP server ["\x{201C}].+["\x{201D}] requests your input\s*$']
 all = [
   { any = [
-    { line_regex = ['^\s*\x{276F}?\s*Accept\b'] },
-    { line_regex = ['^\s*\x{276F}?\s*Decline\b'] },
+    { line_regex = ['^\s*(?:\x{276F}\s*)?Accept\b'] },
+    { line_regex = ['^\s*(?:\x{276F}\s*)?Decline\b'] },
   ] },
 ]
 
@@ -220,11 +237,11 @@ any = [
 # rule, not the narrower generic_permission_prompt, claims Bash approvals.
 all = [
   { any = [
-    { line_regex = ['(?i)^\s*❯?\s*yes\b'] },
-    { line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*❯?\s*2\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*❯?\s*2\.\s*no\b'] },
-    { line_regex = ['(?i)^\s*❯?\s*3\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?yes\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?1\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?2\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?2\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?3\.\s*no\b'] },
   ] },
 ]
 
@@ -237,7 +254,7 @@ visible_blocker = true
 contains = ["do you want to proceed?", "esc to cancel"]
 all = [
   { any = [
-    { line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*(?:❯\s*)?1\.\s*yes\b'] },
     { line_regex = ['(?i)^\s*2\.\s*yes\b'] },
     { line_regex = ['(?i)^\s*2\.\s*no\b'] },
     { line_regex = ['(?i)^\s*3\.\s*no\b'] },
@@ -261,7 +278,7 @@ any = [
   { contains = ["skip interview and plan immediately"] },
 ]
 not = [
-  { regex = ['(?m)^\s*❯\s*$'] },
+  { regex = ['(?m)^[^\S\n]*❯[^\S\n]*$'] },
 ]
 
 [[rules]]

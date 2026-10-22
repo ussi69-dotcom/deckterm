@@ -7,10 +7,11 @@
 import {
   test,
   expect,
+  getVisibleXterm,
+  readActiveTerminalText,
   resetAppState,
   waitForTerminal,
 } from "./fixtures";
-import type { Page } from "@playwright/test";
 import { mkdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -29,6 +30,15 @@ const QUESTION_FORM = path.join(
   "claude-2.1.308-blocked-question-form.txt",
 );
 const IDLE_PROMPT = path.join(FIXTURE_DIR, "claude-2.1.308-idle-prompt.txt");
+
+type Page = Parameters<typeof waitForTerminal>[0];
+
+// Worst case from a printed screen to a committed status: the 3 s start
+// grace, up to one 2 s pump tick, the capture (up to 3 s on a busy tmux), one
+// more tick if that capture failed, and the poll. Generous on purpose: the
+// dev host is shared.
+const STATUS_TIMEOUT_MS = 20_000;
+const POLL = { intervals: [250, 500, 1_000] };
 
 async function acquireServerLock(timeoutMs = 30000) {
   const startedAt = Date.now();
@@ -74,13 +84,20 @@ async function terminalRow(page: Page, id: string): Promise<AgentRow | null> {
   return rows.find((row) => row.id === id) ?? null;
 }
 
-async function sendTerminalInput(page: Page, data: string) {
-  await page.evaluate((input) => {
-    // @ts-ignore
-    const tm = window.terminalManager;
-    const active = tm?.terminals?.get(tm.activeId);
-    active?.ws?.send(JSON.stringify({ type: "input", data: input }));
-  }, data);
+// Types into the visible terminal like a user.
+async function typeLine(page: Page, line: string) {
+  await (await getVisibleXterm(page)).click();
+  await page.keyboard.type(line);
+  await page.keyboard.press("Enter");
+}
+
+async function waitForScreenText(page: Page, text: string) {
+  await expect
+    .poll(() => readActiveTerminalText(page), {
+      timeout: STATUS_TIMEOUT_MS,
+      ...POLL,
+    })
+    .toContain(text);
 }
 
 // Prints a fixture's capture (everything after the second `---` line).
@@ -101,6 +118,7 @@ test.describe("Screen-rule agent status", () => {
   test("a Claude question form reads blocked, then a prompt box reads idle with done", async ({
     page,
   }) => {
+    test.setTimeout(120_000);
     await page.goto(BASE_URL);
     await waitForTerminal(page);
     const id = await activeTerminalId(page);
@@ -111,6 +129,8 @@ test.describe("Screen-rule agent status", () => {
     );
     expect(initial?.agentStatus ?? null).toBe(null);
 
+    // `sleep 1`: the agent marker and the screen arrive in different pipe
+    // reads, as with a real agent (it is in the shell, not in the test).
     const command = [
       "clear",
       "printf '\\033]9;9;deckterm;agent;claude;start\\a'",
@@ -121,9 +141,10 @@ test.describe("Screen-rule agent status", () => {
       printFixture(IDLE_PROMPT),
       "sleep 300",
     ].join("; ");
-    await sendTerminalInput(page, `${command}\r`);
+    await typeLine(page, command);
+    // The form is on screen before the status clock starts.
+    await waitForScreenText(page, "Enter to select · ↑/↓ to navigate");
 
-    // Start grace (3 s) plus at most one 2 s pump tick.
     await expect
       .poll(
         async () => {
@@ -134,7 +155,7 @@ test.describe("Screen-rule agent status", () => {
             agentStatusRule: row?.agentStatusRule ?? null,
           };
         },
-        { timeout: 6_000, intervals: [250] },
+        { timeout: STATUS_TIMEOUT_MS, ...POLL },
       )
       .toEqual({
         agentName: "claude",
@@ -150,7 +171,8 @@ test.describe("Screen-rule agent status", () => {
     });
 
     // Answer the fake form: the prompt box replaces it.
-    await sendTerminalInput(page, "go\r");
+    await typeLine(page, "go");
+    await waitForScreenText(page, "manual mode on");
     await expect
       .poll(
         async () => {
@@ -160,7 +182,7 @@ test.describe("Screen-rule agent status", () => {
             attentionKind: row?.attention?.kind ?? null,
           };
         },
-        { timeout: 6_000, intervals: [250] },
+        { timeout: STATUS_TIMEOUT_MS, ...POLL },
       )
       .toEqual({ agentStatus: "idle", attentionKind: "done" });
     const idle = await terminalRow(page, id);
@@ -168,10 +190,12 @@ test.describe("Screen-rule agent status", () => {
     expect(idle?.attention?.source).toBe("screen");
 
     // End the fake agent: the status clears with it.
-    await sendTerminalInput(page, "\u0003");
+    await (await getVisibleXterm(page)).click();
+    await page.keyboard.press("Control+C");
     await expect
       .poll(async () => (await terminalRow(page, id))?.agentStatus ?? null, {
-        timeout: 8_000,
+        timeout: STATUS_TIMEOUT_MS,
+        ...POLL,
       })
       .toBe(null);
   });
