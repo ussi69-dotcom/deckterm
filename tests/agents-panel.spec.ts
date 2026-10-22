@@ -106,13 +106,16 @@ async function activeCols(page: Page): Promise<number> {
   return rows.find((row) => row.id === id)?.cols ?? 0;
 }
 
-// Resolves once the page has saved `key` to the actor's settings, so a
-// following reload reads the new value.
+// Resolves once the server has answered a successful PUT /api/settings that
+// carries `key`, so a following reload reads the new value. (Waiting for the
+// request alone races the write.)
 function settingSaved(page: Page, key: string) {
-  return page.waitForRequest(
-    (request) => {
+  return page.waitForResponse(
+    (response) => {
+      const request = response.request();
       if (request.method() !== "PUT") return false;
-      if (new URL(request.url()).pathname !== "/api/settings") return false;
+      if (new URL(response.url()).pathname !== "/api/settings") return false;
+      if (!response.ok()) return false;
       const body = request.postDataJSON() as {
         settings?: Record<string, unknown>;
       } | null;
@@ -314,11 +317,16 @@ test.describe("Agents panel (desktop default view)", () => {
       .toBe("1");
 
     // ... page A opens it ...
-    const seenPut = page.waitForRequest(
-      (request) =>
-        request.method() === "PUT" &&
-        new URL(request.url()).pathname === "/api/settings" &&
-        Boolean(request.postDataJSON()?.settings?.["attention.seen"]?.[doneId]),
+    const seenPut = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname === "/api/settings" &&
+        response.ok() &&
+        Boolean(
+          response.request().postDataJSON()?.settings?.["attention.seen"]?.[
+            doneId
+          ],
+        ),
       { timeout: 20_000 },
     );
     await page.bringToFront();
@@ -403,11 +411,17 @@ test.describe("Agents panel (desktop default view)", () => {
     }
     const ideRows = page.locator(".agents-ide-view [data-agent-session-id]");
     await expect(ideRows.first()).toBeVisible();
-    expect(
-      await ideRows.evaluateAll((rows) =>
-        rows.map((row) => (row as HTMLElement).dataset.agentSessionId),
-      ),
-    ).toEqual(panelRows);
+    // The same sessions. Plain shell rows tie on tier and order by recent
+    // activity, which can move between the two reads, so compare the sets.
+    await expect
+      .poll(async () =>
+        (
+          await ideRows.evaluateAll((rows) =>
+            rows.map((row) => (row as HTMLElement).dataset.agentSessionId),
+          )
+        ).sort(),
+      )
+      .toEqual([...panelRows].sort());
     await expect(page.locator(".agents-ide-view .agents-summary")).toBeVisible();
 
     await page.click("#ide-toggle-btn");
@@ -415,5 +429,139 @@ test.describe("Agents panel (desktop default view)", () => {
       () => !document.body.classList.contains("ide-mode"),
     );
     await expect(panel(page)).toBeVisible();
+  });
+  test("a refresh keeps keyboard focus on the same row and on Next; an unchanged model leaves the DOM alone", async ({
+    page,
+  }) => {
+    await createTerminal(page);
+    const [firstId] = await terminalIds(page);
+    // Freeze the live catalog so only this test's re-renders happen.
+    await page.evaluate(() => {
+      // @ts-ignore
+      const tm = window.terminalManager;
+      clearInterval(tm.telemetryRefreshInterval);
+      tm.queueTelemetryRefresh = () => {};
+    });
+    const row = page.locator(
+      `#agents-panel [data-agent-session-id="${firstId}"]`,
+    );
+    await expect(row).toBeVisible();
+    await row.focus();
+
+    // An unchanged model: same node, still focused.
+    const sameNode = await page.evaluate((id) => {
+      // @ts-ignore
+      const tm = window.terminalManager;
+      const sel = `#agents-panel [data-agent-session-id="${id}"]`;
+      const before = document.querySelector(sel);
+      tm.renderAgentsOverview();
+      return document.querySelector(sel) === before;
+    }, firstId);
+    expect(sameNode).toBe(true);
+    await expect(row).toBeFocused();
+
+    // A changed model (an agent asks for input elsewhere): the list is
+    // rebuilt and reordered, and focus comes back to the same session's row.
+    const fakeId = "00000000-0000-4000-8000-0000000000f1";
+    const rebuilt = await page.evaluate(
+      ({ id, fakeId }) => {
+        // @ts-ignore
+        const tm = window.terminalManager;
+        const sel = `#agents-panel [data-agent-session-id="${id}"]`;
+        const before = document.querySelector(sel);
+        tm._sessionCatalog = [
+          ...(tm._sessionCatalog || []),
+          {
+            id: fakeId,
+            status: "active",
+            sessionStatus: "active",
+            agentName: "claude",
+            agentStatus: "blocked",
+            cwd: "/tmp/agents-focus",
+          },
+        ];
+        tm.renderAgentsOverview();
+        return document.querySelector(sel) !== before;
+      },
+      { id: firstId, fakeId },
+    );
+    expect(rebuilt).toBe(true);
+    await expect(
+      page.locator(`#agents-panel [data-agent-session-id="${fakeId}"]`),
+    ).toHaveAttribute("data-tier", "0");
+    await expect(row).toBeFocused();
+
+    // Next keeps focus across a status change too.
+    const next = page.locator("#agents-panel [data-agents-next]");
+    await expect(next).toBeEnabled();
+    await next.focus();
+    await page.evaluate((fakeId) => {
+      // @ts-ignore
+      const tm = window.terminalManager;
+      tm._sessionCatalog = tm._sessionCatalog.map((s: any) =>
+        s.id === fakeId ? { ...s, cwd: "/tmp/agents-focus-2" } : s,
+      );
+      tm.renderAgentsOverview();
+    }, fakeId);
+    await expect(
+      page.locator(
+        '#agents-panel .agents-group[data-group-key="/tmp/agents-focus-2"]',
+      ),
+    ).toHaveCount(1);
+    await expect(next).toBeFocused();
+  });
+
+  test("fullscreen hides the panel; the toggle is a no-op there and the choice comes back on exit", async ({
+    page,
+  }) => {
+    const anyButton = page.locator('[data-action="agents"]').first();
+    await expect(panel(page)).toBeVisible();
+    await expect(anyButton).toHaveAttribute("aria-pressed", "true");
+    let puts = 0;
+    page.on("request", (request) => {
+      if (
+        request.method() === "PUT" &&
+        new URL(request.url()).pathname === "/api/settings" &&
+        Object.prototype.hasOwnProperty.call(
+          request.postDataJSON()?.settings || {},
+          "agents.panelVisible",
+        )
+      ) {
+        puts += 1;
+      }
+    });
+
+    await page.evaluate(() => {
+      // @ts-ignore
+      window.terminalManager.toggleFullscreen();
+    });
+    await expect(panel(page)).toBeHidden();
+    await expect(sash(page)).toBeHidden();
+    await expect(anyButton).toHaveAttribute("aria-pressed", "false");
+
+    // The shortcut and the action change nothing while fullscreen.
+    await page.locator(".tile.active .xterm").first().click();
+    await page.keyboard.press("Control+Shift+L");
+    await page.evaluate(() => {
+      // @ts-ignore
+      window.terminalManager.toggleAgentsPanel();
+    });
+    await expect(panel(page)).toBeHidden();
+    await expect(page.locator("#sessions-panel")).toBeHidden();
+    expect(
+      await page.evaluate(() =>
+        // @ts-ignore
+        window.terminalManager.settingsStore.get("agents.panelVisible", true),
+      ),
+    ).not.toBe(false);
+
+    await page.evaluate(() => {
+      // @ts-ignore
+      window.terminalManager.toggleFullscreen();
+    });
+    await expect(panel(page)).toBeVisible();
+    await expect(sash(page)).toBeVisible();
+    await expect(toolbarButton(page)).toHaveAttribute("aria-pressed", "true");
+    expect(puts).toBe(0);
   });
 });

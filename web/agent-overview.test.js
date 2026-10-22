@@ -21,6 +21,9 @@ import {
   mergeSeenMaps,
   sessionIdFromDeepLink,
   renderAgentListHtml,
+  showSummaryChip,
+  focusKeyOf,
+  pickFocusIndex,
 } from "./agent-overview";
 
 const att = (kind, seq) => ({ kind, seq, at: seq, title: "", body: "" });
@@ -398,4 +401,88 @@ test("renderAgentListHtml: counts, Next, groups and escaped rows", () => {
   const none = renderAgentListHtml([agent("w", { agentStatus: "working" })], {});
   expect(none).toContain("data-agents-next disabled");
   expect(none).toContain('title="Nothing needs you"');
+});
+
+describe("showSummaryChip (phone)", () => {
+  test("shown while an agent runs, hidden with nothing to say", () => {
+    expect(showSummaryChip({ agents: 1, needsYou: 0, done: 0 })).toBe(true);
+    expect(showSummaryChip({ agents: 0, needsYou: 0, done: 0 })).toBe(false);
+    expect(showSummaryChip(null)).toBe(false);
+  });
+
+  test("an unseen done or needs-input of a session without an agent shows it", () => {
+    // A plain shell whose command finished: listed in the Sessions sheet as
+    // done, so the chip must not hide it.
+    const shellDone = live({
+      id: "s",
+      cwd: "/w",
+      attention: att("done", 4),
+    });
+    const counts = summaryCounts([shellDone], {});
+    expect(counts.agents).toBe(0);
+    expect(counts.done).toBe(1);
+    expect(showSummaryChip(counts)).toBe(true);
+
+    const shellAsks = live({
+      id: "q",
+      cwd: "/w",
+      attention: att("needs-input", 2),
+    });
+    const asks = summaryCounts([shellAsks], {});
+    expect(asks.needsYou).toBe(1);
+    expect(showSummaryChip(asks)).toBe(true);
+    // Seen: nothing left to say.
+    expect(showSummaryChip(summaryCounts([shellAsks], { q: 2 }))).toBe(false);
+  });
+});
+
+describe("focus keeping across a re-render", () => {
+  test("a key is the data-* attributes without the tier", () => {
+    expect(focusKeyOf({ agentSessionId: "a", tier: "0" })).toBe(
+      "agentSessionId=a",
+    );
+    expect(focusKeyOf({ agentSessionId: "a", tier: "2" })).toBe(
+      focusKeyOf({ tier: "0", agentSessionId: "a" }),
+    );
+    expect(focusKeyOf({ agentsNext: "" })).toBe("agentsNext=");
+    // Row and an action button of the same session differ by role.
+    expect(focusKeyOf({ agentSessionId: "a" })).not.toBe(
+      focusKeyOf({ agentSessionId: "a", agentAction: "resume" }),
+    );
+    expect(focusKeyOf({})).toBeNull();
+    expect(focusKeyOf(null)).toBeNull();
+  });
+
+  test("the same session and role keeps focus when rows reorder", () => {
+    const before = ["agentsNext=", "agentSessionId=a", "agentSessionId=b"];
+    const after = ["agentsNext=", "agentSessionId=b", "agentSessionId=a"];
+    expect(pickFocusIndex(before, "agentSessionId=a", after)).toBe(2);
+    expect(pickFocusIndex(before, "agentsNext=", after)).toBe(0);
+  });
+
+  test("a removed element hands focus to the one at its old position", () => {
+    const before = ["agentsNext=", "agentSessionId=a", "agentSessionId=b"];
+    expect(
+      pickFocusIndex(before, "agentSessionId=a", ["agentsNext=", "agentSessionId=b"]),
+    ).toBe(1);
+    // The last one removed: clamped to the new end.
+    expect(
+      pickFocusIndex(before, "agentSessionId=b", ["agentsNext=", "agentSessionId=a"]),
+    ).toBe(1);
+  });
+
+  test("nothing to restore", () => {
+    expect(pickFocusIndex(["x"], null, ["x"])).toBe(-1);
+    expect(pickFocusIndex(["x"], "x", [])).toBe(-1);
+    expect(pickFocusIndex([], "gone", ["y"])).toBe(-1);
+  });
+
+  test("rendered rows and Next carry stable keys", () => {
+    const sessions = [agent("a", { agentStatus: "blocked" })];
+    const html = renderAgentListHtml(sessions, {});
+    expect(html).toContain('data-agent-session-id="a"');
+    expect(html).toContain("data-agents-next");
+    // The same model renders the same HTML (the app skips the DOM write).
+    expect(renderAgentListHtml(sessions, {})).toBe(html);
+  });
 });

@@ -13510,12 +13510,15 @@ class TerminalManager {
     );
   }
 
+  // Fullscreen hides the panel too: not eligible there, so the panel state,
+  // the toolbar's aria-pressed and the terminal width follow reality.
   isAgentsPanelEligible() {
     return (
       !platformDetector.isMobile &&
       window.innerWidth >= 768 &&
       !document.body.classList.contains("ide-mode") &&
-      !document.body.classList.contains("chrome-mobile")
+      !document.body.classList.contains("chrome-mobile") &&
+      !document.body.classList.contains("fullscreen")
     );
   }
 
@@ -13586,6 +13589,9 @@ class TerminalManager {
   // view. Phones and narrow windows (no panel there): the sorted Sessions
   // sheet.
   toggleAgentsPanel() {
+    // Fullscreen hides the panel: a toggle there would flip the saved setting
+    // with nothing on screen, so it does nothing.
+    if (document.body.classList.contains("fullscreen")) return;
     if (this.isIdeModeActive?.() && this.ideShell) {
       this.ideShell.onActivityClick?.("agents");
       this.syncSurfaceButtonState();
@@ -13631,9 +13637,12 @@ class TerminalManager {
     if (targets.length) {
       const html = overview.renderAgentListHtml(sessions, seen, listOptions);
       for (const el of targets) {
+        // Unchanged model, unchanged DOM. The row age is minute-grained
+        // ("just now", "3 min ago"), so it changes the HTML at most once a
+        // minute per row.
         if (this.agentsRenderedHtml.get(el) === html) continue;
         this.agentsRenderedHtml.set(el, html);
-        el.innerHTML = html;
+        this.replaceAgentsListHtml(el, html);
       }
     }
 
@@ -13645,7 +13654,7 @@ class TerminalManager {
       const showChip =
         platformDetector.isMobile &&
         this.readAgentsChipSetting() &&
-        counts.agents > 0;
+        overview.showSummaryChip(counts);
       chip.hidden = !showChip;
       if (showChip) {
         const phone = overview.summaryText(counts, "phone");
@@ -13674,6 +13683,37 @@ class TerminalManager {
         );
       }
     }
+  }
+
+  // Rebuild an Agents list (panel or IDE view) and keep keyboard focus: when
+  // focus was on a button inside it, the button with the same key (same
+  // session and role) gets it back, else the one now at its old position.
+  agentsListFocusables(el) {
+    return Array.from(
+      el.querySelectorAll("button:not([disabled]), a[href], [tabindex]"),
+    );
+  }
+
+  replaceAgentsListHtml(el, html) {
+    const overview = window.AgentOverview;
+    const focused = document.activeElement;
+    const hadFocus =
+      focused && focused !== el && el.contains(focused) && overview?.focusKeyOf;
+    const previousKeys = hadFocus
+      ? this.agentsListFocusables(el).map((node) =>
+          overview.focusKeyOf(node.dataset),
+        )
+      : null;
+    const previousKey = hadFocus ? overview.focusKeyOf(focused.dataset) : null;
+    el.innerHTML = html;
+    if (!hadFocus) return;
+    const items = this.agentsListFocusables(el);
+    const index = overview.pickFocusIndex(
+      previousKeys,
+      previousKey,
+      items.map((node) => overview.focusKeyOf(node.dataset)),
+    );
+    if (index >= 0) items[index].focus({ preventScroll: true });
   }
 
   // Focus a session from the panel, Next or a deep link: switch to an open
@@ -18681,6 +18721,10 @@ class TerminalManager {
         "hidden",
         !document.body.classList.contains("fullscreen"),
       );
+    // The Agents panel is not eligible in fullscreen: hide it on enter and
+    // bring the saved choice back on exit (refits the visible terminals when
+    // the panel's width comes or goes).
+    this.syncAgentsPanelVisibility?.();
     const active = this.terminals.get(this.activeId);
     if (active)
       setTimeout(() => {

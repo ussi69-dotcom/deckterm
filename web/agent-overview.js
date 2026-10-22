@@ -275,6 +275,47 @@
     return null;
   }
 
+  // The phone chip shows while an agent runs, and also while any session
+  // (agent or not, e.g. "command finished") has an unseen needs-you or done
+  // that the Sessions sheet lists.
+  function showSummaryChip(counts) {
+    const c = counts || {};
+    return (
+      Number(c.agents) > 0 || Number(c.needsYou) > 0 || Number(c.done) > 0
+    );
+  }
+
+  // --- Focus across a list re-render -----------------------------------------
+  // The panel and the IDE view are rebuilt from HTML, which drops keyboard
+  // focus. A focusable element's key is its data-* attributes minus the
+  // volatile ones (the tier), so a row, the Next button or a per-session
+  // action button keeps its identity while its status changes.
+  const VOLATILE_FOCUS_DATA = new Set(["tier"]);
+
+  function focusKeyOf(dataset) {
+    if (!dataset) return null;
+    const parts = Object.keys(dataset)
+      .filter((key) => !VOLATILE_FOCUS_DATA.has(key))
+      .sort()
+      .map((key) => `${key}=${dataset[key]}`);
+    return parts.length ? parts.join("&") : null;
+  }
+
+  // Index (into nextKeys) to focus after a re-render: the element with the
+  // same key when it is still there, else the one now at the old position
+  // (clamped to the end), else -1 (nothing was focused or nothing is left).
+  function pickFocusIndex(previousKeys, previousKey, nextKeys) {
+    const next = Array.isArray(nextKeys) ? nextKeys : [];
+    if (!previousKey || !next.length) return -1;
+    const same = next.indexOf(previousKey);
+    if (same >= 0) return same;
+    const before = (Array.isArray(previousKeys) ? previousKeys : []).indexOf(
+      previousKey,
+    );
+    if (before < 0) return -1;
+    return Math.min(before, next.length - 1);
+  }
+
   // IDE sidebar sash contract: 180 px .. min(640, floor(50% of the window)).
   function clampPanelWidth(px, innerWidth) {
     const width = Number(innerWidth) > 0 ? Number(innerWidth) : 1280;
@@ -451,6 +492,9 @@
     summaryCounts,
     summaryText,
     nextTarget,
+    showSummaryChip,
+    focusKeyOf,
+    pickFocusIndex,
     clampPanelWidth,
     storedPanelWidth,
     tooltipFor,

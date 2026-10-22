@@ -155,12 +155,16 @@ test.describe("Agents summary chip (phone)", () => {
       'input[data-setting-key="agents.summaryVisibleTouch"]',
     );
     await expect(toggle).toBeChecked();
-    const saved = page.waitForRequest(
-      (request) =>
-        request.method() === "PUT" &&
-        new URL(request.url()).pathname === "/api/settings" &&
-        request.postDataJSON()?.settings?.["agents.summaryVisibleTouch"] ===
-          false,
+    // The server's successful answer, not just the request: the reload
+    // below must read the saved value.
+    const saved = page.waitForResponse(
+      (response) =>
+        response.request().method() === "PUT" &&
+        new URL(response.url()).pathname === "/api/settings" &&
+        response.ok() &&
+        response.request().postDataJSON()?.settings?.[
+          "agents.summaryVisibleTouch"
+        ] === false,
       { timeout: 10_000 },
     );
     await toggle.uncheck({ force: true });
@@ -170,17 +174,48 @@ test.describe("Agents summary chip (phone)", () => {
 
     await page.reload();
     await waitForTerminal(page);
-    await page.waitForTimeout(1500);
-    await expect(chip(page)).toBeHidden();
-    const stored = await page.evaluate(() => {
+    // The chip starts hidden in the page's HTML, so check it only after the
+    // actor's settings have loaded (and the chip has been rendered from them).
+    await page.evaluate(
       // @ts-ignore
-      const store = window.terminalManager?.settingsStore;
-      return {
-        touch: store?.get("agents.summaryVisibleTouch"),
-        desktop: store?.get("agents.panelVisible"),
-      };
+      () => window.terminalManager?.settingsReady,
+    );
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          // @ts-ignore
+          const store = window.terminalManager?.settingsStore;
+          return {
+            touch: store?.get("agents.summaryVisibleTouch"),
+            desktop: store?.get("agents.panelVisible"),
+          };
+        }),
+      )
+      .toEqual({ touch: false, desktop: undefined });
+    // The seeded agent is still listed (the chip would show for it): only the
+    // setting hides the chip.
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            // @ts-ignore
+            const tm = window.terminalManager;
+            // @ts-ignore
+            const ov = window.AgentOverview;
+            return ov.summaryCounts(
+              tm._sessionCatalog || [],
+              tm.getAttentionSeenMap(),
+              { activeVisibleId: tm.getActiveVisibleTerminalId() },
+            ).agents;
+          }),
+        { timeout: 20_000 },
+      )
+      .toBeGreaterThan(0);
+    await page.evaluate(() => {
+      // @ts-ignore
+      window.terminalManager.renderAgentsOverview();
     });
-    expect(stored).toEqual({ touch: false, desktop: undefined });
+    await expect(chip(page)).toBeHidden();
   });
 
   test("has no left panel and no sash", async ({ page }) => {
@@ -192,5 +227,35 @@ test.describe("Agents summary chip (phone)", () => {
     const area = await page.locator("#workspace-area").boundingBox();
     expect(area?.x ?? -1).toBe(0);
     expect(Math.round(area?.width ?? 0)).toBe(390);
+  });
+  test("shows for an unseen finished command of a session without an agent", async ({
+    page,
+  }) => {
+    // The seeded agent session from beforeEach is the first one; a third,
+    // plain shell gets a "command finished" notification while the second
+    // stays active.
+    await expect(chip(page)).toBeVisible({ timeout: 20_000 });
+    const shellId = "00000000-0000-4000-8000-0000000000d1";
+    await page.evaluate((shellId) => {
+      // @ts-ignore
+      const tm = window.terminalManager;
+      clearInterval(tm.telemetryRefreshInterval);
+      tm.queueTelemetryRefresh = () => {};
+      // Only a plain shell with an unseen done: no agent anywhere.
+      tm._sessionCatalog = [
+        {
+          id: shellId,
+          status: "active",
+          sessionStatus: "active",
+          agentName: null,
+          cwd: "/tmp/agents-chip",
+          attention: { kind: "done", seq: 7, at: Date.now(), title: "Command finished" },
+        },
+      ];
+      tm.renderAgentsOverview();
+    }, shellId);
+    await expect(chip(page)).toBeVisible();
+    await expect(chip(page)).toContainText("✓ 1");
+    await expect(chip(page)).toHaveAttribute("data-attention", "done");
   });
 });
