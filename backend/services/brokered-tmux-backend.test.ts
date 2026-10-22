@@ -209,60 +209,16 @@ test("scrollHistory refuses copy-mode on the alternate screen", async () => {
   ).toHaveLength(1);
 });
 
-test("readScrollState reads the pane through an allowlisted display-message", async () => {
+test("brokered backend opts out of scroll control and never asks the broker for it", async () => {
   const b = backend();
-  execResult = {
-    code: 0,
-    stdout: "1|copy-mode|6|191|191|10|0|0|0|0|0\n",
-    stderr: "",
-  };
-  expect(await b.readScrollState("deckterm_decktermdev_s1")).toMatchObject({
-    inMode: true,
-    position: 6,
-    total: 191,
-  });
-  const args = calls[0]!.opts.profileArgs as string[];
-  expect(args.slice(0, 4)).toEqual([
-    "display-message",
-    "-t",
-    "deckterm_decktermdev_s1",
-    "-p",
-  ]);
-  // The broker refuses `#(` (shell) in formats; ours never has one.
-  expect(args[4]).not.toContain("#(");
-
-  execResult = { code: 1, stdout: "", stderr: "no session" };
-  expect(await b.readScrollState("deckterm_decktermdev_s1")).toBeNull();
-});
-
-test("brokered absolute jumps are refused; exitScroll scrolls down to leave copy-mode", async () => {
-  const b = backend();
-  execResult = {
-    code: 0,
-    stdout: "1|copy-mode|250|300|300|10|0|0|0|0|0\n",
-    stderr: "",
-  };
-  expect(await b.scrollToPosition("deckterm_decktermdev_s1", 40)).toBe(false);
+  // The broker refuses display-message formats, goto-line and copy-mode -q:
+  // the server must route touch drags to scrollHistory and skip the rest.
+  expect(b.supportsScrollControl).toBe(false);
+  expect(await b.readScrollState()).toBeNull();
+  expect(await b.scrollToPosition()).toBe(false);
+  expect(await b.exitScroll()).toBe(false);
+  expect(await b.cancelScroll()).toBe(false);
   expect(calls).toHaveLength(0);
-
-  // Still reported in copy-mode after the scroll-downs: not a success.
-  expect(await b.exitScroll("deckterm_decktermdev_s1")).toBe(false);
-  const scrolls = calls.filter((c) => c.opts.profileArgs?.[0] === "send-keys");
-  expect(scrolls).toHaveLength(4);
-  expect(scrolls[0]!.opts.profileArgs).toEqual([
-    "send-keys",
-    "-X",
-    "-N",
-    "100",
-    "-t",
-    "deckterm_decktermdev_s1",
-    "scroll-down",
-  ]);
-
-  calls.length = 0;
-  execResult = { code: 0, stdout: "0||||300|10|0|0|0|0|0\n", stderr: "" };
-  expect(await b.exitScroll("deckterm_decktermdev_s1")).toBe(true);
-  expect(calls).toHaveLength(1);
 });
 
 test("cache returns one backend instance per uid", () => {

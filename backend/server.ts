@@ -5367,20 +5367,26 @@ function getScrollController(term: Terminal): TerminalScrollController | null {
   const sessionName = term.sessionName;
   const controller = new TerminalScrollController(
     {
-      readState: () => backend.readScrollState(sessionName),
-      scrollHistory: (direction, lines) =>
-        backend.scrollHistory(sessionName, direction, lines),
-      scrollToPosition: (position) =>
-        backend.scrollToPosition(sessionName, position),
-      exitScroll: () => backend.exitScroll(sessionName),
+      readState: (signal) => backend.readScrollState(sessionName, { signal }),
+      scrollHistory: (direction, lines, signal) =>
+        backend.scrollHistory(sessionName, direction, lines, { signal }),
+      scrollToPosition: (position, signal) =>
+        backend.scrollToPosition(sessionName, position, { signal }),
+      exitScroll: (signal) => backend.exitScroll(sessionName, { signal }),
+      cancelScroll: (signal) => backend.cancelScroll(sessionName, { signal }),
       writeInput: (data) => writeTerminalInputNow(term, data),
       paneSize: () => ({ cols: term.cols, rows: term.rows }),
       subscribers: () => scrollSubscribers(term),
       isActive: () => terminals.get(term.id) === term,
     },
     {
+      // Brokered and raw backends cannot read or position the pane: plain
+      // history scrolling only, no frames, no input barrier.
+      scrollControl: backend.supportsScrollControl,
       onError: (err) =>
         debug(`[tmux] scroll control failed for ${term.id}:`, err),
+      // Drops and degraded exits; byte counts only, never input content.
+      log: (message) => console.warn(`[scroll] ${term.id}: ${message}`),
     },
   );
   terminalScrollControllers.set(term, controller);
@@ -5388,11 +5394,13 @@ function getScrollController(term: Terminal): TerminalScrollController | null {
 }
 
 // Every input path (JSON `input`, raw text, binary) goes through here so
-// input never overtakes a pending "back to latest".
-function writeTerminalInput(term: Terminal, data: string) {
+// input never overtakes a pending "back to latest". `scroll` is the socket's
+// `scroll=1` URL flag: only those (touch) sockets get the server barrier that
+// leaves copy-mode before typed input; desktop input keeps its old path.
+function writeTerminalInput(term: Terminal, data: string, scroll: boolean) {
   const controller = terminalScrollControllers.get(term);
   if (controller) {
-    controller.input(data);
+    controller.input(data, { scroll });
     return;
   }
   writeTerminalInputNow(term, data);
@@ -11738,7 +11746,7 @@ async function startOwnedWebServer(
                     broadcastTerminalState(term);
                   }
                 }
-                writeTerminalInput(term, parsed.data);
+                writeTerminalInput(term, parsed.data, data.scroll === true);
                 return;
               }
               if (parsed.type === "resume-ready") {
@@ -11755,13 +11763,17 @@ async function startOwnedWebServer(
             } catch {
               debug(`Raw input ${terminalId}`);
               term.lastActivityAt = Date.now();
-              writeTerminalInput(term, message);
+              writeTerminalInput(term, message, data.scroll === true);
             }
           } else {
             const buf = message as unknown as Uint8Array;
             debug(`Binary input ${terminalId}: ${buf.byteLength} bytes`);
             term.lastActivityAt = Date.now();
-            writeTerminalInput(term, new TextDecoder().decode(buf));
+            writeTerminalInput(
+              term,
+              new TextDecoder().decode(buf),
+              data.scroll === true,
+            );
           }
         } catch (err) {
           console.error("[WebSocket] Message handler error:", err);

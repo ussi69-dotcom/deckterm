@@ -4,6 +4,13 @@ import type { TmuxScrollState } from "./tmux-scroll-state";
 export type TerminalBackendMode = "raw" | "tmux";
 export type TerminalScrollDirection = "up" | "down";
 
+/**
+ * Options for the tmux calls the scroll controller makes. Aborting `signal`
+ * kills the tmux client process, so a timed-out command cannot run later
+ * and break the controller's queue order.
+ */
+export type TerminalScrollCallOptions = { signal?: AbortSignal };
+
 export type TerminalBackendSession = {
   id: string;
   mode: TerminalBackendMode;
@@ -58,6 +65,15 @@ export type TerminalBackendAttachResult = {
 export interface TerminalBackend {
   readonly mode: TerminalBackendMode;
 
+  /**
+   * True when this backend can read the pane's scroll state and position
+   * copy-mode itself (readScrollState, scrollToPosition, exitScroll,
+   * cancelScroll). False (brokered tmux, raw): touch-scroll falls back to
+   * scrollHistory, scroll-to / scroll-latest are ignored, no
+   * `scroll-position` frames and no input barrier.
+   */
+  readonly supportsScrollControl: boolean;
+
   createSession(
     id: string,
     cwd: string,
@@ -77,20 +93,37 @@ export interface TerminalBackend {
     sessionName: string,
     direction: TerminalScrollDirection,
     lines: number,
+    options?: TerminalScrollCallOptions,
   ): Promise<boolean>;
 
   /** The pane's live scroll state, or null when it cannot be read. */
-  readScrollState(sessionName: string): Promise<TmuxScrollState | null>;
+  readScrollState(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
+  ): Promise<TmuxScrollState | null>;
 
   /**
    * Shows the history `position` lines above the live bottom (tmux copy-mode,
    * clamped by tmux to the available history). 0 or less leaves copy-mode.
    * Refused (false) on the alternate screen, which has no history.
    */
-  scrollToPosition(sessionName: string, position: number): Promise<boolean>;
+  scrollToPosition(
+    sessionName: string,
+    position: number,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
 
   /** Leaves copy-mode; succeeds when the pane was not scrolled back either. */
-  exitScroll(sessionName: string): Promise<boolean>;
+  exitScroll(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
+
+  /** `send -X cancel`: the fallback when exitScroll left the pane in a mode. */
+  cancelScroll(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
 
   kill(sessionName: string): Promise<void>;
 }
