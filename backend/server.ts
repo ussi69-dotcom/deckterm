@@ -91,6 +91,12 @@ import {
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
 import {
+  sanitizeTerminalEnv,
+  scrubTmuxEnvironmentWithRetry,
+  terminalEnvironmentErrorResponse,
+  TmuxEnvironmentUnverifiedError,
+} from "./services/terminal-env";
+import {
   TmuxTerminalBackend,
   type TmuxSessionLiveness,
 } from "./services/tmux-terminal-backend";
@@ -2616,7 +2622,11 @@ async function runScopedSearch(opts: {
     stderr: "ignore",
     // Sanitized PATH (not the possibly-poisoned process.env.PATH); the binary
     // itself is absolute, this just hardens any grep-internal subprocess.
-    env: { ...process.env, PATH: SEARCH_SAFE_PATH, LC_ALL: "C" },
+    env: {
+      ...sanitizeTerminalEnv(process.env),
+      PATH: SEARCH_SAFE_PATH,
+      LC_ALL: "C",
+    },
   });
   inFlightSearches.set(ownerId, proc);
 
@@ -3767,7 +3777,7 @@ async function runTreeGit(
       stdout: "pipe",
       stderr: "ignore",
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         GIT_OPTIONAL_LOCKS: "0",
       },
@@ -4894,6 +4904,14 @@ async function resolveShellCommand(): Promise<string[]> {
     : [shell, "-il"];
 }
 
+function logTerminalEnvironmentRefusal(err: unknown) {
+  const detail =
+    err instanceof TmuxEnvironmentUnverifiedError ? err.detail : String(err);
+  console.error(
+    `[tmux] environment: refused a new terminal, environment unverified (${detail})`,
+  );
+}
+
 function createTerminalHandle(id: string, cols: number, rows: number) {
   return new BunTerminal({
     cols,
@@ -5762,14 +5780,27 @@ async function createManagedTerminal({
   let tmuxPipeOffset = 0;
 
   if (createTmuxSession || !TMUX_BACKEND) {
-    const backendSession = await backend.createSession(
-      id,
-      cwd,
-      cols,
-      rows,
-      ownerId,
-      ownerEmail,
-    );
+    let backendSession: Awaited<ReturnType<TerminalBackend["createSession"]>>;
+    try {
+      backendSession = await backend.createSession(
+        id,
+        cwd,
+        cols,
+        rows,
+        ownerId,
+        ownerEmail,
+      );
+    } catch (err) {
+      // Nothing was registered yet: release the PTY handle so a refused
+      // create (e.g. an unverified tmux environment) leaks nothing.
+      markHandleSettled();
+      try {
+        terminal.close();
+      } catch {
+        // already closed
+      }
+      throw err;
+    }
     if (TMUX_BACKEND) {
       activeSessionName = backendSession.sessionName;
     }
@@ -6153,6 +6184,11 @@ export function createWebApp() {
   app.onError((err, c) => {
     if (err instanceof UnauthorizedRequestError) {
       return c.text(err.message, err.status);
+    }
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
     }
     console.error("[Hono] Route error:", err);
     const response: { error: string; message?: string } = {
@@ -7372,6 +7408,11 @@ export function createWebApp() {
   });
 
   function taskErrorResponse(c: any, err: unknown) {
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
+    }
     if (err instanceof TaskRunnerError) {
       return c.json({ error: err.message }, err.status as never);
     }
@@ -9614,8 +9655,10 @@ export function createWebApp() {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
+      // Git writes keep the user's repo hooks: user code, so no service
+      // secrets (terminal-env.ts).
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         ...hardened.env,
         ...extraEnv,
@@ -11187,6 +11230,35 @@ async function startOwnedWebServer(
     console.log(
       "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
     );
+    // A tmux server started before environment hygiene still holds the
+    // service secrets in its global environment and would hand them to every
+    // new pane. Remove them now (names only are logged, never values).
+    // Running shells keep their copy until they are restarted.
+    // A failure is retried a few times; if it still cannot be verified the
+    // service keeps running, and every terminal creation re-runs the scrub
+    // and is refused (HTTP 503) until one succeeds.
+    if (tmuxTerminalBackend) {
+      const backend = tmuxTerminalBackend;
+      const { result, attempts } = await scrubTmuxEnvironmentWithRetry(
+        () => backend.scrubServerEnvironment(),
+        { attempts: 3, delayMs: 500 },
+      );
+      if (result.removed.length > 0) {
+        console.log(
+          `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
+        );
+      }
+      for (const { session, id, removed } of result.sessions) {
+        console.log(
+          `[tmux] environment: removed ${removed.length} service variable(s) from session ${id} (${session}): ${removed.join(", ")}`,
+        );
+      }
+      if (!result.ok) {
+        console.error(
+          `[tmux] environment: UNVERIFIED after ${attempts} attempt(s) (${result.error}). New terminals are refused until a scrub succeeds; each creation retries it.`,
+        );
+      }
+    }
     const recovered = await recoverTmuxSessions();
     if (recovered > 0) {
       console.log(`[tmux] Recovered ${recovered} session(s)`);
