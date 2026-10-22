@@ -15,6 +15,7 @@ import {
   AGENT_RULES_DIR,
   CODEX_WORKING_FALLBACK_PATTERN,
   LINEAR_PATTERN_MATCHERS,
+  CLIP_MARK,
   MAX_REGION_LINE_CHARS,
   MAX_REGION_LINES,
   boundRegionText,
@@ -471,20 +472,41 @@ describe("linear rewrites of super-linear vendored patterns", () => {
 });
 
 describe("bounded input", () => {
-  test("a region keeps its last 200 lines of at most 512 characters", () => {
+  test("a region keeps its last 200 lines of at most MAX_REGION_LINE_CHARS characters", () => {
     const tall = Array.from({ length: 250 }, (_, i) => `line ${i}`).join("\n");
     const bounded = boundRegionText(tall).split("\n");
     expect(bounded.length).toBe(MAX_REGION_LINES);
     expect(bounded[0]).toBe("line 50");
     expect(bounded.at(-1)).toBe("line 249");
-    expect(boundRegionText(`${"a".repeat(600)}\nb\n`)).toBe(
-      `${"a".repeat(MAX_REGION_LINE_CHARS)}\nb\n`,
+    const wide = "a".repeat(MAX_REGION_LINE_CHARS + 88);
+    expect(boundRegionText(`${wide}\nb\n`)).toBe(
+      `${"a".repeat(MAX_REGION_LINE_CHARS)}${CLIP_MARK}\nb\n`,
     );
     // A cut never leaves half of a surrogate pair.
     const emoji = `${"a".repeat(MAX_REGION_LINE_CHARS - 1)}😀tail`;
-    expect(boundRegionText(emoji)).toBe("a".repeat(MAX_REGION_LINE_CHARS - 1));
+    expect(boundRegionText(emoji)).toBe(
+      `${"a".repeat(MAX_REGION_LINE_CHARS - 1)}${CLIP_MARK}`,
+    );
     const small = "short\nscreen\n";
     expect(boundRegionText(small)).toBe(small);
+    // A real 1000-column pane line is never cut.
+    const pane = "x".repeat(1000);
+    expect(boundRegionText(pane)).toBe(pane);
+  });
+
+  test("201 short lines without a trailing break are cut to 200", () => {
+    const text = "\n".repeat(MAX_REGION_LINES) + "x";
+    const bounded = boundRegionText(text);
+    expect(bounded.split("\n").length).toBe(MAX_REGION_LINES);
+    expect(bounded.endsWith("x")).toBe(true);
+  });
+
+  test("a cut line never creates a match anchored at its end (Codex re-check)", () => {
+    // Upstream rejects this: something follows the timer. A plain cut at the
+    // character limit would drop the "!" and make the working rule match.
+    const line = "x (1s)" + " ".repeat(MAX_REGION_LINE_CHARS) + "!";
+    const result = evaluate("codex", { screen: `${line}\n`, title: "", progress: "" });
+    expect(result.state).not.toBe("working");
   });
 
   test("only \\n breaks lines: CRLF becomes LF, a lone CR, U+2028 and U+2029 a space", () => {

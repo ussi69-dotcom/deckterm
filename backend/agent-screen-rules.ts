@@ -252,7 +252,11 @@ export function compilePattern(pattern: string): PatternMatcher {
 // ---------------------------------------------------------------------------
 
 export const MAX_REGION_LINES = 200;
-export const MAX_REGION_LINE_CHARS = 512;
+// Above MAX_TERMINAL_COLS (1000), so a real pane-width capture line is never
+// cut. A cut line ends in CLIP_MARK, so an artificial end of line can never
+// satisfy a rule anchored at the end ($ or \z).
+export const MAX_REGION_LINE_CHARS = 2048;
+export const CLIP_MARK = "\u2026";
 
 /**
  * CRLF becomes LF; a lone CR, U+2028 and U+2029 become a space. Rust's
@@ -273,12 +277,12 @@ function clipLine(line: string): string {
   // Never leave half of a surrogate pair at the cut.
   const last = line.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return line.slice(0, end);
+  return line.slice(0, end) + CLIP_MARK;
 }
 
 /**
  * The last MAX_REGION_LINES lines of a region, each cut to
- * MAX_REGION_LINE_CHARS. Captures are pane-sized, so this only changes the
+ * MAX_REGION_LINE_CHARS (plus CLIP_MARK). Captures are pane-sized, so this only changes the
  * text of very tall or very wide panes.
  */
 export function boundRegionText(text: string): string {
@@ -287,7 +291,9 @@ export function boundRegionText(text: string): string {
     for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
       breaks++;
     }
-    if (breaks <= MAX_REGION_LINES) return text;
+    // A last line without a trailing break is a line too.
+    const lines = text.length > 0 && !text.endsWith("\n") ? breaks + 1 : breaks;
+    if (lines <= MAX_REGION_LINES) return text;
   }
   const trailingBreak = text.endsWith("\n");
   let lines = text.split("\n");
