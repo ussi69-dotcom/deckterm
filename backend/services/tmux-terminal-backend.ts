@@ -2,6 +2,10 @@ import type { Subprocess } from "bun";
 import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  sanitizeTerminalEnv,
+  scrubTmuxGlobalEnvironment,
+} from "./terminal-env";
+import {
   parseTmuxWindowSize,
   planTmuxResize,
   syncTmuxSessionClients,
@@ -139,6 +143,15 @@ export class TmuxTerminalBackend implements TerminalBackend {
   }
 
   /**
+   * baseEnv minus the service-only variables (terminal-env.ts). Everything
+   * that can start the tmux server or reach a shell uses this. Computed per
+   * call so it follows baseEnv (process.env by default) like before.
+   */
+  private get shellEnv(): Record<string, string | undefined> {
+    return sanitizeTerminalEnv(this.baseEnv);
+  }
+
+  /**
    * Fails fast when the tmux server is expected to be supplied by its own
    * systemd unit but is not running.
    *
@@ -194,8 +207,10 @@ export class TmuxTerminalBackend implements TerminalBackend {
         ...shellCommand,
       ],
       {
+        // new-session is the call that may start the tmux server, and the
+        // server hands its environment to every pane it ever creates.
         env: {
-          ...this.baseEnv,
+          ...this.shellEnv,
           TERM: "xterm-256color",
           COLORTERM: "truecolor",
         },
@@ -238,7 +253,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     const proc = await this.spawnTmux(["attach-session", "-t", sessionName], {
       cwd: spawnCwd,
       env: {
-        ...this.baseEnv,
+        ...this.shellEnv,
         ...options.env,
         TERM: "xterm-256color",
         COLORTERM: "truecolor",
@@ -584,9 +599,33 @@ export class TmuxTerminalBackend implements TerminalBackend {
     }
   }
 
+  /**
+   * Removes the service-only variables (terminal-env.ts) from this tmux
+   * server's global environment, so panes created from now on do not inherit
+   * them. Needed for a server started before environment hygiene existed —
+   * tmux keeps the environment it was started with. Returns the removed
+   * names; empty when no server is running.
+   */
+  async scrubServerEnvironment(): Promise<string[]> {
+    return scrubTmuxGlobalEnvironment(async (args) => {
+      const proc = await this.spawnTmux(args, {
+        stdout: "pipe",
+        stderr: "ignore",
+        stdin: "ignore",
+      });
+      const stdout = await new Response((proc as any).stdout).text();
+      return { code: await proc.exited, stdout };
+    });
+  }
+
   private async spawnTmux(args: string[], options?: any): Promise<Subprocess> {
     await this.ensureSocketDirectory();
-    return Bun.spawn(["tmux", "-S", this.socketPath, ...args], options);
+    // Callers that pass no env still get the sanitized one: a tmux client
+    // never needs the service secrets, and new-session (the only implicit
+    // server start) must not hand them to the server.
+    const spawnOptions =
+      options && options.env ? options : { ...options, env: this.shellEnv };
+    return Bun.spawn(["tmux", "-S", this.socketPath, ...args], spawnOptions);
   }
 
   private async ensureSocketDirectory(): Promise<void> {

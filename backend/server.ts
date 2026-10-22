@@ -90,6 +90,7 @@ import {
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
+import { sanitizeTerminalEnv } from "./services/terminal-env";
 import {
   TmuxTerminalBackend,
   type TmuxSessionLiveness,
@@ -2616,7 +2617,11 @@ async function runScopedSearch(opts: {
     stderr: "ignore",
     // Sanitized PATH (not the possibly-poisoned process.env.PATH); the binary
     // itself is absolute, this just hardens any grep-internal subprocess.
-    env: { ...process.env, PATH: SEARCH_SAFE_PATH, LC_ALL: "C" },
+    env: {
+      ...sanitizeTerminalEnv(process.env),
+      PATH: SEARCH_SAFE_PATH,
+      LC_ALL: "C",
+    },
   });
   inFlightSearches.set(ownerId, proc);
 
@@ -3767,7 +3772,7 @@ async function runTreeGit(
       stdout: "pipe",
       stderr: "ignore",
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         GIT_OPTIONAL_LOCKS: "0",
       },
@@ -9614,8 +9619,10 @@ export function createWebApp() {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
+      // Git writes keep the user's repo hooks: user code, so no service
+      // secrets (terminal-env.ts).
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         ...hardened.env,
         ...extraEnv,
@@ -11187,6 +11194,25 @@ async function startOwnedWebServer(
     console.log(
       "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
     );
+    // A tmux server started before environment hygiene still holds the
+    // service secrets in its global environment and would hand them to every
+    // new pane. Remove them now (names only are logged, never values).
+    // Running shells keep their copy until they are restarted.
+    if (tmuxTerminalBackend) {
+      try {
+        const scrubbed = await tmuxTerminalBackend.scrubServerEnvironment();
+        if (scrubbed.length > 0) {
+          console.log(
+            `[tmux] Removed ${scrubbed.length} service variable(s) from the tmux global environment: ${scrubbed.join(", ")}`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          "[tmux] Failed to scrub the tmux global environment:",
+          err,
+        );
+      }
+    }
     const recovered = await recoverTmuxSessions();
     if (recovered > 0) {
       console.log(`[tmux] Recovered ${recovered} session(s)`);

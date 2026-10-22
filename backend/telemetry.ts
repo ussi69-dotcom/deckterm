@@ -1,4 +1,5 @@
 import { dirname } from "node:path";
+import { sanitizeTerminalEnv } from "./services/terminal-env";
 
 const BUSY_ACTIVITY_WINDOW_MS = 30_000;
 const BUSY_BOOTSTRAP_WINDOW_MS = 10_000;
@@ -713,6 +714,8 @@ async function runGitCommand(
     cwd,
     stdout: "pipe",
     stderr: "pipe",
+    // git runs in a user's repo (config, hooks, fsmonitor): no service secrets.
+    env: sanitizeTerminalEnv(process.env),
   });
 
   const timeoutId = setTimeout(() => proc.kill(), GIT_COMMAND_TIMEOUT_MS);

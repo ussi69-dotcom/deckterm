@@ -1,3 +1,5 @@
+import { sanitizeTerminalEnv } from "./terminal-env";
+
 export interface AgentHarness {
   id: string;
   label: string;
@@ -103,6 +105,8 @@ async function defaultSpawn(
   const proc = Bun.spawn(argv, {
     stdout: "pipe",
     stderr: "pipe",
+    // Agent CLIs are third-party programs: no service secrets.
+    env: sanitizeTerminalEnv(process.env),
   });
   let timedOut = false;
   const timeout = setTimeout(() => {

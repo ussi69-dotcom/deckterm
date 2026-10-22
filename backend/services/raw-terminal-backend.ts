@@ -1,5 +1,6 @@
 import type { Subprocess } from "bun";
 import { brokerKill, brokerSpawn } from "./broker-client";
+import { sanitizeTerminalEnv } from "./terminal-env";
 import type {
   BrokeredExecContext,
   TerminalBackend,
@@ -65,8 +66,10 @@ export class RawTerminalBackend implements TerminalBackend {
       options.shellCommand || (await this.shellCommandResolver());
     const proc = Bun.spawn(shellCommand, {
       cwd: options.cwd,
+      // Service-only variables (push key, CF Access config, DeckTerm switches)
+      // never reach the shell; per-terminal options.env is applied on top.
       env: {
-        ...this.baseEnv,
+        ...sanitizeTerminalEnv(this.baseEnv),
         ...options.env,
         TERM: "xterm-256color",
         COLORTERM: "truecolor",

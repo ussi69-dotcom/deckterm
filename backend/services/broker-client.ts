@@ -1,4 +1,5 @@
 import type { Subprocess } from "bun";
+import { sanitizeTerminalEnv } from "./terminal-env";
 
 /**
  * B2 broker client (design §4.1). Thin typed wrapper over the root-owned
@@ -128,8 +129,10 @@ export function brokerSpawn(
 ): Subprocess {
   const argv = buildBrokerArgv(resolveBrokerPath(env), "spawn", opts);
   return Bun.spawn(argv, {
-    // The broker constructs the child env from the target account; we forward
-    // nothing (sudoers env_reset strips it anyway).
+    // The broker constructs the child env from the target account and sudoers
+    // env_reset strips ours; the sanitized env is defense in depth so service
+    // secrets never reach sudo even if env_reset were misconfigured.
+    env: sanitizeTerminalEnv(process.env),
     // @ts-expect-error - terminal option is Bun 1.3.5+ API, not yet in bun-types
     terminal: opts.terminal,
     onExit: opts.onExit,
@@ -159,6 +162,7 @@ export async function brokerExec(
     stdin: opts.stdin != null ? Buffer.from(opts.stdin, "utf8") : "ignore",
     stdout: "pipe",
     stderr: "pipe",
+    env: sanitizeTerminalEnv(process.env),
   });
   const timer = setTimeout(() => {
     try {
