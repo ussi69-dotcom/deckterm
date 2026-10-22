@@ -236,6 +236,67 @@ test.describe("Touch input reaches the shell once", () => {
     });
   }
 
+  test("Safari-style commit with an IME keydown before insertFromComposition is sent once", async ({
+    page,
+  }) => {
+    const mark = frames.length;
+    await page.evaluate(() =>
+      (window as any).__kbd.safariCompose(["e", "é"], true, true),
+    );
+    expect(await sentSince(mark)).toBe("é");
+    await page.waitForTimeout(300);
+    expect(frames.slice(mark).join("")).toBe("é");
+  });
+
+  // Commits "ab" through Blink's real IME path (no key events, so xterm's
+  // own input listener would forward an uncancelled insertText).
+  async function commitThroughIme(page: Page, steps: string[], commit: string) {
+    const cdp = await page.context().newCDPSession(page);
+    try {
+      for (const text of steps) {
+        await cdp.send("Input.imeSetComposition", {
+          text,
+          selectionStart: text.length,
+          selectionEnd: text.length,
+        });
+      }
+      await cdp.send("Input.insertText", { text: commit });
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+  }
+
+  for (const before of ["none", "noncancelable"] as const) {
+    test(`a repeated commit with ${before === "none" ? "no" : "a non-cancelable"} beforeinput is not sent again`, async ({
+      page,
+    }) => {
+      const mark = frames.length;
+      await commitThroughIme(page, ["a", "ab"], "ab");
+      expect(await sentSince(mark)).toBe("ab");
+      await page.evaluate(
+        (kind) => (window as any).__kbd.softText("ab", kind),
+        before,
+      );
+      await page.waitForTimeout(300);
+      expect(frames.slice(mark).join("")).toBe("ab");
+      expect(await helperValue(page)).toBe("");
+    });
+  }
+
+  test("after a commit, other text closes the confirmation: a, b, a arrive as aba", async ({
+    page,
+  }) => {
+    const mark = frames.length;
+    await commitThroughIme(page, ["a"], "a");
+    expect(await sentSince(mark)).toBe("a");
+    await page.evaluate(() => {
+      const kbd = (window as any).__kbd;
+      kbd.softText("b");
+      kbd.softText("a");
+    });
+    expect(await sentSince(mark)).toBe("aba");
+  });
+
   test("a Gboard A then a physical A within a second both arrive once", async ({
     page,
   }) => {
@@ -453,7 +514,11 @@ async function installKeyboardEmulator(page: Page) {
 
     // WebKit (Safari) commit: deleteCompositionText + insertFromComposition,
     // with compositionend either before or after insertFromComposition.
-    const safariCompose = (updates: string[], endFirst: boolean) => {
+    const safariCompose = (
+      updates: string[],
+      endFirst: boolean,
+      imeKeydownAfterEnd = false,
+    ) => {
       compositionEvent("compositionstart", "");
       const start = textarea.selectionStart ?? textarea.value.length;
       let composed = "";
@@ -473,6 +538,10 @@ async function installKeyboardEmulator(page: Page) {
       }
       const word = updates[updates.length - 1];
       if (endFirst) compositionEvent("compositionend", word);
+      if (endFirst && imeKeydownAfterEnd) {
+        // The IME key that finished the composition (keyCode 229).
+        key("keydown", { key: "Unidentified", keyCode: 229, which: 229 });
+      }
       input("beforeinput", {
         inputType: "deleteCompositionText",
         isComposing: !endFirst,
@@ -498,7 +567,32 @@ async function installKeyboardEmulator(page: Page) {
       if (!endFirst) compositionEvent("compositionend", word);
     };
 
-    (window as any).__kbd = { hardware, special, gboard, compose, safariCompose };
+    // Software text with no key events: an insertText whose beforeinput is
+    // cancelable (the default), not cancelable, or missing.
+    const softText = (
+      text: string,
+      before: "cancelable" | "noncancelable" | "none" = "cancelable",
+    ) => {
+      if (before !== "none") {
+        const event = input("beforeinput", {
+          inputType: "insertText",
+          data: text,
+          cancelable: before === "cancelable",
+        });
+        if (event.defaultPrevented) return;
+      }
+      insert(text);
+      input("input", { inputType: "insertText", data: text });
+    };
+
+    (window as any).__kbd = {
+      hardware,
+      special,
+      gboard,
+      compose,
+      safariCompose,
+      softText,
+    };
   });
 }
 

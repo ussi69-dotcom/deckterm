@@ -65,9 +65,11 @@ function createKeystrokeArbiter() {
 //
 // A commit can be reported twice: compositionend plus WebKit's
 // insertFromComposition (in either order), or a browser that repeats the
-// committed text as insertText. After a commit, the same composition's
-// confirmation is swallowed until the next key goes down or the next
-// composition starts.
+// committed text as insertText. After a commit, that one confirmation is
+// swallowed. The window closes at the first sign of other input: a real
+// (non-IME) keydown, a new composition, an insertText with different text or
+// any other edit. IME keydowns (keyCode 229 or isComposing) belong to the
+// composition being finished and keep it open.
 function createCompositionTracker() {
   let active = false;
   let text = "";
@@ -122,28 +124,40 @@ function createCompositionTracker() {
       if (confirm !== null) return "";
       return typeof data === "string" ? data : "";
     },
-    // insertText after a commit: true when it repeats the commit.
-    confirmText(data) {
-      if (confirm === null || data !== confirm) return false;
-      confirm = null;
-      return true;
+    // Whether insertText `data` would confirm the last commit (no change).
+    matchesConfirmation(data) {
+      return confirm !== null && data === confirm;
     },
-    // A real (non-IME) key during a composition commits what is composed.
-    interrupt() {
-      if (!active) return "";
+    // insertText: true when it repeats the commit (and consumes it). Any
+    // other text closes the window.
+    confirmText(data) {
+      const match = confirm !== null && data === confirm;
+      confirm = null;
+      return match;
+    },
+    // keydown. An IME key (229 / isComposing) or a lone modifier changes
+    // nothing. A real key commits an active composition (returns its text)
+    // or closes the confirmation window.
+    keydown({ keyCode = 0, isComposing = false } = {}) {
+      if (keyCode === 229 || isComposing) return "";
+      if (keyCode === 16 || keyCode === 17 || keyCode === 18) return "";
+      if (!active) {
+        confirm = null;
+        return "";
+      }
       const value = committed !== null ? "" : text;
       close(committed !== null ? committed : value);
       return value;
+    },
+    // Any edit other than the confirmation closes the window.
+    edit() {
+      confirm = null;
     },
     // The composition vanished without a commit (no compositionend came).
     abandon() {
       active = false;
       text = "";
       committed = null;
-    },
-    // A new key went down: an earlier commit can no longer be confirmed.
-    boundary() {
-      confirm = null;
     },
   };
 }

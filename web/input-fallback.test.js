@@ -172,8 +172,8 @@ test("an input event xterm already forwarded is not sent again; the next one is"
 // the committed text is sent, once, with no DELs. Events are named as the
 // page sees them: start = compositionstart, update = input
 // insertCompositionText, fromComposition = input insertFromComposition,
-// end = compositionend, text = beforeinput/input insertText after a commit,
-// interrupt = a non-IME keydown, boundary = any keydown.
+// end = compositionend, text = beforeinput/input insertText,
+// keydown = a keydown ({ keyCode, isComposing }), edit = any other edit.
 function compose(steps) {
   const tracker = createCompositionTracker();
   const sent = [];
@@ -187,8 +187,8 @@ function compose(steps) {
     else if (type === "end") push(tracker.end(data));
     else if (type === "text") {
       if (!tracker.confirmText(data)) push(data);
-    } else if (type === "interrupt") push(tracker.interrupt());
-    else if (type === "boundary") tracker.boundary();
+    } else if (type === "keydown") push(tracker.keydown(data));
+    else if (type === "edit") tracker.edit();
   }
   return { sent, active: tracker.active };
 }
@@ -259,7 +259,7 @@ test("an insertText repeating the commit confirms it; a new keystroke ends that 
       ["start"],
       ["update", "ab"],
       ["end", "ab"],
-      ["boundary"],
+      ["keydown", { keyCode: 65 }],
       ["text", "ab"],
     ]).sent,
   ).toEqual(["ab", "ab"]);
@@ -272,6 +272,74 @@ test("a commit with no composition around it is sent", () => {
 
 test("a real key during a composition commits its text once", () => {
   expect(
-    compose([["start"], ["update", "ab"], ["interrupt"], ["end", "ab"]]),
+    compose([
+      ["start"],
+      ["update", "ab"],
+      ["keydown", { keyCode: 13 }],
+      ["end", "ab"],
+    ]),
   ).toEqual({ sent: ["ab"], active: false });
+});
+
+test("an IME keydown (229 or isComposing) keeps the confirmation window open", () => {
+  expect(
+    compose([
+      ["start"],
+      ["update", "é"],
+      ["end", "é"],
+      ["keydown", { keyCode: 229 }],
+      ["fromComposition", "é"],
+    ]).sent,
+  ).toEqual(["é"]);
+  expect(
+    compose([
+      ["start"],
+      ["update", "ab"],
+      ["end", "ab"],
+      ["keydown", { keyCode: 65, isComposing: true }],
+      ["text", "ab"],
+    ]).sent,
+  ).toEqual(["ab"]);
+});
+
+test("an IME keydown does not interrupt a composition", () => {
+  expect(
+    compose([
+      ["start"],
+      ["update", "a"],
+      ["keydown", { keyCode: 229 }],
+      ["update", "ab"],
+      ["end", "ab"],
+    ]),
+  ).toEqual({ sent: ["ab"], active: false });
+});
+
+test("a different text ends the confirmation window: a, then b, a arrive as aba", () => {
+  expect(
+    compose([
+      ["start"],
+      ["update", "a"],
+      ["end", "a"],
+      ["text", "b"],
+      ["text", "a"],
+    ]).sent,
+  ).toEqual(["a", "b", "a"]);
+});
+
+test("any other edit ends the confirmation window", () => {
+  expect(
+    compose([["start"], ["update", "a"], ["end", "a"], ["edit"], ["text", "a"]])
+      .sent,
+  ).toEqual(["a", "a"]);
+});
+
+test("matchesConfirmation only peeks", () => {
+  const tracker = createCompositionTracker();
+  tracker.start();
+  tracker.update("ab");
+  expect(tracker.end("ab")).toBe("ab");
+  expect(tracker.matchesConfirmation("ab")).toBe(true);
+  expect(tracker.matchesConfirmation("ab")).toBe(true);
+  expect(tracker.confirmText("ab")).toBe(true);
+  expect(tracker.matchesConfirmation("ab")).toBe(false);
 });
