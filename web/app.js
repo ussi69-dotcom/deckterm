@@ -7902,9 +7902,65 @@ class TerminalManager {
       case "open-here":
         await this.createTerminal(false, { cwd: session.cwd });
         break;
+      case "resume":
+        await this.resumeAgentSession(sessionId);
+        break;
     }
     this.updateSessionsAvailableBadge();
     this.closeSessionsPanel({ restoreFocus: false });
+  }
+
+  // S3 one-tap resume: the server reopens the agent conversation of an ENDED
+  // session in a new terminal in the agent's folder (POST
+  // /api/terminals/:id/resume, through the normal create path). Only ever
+  // called from a tap or a key press on a "Resume" control, never at boot
+  // or on reconnect.
+  async resumeAgentSession(sessionId) {
+    const session = (this._sessionCatalog || []).find(
+      (s) => s?.id === sessionId,
+    );
+    const resume = window.SessionActions?.resumeInfo?.(session);
+    if (!session || !resume) {
+      await this.refreshSessionsPanel();
+      return false;
+    }
+    // A double tap must not start the agent twice.
+    this.agentResumesInFlight ||= new Set();
+    if (this.agentResumesInFlight.has(sessionId)) return false;
+    this.agentResumesInFlight.add(sessionId);
+    const url = `/api/terminals/${encodeURIComponent(sessionId)}/resume`;
+    let result = null;
+    try {
+      result = await this.createTerminal(false, {
+        cwd: resume.cwd,
+        createRequest: ({ cols, rows }) =>
+          fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cols, rows }),
+          }),
+      });
+    } finally {
+      this.agentResumesInFlight.delete(sessionId);
+    }
+    if (result?.resumed && result.resumed.typed === false) {
+      this.notify({
+        key: "agent-resume-folder",
+        kind: "info",
+        title: "Opened a shell without resuming",
+        body: `${resume.cwd} is no longer available, so ${resume.agent} was not started.`,
+      });
+    }
+    if (result?.resumed?.typed) {
+      // The server cleared the ended row's resume data: drop the button now
+      // instead of waiting for the next catalog refresh.
+      this._sessionCatalog = (this._sessionCatalog || []).map((s) =>
+        s?.id === sessionId ? { ...s, resume: null } : s,
+      );
+    }
+    this.renderAgentsOverview();
+    this.queueTelemetryRefresh(0);
+    return Boolean(result);
   }
 
   // Desktop: Sessions is a SurfaceWindow (non-modal, terminals stay usable);
@@ -7957,9 +8013,10 @@ class TerminalManager {
 
   focusSessionsWindowAfterRender(panel, listState, parked) {
     if (panel.classList.contains("hidden")) return;
-    // "Open here" rows create a terminal on Enter; never land on one.
+    // "Open here" and "Resume" rows create a terminal on Enter; never land
+    // on one.
     const safeRow = panel.querySelector(
-      '#sessions-list .session-row:not([data-row-action="open-here"])',
+      '#sessions-list .session-row:not([data-row-action="open-here"]):not([data-row-action="resume"])',
     );
     const target = window.SurfaceWindows?.planSessionsWindowFocus?.({
       listState,
@@ -7991,7 +8048,7 @@ class TerminalManager {
     else if (plan === "front") {
       this.surfaceWindowManager?.bringToFront("sessions");
       const row = panel.querySelector(
-        '#sessions-list .session-row:not([data-row-action="open-here"])',
+        '#sessions-list .session-row:not([data-row-action="open-here"]):not([data-row-action="resume"])',
       );
       if (row) row.focus({ preventScroll: true });
       else panel.querySelector("#sessions-refresh-btn")?.focus();
@@ -8095,7 +8152,8 @@ class TerminalManager {
             signals?.sessionDisplayTitle?.(s) || s.cwd || "Terminal";
           const tier = overview?.statusTier?.(s, seen, tierOptions) ?? null;
           const tierIcon =
-            tier !== null && tier <= overview.TIER_IDLE
+            tier !== null &&
+            (tier <= overview.TIER_IDLE || tier === overview.TIER_RESUMABLE)
               ? `<span class="agent-tier-icon" data-tier="${tier}" role="img" aria-label="${esc(overview.TIER_LABELS[tier])}" title="${esc(overview.tooltipFor(s, tier))}">${overview.TIER_ICONS[tier]}</span>`
               : "";
           const unseen = signals?.hasUnseenAttention?.(s, seen[s.id], {
@@ -8133,9 +8191,11 @@ class TerminalManager {
                 : "needs input";
           const agentChip = s.agentName
             ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
-            : s.running
-              ? `<span class="session-chip session-chip-running">Running</span>`
-              : "";
+            : action.kind === "resume"
+              ? `<span class="session-chip session-chip-agent session-chip-resume">${esc(action.agent)} · was running</span>`
+              : s.running
+                ? `<span class="session-chip session-chip-running">Running</span>`
+                : "";
           const attentionChip = attentionKind
             ? `<span class="session-chip session-chip-attention" data-kind="${esc(attentionKind)}">${esc(ATTENTION_KIND_LABELS[attentionKind] || "Attention")}</span>`
             : "";
@@ -8152,7 +8212,11 @@ class TerminalManager {
           ]
             .filter(Boolean)
             .join(" · ");
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" data-tier="${tier ?? ""}" title="${esc(`Session ${s.id}`)}">
+          const rowTitle =
+            action.kind === "resume"
+              ? overview?.resumeTooltip?.(s) || action.label
+              : `Session ${s.id}`;
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" data-tier="${tier ?? ""}" title="${esc(rowTitle)}">
           <div class="session-row-main">
             <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> ${tierIcon}<span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
@@ -13464,7 +13528,13 @@ class TerminalManager {
         return;
       }
       const row = event.target.closest("[data-agent-session-id]");
-      if (row) void this.activateAgentSession(row.dataset.agentSessionId);
+      if (!row) return;
+      // The "Resume" group: one tap reopens the agent conversation.
+      if (row.dataset.agentResume === "1") {
+        void this.resumeAgentSession(row.dataset.agentSessionId);
+        return;
+      }
+      void this.activateAgentSession(row.dataset.agentSessionId);
     };
     this.agentsPanelBody?.addEventListener("click", onListClick);
     this.onAgentsListClick = onListClick;
@@ -17260,7 +17330,13 @@ class TerminalManager {
 
   // Create a new terminal in a new workspace (split=false) or current workspace (split=true)
   async createTerminal(split = false, options = {}) {
-    const { skipBootstrapWait = false, cwd: cwdOverride } = options;
+    // `createRequest({ cols, rows })` replaces the POST /api/terminals call
+    // (S3 resume: the server creates the terminal and types the command).
+    const {
+      skipBootstrapWait = false,
+      cwd: cwdOverride,
+      createRequest = null,
+    } = options;
     if (!skipBootstrapWait) {
       await this.waitForBootstrap();
     }
@@ -17271,11 +17347,13 @@ class TerminalManager {
 
     try {
       const postTerminal = (requestCwd) =>
-        fetch("/api/terminals", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cwd: requestCwd, cols, rows }),
-        });
+        createRequest
+          ? createRequest({ cols, rows })
+          : fetch("/api/terminals", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ cwd: requestCwd, cols, rows }),
+            });
       let res = await postTerminal(cwd);
 
       if (!res.ok) {
@@ -17293,6 +17371,7 @@ class TerminalManager {
         // An implicit cwd (the field / saved default) outside the allowed
         // roots: start in the server's default root instead of failing.
         if (
+          !createRequest &&
           window.LiveCwd?.shouldRetryCreateWithoutCwd?.({
             status: res.status,
             reason: denialReason,
@@ -17538,9 +17617,11 @@ class TerminalManager {
 
       // Disable mobile keyboard autocorrect etc.
       setTimeout(() => this.disableMobileKeyboardFeatures(element), 100);
+      return terminalInfo;
     } catch (err) {
       console.error("Failed to create terminal:", err);
       alert("Failed to create terminal: " + err.message);
+      return null;
     }
   }
 
