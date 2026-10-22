@@ -123,6 +123,47 @@ test("parseShellIntegrationChunk tracks active agent markers", () => {
   });
 });
 
+// S3: the start marker may carry the agent conversation id, `sid=<uuid>`.
+// The marker is pane output (forgeable), so only a lowercase UUID counts.
+test("parseShellIntegrationChunk accepts a UUID sid on the agent start", () => {
+  const sid = "0f0e0d0c-1111-2222-3333-444455556666";
+  const result = parseShellIntegrationChunk(
+    `\x1b]9;9;deckterm;agent;claude;start;sid=${sid}\x07hi`,
+  );
+  expect(result.output).toBe("hi");
+  expect(result.events).toEqual([
+    { type: "agent-start", agentName: "claude", sessionId: sid },
+  ]);
+  expect(result.state.agentName).toBe("claude");
+});
+
+test("parseShellIntegrationChunk drops a forged or malformed sid but keeps the start", () => {
+  const forged = [
+    "sid=x;$(id)",
+    "sid=0f0e0d0c-1111-2222-3333-444455556666;$(id)",
+    "sid=0f0e0d0c-1111-2222-3333-444455556666;sid=0f0e0d0c-1111-2222-3333-444455556667",
+    "sid=0F0E0D0C-1111-2222-3333-444455556666",
+    "sid=0f0e0d0c-1111-2222-3333-44445555666",
+    "sid=0f0e0d0c11112222333344445555666600",
+    "sid= 0f0e0d0c-1111-2222-3333-444455556666",
+    "sid=0f0e0d0c-1111-2222-3333-444455556666 ",
+    "id=0f0e0d0c-1111-2222-3333-444455556666",
+    "sid=",
+    "sid=$(id)",
+    "",
+  ];
+  for (const extra of forged) {
+    const result = parseShellIntegrationChunk(
+      `\x1b]9;9;deckterm;agent;codex;start;${extra}\x07`,
+    );
+    expect(result.events).toEqual([{ type: "agent-start", agentName: "codex" }]);
+    expect(
+      (result.events[0] as { sessionId?: string }).sessionId,
+    ).toBeUndefined();
+    expect(result.state.agentName).toBe("codex");
+  }
+});
+
 test("parseShellIntegrationChunk detects the Codex title reset at turn completion", () => {
   const initial: ShellIntegrationParseState = {
     carry: "",

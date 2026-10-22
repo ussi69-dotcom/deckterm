@@ -306,6 +306,16 @@ export function getRouteCapability(
         resourceId,
       };
     }
+    // S3 one-tap resume: it creates a NEW terminal (in the ended row's agent
+    // folder) through the normal create path, so it needs terminal.create;
+    // the create path keys that check on the resolved root.
+    if (normalizedMethod === "POST" && action === "resume") {
+      return {
+        capability: "terminal.create",
+        resourceType: "terminal",
+        resourceId,
+      };
+    }
   }
 
   if (

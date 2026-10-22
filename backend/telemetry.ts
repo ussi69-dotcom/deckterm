@@ -1,6 +1,7 @@
 import { dirname } from "node:path";
 import { hardenGitInvocation } from "./git-readonly";
 import { sanitizeTerminalEnv } from "./services/terminal-env";
+import { isAgentSessionId } from "./agent-resume";
 
 const BUSY_ACTIVITY_WINDOW_MS = 30_000;
 const BUSY_BOOTSTRAP_WINDOW_MS = 10_000;
@@ -88,7 +89,12 @@ export type ShellIntegrationParseState = {
 export type ShellIntegrationEvent =
   | { type: "running-start" }
   | { type: "running-done"; exitCode: number | null }
-  | { type: "agent-start"; agentName: AgentName }
+  | {
+      type: "agent-start";
+      agentName: AgentName;
+      /** Validated agent conversation id from `sid=` (S3); absent if none. */
+      sessionId?: string;
+    }
   | { type: "agent-done"; agentName: AgentName; exitCode: number | null }
   | { type: "agent-turn-complete"; agentName: "codex" }
   | { type: "tool-used"; name: string; summary: string };
@@ -140,6 +146,19 @@ function hasCodexTurnCompleteTitle(chunk: string): boolean {
     if (title && !/^[\u2800-\u28ff]/u.test(title)) return true;
   }
   return false;
+}
+
+// The start marker is `agent;<name>;start` or `agent;<name>;start;sid=<uuid>`.
+// It travels in pane output, so any program can forge it: the id counts only
+// as a lowercase UUID in the single extra field.
+function parseAgentStartSessionId(
+  field: string | undefined,
+  rest: string[],
+): string | null {
+  if (field === undefined || rest.length > 0) return null;
+  if (!field.startsWith("sid=")) return null;
+  const value = field.slice("sid=".length);
+  return isAgentSessionId(value) ? value : null;
 }
 
 function normalizeAgentName(value: string): AgentName | null {
@@ -547,7 +566,7 @@ export function parseShellIntegrationChunk(
       lastExitCode = exitCode;
       events.push({ type: "running-done", exitCode });
     } else if (payload.startsWith("agent;")) {
-      const [, rawAgentName, action, rawExitCode] = payload.split(";");
+      const [, rawAgentName, action, rawExitCode, ...rest] = payload.split(";");
       const normalizedAgentName = normalizeAgentName(rawAgentName || "");
       if (!normalizedAgentName) {
         output += input.slice(
@@ -557,7 +576,14 @@ export function parseShellIntegrationChunk(
       } else if (action === "start") {
         agentName = normalizedAgentName;
         agentState = "thinking";
-        events.push({ type: "agent-start", agentName: normalizedAgentName });
+        // S3: exactly one extra field, `sid=<uuid>`. Anything else (more
+        // fields, a non-UUID) is dropped; the start itself still counts.
+        const sessionId = parseAgentStartSessionId(rawExitCode, rest);
+        events.push(
+          sessionId
+            ? { type: "agent-start", agentName: normalizedAgentName, sessionId }
+            : { type: "agent-start", agentName: normalizedAgentName },
+        );
       } else if (action === "done") {
         const codeValue = Number.parseInt(rawExitCode || "", 10);
         const exitCode = Number.isFinite(codeValue) ? codeValue : null;
