@@ -1139,6 +1139,21 @@ export function reserveAgentResume(
   expected: { agentName: string; sessionId: string | null; cwd: string },
   { now = new Date() }: { now?: Date } = {},
 ): boolean {
+  return reserveAgentResumeToken(db, terminalId, expected, { now }) !== null;
+}
+
+// S3: like reserveAgentResume, but returns the owner token stored in the
+// row (the reservation time plus a random suffix, so it still sorts by time
+// for the stale check). Release and hand-over are conditional on it, so a
+// request whose stale reservation was taken over can neither release the
+// new owner's reservation nor type into its terminal.
+export function reserveAgentResumeToken(
+  db: Database,
+  terminalId: string,
+  expected: { agentName: string; sessionId: string | null; cwd: string },
+  { now = new Date() }: { now?: Date } = {},
+): string | null {
+  const token = `${isoDate(now)}#${crypto.randomUUID()}`;
   const staleBefore = isoDate(
     new Date(now.getTime() - AGENT_RESUME_RESERVATION_TTL_MS),
   );
@@ -1152,22 +1167,47 @@ export function reserveAgentResume(
               OR agent_resume_reserved_at < ?)`,
     )
     .run(
-      isoDate(now),
+      token,
       terminalId,
       expected.agentName,
       expected.sessionId,
       expected.cwd,
       staleBefore,
     );
-  return result.changes === 1;
+  return result.changes === 1 ? token : null;
+}
+
+// S3: true while `token` still owns the reservation of `terminalId`.
+export function agentResumeReservedBy(
+  db: Database,
+  terminalId: string,
+  token: string,
+): boolean {
+  const row = db
+    .query(
+      "SELECT 1 AS owned FROM terminal_sessions WHERE id = ? AND agent_resume_reserved_at = ?",
+    )
+    .get(terminalId, token) as { owned: number } | null;
+  return row !== null;
 }
 
 // S3: the hand-over did not happen (nothing was typed): the row stays
 // resumable and a retry may reserve it again.
-export function releaseAgentResume(db: Database, terminalId: string): void {
+export function releaseAgentResume(
+  db: Database,
+  terminalId: string,
+  token?: string,
+): void {
+  if (token === undefined) {
+    db.query(
+      "UPDATE terminal_sessions SET agent_resume_reserved_at = NULL WHERE id = ?",
+    ).run(terminalId);
+    return;
+  }
+  // Only the owner may release: a taken-over request leaves the row alone.
   db.query(
-    "UPDATE terminal_sessions SET agent_resume_reserved_at = NULL WHERE id = ?",
-  ).run(terminalId);
+    "UPDATE terminal_sessions SET agent_resume_reserved_at = NULL WHERE id = ? AND agent_resume_reserved_at = ?",
+  ).run(terminalId, token);
 }
 
 // S3: the rows of `actorUserId` other than `excludeId` that name a Codex

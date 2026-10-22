@@ -227,8 +227,9 @@ import {
   markUserReviewed,
   recordAgentSession,
   recordTerminalSession,
+  agentResumeReservedBy,
   releaseAgentResume,
-  reserveAgentResume,
+  reserveAgentResumeToken,
   resolveUserForActor,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
@@ -467,6 +468,15 @@ const MAX_TERMINALS_PER_USER = parseInt(
 const AGENT_RESUME_SUBMIT_DELAY_MS = 300;
 // S3: ended rows a resume request in THIS process is handing over right now.
 const agentResumesInProgress = new Set<string>();
+// S3: Codex resumes being handed over, keyed by owner and folder, until the
+// new terminal's own start marker shows the agent (or the window passes). A
+// second `codex resume --last` in the same folder meanwhile would open the
+// conversation that is being resumed, so it is offered the picker instead.
+const codexResumeHandoffs = new Map<string, number>();
+const CODEX_RESUME_HANDOFF_MS = 30_000;
+function codexHandoffKey(ownerId: string, cwd: string): string {
+  return `${ownerId}\u0000${cwd}`;
+}
 const TERMINAL_LIST_ENDED_LIMIT = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TERMINAL_LIST_ENDED_LIMIT || "10",
@@ -5012,6 +5022,11 @@ function codexFolderShared(
 ): boolean {
   if (session.agentName !== "codex" || !session.agentCwd) return false;
   const cwd = session.agentCwd;
+  const handoffUntil = codexResumeHandoffs.get(codexHandoffKey(ownerId, cwd));
+  if (handoffUntil !== undefined) {
+    if (handoffUntil > Date.now()) return true;
+    codexResumeHandoffs.delete(codexHandoffKey(ownerId, cwd));
+  }
   for (const term of terminals.values()) {
     if (
       term.id !== session.id &&
@@ -9057,16 +9072,17 @@ export function createWebApp() {
       );
     if (agentResumesInProgress.has(id)) return inProgress();
     agentResumesInProgress.add(id);
+    const handoffKey =
+      plan.agent === "codex" ? codexHandoffKey(ownerId, plan.cwd) : null;
     try {
-      if (
-        !reserveAgentResume(state.db, id, {
-          agentName: plan.agent,
-          sessionId: row.agentSessionId,
-          cwd: plan.cwd,
-        })
-      ) {
-        return inProgress();
-      }
+      const token = reserveAgentResumeToken(state.db, id, {
+        agentName: plan.agent,
+        sessionId: row.agentSessionId,
+        cwd: plan.cwd,
+      });
+      if (token === null) return inProgress();
+      const handoffUntil = Date.now() + CODEX_RESUME_HANDOFF_MS;
+      if (handoffKey) codexResumeHandoffs.set(handoffKey, handoffUntil);
       let handedOver = false;
       try {
         const created = await createTerminalThroughCreatePath(
@@ -9079,7 +9095,10 @@ export function createWebApp() {
         // The create path may fall back to a parent folder when the agent's
         // folder is gone. Codex `resume --last` would then pick another
         // folder's conversation, so nothing is typed there.
-        const typeIt = terminal.cwd === plan.cwd;
+        // A reservation taken over meanwhile (a stale one, by another
+        // process) must not type: the new owner does.
+        const stillOwner = agentResumeReservedBy(state.db, id, token);
+        const typeIt = terminal.cwd === plan.cwd && stillOwner;
         // Typed through the shell functions (Codex keeps --no-alt-screen and
         // the new run reports its id again), then a separate deferred Enter.
         const typed =
@@ -9135,7 +9154,13 @@ export function createWebApp() {
       } finally {
         // Nothing was handed over (refused, failed or not typed): the row
         // stays resumable and a retry can reserve it again.
-        if (!handedOver) releaseAgentResume(state.db, id);
+        if (!handedOver) {
+          releaseAgentResume(state.db, id, token);
+          // Only our own entry: another hand-over in this folder keeps its.
+          if (handoffKey && codexResumeHandoffs.get(handoffKey) === handoffUntil) {
+            codexResumeHandoffs.delete(handoffKey);
+          }
+        }
       }
     } finally {
       agentResumesInProgress.delete(id);

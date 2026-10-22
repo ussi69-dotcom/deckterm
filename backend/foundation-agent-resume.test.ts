@@ -18,8 +18,10 @@ import {
   markTerminalSessionEnded,
   recordAgentSession,
   recordTerminalSession,
+  agentResumeReservedBy,
   releaseAgentResume,
   reserveAgentResume,
+  reserveAgentResumeToken,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
   setUserRole,
@@ -545,6 +547,29 @@ test("only one resume can reserve a row; release and a stale reservation free it
         now: new Date(t0.getTime() + 61_000),
       }),
     ).toBe(true);
+    // Owner tokens (Codex re-check): a stale reservation taken over by B
+    // can neither be released by A nor typed into by A.
+    releaseAgentResume(db, "r1");
+    const tokenA = reserveAgentResumeToken(db, "r1", expected, { now: t0 });
+    expect(tokenA).not.toBeNull();
+    const tokenB = reserveAgentResumeToken(db, "r1", expected, {
+      now: new Date(t0.getTime() + 61_000),
+    });
+    expect(tokenB).not.toBeNull();
+    expect(tokenB).not.toBe(tokenA);
+    expect(agentResumeReservedBy(db, "r1", tokenA!)).toBe(false);
+    expect(agentResumeReservedBy(db, "r1", tokenB!)).toBe(true);
+    releaseAgentResume(db, "r1", tokenA!);
+    expect(agentResumeReservedBy(db, "r1", tokenB!)).toBe(true);
+    // A third request still loses against B's fresh reservation.
+    expect(
+      reserveAgentResume(db, "r1", expected, {
+        now: new Date(t0.getTime() + 62_000),
+      }),
+    ).toBe(false);
+    releaseAgentResume(db, "r1", tokenB!);
+    expect(agentResumeReservedBy(db, "r1", tokenB!)).toBe(false);
+    expect(reserveAgentResume(db, "r1", expected, { now: t0 })).toBe(true);
     // Completing the hand-over clears the data and the reservation.
     clearAgentSession(db, "r1");
     expect(getTerminalSession(db, "r1")).toMatchObject({
@@ -1187,6 +1212,29 @@ test("the Codex same-folder check sees resumable rows outside the catalog", asyn
   const dry = await post("/api/terminals/codex-visible/resume", {
     dryRun: true,
   });
+  expect(await json(dry)).toEqual({
+    command: "codex resume",
+    cwd: folder,
+    mode: "pick",
+  });
+});
+
+// Codex re-check: while one Codex row of a folder is handed over, the new
+// terminal's start marker has not arrived yet, so another row of the same
+// folder must not fall back to `codex resume --last` (it would open the
+// conversation being resumed).
+test("a Codex hand-over in progress keeps the folder's other rows on the picker", async () => {
+  const folder = join(allowedRoot, "proj-codex-handoff");
+  mkdirSync(folder);
+  seedEnded("cdx-a", { agentName: "codex", sessionId: null, cwd: folder });
+  seedEnded("cdx-b", { agentName: "codex", sessionId: null, cwd: folder });
+  const resumed = await post("/api/terminals/cdx-a/resume", {});
+  expect(resumed.status).toBe(200);
+  createdTerminalIds.push((await json(resumed)).id);
+  expect(withDb((db) => getTerminalSession(db, "cdx-a"))).toMatchObject({
+    agentName: null,
+  });
+  const dry = await post("/api/terminals/cdx-b/resume", { dryRun: true });
   expect(await json(dry)).toEqual({
     command: "codex resume",
     cwd: folder,
