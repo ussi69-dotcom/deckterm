@@ -530,7 +530,8 @@ test("successful deploy isolates preflight, persists contracts, and rollback ver
     .split("\n")
     .map((line) => JSON.parse(line));
   expect(liveEvents).toEqual([{ release: "new-release", preflight: false }]);
-  expect(readdirSync(join(setup.liveState, "tmux"))).toEqual(["live.marker", "pipes"]);
+  // readdir order depends on the filesystem (it differs on the CI runner).
+  expect(readdirSync(join(setup.liveState, "tmux")).sort()).toEqual(["live.marker", "pipes"]);
   expect(readdirSync(setup.liveCapture)).toEqual(["new-release.marker"]);
   const oldContract = join(
     setup.deployRoot,
