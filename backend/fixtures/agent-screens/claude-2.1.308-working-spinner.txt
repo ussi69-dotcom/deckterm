@@ -1,0 +1,49 @@
+---
+agent: claude
+version: 2.1.308
+state: working
+rule: live_turn_working
+title: ✳ Bash tool directory listing
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-10-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines); user name -> user
+notes: Frame ~6s into a reply to "Run ls in this folder with the Bash tool." The OSC title stays "✳ <topic>" while working (no Braille/half-circle spinner seen in the title on 2.1.308), so osc_title_working does not fire and osc_title_idle (250) is outranked by the screen rule.
+---
+
+ ▐▛███▛█   Claude Code v2.1.308
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /tmp/scratch
+
+
+❯ Run ls in this folder with the Bash tool.
+
+  Listing files in the working directory
+  ⎿  $ ls -la /tmp/scratch
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+* Baking… (6s · ↓ 74 tokens)
+                                                  Advisor Tool (experimental) is on and may use more tokens · /advisor
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    scratch  ✻ Haiku 5.5 ·medium  █······· 5% 55k/1M  $0.01  5h 16% · 7d 33%  user@host
+  ⏸ manual mode on

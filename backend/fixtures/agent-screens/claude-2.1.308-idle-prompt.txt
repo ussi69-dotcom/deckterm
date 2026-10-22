@@ -1,0 +1,49 @@
+---
+agent: claude
+version: 2.1.308
+state: idle
+rule: live_prompt_box
+title: ✳ Bash tool directory listing
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-10-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines); user name -> user
+notes: Empty prompt after the ls reply. The prompt line is "❯" followed by U+00A0 (no-break space), kept byte for byte.
+---
+
+ ▐▛███▛█   Claude Code v2.1.308
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /tmp/scratch
+
+
+❯ Run ls in this folder with the Bash tool.
+
+  Listed 1 directory
+
+● Složka /tmp/scratch je prázdná. Obsahuje jen . a .., žádné soubory ani podsložky.
+
+✻ Worked for 8s · done 1:59 PM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                     tmux detected · scroll with PgUp/PgDn · or add 'set -g mouse on' to ~/.tmux.conf for wheel scroll
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    scratch  ✻ Haiku 5.5 ·medium  █······· 5% 55k/1M  $0.01  5h 16% · 7d 33%  user@host
+  ⏸ manual mode on
