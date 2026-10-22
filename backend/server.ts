@@ -11248,9 +11248,9 @@ async function startOwnedWebServer(
           `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
         );
       }
-      for (const { session, removed } of result.sessions) {
+      for (const { session, id, removed } of result.sessions) {
         console.log(
-          `[tmux] environment: removed ${removed.length} service variable(s) from session ${session}: ${removed.join(", ")}`,
+          `[tmux] environment: removed ${removed.length} service variable(s) from session ${id} (${session}): ${removed.join(", ")}`,
         );
       }
       if (!result.ok) {

@@ -3,8 +3,10 @@ import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
   sanitizeTerminalEnv,
+  readTmuxServerIdentity,
   scrubTmuxEnvironment,
   TmuxEnvironmentGuard,
+  type TmuxCommandRunner,
   type TmuxScrubResult,
 } from "./terminal-env";
 import {
@@ -142,19 +144,21 @@ export class TmuxTerminalBackend implements TerminalBackend {
   private socketDirectoryReady: Promise<void> | null = null;
   // Gate in front of new-session: refuses to create a shell while the
   // server's environment has not been verified free of service secrets.
-  private readonly environmentGuard = new TmuxEnvironmentGuard(() =>
-    scrubTmuxEnvironment(async (args) => {
-      const proc = await this.spawnTmux(args, {
-        stdout: "pipe",
-        stderr: "pipe",
-        stdin: "ignore",
-      });
-      const [stdout, stderr] = await Promise.all([
-        new Response((proc as any).stdout).text(),
-        new Response((proc as any).stderr).text(),
-      ]);
-      return { code: await proc.exited, stdout, stderr };
-    }),
+  private readonly runTmuxCommand: TmuxCommandRunner = async (args) => {
+    const proc = await this.spawnTmux(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr] = await Promise.all([
+      new Response((proc as any).stdout).text(),
+      new Response((proc as any).stderr).text(),
+    ]);
+    return { code: await proc.exited, stdout, stderr };
+  };
+  private readonly environmentGuard = new TmuxEnvironmentGuard(
+    () => scrubTmuxEnvironment(this.runTmuxCommand),
+    () => readTmuxServerIdentity(this.runTmuxCommand),
   );
 
   constructor(options: TmuxTerminalBackendOptions) {
@@ -218,7 +222,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
     const shellCommand = await this.shellCommandResolver();
     await this.assertExternalServerRunning();
     // Throws TmuxEnvironmentUnverifiedError (HTTP 503) when the server may
-    // still hold service secrets; the next create tries again.
+    // still hold service secrets; the next create tries again. Re-scrubs
+    // whenever a different server answers the socket than the one verified.
+    // Known gap (operator decision 2026-10-22): BrokeredTmuxBackend (per-uid
+    // servers, DECKTERM_OS_ISOLATION=1, off on dev and prod) has no such
+    // gate; the broker builds each child environment from scratch.
     await this.environmentGuard.ensureVerified();
     const createProc = await this.spawnTmux(
       [

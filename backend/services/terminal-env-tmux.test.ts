@@ -225,7 +225,7 @@ test("scrubServerEnvironment cleans a server that was started with the secrets",
 
   // Idempotent: a second scrub has nothing left to remove.
   const again = await backend.scrubServerEnvironment();
-  expect(again).toEqual({
+  expect(again).toMatchObject({
     ok: true,
     serverPresent: true,
     removed: [],
@@ -281,6 +281,7 @@ test("scrubServerEnvironment also cleans a session's own environment", async () 
   expect(result.sessions).toEqual([
     {
       session: "seed",
+      id: expect.stringMatching(/^\$[0-9]+$/),
       removed: ["CF_ACCESS_AUD", "DECKTERM_VAPID_PRIVATE_KEY"],
     },
   ]);
@@ -350,3 +351,53 @@ test.skipIf(process.getuid?.() === 0)(
     expect(names.some((n) => n.endsWith("t3"))).toBe(true);
   },
 );
+
+async function stopServer(socket: string) {
+  for (const pid of pidsForSocket(socket)) {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+  for (let i = 0; i < 100 && pidsForSocket(socket).length > 0; i++) {
+    await Bun.sleep(20);
+  }
+  expect(pidsForSocket(socket)).toEqual([]);
+}
+
+test("a different server appearing on the socket after verification is scrubbed before the next create", async () => {
+  const { dir, home } = freshDir();
+  const socket = join(dir, "t.sock");
+  sockets.push(socket);
+  const out = join(dir, "env.txt");
+  let shell: string[] = ["sleep", "30"];
+  const backend = backendFor(socket, dir, home, () => shell);
+
+  // Server A: started clean by DeckTerm and verified.
+  await backend.createSession("t1", dir, 80, 24, "u1", "u@example.com");
+  expect((await backend.scrubServerEnvironment()).ok).toBe(true);
+  expect(backend.environmentVerified).toBe(true);
+
+  // A exits; server B is started on the same socket from a polluted
+  // environment (e.g. by hand from a shell that still had the secrets).
+  await stopServer(socket);
+  expect(
+    tmux(socket, home, ["new-session", "-d", "-s", "evil", "sleep 30"], SECRETS)
+      .exitCode,
+  ).toBe(0);
+  expect(envNames(socket, home)).toContain("DECKTERM_VAPID_PRIVATE_KEY");
+
+  // The next create notices the new server identity and scrubs it first.
+  shell = dumpShell(out);
+  await backend.createSession("t2", dir, 80, 24, "u1", "u@example.com");
+  const dump = await waitForFile(out);
+  for (const name of Object.keys(SECRETS)) {
+    expect(dump).not.toContain(`${name}=`);
+  }
+  const names = envNames(socket, home);
+  for (const name of Object.keys(SECRETS)) {
+    expect(names).not.toContain(name);
+  }
+  expect(backend.environmentVerified).toBe(true);
+});

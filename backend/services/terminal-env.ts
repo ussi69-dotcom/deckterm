@@ -208,12 +208,67 @@ export function parseTmuxEnvironmentNames(output: string): string[] {
   return names;
 }
 
-/** Parses `list-sessions -F '#{session_name}'` output (one name per line). */
-export function parseTmuxSessionNames(output: string): string[] {
-  return output
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
+export const TMUX_SESSION_LIST_FORMAT = "#{session_id} #{session_name}";
+
+export type TmuxSessionRef = {
+  /** Stable session id (`$3`): survives a rename, used as the target. */
+  id: string;
+  /** Name at listing time: for logs only, never a target. */
+  name: string;
+};
+
+/**
+ * Parses `list-sessions -F '#{session_id} #{session_name}'` output. The
+ * separator is a printable space (tmux turns a TAB in format output into `_`
+ * when LANG is unset); the id never contains one, the name may, so the line
+ * is split at the FIRST space and nothing is trimmed.
+ */
+export function parseTmuxSessionRefs(output: string): TmuxSessionRef[] {
+  const refs: TmuxSessionRef[] = [];
+  for (const line of output.split("\n")) {
+    const match = /^(\$[0-9]+) (.*)$/.exec(line);
+    if (match) refs.push({ id: match[1], name: match[2] });
+  }
+  return refs;
+}
+
+/** Format for the server identity: pid + server start time (seconds). */
+export const TMUX_SERVER_IDENTITY_FORMAT = "#{pid} #{start_time}";
+
+export type TmuxServerIdentity =
+  | { status: "present"; id: string }
+  | { status: "absent" }
+  | { status: "error"; error: string };
+
+/**
+ * Reads which tmux server answers the socket: `pid start_time`. A server that
+ * exits and is replaced on the same socket has a different identity (a reused
+ * pid still differs in start time), so a verification bound to it lapses.
+ */
+export async function readTmuxServerIdentity(
+  runTmux: TmuxCommandRunner,
+): Promise<TmuxServerIdentity> {
+  const shown = await runTmux([
+    "display-message",
+    "-p",
+    TMUX_SERVER_IDENTITY_FORMAT,
+  ]);
+  if (shown.code !== 0) {
+    return isTmuxNoServerError(shown.stderr)
+      ? { status: "absent" }
+      : {
+          status: "error",
+          error: describeTmuxFailure("tmux display-message (server id)", shown),
+        };
+  }
+  const id = shown.stdout.trim();
+  if (!/^[0-9]+ [0-9]+$/.test(id)) {
+    return {
+      status: "error",
+      error: `tmux server id unreadable: ${JSON.stringify(id.slice(0, 80))}`,
+    };
+  }
+  return { status: "present", id };
 }
 
 /**
@@ -231,17 +286,18 @@ export function buildTmuxGlobalEnvUnsetArgs(names: string[]): string[] {
 
 /**
  * Builds ONE tmux client argv tail that unsets each name from one session's
- * own environment (`set-environment -t =SESSION -u NAME ; …`). `=` makes the
- * target an exact session name, never a prefix match. Empty input → [].
+ * own environment (`set-environment -t $ID -u NAME ; …`). The target is the
+ * stable session id (`$3`), so a rename cannot redirect or skip it. Empty
+ * input → [].
  */
 export function buildTmuxSessionEnvUnsetArgs(
-  session: string,
+  sessionId: string,
   names: string[],
 ): string[] {
   const args: string[] = [];
   for (const name of names) {
     if (args.length > 0) args.push(";");
-    args.push("set-environment", "-t", `=${session}`, "-u", name);
+    args.push("set-environment", "-t", sessionId, "-u", name);
   }
   return args;
 }
@@ -284,10 +340,15 @@ export type TmuxScrubResult = {
   ok: boolean;
   /** false only when tmux proved no server exists on the socket. */
   serverPresent: boolean;
+  /**
+   * Identity (`pid start_time`) of the server read at the START of the scrub;
+   * the verification is bound to it. Absent when no server or unreadable.
+   */
+  serverId?: string;
   /** Denied names removed from the global environment (names only). */
   removed: string[];
   /** Denied names removed per session (names only, never values). */
-  sessions: Array<{ session: string; removed: string[] }>;
+  sessions: Array<{ session: string; id: string; removed: string[] }>;
   /** Why verification failed; tmux's own error text, never a value. */
   error?: string;
 };
@@ -314,7 +375,8 @@ export async function scrubTmuxEnvironment(
   runTmux: TmuxCommandRunner,
 ): Promise<TmuxScrubResult> {
   const removed: string[] = [];
-  const sessions: Array<{ session: string; removed: string[] }> = [];
+  const sessions: Array<{ session: string; id: string; removed: string[] }> =
+    [];
   const absent = (): TmuxScrubResult => ({
     ok: true,
     serverPresent: false,
@@ -328,6 +390,14 @@ export async function scrubTmuxEnvironment(
     sessions,
     error,
   });
+
+  // Identity first: if the server is replaced mid-scrub, the verification is
+  // bound to the OLD identity, so the next create sees a different server and
+  // scrubs again — never the other way round.
+  const identity = await readTmuxServerIdentity(runTmux);
+  if (identity.status === "absent") return absent();
+  if (identity.status === "error") return failed(identity.error);
+  const serverId = identity.id;
 
   const shown = await runTmux(["show-environment", "-g"]);
   if (shown.code !== 0) {
@@ -352,24 +422,27 @@ export async function scrubTmuxEnvironment(
     removed.push(...globalDenied);
   }
 
-  const listed = await runTmux(["list-sessions", "-F", "#{session_name}"]);
+  const listed = await runTmux([
+    "list-sessions",
+    "-F",
+    TMUX_SESSION_LIST_FORMAT,
+  ]);
   if (listed.code !== 0) {
     return isTmuxNoServerError(listed.stderr)
       ? absent()
       : failed(describeTmuxFailure("tmux list-sessions", listed));
   }
-  for (const session of parseTmuxSessionNames(listed.stdout)) {
-    const sessionShown = await runTmux([
-      "show-environment",
-      "-t",
-      `=${session}`,
-    ]);
+  // Sessions are targeted by id ($N), which a rename does not change. "No
+  // such session" therefore means the session was destroyed — it can create
+  // no more panes, so skipping it is safe.
+  for (const { id, name: session } of parseTmuxSessionRefs(listed.stdout)) {
+    const sessionShown = await runTmux(["show-environment", "-t", id]);
     if (sessionShown.code !== 0) {
       if (isTmuxNoSuchSessionError(sessionShown.stderr)) continue;
       if (isTmuxNoServerError(sessionShown.stderr)) return absent();
       return failed(
         describeTmuxFailure(
-          `tmux show-environment -t ${session}`,
+          `tmux show-environment -t ${id} (${session})`,
           sessionShown,
         ),
       );
@@ -378,21 +451,21 @@ export async function scrubTmuxEnvironment(
       isDeniedTerminalEnvName,
     );
     if (denied.length === 0) continue;
-    const unset = await runTmux(buildTmuxSessionEnvUnsetArgs(session, denied));
+    const unset = await runTmux(buildTmuxSessionEnvUnsetArgs(id, denied));
     if (unset.code !== 0) {
       if (isTmuxNoSuchSessionError(unset.stderr)) continue;
       if (isTmuxNoServerError(unset.stderr)) return absent();
       return failed(
         describeTmuxFailure(
-          `tmux set-environment -t ${session} -u (${denied.join(", ")})`,
+          `tmux set-environment -t ${id} (${session}) -u (${denied.join(", ")})`,
           unset,
         ),
       );
     }
-    sessions.push({ session, removed: denied });
+    sessions.push({ session, id, removed: denied });
   }
 
-  return { ok: true, serverPresent: true, removed, sessions };
+  return { ok: true, serverPresent: true, serverId, removed, sessions };
 }
 
 /**
@@ -478,32 +551,47 @@ export function terminalEnvironmentErrorResponse(
  * Gate in front of every tmux new-session (the only call that creates shells
  * or starts the server).
  *
- * - Verified once the scrub succeeded against a PRESENT server; after that
- *   creation costs nothing extra.
- * - Until then, every create re-runs the scrub first. An absent server passes
- *   (new-session will start a clean one) but stays unverified, so the next
- *   create checks the server that now exists.
+ * - Verification is bound to the IDENTITY of the server it checked (`pid
+ *   start_time`). Each create reads the identity (one cheap tmux call); the
+ *   same server → no scrub. A different server on the socket (the old one
+ *   exited and something started a new one, possibly from a polluted
+ *   environment) → scrub again before creating.
+ * - Unverified → every create runs the scrub first. An absent server passes
+ *   (new-session will start a clean one from the sanitized env) but is not
+ *   verified, so the next create checks the server that now exists.
  * - A failed scrub refuses the create with TmuxEnvironmentUnverifiedError.
  *   Nothing is latched: the next create tries again, so a transient failure
  *   heals itself and the service is never bricked.
  * - Concurrent creates share one in-flight scrub.
+ *
+ * Residual window: a server swapped between the identity read and the
+ * new-session call is caught only by the next create.
  */
 export class TmuxEnvironmentGuard {
-  private verified = false;
+  private verifiedServerId: string | null = null;
   private inFlight: Promise<TmuxScrubResult> | null = null;
   private last: TmuxScrubResult | null = null;
 
-  constructor(private readonly scrub: () => Promise<TmuxScrubResult>) {}
+  constructor(
+    private readonly scrub: () => Promise<TmuxScrubResult>,
+    private readonly readIdentity: () => Promise<TmuxServerIdentity>,
+  ) {}
 
+  /** True once a scrub verified a running server (by identity). */
   get isVerified(): boolean {
-    return this.verified;
+    return this.verifiedServerId !== null;
+  }
+
+  /** Identity of the server the last successful scrub verified. */
+  get verifiedServer(): string | null {
+    return this.verifiedServerId;
   }
 
   get lastResult(): TmuxScrubResult | null {
     return this.last;
   }
 
-  /** Runs (or joins) a scrub and records whether it verified the server. */
+  /** Runs (or joins) a scrub and records which server it verified. */
   run(): Promise<TmuxScrubResult> {
     if (!this.inFlight) {
       this.inFlight = (async () => {
@@ -519,7 +607,10 @@ export class TmuxEnvironmentGuard {
             error: err instanceof Error ? err.message : String(err),
           };
         }
-        this.verified = result.ok && result.serverPresent;
+        this.verifiedServerId =
+          result.ok && result.serverPresent && result.serverId
+            ? result.serverId
+            : null;
         this.last = result;
         return result;
       })().finally(() => {
@@ -531,7 +622,24 @@ export class TmuxEnvironmentGuard {
 
   /** Resolves when creating a session is safe; throws when it is not. */
   async ensureVerified(): Promise<void> {
-    if (this.verified) return;
+    if (this.verifiedServerId !== null) {
+      let identity: TmuxServerIdentity;
+      try {
+        identity = await this.readIdentity();
+      } catch (err) {
+        identity = {
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      if (
+        identity.status === "present" &&
+        identity.id === this.verifiedServerId
+      ) {
+        return;
+      }
+      // Another server, none, or unreadable: verify again below.
+    }
     const result = await this.run();
     if (!result.ok) {
       throw new TmuxEnvironmentUnverifiedError(

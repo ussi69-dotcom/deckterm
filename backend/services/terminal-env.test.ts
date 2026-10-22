@@ -13,12 +13,15 @@ import {
   isTmuxNoServerError,
   listDeniedTerminalEnvNames,
   parseTmuxEnvironmentNames,
+  parseTmuxSessionRefs,
+  readTmuxServerIdentity,
   sanitizeTerminalEnv,
   scrubTmuxEnvironment,
   scrubTmuxEnvironmentWithRetry,
   terminalEnvironmentErrorResponse,
   type TmuxCommandResult,
   type TmuxScrubResult,
+  type TmuxServerIdentity,
 } from "./terminal-env";
 import { RawTerminalBackend } from "./raw-terminal-backend";
 import { launchTmuxServer } from "../tmux-server-launch";
@@ -153,18 +156,33 @@ describe("deny-list", () => {
   });
 });
 
-// Fake tmux: a global env, per-session envs, and optional failures keyed by
-// the first argv words. Records every call.
+// Fake tmux: a server identity, a global env, sessions (id → name + env),
+// and optional failures keyed by the first argv words. Records every call.
+// `onCall` lets a test change the server between calls (e.g. a rename).
 function fakeTmux(options: {
+  serverId?: string;
   global?: string;
   sessions?: Record<string, string>;
   fail?: Record<string, TmuxCommandResult>;
+  onCall?: (args: string[], state: FakeState) => void;
 }) {
+  const state: FakeState = {
+    names: new Map(),
+    envs: new Map(),
+  };
+  Object.entries(options.sessions ?? {}).forEach(([name, env], index) => {
+    state.names.set(`$${index}`, name);
+    state.envs.set(`$${index}`, env);
+  });
   const calls: string[][] = [];
   const run = async (args: string[]): Promise<TmuxCommandResult> => {
     calls.push(args);
+    options.onCall?.(args, state);
     for (const [prefix, result] of Object.entries(options.fail ?? {})) {
       if (args.join(" ").startsWith(prefix)) return result;
+    }
+    if (args[0] === "display-message") {
+      return { code: 0, stdout: `${options.serverId ?? "4242 1700000000"}\n` };
     }
     if (args[0] === "show-environment" && args[1] === "-g") {
       return { code: 0, stdout: options.global ?? "" };
@@ -172,17 +190,22 @@ function fakeTmux(options: {
     if (args[0] === "list-sessions") {
       return {
         code: 0,
-        stdout: Object.keys(options.sessions ?? {}).join("\n") + "\n",
+        stdout:
+          [...state.names].map(([id, name]) => `${id} ${name}\n`).join(""),
       };
     }
     if (args[0] === "show-environment" && args[1] === "-t") {
-      const name = args[2].replace(/^=/, "");
-      return { code: 0, stdout: options.sessions?.[name] ?? "" };
+      // Only an id resolves: a name-based target would miss a renamed session.
+      if (!state.envs.has(args[2])) {
+        return { code: 1, stdout: "", stderr: `no such session: ${args[2]}` };
+      }
+      return { code: 0, stdout: state.envs.get(args[2]) ?? "" };
     }
     return { code: 0, stdout: "" };
   };
-  return { calls, run };
+  return { calls, run, state };
 }
+type FakeState = { names: Map<string, string>; envs: Map<string, string> };
 
 const NO_SERVER: TmuxCommandResult = {
   code: 1,
@@ -217,16 +240,16 @@ describe("tmux environment scrub (pure)", () => {
       "-u",
       "B",
     ]);
-    expect(buildTmuxSessionEnvUnsetArgs("s1", ["A", "B"])).toEqual([
+    expect(buildTmuxSessionEnvUnsetArgs("$1", ["A", "B"])).toEqual([
       "set-environment",
       "-t",
-      "=s1",
+      "$1",
       "-u",
       "A",
       ";",
       "set-environment",
       "-t",
-      "=s1",
+      "$1",
       "-u",
       "B",
     ]);
@@ -255,14 +278,17 @@ describe("tmux environment scrub (pure)", () => {
     expect(result).toEqual({
       ok: true,
       serverPresent: true,
+      serverId: "4242 1700000000",
       removed: ["DECKTERM_VAPID_PRIVATE_KEY", "PORT"],
-      sessions: [{ session: "seed", removed: ["DECKTERM_VAPID_PRIVATE_KEY"] }],
+      sessions: [
+        { session: "seed", id: "$0", removed: ["DECKTERM_VAPID_PRIVATE_KEY"] },
+      ],
     });
     expect(tmux.calls).toContainEqual(
       buildTmuxGlobalEnvUnsetArgs(["DECKTERM_VAPID_PRIVATE_KEY", "PORT"]),
     );
     expect(tmux.calls).toContainEqual(
-      buildTmuxSessionEnvUnsetArgs("seed", ["DECKTERM_VAPID_PRIVATE_KEY"]),
+      buildTmuxSessionEnvUnsetArgs("$0", ["DECKTERM_VAPID_PRIVATE_KEY"]),
     );
     // Protected and user variables are never unset; the clean session gets
     // no unset call at all.
@@ -273,19 +299,19 @@ describe("tmux environment scrub (pure)", () => {
     expect(unsetNames).not.toContain("TMUX_PANE");
     expect(unsetNames).not.toContain("SSH_AUTH_SOCK");
     expect(
-      tmux.calls.some((c) => c[0] === "set-environment" && c[2] === "=clean"),
+      tmux.calls.some((c) => c[0] === "set-environment" && c[2] === "$1"),
     ).toBe(false);
   });
 
   test("an absent server is verified-absent, not a failure", async () => {
-    const tmux = fakeTmux({ fail: { "show-environment -g": NO_SERVER } });
+    const tmux = fakeTmux({ fail: { "display-message": NO_SERVER } });
     const result = await scrubTmuxEnvironment(tmux.run);
     expect(result).toMatchObject({ ok: true, serverPresent: false });
     expect(tmux.calls).toHaveLength(1);
   });
 
   test("a communication error is NOT treated as no server", async () => {
-    const tmux = fakeTmux({ fail: { "show-environment -g": PERMISSION_DENIED } });
+    const tmux = fakeTmux({ fail: { "display-message": PERMISSION_DENIED } });
     const result = await scrubTmuxEnvironment(tmux.run);
     expect(result.ok).toBe(false);
     expect(result.serverPresent).toBe(true);
@@ -330,6 +356,7 @@ describe("tmux environment scrub (pure)", () => {
     expect(unsetFail.ok).toBe(false);
     expect(unsetFail.error).toContain("DECKTERM_X");
 
+    // A session destroyed between list-sessions and its read is skipped.
     const vanished = await scrubTmuxEnvironment(
       fakeTmux({
         sessions: { gone: "DECKTERM_X=1\n" },
@@ -337,12 +364,67 @@ describe("tmux environment scrub (pure)", () => {
           "show-environment -t": {
             code: 1,
             stdout: "",
-            stderr: "no such session: =gone",
+            stderr: "no such session: $0",
           },
         },
       }).run,
     );
     expect(vanished).toMatchObject({ ok: true, serverPresent: true });
+  });
+
+  test("sessions are targeted by id, so a rename during the scrub cannot skip one", async () => {
+    const tmux = fakeTmux({
+      sessions: { seed: "DECKTERM_VAPID_PRIVATE_KEY=y\n", " padded name ": "" },
+      // Rename "seed" after it was listed, as its read arrives: a name
+      // target would now miss it ("no such session") and skip it.
+      onCall: (args, state) => {
+        if (args[0] === "show-environment" && args[1] === "-t") {
+          state.names.set("$0", "renamed");
+        }
+      },
+    });
+    const result = await scrubTmuxEnvironment(tmux.run);
+    expect(result.ok).toBe(true);
+    expect(result.sessions).toEqual([
+      { session: "seed", id: "$0", removed: ["DECKTERM_VAPID_PRIVATE_KEY"] },
+    ]);
+    const targets = tmux.calls
+      .filter((c) => c[1] === "-t")
+      .map((c) => c[2]);
+    expect(targets).toEqual(["$0", "$0", "$1"]);
+  });
+
+  test("session refs keep the name verbatim and only accept $N ids", () => {
+    expect(
+      parseTmuxSessionRefs("$0 seed\n$12  padded name \n$3 a b\nbogus\n\n"),
+    ).toEqual([
+      { id: "$0", name: "seed" },
+      { id: "$12", name: " padded name " },
+      { id: "$3", name: "a b" },
+    ]);
+  });
+
+  test("server identity: present, absent, error", async () => {
+    expect(await readTmuxServerIdentity(fakeTmux({}).run)).toEqual({
+      status: "present",
+      id: "4242 1700000000",
+    });
+    expect(
+      await readTmuxServerIdentity(
+        fakeTmux({ fail: { "display-message": NO_SERVER } }).run,
+      ),
+    ).toEqual({ status: "absent" });
+    expect(
+      (
+        await readTmuxServerIdentity(
+          fakeTmux({ fail: { "display-message": PERMISSION_DENIED } }).run,
+        )
+      ).status,
+    ).toBe("error");
+    expect(
+      (await readTmuxServerIdentity(fakeTmux({ serverId: "garbage" }).run))
+        .status,
+    ).toBe("error");
   });
 
   test("startup retry: stops at the first success, returns the last failure otherwise", async () => {
@@ -387,19 +469,29 @@ describe("tmux environment scrub (pure)", () => {
 });
 
 describe("tmux environment guard (create gate)", () => {
-  function scripted(results: TmuxScrubResult[]) {
+  function scripted(
+    results: TmuxScrubResult[],
+    identity: () => TmuxServerIdentity = () => ({
+      status: "present",
+      id: "100 1700000000",
+    }),
+  ) {
     let runs = 0;
-    const guard = new TmuxEnvironmentGuard(async () => {
-      runs += 1;
-      const next = results.shift();
-      if (!next) throw new Error("unexpected extra scrub");
-      return next;
-    });
+    const guard = new TmuxEnvironmentGuard(
+      async () => {
+        runs += 1;
+        const next = results.shift();
+        if (!next) throw new Error("unexpected extra scrub");
+        return next;
+      },
+      async () => identity(),
+    );
     return { guard, runs: () => runs };
   }
   const OK: TmuxScrubResult = {
     ok: true,
     serverPresent: true,
+    serverId: "100 1700000000",
     removed: [],
     sessions: [],
   };
@@ -459,12 +551,15 @@ describe("tmux environment guard (create gate)", () => {
     let runs = 0;
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    const guard = new TmuxEnvironmentGuard(async () => {
-      runs += 1;
-      await gate;
-      if (runs === 1) throw new Error("spawn EAGAIN");
-      return OK;
-    });
+    const guard = new TmuxEnvironmentGuard(
+      async () => {
+        runs += 1;
+        await gate;
+        if (runs === 1) throw new Error("spawn EAGAIN");
+        return OK;
+      },
+      async () => ({ status: "present", id: "100 1700000000" }),
+    );
     const both = Promise.allSettled([
       guard.ensureVerified(),
       guard.ensureVerified(),
@@ -479,6 +574,41 @@ describe("tmux environment guard (create gate)", () => {
     expect(runs).toBe(1);
     await guard.ensureVerified();
     expect(runs).toBe(2);
+  });
+
+  test("a different server on the socket after verification is scrubbed again", async () => {
+    let current: TmuxServerIdentity = { status: "present", id: "100 1700000000" };
+    const replacement: TmuxScrubResult = { ...OK, serverId: "200 1700000500" };
+    const { guard, runs } = scripted([OK, replacement, FAILED], () => current);
+    await guard.ensureVerified();
+    await guard.ensureVerified(); // same server: identity read only
+    expect(runs()).toBe(1);
+
+    // The server exited and another one answers the socket.
+    current = { status: "present", id: "200 1700000500" };
+    await guard.ensureVerified();
+    expect(runs()).toBe(2);
+    expect(guard.verifiedServer).toBe("200 1700000500");
+
+    // Same pid reused but a different start time is still another server,
+    // and when that one cannot be verified the create is refused.
+    current = { status: "present", id: "200 1700000999" };
+    await expect(guard.ensureVerified()).rejects.toBeInstanceOf(
+      TmuxEnvironmentUnverifiedError,
+    );
+    expect(runs()).toBe(3);
+    expect(guard.isVerified).toBe(false);
+  });
+
+  test("an unreadable identity after verification triggers a scrub, not a pass", async () => {
+    let current: TmuxServerIdentity = { status: "present", id: "100 1700000000" };
+    const { guard, runs } = scripted([OK, FAILED], () => current);
+    await guard.ensureVerified();
+    current = { status: "error", error: "Permission denied" };
+    await expect(guard.ensureVerified()).rejects.toBeInstanceOf(
+      TmuxEnvironmentUnverifiedError,
+    );
+    expect(runs()).toBe(2);
   });
 
   test("the refusal maps to a 503 with a plain message; other errors do not", () => {
