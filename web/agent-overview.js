@@ -104,6 +104,9 @@
     }
     if (unseen === "needs-input") return TIER_NEEDS_YOU;
     if (unseen === "done" || unseen === "error") return TIER_DONE;
+    // "Working" is about agents: a shell running a dev server or a build
+    // without an agent stays a plain shell row and is not counted.
+    if (!hasAgent(session)) return TIER_NO_AGENT;
     const agentState = String(session.agentState || "").toLowerCase();
     if (
       session.running === true ||
@@ -112,7 +115,7 @@
     ) {
       return TIER_WORKING;
     }
-    return hasAgent(session) ? TIER_IDLE : TIER_NO_AGENT;
+    return TIER_IDLE;
   }
 
   function finiteOrZero(value) {

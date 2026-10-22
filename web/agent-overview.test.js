@@ -92,8 +92,10 @@ describe("statusTier fallback (agentStatus null)", () => {
     );
   });
 
-  test("running or a live agentState is working", () => {
-    expect(statusTier(live({ id: "a", running: true }))).toBe(TIER_WORKING);
+  test("running or a live agentState is working, for agents only", () => {
+    expect(statusTier(agent("a", { running: true }))).toBe(TIER_WORKING);
+    // A dev server or a build without an agent stays a plain shell row.
+    expect(statusTier(live({ id: "a", running: true }))).toBe(TIER_NO_AGENT);
     expect(statusTier(agent("a", { agentState: "thinking" }))).toBe(
       TIER_WORKING,
     );

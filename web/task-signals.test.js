@@ -197,21 +197,22 @@ test("orderSessionsForPanel delegates to the Agents overview order", () => {
     { id: "idle1" },
     { id: "run1", running: true },
     { id: "ask", attention: att("needs-input", 9) },
-    { id: "agent", agentState: "thinking" },
+    { id: "agent", agentName: "codex", agentState: "thinking" },
     { id: "askSeen", attention: att("needs-input", 4) },
     { id: "doneUnseen", agentName: "claude", attention: att("done", 6) },
     { id: "idle2" },
   ];
   const ordered = orderSessionsForPanel(sessions, { askSeen: 4 });
-  // needs you > done (unseen) > working > no agent; ties: most recent
-  // attention first, then the original order.
+  // needs you > done (unseen) > working (agents only) > no agent; ties:
+  // most recent attention first, then the original order. A running command
+  // without an agent (run1) is a plain shell row.
   expect(ordered.map((s) => s.id)).toEqual([
     "ask",
     "doneUnseen",
-    "run1",
     "agent",
     "askSeen",
     "idle1",
+    "run1",
     "idle2",
   ]);
   // Input array is not mutated.
@@ -220,7 +221,7 @@ test("orderSessionsForPanel delegates to the Agents overview order", () => {
 
 test("orderSessionsForPanel never treats the active, visible session as unseen", () => {
   const sessions = [
-    { id: "a", running: true },
+    { id: "a", agentName: "claude", running: true },
     { id: "b", attention: att("needs-input", 9) },
   ];
   expect(
