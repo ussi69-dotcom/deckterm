@@ -216,4 +216,100 @@ describe("push service worker", () => {
     await clickPromise;
     expect(focused).toBe(1);
   });
+
+  function loadWorker({ clients }) {
+    const handlers = new Map();
+    const shown = [];
+    const opened = [];
+    const selfRef = {
+      location: { origin: "https://deckterm.example.test" },
+      addEventListener: (type, handler) => handlers.set(type, handler),
+      registration: {
+        showNotification: async (...args) => shown.push(args),
+      },
+      clients: {
+        matchAll: async () => clients,
+        openWindow: async (url) => {
+          opened.push(url);
+        },
+      },
+    };
+    return Bun.file(new URL("./service-worker.js", import.meta.url))
+      .text()
+      .then((source) => {
+        new Function("self", "URL", source)(selfRef, URL);
+        return { handlers, shown, opened };
+      });
+  }
+
+  async function click(handlers, url) {
+    let clickPromise;
+    handlers.get("notificationclick")({
+      notification: { close: () => {}, data: { url } },
+      waitUntil: (promise) => {
+        clickPromise = promise;
+      },
+    });
+    await clickPromise;
+  }
+
+  const SESSION = "4b6f3c1e-8f2a-4d6b-9c1e-2a3b4c5d6e7f";
+
+  test("a session deep link is posted to an open window instead of navigating", async () => {
+    const messages = [];
+    const navigations = [];
+    let focused = 0;
+    const { handlers } = await loadWorker({
+      clients: [
+        {
+          url: "https://deckterm.example.test/",
+          focus: async () => {
+            focused += 1;
+          },
+          navigate: async (url) => navigations.push(url),
+          postMessage: (message) => messages.push(message),
+        },
+      ],
+    });
+    await click(handlers, `/?session=${SESSION}`);
+    expect(focused).toBe(1);
+    expect(messages).toEqual([
+      { type: "deckterm-open-session", terminalId: SESSION },
+    ]);
+    expect(navigations).toEqual([]);
+  });
+
+  test("with no window open the deep link opens in a new window", async () => {
+    const { handlers, opened } = await loadWorker({ clients: [] });
+    await click(handlers, `/?session=${SESSION}`);
+    expect(opened).toEqual([
+      `https://deckterm.example.test/?session=${SESSION}`,
+    ]);
+  });
+
+  test("only a same-origin path is accepted", async () => {
+    const { handlers, shown, opened } = await loadWorker({ clients: [] });
+    for (const url of [
+      "//evil.example/",
+      "/\\evil.example/",
+      "https://evil.example/",
+      42,
+    ]) {
+      let pushPromise;
+      handlers.get("push")({
+        data: { json: () => ({ data: { url } }) },
+        waitUntil: (promise) => {
+          pushPromise = promise;
+        },
+      });
+      await pushPromise;
+      await click(handlers, url);
+    }
+    for (const [, options] of shown) {
+      expect(options.data.url).toBe("/");
+    }
+    expect(opened.every((url) => url === "https://deckterm.example.test/")).toBe(
+      true,
+    );
+  });
 });

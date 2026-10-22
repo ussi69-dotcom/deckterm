@@ -113,6 +113,11 @@ export class RawTerminalBackend implements TerminalBackend {
     return "";
   }
 
+  // No screen to read: agentStatus stays null on the raw backend.
+  async captureVisible(_sessionName: string): Promise<string | null> {
+    return null;
+  }
+
   async resize(
     _sessionName: string,
     _cols: number,

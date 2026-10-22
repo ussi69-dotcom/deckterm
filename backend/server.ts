@@ -75,7 +75,7 @@ import {
   createGitWorktreeDetector,
   createOscTitleParseState,
   createTerminalNotificationParseState,
-  detectTitleAttention,
+  formatProgressPayload,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
   nextAgentMarkerActive,
@@ -87,6 +87,23 @@ import {
   type OscTitleParseState,
   type TerminalNotificationParseState,
 } from "./telemetry";
+import {
+  evaluate as evaluateAgentScreen,
+  type RuleAgent,
+} from "./agent-screen-rules";
+import {
+  agentStatusNeedsEvaluation,
+  applyAgentStatusEvaluation,
+  createAgentStatusRecord,
+  createAgentsChangedCoalescer,
+  markBlockedEpisodePushed,
+  selectAgentsChangedSockets,
+  shouldSendNotificationInputPush,
+  socketWantsAgentsFrames,
+  syncAgentStatusAgent,
+  type AgentStatusEffect,
+  type AgentStatusRecord,
+} from "./agent-status";
 import { isCloudflareAudienceAllowed } from "./cloudflare-access-guards";
 import {
   applyOnboardingProfile,
@@ -361,6 +378,16 @@ type Terminal = {
   // sanitized, capped at 256 characters, cleared when the agent changes.
   agentOscTitle: string;
   oscTitleParse: OscTitleParseState;
+  // Latest OSC 9;4 payload rebuilt as `4;<state>[;<percent>]` for the
+  // osc_progress screen-rule region; cleared when the agent changes.
+  agentOscProgress: string;
+  // S1 screen-rule agent status (design 1.1-1.6). Untrusted, display and
+  // alert only: never in the terminal_state frame or the persisted events.
+  agentStatusRecord: AgentStatusRecord;
+  // The pane printed something since the last screen-rule evaluation.
+  agentScreenDirty: boolean;
+  agentStatusBusy: boolean;
+  agentStatusRecheckTimer: ReturnType<typeof setTimeout> | null;
   tmuxPipeRead?: Promise<string>;
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
@@ -385,6 +412,9 @@ type TerminalWsData = {
   // `scroll=1` in the socket URL: this page understands `scroll-position`
   // frames. Older pages would print them into the terminal as text.
   scroll?: boolean;
+  // `agents=1` in the socket URL: this page understands the content-free
+  // `agents_changed` frame (same opt-in mechanism as `scroll=1`).
+  agents?: boolean;
 };
 export type WsData = TerminalWsData;
 
@@ -898,6 +928,7 @@ function processShellIntegrationChunk(
     agentState: term.agentState || null,
   });
   applyParsedShellIntegrationState(term, parsed, options);
+  if (options.source === "pipe" && chunk) term.agentScreenDirty = true;
   processTerminalNotifications(term, chunk, options.source || "live");
   if (
     term.attention.progress &&
@@ -931,41 +962,58 @@ function processTerminalNotifications(
     { now: Date.now(), agentName: term.agentName },
   );
   term.attention = applied.tracker;
+  for (const event of parsed.events) {
+    if (event.type === "progress") {
+      term.agentOscProgress = formatProgressPayload(event);
+    }
+  }
   for (const attention of applied.accepted) {
     if (attention.kind === "needs-input") {
-      notifyCompletionPush(term, "input");
+      // Once per blocked episode: the screen rule may already have pushed
+      // for this prompt (design 1.6).
+      if (shouldSendNotificationInputPush(term.agentStatusRecord)) {
+        notifyCompletionPush(term, "input");
+        term.agentStatusRecord = markBlockedEpisodePushed(
+          term.agentStatusRecord,
+        );
+      }
     } else if (attention.kind === "done") {
       notifyCompletionPush(term, "agent");
     }
   }
 }
 
-// The window title belongs to the agent that set it.
+// The window title, the progress and the screen-rule status belong to the
+// agent that produced them.
 function onTerminalAgentChanged(term: Terminal) {
   term.agentOscTitle = "";
+  term.agentOscProgress = "";
+  syncAgentStatusRecord(term);
 }
 
-// S1a: the latest OSC 0/2 title. A Codex title that turns to
-// "Action Required" raises needs-input and sends the input push.
+// New agent: reset and start the 3 s grace. No agent: clear, raise nothing.
+function syncAgentStatusRecord(term: Terminal) {
+  const step = syncAgentStatusAgent(
+    term.agentStatusRecord,
+    term.agentName,
+    Date.now(),
+  );
+  term.agentStatusRecord = step.record;
+  if (term.agentStatusRecheckTimer) {
+    clearTimeout(term.agentStatusRecheckTimer);
+    term.agentStatusRecheckTimer = null;
+  }
+  runAgentStatusEffects(term, step.effects);
+}
+
+// The latest OSC 0/2 title, input of the osc_title screen-rule region. (S1a
+// raised Codex "Action Required" here; the vendored codex.toml rule
+// osc_title_blocked now does that through the screen-rule evaluator.)
 function processTerminalTitle(term: Terminal, chunk: string) {
   const parsed = parseLatestOscTitle(chunk, term.oscTitleParse);
   term.oscTitleParse = parsed.state;
   if (parsed.title === null) return;
-  const previousTitle = term.agentOscTitle;
   term.agentOscTitle = parsed.title;
-  const edge = detectTitleAttention({
-    agentName: term.agentName,
-    previousTitle,
-    nextTitle: parsed.title,
-  });
-  if (!edge) return;
-  const applied = applyAgentAttention(term.attention, edge.kind, {
-    now: Date.now(),
-    source: "title",
-    rule: edge.rule,
-  });
-  term.attention = applied.tracker;
-  notifyCompletionPush(term, "input");
 }
 
 function clearAgentRespondingTimer(term: Terminal) {
@@ -4733,6 +4781,16 @@ function supportsLinkedView(term: Terminal): boolean {
   });
 }
 
+function serializeAgentStatus(record: AgentStatusRecord) {
+  const committed = record.agentName !== null && record.status !== null;
+  return {
+    agentStatus: committed ? record.status : null,
+    agentStatusRule: committed ? record.rule : null,
+    agentStatusChangedAt: committed ? record.changedAt : null,
+    agentRulesVersion: committed ? record.rulesVersion : null,
+  };
+}
+
 function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
   const socketStats = getTerminalSocketStats(term, requestingClientId);
   return {
@@ -4746,6 +4804,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentName: term.agentName,
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
+    ...serializeAgentStatus(term.agentStatusRecord),
     recentTools: term.recentTools,
     attention: term.attention.attention,
     progress: term.attention.progress,
@@ -4798,6 +4857,10 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
     lastExitCode: session.status === "ended" ? 0 : null,
     agentName: null,
     agentState: null,
+    agentStatus: null,
+    agentStatusRule: null,
+    agentStatusChangedAt: null,
+    agentRulesVersion: null,
     backendMode: getBackendMode(),
     supportsLinkedView: Boolean(TMUX_BACKEND && sharedSessionKey),
     sharedSessionKey,
@@ -5624,11 +5687,123 @@ async function pumpTmuxPipeOutput(): Promise<void> {
           source: "pipe",
         });
       }
+      if (terminals.get(term.id) === term) {
+        await updateAgentScreenStatus(term).catch((err) =>
+          debug(`[agent-status] evaluation failed for ${term.id}`, err),
+        );
+      }
     }
   } finally {
     tmuxPipePumpRunning = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// S1 screen-rule agent status (design 1.2-1.8). Evaluated here, after the
+// pipe delta, only when the pane printed something since the last evaluation
+// or a grace/hold is pending. The capture is held in memory for this one
+// evaluation and never logged or persisted.
+// ---------------------------------------------------------------------------
+
+let agentScreenRulesBroken = false;
+
+async function updateAgentScreenStatus(term: Terminal): Promise<void> {
+  const agentName = term.agentName;
+  if (!term.sessionName || !agentName || term.agentStatusBusy) return;
+  if (agentScreenRulesBroken) return;
+  if (term.agentStatusRecord.agentName !== agentName) {
+    syncAgentStatusRecord(term);
+  }
+  if (
+    !agentStatusNeedsEvaluation(term.agentStatusRecord, {
+      now: Date.now(),
+      outputSeen: term.agentScreenDirty,
+    })
+  ) {
+    return;
+  }
+  const backend = term.backend ?? terminalBackend;
+  term.agentStatusBusy = true;
+  try {
+    term.agentScreenDirty = false;
+    const screen = await backend.captureVisible(term.sessionName);
+    if (screen === null) return;
+    if (terminals.get(term.id) !== term) return;
+    if (term.agentName !== agentName) return;
+    if (term.agentStatusRecord.agentName !== agentName) return;
+    let result;
+    try {
+      result = evaluateAgentScreen(agentName as RuleAgent, {
+        screen,
+        title: term.agentOscTitle,
+        progress: term.agentOscProgress,
+      });
+    } catch (err) {
+      // A broken vendored manifest must not spam every tick; agentStatus
+      // stays null and everything falls back to today's behaviour.
+      agentScreenRulesBroken = true;
+      console.error("[agent-status] screen rules failed to load:", err);
+      return;
+    }
+    const step = applyAgentStatusEvaluation(term.agentStatusRecord, result, {
+      now: Date.now(),
+      lastInputPushAt: term.lastInputPushAt ?? null,
+    });
+    term.agentStatusRecord = step.record;
+    runAgentStatusEffects(term, step.effects);
+  } finally {
+    term.agentStatusBusy = false;
+  }
+}
+
+function runAgentStatusEffects(term: Terminal, effects: AgentStatusEffect[]) {
+  for (const effect of effects) {
+    if (effect.type === "raise") {
+      const applied = applyAgentAttention(term.attention, effect.kind, {
+        now: Date.now(),
+        source: effect.source,
+        rule: effect.rule,
+      });
+      term.attention = applied.tracker;
+    } else if (effect.type === "push") {
+      notifyCompletionPush(term, effect.kind);
+    } else if (effect.type === "nudge") {
+      agentsChangedCoalescer.notify(term.ownerId);
+    } else if (effect.type === "recheck") {
+      if (term.agentStatusRecheckTimer) {
+        clearTimeout(term.agentStatusRecheckTimer);
+      }
+      term.agentStatusRecheckTimer = setTimeout(
+        () => {
+          term.agentStatusRecheckTimer = null;
+          if (terminals.get(term.id) !== term || shutdownInProgress) return;
+          void updateAgentScreenStatus(term).catch((err) =>
+            debug(`[agent-status] re-check failed for ${term.id}`, err),
+          );
+        },
+        Math.max(0, effect.at - Date.now()),
+      );
+    }
+  }
+}
+
+// `{type:"agents_changed"}` to the owner's `agents=1` terminal sockets,
+// coalesced to at most one per 500 ms per owner. Content-free: the page
+// refetches /api/terminals.
+const AGENTS_CHANGED_FRAME = JSON.stringify({ type: "agents_changed" });
+const agentsChangedCoalescer = createAgentsChangedCoalescer({
+  send: (ownerId) => {
+    for (const sockets of terminalSockets.values()) {
+      for (const ws of selectAgentsChangedSockets(sockets, ownerId)) {
+        try {
+          ws.send(AGENTS_CHANGED_FRAME);
+        } catch {
+          // WebSocket closed
+        }
+      }
+    }
+  },
+});
 
 // Pass a snapshot to share one `ps` run across many sessions (GET
 // /api/terminals); without one a fresh snapshot is taken.
@@ -5996,6 +6171,15 @@ async function createManagedTerminal({
     attention: createAttentionTracker(),
     agentOscTitle: resumePipe?.agentOscTitle ?? "",
     oscTitleParse: resumePipe?.oscTitleParse ?? createOscTitleParseState(),
+    agentOscProgress: "",
+    agentStatusRecord: syncAgentStatusAgent(
+      createAgentStatusRecord(),
+      initialRuntimeState?.agentName || null,
+      now,
+    ).record,
+    agentScreenDirty: false,
+    agentStatusBusy: false,
+    agentStatusRecheckTimer: null,
     shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
@@ -11588,6 +11772,7 @@ async function startOwnedWebServer(
             clientId,
             lastEventId: Number.isFinite(lastEventId) ? lastEventId : null,
             scroll: socketWantsScrollFrames(url),
+            agents: socketWantsAgentsFrames(url),
           },
         });
         if (success) return undefined;

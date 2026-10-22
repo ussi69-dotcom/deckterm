@@ -916,6 +916,25 @@ function parseProgressPayload(
   };
 }
 
+const PROGRESS_STATE_CODES: Record<TerminalProgressState, string> = {
+  normal: "1",
+  error: "2",
+  indeterminate: "3",
+  paused: "4",
+};
+
+/**
+ * Rebuilds a parsed OSC 9;4 progress event as `4;<state>[;<percent>]`, the
+ * input of herdr's `osc_progress` screen-rule region (`4;0` = cleared).
+ */
+export function formatProgressPayload(
+  event: Extract<TerminalNotificationEvent, { type: "progress" }>,
+): string {
+  if (!event.state) return "4;0";
+  const code = PROGRESS_STATE_CODES[event.state];
+  return event.percent === null ? `4;${code}` : `4;${code};${event.percent}`;
+}
+
 function capRaw(value: string): string {
   return value.length > KITTY_PENDING_MAX_LENGTH
     ? value.slice(0, KITTY_PENDING_MAX_LENGTH)
@@ -1305,29 +1324,4 @@ export function parseLatestOscTitle(
     title: latest === null ? null : sanitizeOscTitle(latest),
     state: { carry },
   };
-}
-
-export const CODEX_ACTION_REQUIRED_TEXT = "Action Required";
-
-/**
- * S1a: Codex puts "Action Required" in its window title while an approval is
- * open. Fires only on the edge into such a title, and only for Codex.
- */
-export function detectTitleAttention({
-  agentName,
-  previousTitle,
-  nextTitle,
-}: {
-  agentName: AgentName | null;
-  previousTitle: string | null;
-  nextTitle: string | null;
-}): { kind: "needs-input"; rule: "osc_title_blocked" } | null {
-  if (agentName !== "codex") return null;
-  if (!nextTitle || !nextTitle.includes(CODEX_ACTION_REQUIRED_TEXT)) {
-    return null;
-  }
-  if (previousTitle && previousTitle.includes(CODEX_ACTION_REQUIRED_TEXT)) {
-    return null;
-  }
-  return { kind: "needs-input", rule: "osc_title_blocked" };
 }

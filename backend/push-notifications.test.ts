@@ -211,7 +211,6 @@ describe("push validation and delivery", () => {
     expect(payloads).toHaveLength(3);
     for (const payload of payloads) {
       expect(payload).toContain("Agent turn finished");
-      expect(payload).not.toContain("secret-terminal-id");
       expect(payload).not.toContain("example.test/ok");
     }
     expect(
@@ -247,6 +246,47 @@ describe("push validation and delivery", () => {
     });
     expect(result.delivered).toBe(1);
     expect(JSON.parse(payloads[0]).body).toBe("Agent needs your input");
-    expect(payloads[0]).not.toContain("secret-terminal-id");
+  });
+
+  test("the payload deep-links to the session and the text stays generic", async () => {
+    const state = await createState();
+    const subscription = validSubscription("https://push.example.test/link");
+    upsertPushSubscription(state.db, {
+      userId: "user-a",
+      endpoint: subscription.endpoint,
+      p256dh: subscription.keys.p256dh,
+      auth: subscription.keys.auth,
+    });
+    const terminalId = "4b6f3c1e-8f2a-4d6b-9c1e-2a3b4c5d6e7f";
+    const payloads: string[] = [];
+    const topics: string[] = [];
+    for (const kind of ["input", "agent", "command"] as const) {
+      await dispatchCompletionPush({
+        db: state.db,
+        config: validConfig(),
+        userId: "user-a",
+        terminalId,
+        kind,
+        send: (async (_subscription, payload, options) => {
+          payloads.push(String(payload));
+          topics.push(String(options?.topic));
+          return { statusCode: 201, headers: {}, body: "" };
+        }) as typeof import("web-push").sendNotification,
+      });
+    }
+    expect(payloads.map((payload) => JSON.parse(payload).body)).toEqual([
+      "Agent needs your input",
+      "Agent turn finished",
+      "Command finished",
+    ]);
+    for (const payload of payloads) {
+      const parsed = JSON.parse(payload);
+      expect(parsed.title).toBe("DeckTerm");
+      expect(parsed.data).toEqual({ url: `/?session=${terminalId}` });
+      // The id appears only in the (end-to-end encrypted) deep link.
+      expect(parsed.tag).not.toContain(terminalId);
+    }
+    // The topic header the push service can read stays a hash.
+    for (const topic of topics) expect(topic).not.toContain(terminalId);
   });
 });

@@ -264,12 +264,12 @@ The fixture suite is the main quality gate, because herdr ships no real Claude o
 - **Claude.** Run `claude --model claude-haiku-5-5`, never with `--dangerously-skip-permissions`. The owner's settings (fullscreen TUI, notifications) apply as they are; `~/.claude` is not changed.
   - Question form: ask it to ask you a multiple-choice question with its question tool.
   - Plan approval: add `--permission-mode plan` and ask for a plan to create one file.
-  - Bash permission prompt: add `--permission-mode default`, in case the settings default to bypass, and ask it to run `ls`.
+  - Bash permission prompt: add `--permission-mode default`, in case the settings default to bypass, and ask it to run a command the owner's settings do not pre-allow (they allow `ls`; the 2.1.308 capture used `mkdir demo`, cancelled before it ran).
   - Working: capture during a reply.
   - Idle: capture the empty prompt after a reply.
 - **Codex.** Only if `codex login status` reports logged in. Use the cheapest model the account offers and record it in `notes`.
   - Trust dialog: the first start in a fresh scratch folder.
-  - Approval prompt: `-a untrusted` and a request to create a file.
+  - Approval prompt: `-s read-only -a on-request` and a request to create a file (Codex 0.163 rejects `-a untrusted`).
   - Working and idle: as for Claude.
   - If not logged in, write synthetic fixtures and report the gap.
 - **Budget.** At most about 15 short sessions in total, prompts short and harmless, each session quit when done (handoff, Authority).

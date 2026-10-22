@@ -193,6 +193,17 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     return res.code === 0 ? res.stdout : "";
   }
 
+  // The broker's tmux schema already accepts `capture-pane -p -t <name>`
+  // (backend/broker-tmux-schema.test.ts).
+  async captureVisible(sessionName: string): Promise<string | null> {
+    const res = await this.control(
+      sessionName,
+      ["capture-pane", "-p", "-t", sessionName],
+      5_000,
+    );
+    return res.code === 0 ? res.stdout : null;
+  }
+
   async resize(
     sessionName: string,
     cols: number,

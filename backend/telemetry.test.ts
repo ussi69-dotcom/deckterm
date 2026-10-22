@@ -13,7 +13,6 @@ import {
   applyAgentAttention,
   applyTerminalNotificationEvents,
   classifyAttentionText,
-  detectTitleAttention,
   parseLatestOscTitle,
   sanitizeOscTitle,
   createAttentionTracker,
@@ -24,6 +23,13 @@ import {
   type ShellIntegrationParseState,
   type TerminalNotificationEvent,
 } from "./telemetry";
+import { evaluate } from "./agent-screen-rules";
+import {
+  applyAgentStatusEvaluation,
+  createAgentStatusRecord,
+  syncAgentStatusAgent,
+  type AgentStatusRecord,
+} from "./agent-status";
 
 const START = "\x1b]9;9;deckterm;running;start\x07";
 const DONE = (code: number) => `\x1b]9;9;deckterm;running;done;${code}\x07`;
@@ -976,60 +982,100 @@ test("sanitizeOscTitle strips control and bidi characters and caps at 256", () =
   expect(Array.from(sanitizeOscTitle("✳".repeat(400)))).toHaveLength(256);
 });
 
+// S1 retired the S1a title edge detector: the vendored codex.toml rule
+// osc_title_blocked does the same through the screen-rule evaluator and the
+// agent-status state machine. These are the S1a cases, run against that path.
+
+const CODEX_APPROVAL_SCREEN = (() => {
+  const text = readFileSync(
+    join(import.meta.dir, "fixtures/agent-screens/codex-0.163-blocked-approval.txt"),
+    "utf8",
+  );
+  return text.slice(text.indexOf("\n---\n", 4) + 5);
+})();
+
+function runningAgent(agent: AgentName, now: number): AgentStatusRecord {
+  // Past the 3 s start grace, committed as working.
+  let record = syncAgentStatusAgent(createAgentStatusRecord(), agent, now)
+    .record;
+  record = applyAgentStatusEvaluation(
+    record,
+    evaluate(agent as "claude" | "codex", {
+      screen: "",
+      title: agent === "codex" ? CODEX_WORKING_TITLE : "\u2810 thinking",
+    }),
+    { now: now + 3_000 },
+  ).record;
+  return record;
+}
+
 test("S1a: the captured Codex approval title fires needs-input once", () => {
   expect(CODEX_APPROVAL_TITLE).toContain("Action Required");
-  const first = detectTitleAttention({
-    agentName: "codex",
-    previousTitle: CODEX_WORKING_TITLE,
-    nextTitle: CODEX_APPROVAL_TITLE,
+  const titleOnly = evaluate("codex", {
+    screen: "",
+    title: CODEX_APPROVAL_TITLE,
   });
-  expect(first).toEqual({ kind: "needs-input", rule: "osc_title_blocked" });
+  expect(titleOnly).toMatchObject({
+    state: "blocked",
+    ruleId: "osc_title_blocked",
+    region: "osc_title",
+  });
+
+  let record = runningAgent("codex", 0);
+  expect(record.status).toBe("working");
+  const first = applyAgentStatusEvaluation(record, titleOnly, { now: 4_000 });
+  expect(first.record.status).toBe("blocked");
+  expect(first.effects).toContainEqual({ type: "push", kind: "input" });
+  record = first.record;
 
   // The title blinks between "[ . ]" and "[ ! ]" while the approval is open;
   // a repeated Action Required title does not fire again.
-  expect(
-    detectTitleAttention({
-      agentName: "codex",
-      previousTitle: CODEX_APPROVAL_TITLE,
-      nextTitle: CODEX_APPROVAL_TITLE.replace("[ . ]", "[ ! ]"),
+  const repeat = applyAgentStatusEvaluation(
+    record,
+    evaluate("codex", {
+      screen: CODEX_APPROVAL_SCREEN,
+      title: CODEX_APPROVAL_TITLE.replace("[ . ]", "[ ! ]"),
     }),
-  ).toBe(null);
+    { now: 6_000 },
+  );
+  expect(repeat.effects).toEqual([]);
+  expect(repeat.record.status).toBe("blocked");
 });
 
 test("S1a: a non-Codex agent and a spinner title never fire", () => {
-  expect(
-    detectTitleAttention({
-      agentName: "claude",
-      previousTitle: "",
-      nextTitle: CODEX_APPROVAL_TITLE,
-    }),
-  ).toBe(null);
-  expect(
-    detectTitleAttention({
-      agentName: null,
-      previousTitle: "",
-      nextTitle: CODEX_APPROVAL_TITLE,
-    }),
-  ).toBe(null);
-  expect(
-    detectTitleAttention({
-      agentName: "codex",
-      previousTitle: "",
-      nextTitle: CODEX_WORKING_TITLE,
-    }),
-  ).toBe(null);
+  // Claude's rules have no title blocker: the Codex title alone is no_match.
+  const claude = evaluate("claude", { screen: "", title: CODEX_APPROVAL_TITLE });
+  expect(claude.state).not.toBe("blocked");
+  // No agent: nothing is evaluated or raised.
+  const none = applyAgentStatusEvaluation(
+    createAgentStatusRecord(),
+    evaluate("codex", { screen: "", title: CODEX_APPROVAL_TITLE }),
+    { now: 10_000 },
+  );
+  expect(none.effects).toEqual([]);
+  expect(none.record.status).toBe(null);
+  // A spinner title is working, not blocked.
+  const spinner = evaluate("codex", { screen: "", title: CODEX_WORKING_TITLE });
+  expect(spinner).toMatchObject({ state: "working", ruleId: "osc_title_working" });
 });
 
 test("S1a: the raised attention carries source title and rule osc_title_blocked", () => {
-  const edge = detectTitleAttention({
-    agentName: "codex",
-    previousTitle: "",
-    nextTitle: CODEX_APPROVAL_TITLE,
-  })!;
-  const applied = applyAgentAttention(createAttentionTracker(), edge.kind, {
+  const step = applyAgentStatusEvaluation(
+    runningAgent("codex", 0),
+    evaluate("codex", { screen: "", title: CODEX_APPROVAL_TITLE }),
+    { now: 4_000 },
+  );
+  const raise = step.effects.find((effect) => effect.type === "raise");
+  expect(raise).toEqual({
+    type: "raise",
+    kind: "needs-input",
+    source: "title",
+    rule: "osc_title_blocked",
+  });
+  const applied = applyAgentAttention(createAttentionTracker(), "needs-input", {
     now: 50_000,
     source: "title",
-    rule: edge.rule,
+    rule: "osc_title_blocked",
   });
   expect(applied.accepted).toMatchObject({
     kind: "needs-input",
