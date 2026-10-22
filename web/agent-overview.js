@@ -334,10 +334,42 @@
     return Number.isFinite(n) && n > 0 ? n : null;
   }
 
+  // S3: the resume summary of an ended row ({ agent, mode, cwd }), or null.
+  function resumeOf(session) {
+    const resume = session?.resume;
+    if (!resume || typeof resume !== "object") return null;
+    if (resume.agent !== "claude" && resume.agent !== "codex") return null;
+    if (!["exact", "last", "pick"].includes(resume.mode)) return null;
+    return resume;
+  }
+
+  // Button word of a resumable row: "Resume (pick)" when the agent's own
+  // picker opens because no exact conversation is known.
+  function resumeLabel(session) {
+    return resumeOf(session)?.mode === "pick" ? "Resume (pick)" : "Resume";
+  }
+
+  // "Resume claude in /w/proj: the same conversation".
+  function resumeTooltip(session) {
+    const resume = resumeOf(session);
+    if (!resume) return TIER_LABELS[TIER_RESUMABLE];
+    const what =
+      resume.mode === "exact"
+        ? "the same conversation"
+        : resume.mode === "last"
+          ? "Resume uses Codex's most recent conversation in this folder"
+          : `opens ${resume.agent}'s conversation picker`;
+    const where = resume.cwd ? ` in ${resume.cwd}` : "";
+    // `last` is a whole sentence (the known Codex limitation, design 6).
+    const joiner = resume.mode === "last" ? ". " : ": ";
+    return `Resume ${resume.agent}${where}${joiner}${what}`;
+  }
+
   // Row tooltip: "Needs your answer · rule live_blocked_form
   // (claude@2026.10.11.1)". Without a screen-rule status it names the tier and
   // where it came from. Never screen text.
   function tooltipFor(session, tier = null) {
+    if (tier === TIER_RESUMABLE) return resumeTooltip(session);
     const status = session?.agentStatus;
     if (hasAgent(session) && AGENT_STATUSES.has(status)) {
       const word = STATUS_WORDS[status];
@@ -450,12 +482,17 @@
           .map(({ session, tier }) => {
             const title = getTitle(session);
             const age = getAge(session);
-            const meta = [hasAgent(session) ? session.agentName : "", age]
-              .filter(Boolean)
-              .join(" · ");
+            const resumable = tier === TIER_RESUMABLE;
+            const agentWord = resumable
+              ? resumeOf(session)?.agent || ""
+              : hasAgent(session)
+                ? session.agentName
+                : "";
+            const meta = [agentWord, age].filter(Boolean).join(" · ");
             const active = session.id === activeVisibleId;
-            return `<button type="button" class="agents-row${active ? " active" : ""}" data-agent-session-id="${escapeHtml(session.id)}" data-tier="${tier}" title="${escapeHtml(tooltipFor(session, tier))}">
-  <span class="agents-row-status" data-tier="${tier}"><span class="agents-row-icon" aria-hidden="true">${TIER_ICONS[tier]}</span><span class="agents-row-word">${escapeHtml(TIER_LABELS[tier])}</span></span>
+            const word = resumable ? resumeLabel(session) : TIER_LABELS[tier];
+            return `<button type="button" class="agents-row${active ? " active" : ""}" data-agent-session-id="${escapeHtml(session.id)}" data-tier="${tier}"${resumable ? ' data-agent-resume="1"' : ""} title="${escapeHtml(tooltipFor(session, tier))}">
+  <span class="agents-row-status" data-tier="${tier}"><span class="agents-row-icon" aria-hidden="true">${TIER_ICONS[tier]}</span><span class="agents-row-word">${escapeHtml(word)}</span></span>
   <span class="agents-row-title">${escapeHtml(title)}</span>
   ${meta ? `<span class="agents-row-meta">${escapeHtml(meta)}</span>` : ""}
 </button>`;
@@ -498,6 +535,9 @@
     clampPanelWidth,
     storedPanelWidth,
     tooltipFor,
+    resumeOf,
+    resumeLabel,
+    resumeTooltip,
     sanitizeSeenMap,
     mergeSeenMaps,
     sessionIdFromDeepLink,

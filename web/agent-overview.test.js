@@ -17,6 +17,8 @@ import {
   clampPanelWidth,
   storedPanelWidth,
   tooltipFor,
+  resumeLabel,
+  resumeTooltip,
   sanitizeSeenMap,
   mergeSeenMaps,
   sessionIdFromDeepLink,
@@ -484,5 +486,51 @@ describe("focus keeping across a re-render", () => {
     expect(html).toContain("data-agents-next");
     // The same model renders the same HTML (the app skips the DOM write).
     expect(renderAgentListHtml(sessions, {})).toBe(html);
+
+// S3: the Agents panel's "Resume" group.
+describe("resumable rows", () => {
+  const ended = (id, resume) => ({
+    id,
+    status: "inactive",
+    sessionStatus: "ended",
+    cwd: "/w/app",
+    resume,
+  });
+
+  test("label and tooltip name the mode", () => {
+    const exact = ended("a", { agent: "claude", mode: "exact", cwd: "/w/app" });
+    const last = ended("b", { agent: "codex", mode: "last", cwd: "/w/app" });
+    const pick = ended("c", { agent: "codex", mode: "pick", cwd: "/w/app" });
+    expect(resumeLabel(exact)).toBe("Resume");
+    expect(resumeLabel(last)).toBe("Resume");
+    expect(resumeLabel(pick)).toBe("Resume (pick)");
+    expect(resumeTooltip(exact)).toBe(
+      "Resume claude in /w/app: the same conversation",
+    );
+    expect(resumeTooltip(last)).toBe(
+      "Resume codex in /w/app. Resume uses Codex's most recent conversation in this folder",
+    );
+    expect(resumeTooltip(pick)).toContain("conversation picker");
+    expect(tooltipFor(pick, TIER_RESUMABLE)).toBe(resumeTooltip(pick));
+  });
+
+  test("the panel renders a Resume group whose rows carry the resume flag", () => {
+    const html = renderAgentListHtml(
+      [
+        agent("live-1"),
+        ended("r-1", { agent: "codex", mode: "pick", cwd: "/w/app" }),
+        ended("plain", null),
+      ],
+      {},
+    );
+    expect(html).toContain('data-group-key="__resume__"');
+    expect(html).toMatch(
+      /data-agent-session-id="r-1" data-tier="5" data-agent-resume="1"/,
+    );
+    expect(html).toContain("Resume (pick)");
+    expect(html).toContain("codex");
+    // Plain ended rows stay out of the panel; live rows never carry the flag.
+    expect(html).not.toContain('data-agent-session-id="plain"');
+    expect(html).not.toMatch(/data-agent-session-id="live-1"[^>]*data-agent-resume/);
   });
 });

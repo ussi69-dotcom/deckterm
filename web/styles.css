@@ -8194,6 +8194,14 @@ body.fullscreen .agents-panel-sash {
   color: #a5d0ff;
 }
 
+/* S3: an ended session whose agent one tap resumes. */
+[data-tier="5"].agents-row-status,
+.agent-tier-icon[data-tier="5"] {
+  border-color: rgba(188, 140, 255, 0.5);
+  background: rgba(188, 140, 255, 0.12);
+  color: #d2b8ff;
+}
+
 /* Phone and tablet: the summary chip next to the Sessions button. */
 .agents-summary-chip {
   display: inline-flex;

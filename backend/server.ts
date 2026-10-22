@@ -35,6 +35,12 @@ import {
 import { createCpuUsageMeter } from "./services/cpu-usage";
 import { ATTENTION_SEEN_KEY, mergeSeenMaps } from "./services/attention-seen";
 import {
+  isAgentSessionId,
+  planAgentResume,
+  typeAgentResumeCommand,
+  type AgentResumeDecision,
+} from "./agent-resume";
+import {
   NO_STORE_CACHE_CONTROL,
   createBuildFingerprint,
   createStaticAssetServer,
@@ -56,6 +62,7 @@ import {
   opendir,
   lstat,
   realpath,
+  rename,
 } from "node:fs/promises";
 import {
   readFileSync,
@@ -211,11 +218,17 @@ import {
   listFoundationUsers,
   listScopedGrants,
   listTerminalEventsAfter,
+  listResumableEndedSessionsForActor,
   listTerminalSessionsForActor,
   listWildcardGrantPrincipals,
+  clearAgentSession,
+  listCodexAgentRowsInFolder,
   markTerminalSessionEnded,
   markUserReviewed,
+  recordAgentSession,
   recordTerminalSession,
+  releaseAgentResume,
+  reserveAgentResume,
   resolveUserForActor,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
@@ -294,7 +307,10 @@ import {
   hasExplicitLegacyDevActorMode,
   type DeckTermActor,
 } from "./services/foundation-actors";
-import { buildBashIntegrationRcContents } from "./shell-integration";
+import {
+  bashIntegrationRcPath,
+  buildBashIntegrationRcContents,
+} from "./shell-integration";
 import { hardenGitInvocation } from "./git-readonly";
 import {
   TMUX_REATTACH_BACKOFF_MS,
@@ -407,6 +423,12 @@ type Terminal = {
   // to the same broker path instead of the legacy service-account backend.
   exec?: BrokeredExecContext;
   backend?: TerminalBackend;
+  // S3: the session row's agent columns are written one after another per
+  // terminal (a quick start + done must never end as a recorded agent).
+  agentResumeWrite?: Promise<void>;
+  // S3: the user closed this terminal (DELETE, or the close-later window
+  // expired): a late agent start must not record resume data again.
+  agentResumeClosedByUser?: boolean;
 };
 
 type TerminalWsData = {
@@ -440,6 +462,11 @@ const MAX_TERMINALS_PER_USER = parseInt(
 // Cap on ended sessions in GET /api/terminals (recent-history rows in the
 // sessions drawer). Ended rows past the cap stay in the DB for their B6
 // retention TTL — this only bounds the listing and its per-row telemetry.
+// S3: gap between the typed resume command and its separate Enter, the
+// same 300 ms Task Runner uses for its pointer line (POINTER_SUBMIT_DELAY_MS).
+const AGENT_RESUME_SUBMIT_DELAY_MS = 300;
+// S3: ended rows a resume request in THIS process is handing over right now.
+const agentResumesInProgress = new Set<string>();
 const TERMINAL_LIST_ENDED_LIMIT = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TERMINAL_LIST_ENDED_LIMIT || "10",
@@ -909,6 +936,7 @@ function applyParsedShellIntegrationState(
       recordToolEvent(term, event);
     }
   }
+  recordAgentResumeEvents(term, parsed.events);
 
   if (emitOutput && parsed.output) {
     // Live PTY output is a liveness signal for the reapers: an unattended
@@ -921,6 +949,75 @@ function applyParsedShellIntegrationState(
     // another viewer): refresh the indicator on a trailing throttle.
     terminalScrollControllers.get(term)?.onOutput();
   }
+}
+
+// S3 one-tap resume (design 6). The session row remembers the agent that is
+// alive in it: recorded on the shell marker's agent start (name, validated
+// id, folder), cleared on agent done. An ENDED row that still names an agent
+// therefore had its agent alive when the session died (tmux crash, reboot).
+// The marker is forgeable pane output: the parser keeps only a UUID id, and
+// the resume route validates every stored value again.
+function recordAgentResumeEvents(
+  term: Terminal,
+  events: ReturnType<typeof parseShellIntegrationChunk>["events"],
+) {
+  for (const event of events) {
+    if (event.type === "agent-start") {
+      const agentName = event.agentName;
+      const sessionId = isAgentSessionId(event.sessionId)
+        ? event.sessionId
+        : null;
+      queueAgentResumeWrite(term, async (db) => {
+        const cwd = await resolveAgentStartCwd(term);
+        if (term.agentResumeClosedByUser) return;
+        recordAgentSession(db, term.id, { agentName, sessionId, cwd });
+      });
+    } else if (event.type === "agent-done") {
+      queueAgentResumeWrite(term, (db) => {
+        clearAgentSession(db, term.id);
+      });
+    }
+  }
+}
+
+function queueAgentResumeWrite(
+  term: Terminal,
+  write: (db: FoundationState["db"]) => Promise<void> | void,
+) {
+  const previous = term.agentResumeWrite || Promise.resolve();
+  term.agentResumeWrite = previous
+    .then(async () => {
+      const state = await getFoundationState();
+      await write(state.db);
+    })
+    .catch((err) => {
+      debug(`[resume] agent row write failed for ${term.id}:`, err);
+    });
+}
+
+// The folder the agent runs in: the tmux pane's current path (the agent's own
+// cwd while it runs in the foreground), else the terminal's last known cwd.
+async function resolveAgentStartCwd(term: Terminal): Promise<string> {
+  if (TMUX_BACKEND && term.sessionName && !term.exec) {
+    try {
+      const info = await getTmuxSessionInfo(term.sessionName);
+      if (info.cwd && info.cwd.startsWith("/")) return info.cwd;
+    } catch {
+      // Fall back to the last known cwd below.
+    }
+  }
+  return term.cwd;
+}
+
+// S3 (operator decision): Resume is only for sessions that ended without
+// the user closing them. An explicit close (DELETE, or the close-later window
+// the user started running out) drops the row's resume data.
+function forgetAgentResumeOnUserClose(
+  db: FoundationState["db"],
+  term: Terminal,
+) {
+  term.agentResumeClosedByUser = true;
+  clearAgentSession(db, term.id);
 }
 
 function processShellIntegrationChunk(
@@ -4857,7 +4954,116 @@ function getRecordedSessionCatalogStatus(
   return session.status === "active" ? "detached" : "inactive";
 }
 
-function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
+// S3 (operator decision): ended rows with valid resume data are listed even
+// past the ended-row cap (DECKTERM_TERMINAL_LIST_ENDED_LIMIT), newest end
+// first, at most this many, in addition to the normal listing.
+const RESUMABLE_LIST_LIMIT = 50;
+// Candidates read to find them (a tampered row is a candidate, not listed).
+const RESUMABLE_CANDIDATE_LIMIT = 4 * RESUMABLE_LIST_LIMIT;
+
+// The sessions GET /api/terminals lists for an owner: the normal listing
+// (live rows + the newest ended rows) plus the newest resumable ended rows,
+// in the normal listing's order (created_at, newest first).
+function listCatalogSessions(
+  db: FoundationState["db"],
+  ownerId: string,
+): RecordedTerminalSession[] {
+  const listed = listTerminalSessionsForActor(db, ownerId, {
+    endedLimit: TERMINAL_LIST_ENDED_LIMIT,
+  });
+  const ids = new Set(listed.map((row) => row.id));
+  const extra = listResumableEndedSessionsForActor(
+    db,
+    ownerId,
+    RESUMABLE_CANDIDATE_LIMIT,
+  )
+    .filter(
+      (row) =>
+        planAgentResume({
+          agentName: row.agentName,
+          agentSessionId: row.agentSessionId,
+          agentCwd: row.agentCwd,
+        }).ok,
+    )
+    .slice(0, RESUMABLE_LIST_LIMIT)
+    .filter((row) => !ids.has(row.id));
+  if (extra.length === 0) return listed;
+  return [...listed, ...extra].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+  );
+}
+
+// S3: what a Resume tap on this ENDED row would reopen, or null.
+type AgentResumeSummary = {
+  agent: "claude" | "codex";
+  mode: "exact" | "last" | "pick";
+  cwd: string;
+};
+
+// Design 6: another resumable or live Codex row of this owner in the same
+// agent folder makes `codex resume --last` ambiguous, so that row opens
+// Codex's own picker instead. Asked per row against the WHOLE table (an
+// indexed lookup), not the capped catalog: a resumable row the listing no
+// longer shows still counts.
+function codexFolderShared(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): boolean {
+  if (session.agentName !== "codex" || !session.agentCwd) return false;
+  const cwd = session.agentCwd;
+  for (const term of terminals.values()) {
+    if (
+      term.id !== session.id &&
+      term.ownerId === ownerId &&
+      term.agentName === "codex" &&
+      term.cwd === cwd
+    ) {
+      return true;
+    }
+  }
+  return listCodexAgentRowsInFolder(db, ownerId, cwd, session.id).some(
+    (row) =>
+      row.status !== "ended" ||
+      planAgentResume({
+        agentName: row.agentName,
+        agentSessionId: row.agentSessionId,
+        agentCwd: row.agentCwd,
+      }).ok,
+  );
+}
+
+function decideAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): AgentResumeDecision {
+  return planAgentResume(
+    {
+      agentName: session.agentName,
+      agentSessionId: session.agentSessionId,
+      agentCwd: session.agentCwd,
+    },
+    { codexCwdShared: codexFolderShared(db, ownerId, session) },
+  );
+}
+
+function summarizeAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): AgentResumeSummary | null {
+  if (session.status !== "ended" || terminals.has(session.id)) return null;
+  const decision = decideAgentResume(db, ownerId, session);
+  if (!decision.ok) return null;
+  const { agent, mode, cwd } = decision.plan;
+  return { agent, mode, cwd };
+}
+
+function serializeRecordedTerminalSession(
+  session: RecordedTerminalSession,
+  { resume = null }: { resume?: AgentResumeSummary | null } = {},
+) {
   const status = getRecordedSessionCatalogStatus(session);
   const sharedSessionKey =
     TMUX_BACKEND && session.status === "active"
@@ -4894,6 +5100,7 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
     active: false,
     status,
     sessionStatus: session.status,
+    resume,
   };
 }
 
@@ -5032,9 +5239,14 @@ async function ensureBashIntegrationRc(): Promise<string> {
   if (bashIntegrationRcPathPromise) return bashIntegrationRcPathPromise;
 
   bashIntegrationRcPathPromise = (async () => {
-    const rcPath = "/tmp/deckterm-bash-integration.rc";
     const rcContents = buildBashIntegrationRcContents();
-    await Bun.write(rcPath, rcContents);
+    // Content-addressed, so another DeckTerm version on this host never
+    // rewrites the rc this process's shells read; written to a temp name and
+    // renamed so a starting shell never reads a half-written file.
+    const rcPath = bashIntegrationRcPath(rcContents);
+    const tmpPath = `${rcPath}.${process.pid}.tmp`;
+    await Bun.write(tmpPath, rcContents);
+    await rename(tmpPath, rcPath);
     return rcPath;
   })();
 
@@ -8174,15 +8386,25 @@ export function createWebApp() {
     }
   });
 
-  // Create new terminal running shell
-  app.post("/api/terminals", async (c) => {
+  // The one terminal create path (root checks, capability grants, rate
+  // limits, isolation, audit). POST /api/terminals and the S3 resume route
+  // both go through it, so a resumed agent gets nothing a plain create
+  // would not.
+  type TerminalCreateOutcome =
+    | { ok: true; terminal: Terminal; ownerId: string; state: FoundationState }
+    | { ok: false; response: Response };
+  async function createTerminalThroughCreatePath(
+    c: any,
+    // Same shape the route always read: { cwd?, cols?, rows? }.
+    body: Record<string, any>,
+    routeCapability: { capability: ScopedGrantCapability },
+  ): Promise<TerminalCreateOutcome> {
+    const fail = (response: Response): TerminalCreateOutcome => ({
+      ok: false,
+      response,
+    });
     const actor = getCurrentActor(c);
     const ownerEmail = actor.email;
-    const body = await c.req.json().catch(() => ({}));
-    const routeCapability = getRouteCapability(c.req.method, c.req.url);
-    if (!routeCapability) {
-      return c.json({ error: "Missing route capability" }, 500);
-    }
     // No explicit cwd: start in the service home when it is an allowed root,
     // else in the first allowed root. Defaulting blindly to $HOME rejected a
     // fresh install's very first terminal ("Forbidden terminal root") whenever
@@ -8228,7 +8450,7 @@ export function createWebApp() {
         reason: pre.reason,
         data: { cwd: body.cwd ?? null },
       });
-      return c.json(
+      return fail(c.json(
         foundationGateJson({
           message: pre.message,
           reason: pre.reason,
@@ -8237,7 +8459,7 @@ export function createWebApp() {
           resourceId: "*",
         }),
         403,
-      );
+      ));
     }
     const actorOwnerId = pre.ownerId;
 
@@ -8253,7 +8475,7 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json(
+      return fail(c.json(
         {
           error: "Forbidden terminal root",
           reason: "forbidden_root",
@@ -8266,7 +8488,7 @@ export function createWebApp() {
           }),
         },
         403,
-      );
+      ));
     }
 
     // Lexical (no realpath) root match, same helper requireFileAccess uses.
@@ -8283,14 +8505,14 @@ export function createWebApp() {
         reason: "no_matching_root",
         data: { cwd: resolvedCwd },
       });
-      return c.json(
+      return fail(c.json(
         {
           error: "Forbidden path (no matching registered root)",
           reason: "no_matching_root",
           ...forbiddenRootDetail({ path: resolvedCwd, subject: "terminal" }),
         },
         403,
-      );
+      ));
     }
 
     // terminal.create keyed on the resolved root (was terminal/"*"). Owner/admin
@@ -8305,7 +8527,7 @@ export function createWebApp() {
       data: { cwd: resolvedCwd },
     });
     if (!foundationAuth.ok) {
-      return c.json(foundationGateJson(foundationAuth), foundationAuth.status);
+      return fail(c.json(foundationGateJson(foundationAuth), foundationAuth.status));
     }
     // Canonical ownerId (plan §2, invariant §9.9): every downstream seam in
     // this handler — live-count checks, PTY spawn, session recording, audit
@@ -8320,12 +8542,12 @@ export function createWebApp() {
       data: { cwd: resolvedCwd },
     });
     if (!rootAuth.ok) {
-      return c.json(foundationGateJson(rootAuth), rootAuth.status);
+      return fail(c.json(foundationGateJson(rootAuth), rootAuth.status));
     }
 
     const creationError = getTerminalCreationError(ownerId);
     if (creationError) {
-      return c.json(creationError.body, creationError.status);
+      return fail(c.json(creationError.body, creationError.status));
     }
 
     // Pre-side-effect disabled re-check (invariant §9.2): closes the race
@@ -8341,7 +8563,7 @@ export function createWebApp() {
         reason: "user_disabled",
         data: { cwd: resolvedCwd },
       });
-      return c.json(
+      return fail(c.json(
         foundationGateJson({
           message: "DeckTerm account disabled",
           reason: "user_disabled",
@@ -8350,7 +8572,7 @@ export function createWebApp() {
           resourceId: "*",
         }),
         403,
-      );
+      ));
     }
 
     // B2 OS isolation (§4.3): resolve legacy vs brokered vs deny. Off ⇒ legacy
@@ -8363,7 +8585,7 @@ export function createWebApp() {
       resolvedCwd,
     );
     if (!execResolution.ok) {
-      return c.json(execResolution.body, execResolution.status);
+      return fail(c.json(execResolution.body, execResolution.status));
     }
     const exec = execResolution.exec;
 
@@ -8408,7 +8630,7 @@ export function createWebApp() {
           reason: "user_disabled_postcheck",
           data: { cwd: resolvedCwd },
         });
-        return c.json(
+        return fail(c.json(
           foundationGateJson({
             message: "DeckTerm account disabled",
             reason: "user_disabled_postcheck",
@@ -8417,7 +8639,7 @@ export function createWebApp() {
             resourceId: "*",
           }),
           403,
-        );
+        ));
       }
     }
 
@@ -8455,10 +8677,10 @@ export function createWebApp() {
           reason: "os_mapping_postcheck",
           data: { cwd: resolvedCwd, os_uid: exec.uid },
         });
-        return c.json(
+        return fail(c.json(
           { error: "OS isolation denied", reason: "os_mapping_postcheck" },
           403,
-        );
+        ));
       }
     }
 
@@ -8478,7 +8700,23 @@ export function createWebApp() {
         : { cwd: resolvedCwd },
     });
 
-    return c.json(serializeTerminal(terminal));
+    return { ok: true, terminal, ownerId, state };
+  }
+
+  // Create new terminal running shell
+  app.post("/api/terminals", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    const created = await createTerminalThroughCreatePath(
+      c,
+      body,
+      routeCapability,
+    );
+    if (!created.ok) return created.response;
+    return c.json(serializeTerminal(created.terminal));
   });
 
   app.post("/api/terminals/:id/linked-view", async (c) => {
@@ -8612,9 +8850,7 @@ export function createWebApp() {
       }
       throw err;
     }
-    const recordedSessions = listTerminalSessionsForActor(state.db, ownerId, {
-      endedLimit: TERMINAL_LIST_ENDED_LIMIT,
-    });
+    const recordedSessions = listCatalogSessions(state.db, ownerId);
     const seenIds = new Set<string>();
     // One `ps` snapshot per request, taken only if some session needs a
     // fresh runtime sync (cached syncs reuse their earlier result).
@@ -8658,7 +8894,9 @@ export function createWebApp() {
               : getTerminalSession(state.db, recordedSession.id) ||
                 recordedSession
             : recordedSession;
-        const serialized = serializeRecordedTerminalSession(effectiveSession);
+        const serialized = serializeRecordedTerminalSession(effectiveSession, {
+          resume: summarizeAgentResume(state.db, ownerId, effectiveSession),
+        });
         return {
           ...serialized,
           ...(await getTerminalTelemetry(
@@ -8710,6 +8948,198 @@ export function createWebApp() {
     );
 
     return c.json([...list, ...memoryOnly]);
+  });
+
+  // S3 one-tap resume (design 6). Never automatic: only this explicit POST,
+  // sent by a tap on "Resume", reopens an agent conversation, in a NEW
+  // terminal created through the normal create path in the ended row's
+  // agent folder. `{ "dryRun": true }` answers { command, cwd, mode } and
+  // creates nothing.
+  app.post("/api/terminals/:id/resume", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json().catch(() => ({}));
+    const dryRun = body?.dryRun === true;
+    const actor = getCurrentActor(c);
+    const state = await getFoundationState();
+    let ownerId: string;
+    try {
+      ownerId = isFoundationLegacyBypassEnabled()
+        ? actor.id
+        : resolveCanonicalOwnerId(state, actor).ownerId;
+    } catch (err) {
+      if (err instanceof IdentityConflictError) {
+        return c.json(
+          {
+            error: "DeckTerm identity resolution conflict",
+            reason: "identity_conflict",
+          },
+          403,
+        );
+      }
+      throw err;
+    }
+    const row = getTerminalSession(state.db, id);
+    // Another actor's row answers exactly like a missing one; both refusals
+    // are audited, so probing for other sessions is traceable.
+    if (
+      !row ||
+      row.actorUserId !== ownerId ||
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: row.actorUserId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.resume",
+        resourceType: "terminal",
+        resourceId: id.slice(0, 128),
+        decision: "deny",
+        reason: row ? "foreign_session" : "not_found",
+      });
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (row.status !== "ended" || terminals.has(id)) {
+      return c.json(
+        {
+          error: "This session is still running: attach to it instead",
+          reason: "session_active",
+        },
+        409,
+      );
+    }
+    // The stored values are validated again here, whatever wrote them.
+    const decision = decideAgentResume(state.db, ownerId, row);
+    if (!decision.ok) {
+      if (decision.reason === "invalid_resume_data") {
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.resume",
+          resourceType: "terminal",
+          resourceId: id,
+          decision: "deny",
+          reason: "invalid_resume_data",
+        });
+      }
+      return c.json(
+        {
+          error:
+            decision.reason === "invalid_resume_data"
+              ? "The saved agent data for this session is not valid"
+              : "Nothing to resume in this session",
+          reason: decision.reason,
+        },
+        409,
+      );
+    }
+    const { plan } = decision;
+    if (dryRun) {
+      return c.json({ command: plan.command, cwd: plan.cwd, mode: plan.mode });
+    }
+
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    // One hand-over per row: an in-process reservation (this server) plus a
+    // conditional DB update that only one request can win (any process).
+    // Both are taken before anything is created, so two taps, two browsers
+    // or two direct calls never start two agents on one conversation.
+    const inProgress = () =>
+      c.json(
+        {
+          error: "This session is already being resumed",
+          reason: "resume_in_progress",
+        },
+        409,
+      );
+    if (agentResumesInProgress.has(id)) return inProgress();
+    agentResumesInProgress.add(id);
+    try {
+      if (
+        !reserveAgentResume(state.db, id, {
+          agentName: plan.agent,
+          sessionId: row.agentSessionId,
+          cwd: plan.cwd,
+        })
+      ) {
+        return inProgress();
+      }
+      let handedOver = false;
+      try {
+        const created = await createTerminalThroughCreatePath(
+          c,
+          { cwd: plan.cwd, cols: body?.cols, rows: body?.rows },
+          routeCapability,
+        );
+        if (!created.ok) return created.response;
+        const terminal = created.terminal;
+        // The create path may fall back to a parent folder when the agent's
+        // folder is gone. Codex `resume --last` would then pick another
+        // folder's conversation, so nothing is typed there.
+        const typeIt = terminal.cwd === plan.cwd;
+        // Typed through the shell functions (Codex keeps --no-alt-screen and
+        // the new run reports its id again), then a separate deferred Enter.
+        const typed =
+          typeIt &&
+          (await typeAgentResumeCommand(
+            (data) => terminal.terminal.write(data),
+            plan.command,
+            { delayMs: AGENT_RESUME_SUBMIT_DELAY_MS },
+          ));
+        if (typeIt && !typed) {
+          writeAuditEvent(state.db, {
+            actorUserId: created.ownerId,
+            action: "terminal.resume",
+            resourceType: "terminal",
+            resourceId: terminal.id,
+            decision: "deny",
+            reason: "resume_write_failed",
+            data: { from: id, agent: plan.agent, mode: plan.mode },
+          });
+          return c.json(
+            {
+              error:
+                "The new terminal closed before the resume command was sent; nothing ran, try again",
+              reason: "resume_write_failed",
+            },
+            500,
+          );
+        }
+        if (typed) {
+          // The command and its Enter reached the shell: hand the row over.
+          // The new terminal's own start marker records the new state.
+          clearAgentSession(state.db, id);
+          handedOver = true;
+        }
+        writeAuditEvent(state.db, {
+          actorUserId: created.ownerId,
+          action: "terminal.resume",
+          resourceType: "terminal",
+          resourceId: terminal.id,
+          decision: "allow",
+          data: {
+            from: id,
+            agent: plan.agent,
+            mode: plan.mode,
+            cwd: plan.cwd,
+            typed,
+          },
+        });
+        return c.json({
+          ...serializeTerminal(terminal),
+          resumed: { from: id, agent: plan.agent, mode: plan.mode, typed },
+        });
+      } finally {
+        // Nothing was handed over (refused, failed or not typed): the row
+        // stays resumable and a retry can reserve it again.
+        if (!handedOver) releaseAgentResume(state.db, id);
+      }
+    } finally {
+      agentResumesInProgress.delete(id);
+    }
   });
 
   // Closing a browser tab first schedules termination instead of immediately
@@ -8824,6 +9254,7 @@ export function createWebApp() {
 
     const state = await getFoundationState();
     markTerminalSessionEnded(state.db, id);
+    forgetAgentResumeOnUserClose(state.db, term);
     closeTerminalSockets(id);
     removeTerminalState(id);
     await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
@@ -11310,6 +11741,48 @@ export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
 // Keep the lease strongly reachable even when the entrypoint discards the Bun
 // server wrapper. Native server liveness is not a JavaScript GC ownership root.
 const activeStateOwners = new Set<{ release(): void }>();
+// Ends every terminal whose close-later restore window ran out (the user
+// closed its tab and did not come back). Run by startWebServer's sweep
+// timer; exported so the S3 test can drive one sweep at a chosen time.
+export async function reapScheduledTerminalClosures(
+  now: number = Date.now(),
+): Promise<void> {
+  const state = await getFoundationState();
+
+  for (const [id, term] of terminals) {
+    if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
+      continue;
+    }
+    const sockets = terminalSockets.get(id);
+    const activeSocketsCount = sockets ? sockets.size : 0;
+    if (activeSocketsCount > 0) {
+      // Defensive race handling: a restored tab always wins over the timer.
+      cancelTerminalSessionTermination(state.db, id);
+      term.terminationScheduledAt = undefined;
+      continue;
+    }
+
+    console.log(
+      `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
+    );
+    markTerminalSessionEnded(state.db, id);
+    // The user closed it: no Resume afterwards (S3).
+    forgetAgentResumeOnUserClose(state.db, term);
+    removeTerminalState(id);
+    try {
+      await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
+    } catch (err) {
+      debug(`[close-later] tmux kill-session error for ${id}:`, err);
+    }
+    try {
+      term.proc.kill();
+      term.terminal.close();
+    } catch (err) {
+      debug(`[close-later] cleanup error for ${id}:`, err);
+    }
+  }
+}
+
 export async function startWebServer(host: string, port: number) {
   const lease = acquireStateOwnership(DECKTERM_STATE_DIR);
   const ownership = {
@@ -12217,47 +12690,14 @@ async function startOwnedWebServer(
     }
   };
 
-  const reapScheduledTerminalClosures = async () => {
-    const now = Date.now();
-    const state = await getFoundationState();
-
-    for (const [id, term] of terminals) {
-      if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
-        continue;
-      }
-      const sockets = terminalSockets.get(id);
-      const activeSocketsCount = sockets ? sockets.size : 0;
-      if (activeSocketsCount > 0) {
-        // Defensive race handling: a restored tab always wins over the timer.
-        cancelTerminalSessionTermination(state.db, id);
-        term.terminationScheduledAt = undefined;
-        continue;
-      }
-
-      console.log(
-        `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
-      );
-      markTerminalSessionEnded(state.db, id);
-      removeTerminalState(id);
-      try {
-        await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
-      } catch (err) {
-        debug(`[close-later] tmux kill-session error for ${id}:`, err);
-      }
-      try {
-        term.proc.kill();
-        term.terminal.close();
-      } catch (err) {
-        debug(`[close-later] cleanup error for ${id}:`, err);
-      }
-    }
-  };
-
   const lifecycleTimers = [
     setInterval(cleanupClipboardImages, 15 * 60 * 1000),
     setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
     setInterval(reapDetachedSessions, 15 * 60 * 1000),
-    setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+    setInterval(
+      () => void reapScheduledTerminalClosures(),
+      TERMINAL_TAB_CLOSE_SWEEP_MS,
+    ),
     setInterval(() => {
       void pumpTmuxPipeOutput().catch((err) =>
         debug("[tmux] pipe pump failed:", err),

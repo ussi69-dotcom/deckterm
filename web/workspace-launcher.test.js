@@ -45,6 +45,28 @@ test("planLauncherSessions: live sessions first (newest first), then ended ones"
   });
 });
 
+test("planLauncherSessions: resumable agent sessions come right after live ones (S3)", () => {
+  const sessions = planLauncherSessions([
+    ended("e1", "/srv/old", 900),
+    {
+      ...ended("r1", "/home/u/proj", 100),
+      resume: { agent: "claude", mode: "exact", cwd: "/home/u/proj" },
+    },
+    live("a", "/home/u/api", 50),
+    {
+      ...ended("r2", "/home/u/cdx", 80),
+      resume: { agent: "codex", mode: "pick", cwd: "/home/u/cdx" },
+    },
+  ]);
+  expect(sessions.map((s) => s.id)).toEqual(["a", "r1", "r2", "e1"]);
+  expect(sessions[1]).toMatchObject({ kind: "resume", actionLabel: "Resume" });
+  expect(sessions[2]).toMatchObject({
+    kind: "resume",
+    actionLabel: "Resume (pick)",
+  });
+  expect(sessions[3]).toMatchObject({ kind: "open-here" });
+});
+
 test("planLauncherSessions: restorable closes say Restore; open tabs and junk are skipped; max 5", () => {
   const catalog = [
     live("closed", "/x", 900, { terminationScheduledAt: 123 }),

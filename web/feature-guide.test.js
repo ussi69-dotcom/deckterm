@@ -180,6 +180,7 @@ test("What's what is generated from the shared descriptions", () => {
     "Search",
     "Quick replies",
     "Attention dot",
+    "Resume",
   ]) {
     expect(titles).toContain(wanted);
   }

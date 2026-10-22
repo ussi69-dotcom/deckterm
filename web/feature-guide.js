@@ -64,6 +64,8 @@
       "On a phone, answer an agent's prompt with one tap: 1, 2, 3, Enter, Esc, Shift+Tab, Ctrl+C",
     "attention-dot":
       "A dot on a tab means an agent there finished, hit an error or needs your input",
+    "agent-resume":
+      "After a reboot or a tmux crash, one tap reopens the agent's conversation in its old folder",
     "scroll-handle":
       "On a touch screen, drag this handle to move through the session's history",
     "jump-to-latest":
@@ -133,6 +135,7 @@
     { title: "Search", featureId: "search" },
     { title: "Quick replies", featureId: "quick-replies" },
     { title: "Attention dot", featureId: "attention-dot" },
+    { title: "Resume", featureId: "agent-resume" },
   ]);
 
   // Zero-terminal launcher: three quiet tips. `text` is deliberately shorter
