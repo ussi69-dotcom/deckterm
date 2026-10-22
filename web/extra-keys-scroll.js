@@ -48,8 +48,11 @@ function getTmuxScrollRequestFromWheel(deltaY, deltaMode = 0) {
  * the client, so xterm.js reports a non-"none" mouseTrackingMode, and the
  * wheel/PgUp events must fall through so xterm.js delivers them (as SGR
  * mouse / key input) to the app. Note the xterm buffer type is NOT usable
- * as this signal: the tmux client keeps xterm.js on the alternate buffer
- * for every pane, TUI or plain shell alike.
+ * as this signal: the tmux client's alternate-screen switch is sent on
+ * attach, before the browser socket exists, so xterm.js usually sits on the
+ * normal buffer whatever the pane runs (measured 2026-10-22). Touch scrolling
+ * therefore lets the server read the pane state from tmux instead
+ * (backend/services/terminal-scroll-control.ts).
  *
  * @param {string|null} backendMode  terminal backend ("tmux", "raw", ...)
  * @param {string|undefined} mouseTrackingMode  xterm.js modes.mouseTrackingMode
