@@ -18,7 +18,7 @@ test.describe("Git Explorer - VS Code style", () => {
     await resetAppState(page, APP_URL);
     await waitForTerminal(page);
     await createWorkspaceInDir(page, repoDir);
-    await page.getByRole("button", { name: "Git" }).click();
+    await page.getByRole("button", { name: "Git", exact: true }).click();
     await page.waitForSelector("#git-panel:not(.hidden)");
     await page.waitForTimeout(400);
   });
