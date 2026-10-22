@@ -87,14 +87,17 @@ import {
   type OscTitleParseState,
   type TerminalNotificationParseState,
 } from "./telemetry";
+import { evaluate as evaluateAgentScreen } from "./agent-screen-rules";
 import {
-  evaluate as evaluateAgentScreen,
-  type RuleAgent,
-} from "./agent-screen-rules";
+  AGENT_SCREEN_CONCURRENCY,
+  agentScreenEvaluationDue,
+  createBoundedScheduler,
+  pumpPipeDeltas,
+  resumeAgentScreenState,
+  runAgentScreenEvaluation,
+  type AgentScreenDeps,
+} from "./agent-screen-runner";
 import {
-  agentStatusNeedsEvaluation,
-  applyAgentStatusEvaluation,
-  createAgentStatusRecord,
   createAgentsChangedCoalescer,
   markBlockedEpisodePushed,
   selectAgentsChangedSockets,
@@ -135,6 +138,10 @@ import {
   socketWantsScrollFrames,
   TerminalScrollController,
 } from "./services/terminal-scroll-control";
+import {
+  normalizeTerminalSize,
+  resolveTerminalSize,
+} from "./services/terminal-size";
 import {
   TaskRunnerError,
   buildJudgeCommand,
@@ -1554,6 +1561,14 @@ type TmuxPipeResume = {
   notificationParse: TerminalNotificationParseState;
   oscTitleParse: OscTitleParseState;
   agentOscTitle: string;
+  // S1: the screen-rule record (blocked episode, whether it pushed), the
+  // attention it raised and the last pushes survive a re-attach of the same
+  // agent (resumeAgentScreenState).
+  agentStatusRecord: AgentStatusRecord;
+  attention: AttentionTracker;
+  agentOscProgress: string;
+  lastInputPushAt?: number;
+  lastCompletionPushAt?: number;
 };
 const tmuxPipeResume = new Map<string, TmuxPipeResume>();
 
@@ -1566,6 +1581,11 @@ function rememberTmuxPipeResume(term: Terminal) {
     notificationParse: term.notificationParse,
     oscTitleParse: term.oscTitleParse,
     agentOscTitle: term.agentOscTitle,
+    agentStatusRecord: term.agentStatusRecord,
+    attention: term.attention,
+    agentOscProgress: term.agentOscProgress,
+    lastInputPushAt: term.lastInputPushAt,
+    lastCompletionPushAt: term.lastCompletionPushAt,
   });
 }
 
@@ -5678,81 +5698,69 @@ async function pumpTmuxPipeOutput(): Promise<void> {
   if (!TMUX_BACKEND || tmuxPipePumpRunning || shutdownInProgress) return;
   tmuxPipePumpRunning = true;
   try {
-    for (const term of Array.from(terminals.values())) {
-      if (!term.sessionName || !term.tmuxPipePath) continue;
-      const delta = await readTmuxPipeDelta(term).catch(() => "");
-      if (delta && terminals.get(term.id) === term) {
-        processShellIntegrationChunk(term, delta, {
-          emitOutput: false,
-          source: "pipe",
-        });
-      }
-      if (terminals.get(term.id) === term) {
-        await updateAgentScreenStatus(term).catch((err) =>
-          debug(`[agent-status] evaluation failed for ${term.id}`, err),
-        );
-      }
-    }
+    await pumpPipeDeltas(
+      Array.from(terminals.values()).filter(
+        (term) => term.sessionName && term.tmuxPipePath,
+      ),
+      {
+        readDelta: (term) => readTmuxPipeDelta(term),
+        isCurrent: (term) => terminals.get(term.id) === term,
+        processDelta: (term, delta) =>
+          processShellIntegrationChunk(term, delta, {
+            emitOutput: false,
+            source: "pipe",
+          }),
+        // Never awaited: a slow or wedged capture must not hold up the pipe
+        // processing of the other terminals (or this flag).
+        scheduleScreen: scheduleAgentScreenStatus,
+      },
+    );
   } finally {
     tmuxPipePumpRunning = false;
   }
 }
 
 // ---------------------------------------------------------------------------
-// S1 screen-rule agent status (design 1.2-1.8). Evaluated here, after the
-// pipe delta, only when the pane printed something since the last evaluation
-// or a grace/hold is pending. The capture is held in memory for this one
-// evaluation and never logged or persisted.
+// S1 screen-rule agent status (design 1.2-1.8). Scheduled by the pipe pump
+// (and the working -> idle re-check) only when the pane printed something
+// since the last evaluation or a grace/hold is pending; run off the pump, at
+// most AGENT_SCREEN_CONCURRENCY captures at once and one per terminal. The
+// capture is held in memory for this one evaluation and never logged or
+// persisted.
 // ---------------------------------------------------------------------------
 
 let agentScreenRulesBroken = false;
 
-async function updateAgentScreenStatus(term: Terminal): Promise<void> {
-  const agentName = term.agentName;
-  if (!term.sessionName || !agentName || term.agentStatusBusy) return;
-  if (agentScreenRulesBroken) return;
-  if (term.agentStatusRecord.agentName !== agentName) {
-    syncAgentStatusRecord(term);
-  }
-  if (
-    !agentStatusNeedsEvaluation(term.agentStatusRecord, {
-      now: Date.now(),
-      outputSeen: term.agentScreenDirty,
-    })
-  ) {
-    return;
-  }
-  const backend = term.backend ?? terminalBackend;
-  term.agentStatusBusy = true;
-  try {
-    term.agentScreenDirty = false;
-    const screen = await backend.captureVisible(term.sessionName);
-    if (screen === null) return;
-    if (terminals.get(term.id) !== term) return;
-    if (term.agentName !== agentName) return;
-    if (term.agentStatusRecord.agentName !== agentName) return;
-    let result;
-    try {
-      result = evaluateAgentScreen(agentName as RuleAgent, {
-        screen,
-        title: term.agentOscTitle,
-        progress: term.agentOscProgress,
-      });
-    } catch (err) {
-      // A broken vendored manifest must not spam every tick; agentStatus
-      // stays null and everything falls back to today's behaviour.
-      agentScreenRulesBroken = true;
-      console.error("[agent-status] screen rules failed to load:", err);
-      return;
-    }
-    const step = applyAgentStatusEvaluation(term.agentStatusRecord, result, {
-      now: Date.now(),
-      lastInputPushAt: term.lastInputPushAt ?? null,
-    });
-    term.agentStatusRecord = step.record;
-    runAgentStatusEffects(term, step.effects);
-  } finally {
-    term.agentStatusBusy = false;
+const agentScreenDeps: AgentScreenDeps<Terminal> = {
+  now: () => Date.now(),
+  capture: (term) =>
+    (term.backend ?? terminalBackend).captureVisible(term.sessionName!),
+  isCurrent: (term) => terminals.get(term.id) === term,
+  syncRecord: (term) => syncAgentStatusRecord(term),
+  evaluate: (agent, input) => evaluateAgentScreen(agent, input),
+  applyEffects: (term, effects) => runAgentStatusEffects(term, effects),
+  rulesBroken: () => agentScreenRulesBroken,
+  onRulesBroken: (err) => {
+    // A broken vendored manifest must not spam every tick; agentStatus
+    // stays null and everything falls back to today's behaviour.
+    agentScreenRulesBroken = true;
+    console.error("[agent-status] screen rules failed to load:", err);
+  },
+};
+
+const agentScreenScheduler = createBoundedScheduler<Terminal>({
+  concurrency: AGENT_SCREEN_CONCURRENCY,
+  run: async (term) => {
+    if (shutdownInProgress || terminals.get(term.id) !== term) return;
+    await runAgentScreenEvaluation(term, agentScreenDeps);
+  },
+  onError: (term, err) =>
+    debug(`[agent-status] evaluation failed for ${term.id}`, err),
+});
+
+function scheduleAgentScreenStatus(term: Terminal) {
+  if (agentScreenEvaluationDue(term, agentScreenDeps)) {
+    agentScreenScheduler.schedule(term);
   }
 }
 
@@ -5777,9 +5785,7 @@ function runAgentStatusEffects(term: Terminal, effects: AgentStatusEffect[]) {
         () => {
           term.agentStatusRecheckTimer = null;
           if (terminals.get(term.id) !== term || shutdownInProgress) return;
-          void updateAgentScreenStatus(term).catch((err) =>
-            debug(`[agent-status] re-check failed for ${term.id}`, err),
-          );
+          scheduleAgentScreenStatus(term);
         },
         Math.max(0, effect.at - Date.now()),
       );
@@ -6136,6 +6142,12 @@ async function createManagedTerminal({
   }
 
   const now = Date.now();
+  // Same agent on a re-attach: keep its episode instead of pushing again.
+  const agentResume = resumeAgentScreenState(
+    resumePipe,
+    initialRuntimeState?.agentName || null,
+    now,
+  );
   const managedTerminal: Terminal = {
     id,
     proc,
@@ -6168,16 +6180,18 @@ async function createManagedTerminal({
     toolRate: { windowStart: 0, count: 0 },
     notificationParse:
       resumePipe?.notificationParse ?? createTerminalNotificationParseState(),
-    attention: createAttentionTracker(),
+    attention:
+      agentResume.sameAgent && resumePipe
+        ? resumePipe.attention
+        : createAttentionTracker(),
+    lastInputPushAt: agentResume.lastInputPushAt,
+    lastCompletionPushAt: agentResume.lastCompletionPushAt,
     agentOscTitle: resumePipe?.agentOscTitle ?? "",
     oscTitleParse: resumePipe?.oscTitleParse ?? createOscTitleParseState(),
-    agentOscProgress: "",
-    agentStatusRecord: syncAgentStatusAgent(
-      createAgentStatusRecord(),
-      initialRuntimeState?.agentName || null,
-      now,
-    ).record,
-    agentScreenDirty: false,
+    agentOscProgress:
+      agentResume.sameAgent && resumePipe ? resumePipe.agentOscProgress : "",
+    agentStatusRecord: agentResume.agentStatusRecord,
+    agentScreenDirty: agentResume.agentScreenDirty,
     agentStatusBusy: false,
     agentStatusRecheckTimer: null,
     shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
@@ -8350,8 +8364,7 @@ export function createWebApp() {
     rateLimitState.record(ownerId);
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
-      cols: body.cols || 120,
-      rows: body.rows || 30,
+      ...resolveTerminalSize(body.cols, body.rows),
       ownerId,
       ownerEmail,
       exec,
@@ -8837,8 +8850,7 @@ export function createWebApp() {
     }
 
     const body = await c.req.json();
-    const cols = body.cols || 120;
-    const rows = body.rows || 30;
+    const { cols, rows } = resolveTerminalSize(body?.cols, body?.rows);
     term.cols = cols;
     term.rows = rows;
 
@@ -11963,10 +11975,14 @@ async function startOwnedWebServer(
                 return;
               }
               if (parsed.type === "resize") {
-                debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
-                term.cols = parsed.cols;
-                term.rows = parsed.rows;
-                void requestTerminalResize(term, parsed.cols, parsed.rows).then(
+                // Whole numbers >= 1, clamped: the pane size bounds every
+                // capture and screen-rule evaluation of this terminal.
+                const size = normalizeTerminalSize(parsed.cols, parsed.rows);
+                if (!size) return;
+                debug(`Resize ${terminalId}: ${size.cols}x${size.rows}`);
+                term.cols = size.cols;
+                term.rows = size.rows;
+                void requestTerminalResize(term, size.cols, size.rows).then(
                   () => terminalScrollControllers.get(term)?.onResize(),
                 );
                 return;
