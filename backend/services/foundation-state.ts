@@ -1044,6 +1044,15 @@ export function deletePushSubscriptionById(
   return result.changes > 0;
 }
 
+// S3: a session whose close the user scheduled (the 15-minute restore window
+// after closing its tab) ends without resume data, whatever ends it: the
+// user closed it. SET expressions read the row's OLD values, so the CASEs
+// see termination_scheduled_at before it is cleared.
+const CLEAR_AGENT_IF_CLOSE_SCHEDULED = AGENT_RESUME_COLUMNS.map(
+  (column) =>
+    `${column} = CASE WHEN termination_scheduled_at IS NOT NULL THEN NULL ELSE ${column} END`,
+).join(",\n         ");
+
 export function markTerminalSessionEnded(
   db: Database,
   id: string,
@@ -1053,6 +1062,7 @@ export function markTerminalSessionEnded(
   db.query(
     `UPDATE terminal_sessions
      SET status = 'ended', updated_at = ?, ended_at = COALESCE(ended_at, ?),
+         ${CLEAR_AGENT_IF_CLOSE_SCHEDULED},
          termination_scheduled_at = NULL
      WHERE id = ?`,
   ).run(timestamp, timestamp, id);
@@ -1263,6 +1273,28 @@ export function listTerminalSessionsForActor(
     agentCwd: row.agent_cwd ?? null,
     agentSessionUpdatedAt: row.agent_session_updated_at ?? null,
   }));
+}
+
+// S3: ENDED rows that still name an agent (candidates for Resume), newest
+// end first, at most `limit`. GET /api/terminals lists the valid ones even
+// past the ended-row cap; the caller validates every stored value.
+export function listResumableEndedSessionsForActor(
+  db: Database,
+  actorUserId: string,
+  limit: number,
+): RecordedTerminalSession[] {
+  const rows = db
+    .query(
+      `SELECT id FROM terminal_sessions
+       WHERE actor_user_id = ? AND status = 'ended'
+         AND agent_name IN ('claude', 'codex') AND agent_cwd IS NOT NULL
+       ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
+       LIMIT ?`,
+    )
+    .all(actorUserId, Math.max(0, Math.floor(limit))) as Array<{ id: string }>;
+  return rows
+    .map((row) => getTerminalSession(db, row.id))
+    .filter((row): row is RecordedTerminalSession => row !== null);
 }
 
 function decodeTerminalEventData(data: unknown): string | null {

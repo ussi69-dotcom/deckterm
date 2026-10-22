@@ -217,6 +217,7 @@ import {
   listFoundationUsers,
   listScopedGrants,
   listTerminalEventsAfter,
+  listResumableEndedSessionsForActor,
   listTerminalSessionsForActor,
   listWildcardGrantPrincipals,
   clearAgentSession,
@@ -421,6 +422,9 @@ type Terminal = {
   // S3: the session row's agent columns are written one after another per
   // terminal (a quick start + done must never end as a recorded agent).
   agentResumeWrite?: Promise<void>;
+  // S3: the user closed this terminal (DELETE, or the close-later window
+  // expired): a late agent start must not record resume data again.
+  agentResumeClosedByUser?: boolean;
 };
 
 type TerminalWsData = {
@@ -959,6 +963,7 @@ function recordAgentResumeEvents(
         : null;
       queueAgentResumeWrite(term, async (db) => {
         const cwd = await resolveAgentStartCwd(term);
+        if (term.agentResumeClosedByUser) return;
         recordAgentSession(db, term.id, { agentName, sessionId, cwd });
       });
     } else if (event.type === "agent-done") {
@@ -996,6 +1001,17 @@ async function resolveAgentStartCwd(term: Terminal): Promise<string> {
     }
   }
   return term.cwd;
+}
+
+// S3 (operator decision): Resume is only for sessions that ended without
+// the user closing them. An explicit close (DELETE, or the close-later window
+// the user started running out) drops the row's resume data.
+function forgetAgentResumeOnUserClose(
+  db: FoundationState["db"],
+  term: Terminal,
+) {
+  term.agentResumeClosedByUser = true;
+  clearAgentSession(db, term.id);
 }
 
 function processShellIntegrationChunk(
@@ -4932,6 +4948,45 @@ function getRecordedSessionCatalogStatus(
   return session.status === "active" ? "detached" : "inactive";
 }
 
+// S3 (operator decision): ended rows with valid resume data are listed even
+// past the ended-row cap (DECKTERM_TERMINAL_LIST_ENDED_LIMIT), newest end
+// first, at most this many, in addition to the normal listing.
+const RESUMABLE_LIST_LIMIT = 50;
+// Candidates read to find them (a tampered row is a candidate, not listed).
+const RESUMABLE_CANDIDATE_LIMIT = 4 * RESUMABLE_LIST_LIMIT;
+
+// The sessions GET /api/terminals lists for an owner: the normal listing
+// (live rows + the newest ended rows) plus the newest resumable ended rows,
+// in the normal listing's order (created_at, newest first).
+function listCatalogSessions(
+  db: FoundationState["db"],
+  ownerId: string,
+): RecordedTerminalSession[] {
+  const listed = listTerminalSessionsForActor(db, ownerId, {
+    endedLimit: TERMINAL_LIST_ENDED_LIMIT,
+  });
+  const ids = new Set(listed.map((row) => row.id));
+  const extra = listResumableEndedSessionsForActor(
+    db,
+    ownerId,
+    RESUMABLE_CANDIDATE_LIMIT,
+  )
+    .filter(
+      (row) =>
+        planAgentResume({
+          agentName: row.agentName,
+          agentSessionId: row.agentSessionId,
+          agentCwd: row.agentCwd,
+        }).ok,
+    )
+    .slice(0, RESUMABLE_LIST_LIMIT)
+    .filter((row) => !ids.has(row.id));
+  if (extra.length === 0) return listed;
+  return [...listed, ...extra].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+  );
+}
+
 // S3: what a Resume tap on this ENDED row would reopen, or null.
 type AgentResumeSummary = {
   agent: "claude" | "codex";
@@ -8789,9 +8844,7 @@ export function createWebApp() {
       }
       throw err;
     }
-    const recordedSessions = listTerminalSessionsForActor(state.db, ownerId, {
-      endedLimit: TERMINAL_LIST_ENDED_LIMIT,
-    });
+    const recordedSessions = listCatalogSessions(state.db, ownerId);
     const codexCwds = collectCodexAgentCwds(recordedSessions, ownerId);
     const seenIds = new Set<string>();
     // One `ps` snapshot per request, taken only if some session needs a
@@ -8946,12 +8999,7 @@ export function createWebApp() {
     // The stored values are validated again here, whatever wrote them.
     const decision = decideAgentResume(
       row,
-      collectCodexAgentCwds(
-        listTerminalSessionsForActor(state.db, ownerId, {
-          endedLimit: TERMINAL_LIST_ENDED_LIMIT,
-        }),
-        ownerId,
-      ),
+      collectCodexAgentCwds(listCatalogSessions(state.db, ownerId), ownerId),
     );
     if (!decision.ok) {
       if (decision.reason === "invalid_resume_data") {
@@ -9142,6 +9190,7 @@ export function createWebApp() {
 
     const state = await getFoundationState();
     markTerminalSessionEnded(state.db, id);
+    forgetAgentResumeOnUserClose(state.db, term);
     closeTerminalSockets(id);
     removeTerminalState(id);
     await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
@@ -11628,6 +11677,48 @@ export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
 // Keep the lease strongly reachable even when the entrypoint discards the Bun
 // server wrapper. Native server liveness is not a JavaScript GC ownership root.
 const activeStateOwners = new Set<{ release(): void }>();
+// Ends every terminal whose close-later restore window ran out (the user
+// closed its tab and did not come back). Run by startWebServer's sweep
+// timer; exported so the S3 test can drive one sweep at a chosen time.
+export async function reapScheduledTerminalClosures(
+  now: number = Date.now(),
+): Promise<void> {
+  const state = await getFoundationState();
+
+  for (const [id, term] of terminals) {
+    if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
+      continue;
+    }
+    const sockets = terminalSockets.get(id);
+    const activeSocketsCount = sockets ? sockets.size : 0;
+    if (activeSocketsCount > 0) {
+      // Defensive race handling: a restored tab always wins over the timer.
+      cancelTerminalSessionTermination(state.db, id);
+      term.terminationScheduledAt = undefined;
+      continue;
+    }
+
+    console.log(
+      `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
+    );
+    markTerminalSessionEnded(state.db, id);
+    // The user closed it: no Resume afterwards (S3).
+    forgetAgentResumeOnUserClose(state.db, term);
+    removeTerminalState(id);
+    try {
+      await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
+    } catch (err) {
+      debug(`[close-later] tmux kill-session error for ${id}:`, err);
+    }
+    try {
+      term.proc.kill();
+      term.terminal.close();
+    } catch (err) {
+      debug(`[close-later] cleanup error for ${id}:`, err);
+    }
+  }
+}
+
 export async function startWebServer(host: string, port: number) {
   const lease = acquireStateOwnership(DECKTERM_STATE_DIR);
   const ownership = {
@@ -12535,47 +12626,14 @@ async function startOwnedWebServer(
     }
   };
 
-  const reapScheduledTerminalClosures = async () => {
-    const now = Date.now();
-    const state = await getFoundationState();
-
-    for (const [id, term] of terminals) {
-      if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
-        continue;
-      }
-      const sockets = terminalSockets.get(id);
-      const activeSocketsCount = sockets ? sockets.size : 0;
-      if (activeSocketsCount > 0) {
-        // Defensive race handling: a restored tab always wins over the timer.
-        cancelTerminalSessionTermination(state.db, id);
-        term.terminationScheduledAt = undefined;
-        continue;
-      }
-
-      console.log(
-        `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
-      );
-      markTerminalSessionEnded(state.db, id);
-      removeTerminalState(id);
-      try {
-        await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
-      } catch (err) {
-        debug(`[close-later] tmux kill-session error for ${id}:`, err);
-      }
-      try {
-        term.proc.kill();
-        term.terminal.close();
-      } catch (err) {
-        debug(`[close-later] cleanup error for ${id}:`, err);
-      }
-    }
-  };
-
   const lifecycleTimers = [
     setInterval(cleanupClipboardImages, 15 * 60 * 1000),
     setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
     setInterval(reapDetachedSessions, 15 * 60 * 1000),
-    setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+    setInterval(
+      () => void reapScheduledTerminalClosures(),
+      TERMINAL_TAB_CLOSE_SWEEP_MS,
+    ),
     setInterval(() => {
       void pumpTmuxPipeOutput().catch((err) =>
         debug("[tmux] pipe pump failed:", err),

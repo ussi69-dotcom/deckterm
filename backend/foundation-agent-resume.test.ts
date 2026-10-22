@@ -19,6 +19,7 @@ import {
   recordAgentSession,
   recordTerminalSession,
   revokeScopedCapability,
+  scheduleTerminalSessionTermination,
   setUserRole,
 } from "./services/foundation-state";
 
@@ -147,6 +148,13 @@ function shellLines(): string[] {
   return existsSync(shellLog)
     ? readFileSync(shellLog, "utf8").split("\n").filter(Boolean)
     : [];
+}
+
+// Simulates a crash: SIGKILL to the fake shell that started in `folder`.
+function killFakeShellIn(folder: string) {
+  const line = shellLines().find((l) => l.endsWith(` cwd=${folder}`));
+  expect(line).toBeDefined();
+  process.kill(Number(line!.split(" ")[0]), "SIGKILL");
 }
 
 async function waitFor<T>(
@@ -421,6 +429,54 @@ test("recordAgentSession and clearAgentSession touch only the agent columns", as
   }
 });
 
+test("a session whose close the user scheduled ends without resume data", async () => {
+  const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
+  try {
+    const { db } = await initializeFoundationState({
+      stateDir: dir,
+      allowedFileRoots: [],
+      env: {},
+    });
+    for (const id of ["scheduled", "crashed"]) {
+      recordTerminalSession(db, {
+        id,
+        actorUserId: "u1",
+        cwd: "/w",
+        status: "active",
+      });
+      recordAgentSession(db, id, {
+        agentName: "claude",
+        sessionId: U1,
+        cwd: "/w",
+      });
+    }
+    // The user closed the tab (15-minute restore window), then the session
+    // ended (window expired, or a reboot inside it): the close counts.
+    scheduleTerminalSessionTermination(
+      db,
+      "scheduled",
+      new Date(Date.now() + 15 * 60_000),
+    );
+    markTerminalSessionEnded(db, "scheduled");
+    markTerminalSessionEnded(db, "crashed");
+    expect(getTerminalSession(db, "scheduled")).toMatchObject({
+      status: "ended",
+      terminationScheduledAt: null,
+      agentName: null,
+      agentSessionId: null,
+      agentCwd: null,
+    });
+    expect(getTerminalSession(db, "crashed")).toMatchObject({
+      status: "ended",
+      agentName: "claude",
+      agentSessionId: U1,
+    });
+    db.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 // --- The live marker path: start records, done clears ----------------------
 
 test("the agent start marker records the row; agent done clears it", async () => {
@@ -470,9 +526,11 @@ test("the agent start marker records the row; agent done clears it", async () =>
     status: "active",
   });
 
-  // Started again, then the session dies with the agent alive: resumable.
+  // Started again, then the shell dies with the agent alive (a crash, not
+  // a close the user asked for): resumable.
   await waitFor(() => (rowOf()?.agentSessionId === U3 ? true : null));
-  await deleteTerminal(term.id);
+  killFakeShellIn(folder);
+  await waitFor(() => (rowOf()?.status === "ended" ? true : null));
   const listed = (await listTerminals()).find((row) => row.id === term.id);
   expect(listed?.sessionStatus).toBe("ended");
   expect(listed?.resume).toEqual({
@@ -480,6 +538,59 @@ test("the agent start marker records the row; agent done clears it", async () =>
     mode: "exact",
     cwd: folder,
   });
+});
+
+// --- An explicit close is not a crash: no Resume afterwards ----------------
+
+// A live terminal in its own folder whose fake agent started with `sid`.
+async function liveAgentTerminal(name: string, sid: string) {
+  const folder = join(allowedRoot, name);
+  mkdirSync(folder);
+  writeFileSync(
+    join(folder, ".fake-markers"),
+    [`emit agent;claude;start;sid=${sid}`, ""].join("\n"),
+  );
+  const term = await createTerminal(folder);
+  await waitFor(() =>
+    withDb((db) => getTerminalSession(db, term.id))?.agentSessionId === sid
+      ? true
+      : null,
+  );
+  return { ...term, folder };
+}
+
+test("closing a terminal (DELETE) with its agent alive leaves nothing to resume", async () => {
+  const term = await liveAgentTerminal("proj-closed", U2);
+  await deleteTerminal(term.id);
+  expect(withDb((db) => getTerminalSession(db, term.id))).toMatchObject({
+    status: "ended",
+    agentName: null,
+    agentSessionId: null,
+    agentCwd: null,
+  });
+  const listed = (await listTerminals()).find((row) => row.id === term.id);
+  expect(listed?.sessionStatus).toBe("ended");
+  expect(listed?.resume).toBeNull();
+  const dry = await post(`/api/terminals/${term.id}/resume`, { dryRun: true });
+  expect(dry.status).toBe(409);
+  expect((await json(dry)).reason).toBe("not_resumable");
+});
+
+test("the 15-minute close-later expiry the user started leaves nothing to resume", async () => {
+  const term = await liveAgentTerminal("proj-close-later", U1);
+  const scheduled = await post(`/api/terminals/${term.id}/close-later`, {});
+  expect(scheduled.status).toBe(200);
+  expect((await json(scheduled)).terminationScheduledAt).toBeGreaterThan(0);
+  const { reapScheduledTerminalClosures } = await import("./server");
+  await reapScheduledTerminalClosures(Date.now() + 16 * 60_000);
+  expect(withDb((db) => getTerminalSession(db, term.id))).toMatchObject({
+    status: "ended",
+    agentName: null,
+    agentSessionId: null,
+    agentCwd: null,
+  });
+  const listed = (await listTerminals()).find((row) => row.id === term.id);
+  expect(listed?.resume).toBeNull();
 });
 
 // --- GET /api/terminals: resume on ended rows --------------------------------
@@ -796,4 +907,61 @@ test("a member without terminal.create and root.use grants cannot resume", async
   } finally {
     withDb((db) => setUserRole(db, { userId: ownerId, role: "owner" }));
   }
+});
+
+// Last in the file: it buries every earlier ended row under 205 newer ones.
+test("resumable rows are listed beyond the ended-row cap, newest 50", async () => {
+  const folder = join(allowedRoot, "proj-a");
+  // 55 resumable rows that ended long ago, then 205 plain ended rows that
+  // ended later: the normal listing (newest 200 here) holds none of the 55.
+  withDb((db) => {
+    for (let i = 0; i < 55; i += 1) {
+      const id = `cap-r-${String(i).padStart(2, "0")}`;
+      recordTerminalSession(db, {
+        id,
+        actorUserId: ownerId,
+        cwd: allowedRoot,
+        status: "active",
+      });
+      recordAgentSession(db, id, {
+        agentName: "claude",
+        sessionId: U1,
+        cwd: folder,
+      });
+      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 0, 1, 0, i)));
+    }
+    for (let i = 0; i < 205; i += 1) {
+      const id = `cap-p-${String(i).padStart(3, "0")}`;
+      recordTerminalSession(db, {
+        id,
+        actorUserId: ownerId,
+        cwd: allowedRoot,
+        status: "active",
+      });
+      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 5, 1, 0, i)));
+    }
+  });
+  const rows = await listTerminals();
+  const ids = new Set(rows.map((row) => row.id));
+  const resumable = rows.filter((row) => row.resume);
+  expect(resumable).toHaveLength(50);
+  // Newest first: the oldest resumable rows fall off the 50 cap.
+  const listedCap = [...ids].filter((id) => id.startsWith("cap-r-")).sort();
+  const otherResumable = resumable.filter(
+    (row) => !row.id.startsWith("cap-r-"),
+  );
+  // The newest cap rows fill what the newer resumable rows leave of the 50.
+  const expectedCap = Array.from(
+    { length: 50 - otherResumable.length },
+    (_, k) => `cap-r-${String(54 - k).padStart(2, "0")}`,
+  ).sort();
+  expect(listedCap).toEqual(expectedCap);
+  expect(ids.has("cap-r-00")).toBe(false);
+  for (const row of rows.filter((r) => r.id.startsWith("cap-r-"))) {
+    expect(row.resume).toEqual({ agent: "claude", mode: "exact", cwd: folder });
+  }
+  // The normal cap still bounds plain ended rows.
+  expect([...ids].filter((id) => id.startsWith("cap-p-")).length).toBeLessThan(
+    205,
+  );
 });
