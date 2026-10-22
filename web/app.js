@@ -14825,6 +14825,7 @@ class TerminalManager {
 
     const inputState = this.createInputState();
     const onDataDisposable = terminal.onData((data) => {
+      inputState.keystroke?.xtermData(data);
       // Debug: direct DOM update
       const dbg = document.getElementById("modifier-debug");
       if (dbg)
@@ -14982,53 +14983,26 @@ class TerminalManager {
       lastFallbackData: "",
       pendingFallbackEcho: "",
       pasteDepth: 0,
+      // Which path owns the current keystroke on touch layouts (F17).
+      keystroke: inputFallbackHelpers.createKeystrokeArbiter?.() || null,
     };
   }
 
   rememberFallbackEcho(inputState, data) {
-    if (!inputState || !data) return;
-
-    inputState.lastFallbackAt = performance.now();
-    inputState.lastFallbackData = data;
-    inputState.pendingFallbackEcho =
-      `${inputState.pendingFallbackEcho || ""}${data}`.slice(-256);
+    inputFallbackHelpers.rememberFallbackEcho?.(
+      inputState,
+      data,
+      performance.now(),
+    );
   }
 
   consumePendingFallbackEcho(inputState, data) {
-    if (!inputState || !data) return data;
-
-    let pending = inputState.pendingFallbackEcho || "";
-    let remainingData = data;
-
-    while (pending && remainingData) {
-      if (pending.startsWith(remainingData)) {
-        inputState.pendingFallbackEcho = pending.slice(remainingData.length);
-        return "";
-      }
-
-      if (remainingData.startsWith(pending)) {
-        remainingData = remainingData.slice(pending.length);
-        pending = "";
-        break;
-      }
-
-      let overlap = 0;
-      const limit = Math.min(pending.length, remainingData.length);
-      while (
-        overlap < limit &&
-        pending.charCodeAt(overlap) === remainingData.charCodeAt(overlap)
-      ) {
-        overlap += 1;
-      }
-
-      if (!overlap) break;
-
-      pending = pending.slice(overlap);
-      remainingData = remainingData.slice(overlap);
-    }
-
-    inputState.pendingFallbackEcho = pending;
-    return remainingData;
+    if (!inputFallbackHelpers.consumeFallbackEcho) return data;
+    return inputFallbackHelpers.consumeFallbackEcho(
+      inputState,
+      data,
+      performance.now(),
+    );
   }
 
   applyExtraKeyModifiers(data, options = {}) {
@@ -15128,6 +15102,14 @@ class TerminalManager {
     let lastValue = textarea.value || "";
     let lastCompositionCommitAt = 0;
     let lastCompositionCommitData = "";
+    const keystroke = inputState?.keystroke || null;
+    // An IME composition (Gboard with suggestions, glide typing, CJK) is
+    // streamed as it changes: each update sends only the difference from what
+    // this composition already sent. The textarea keeps the composed text
+    // until the composition ends; clearing it mid-composition makes Chromium
+    // cancel the composition, and an IME that keeps its word then sends the
+    // whole word again ("H", "He", "Hel" arrived as "HHeHel").
+    const composition = { active: false, sent: "" };
     const shouldUseFallback = () =>
       inputFallbackHelpers.shouldUseMobileInputFallback({
         isMobile: platformDetector.isMobile,
@@ -15167,6 +15149,33 @@ class TerminalManager {
       lastCompositionCommitAt = performance.now();
       lastCompositionCommitData = data;
       return true;
+    };
+
+    const streamComposition = (next) => {
+      const delta = inputFallbackHelpers.compositionDelta
+        ? inputFallbackHelpers.compositionDelta(composition.sent, next)
+        : next.slice(composition.sent.length);
+      composition.sent = next;
+      if (!delta) return;
+      ws.sendInput(this.applyExtraKeyModifiers(delta));
+      if (this.isTouchLayout()) this.scrollActiveTerminalToPrompt();
+      if (DEBUG) {
+        dbg("[ExtraKeys] composition stream:", { next, delta });
+      }
+    };
+
+    // Ends the composition: the text was already streamed. Clearing the
+    // textarea before xterm's CompositionHelper reads it (on a zero timeout
+    // after compositionend, or synchronously on a non-IME keydown) keeps
+    // xterm from sending the composed word a second time.
+    const finishComposition = (final) => {
+      if (typeof final === "string") streamComposition(final);
+      lastCompositionCommitAt = performance.now();
+      lastCompositionCommitData = composition.sent;
+      composition.active = false;
+      composition.sent = "";
+      textarea.value = "";
+      lastValue = "";
     };
 
     const commitTextareaValue = (source, e) => {
@@ -15225,6 +15234,24 @@ class TerminalManager {
       // We need to process each character immediately, not wait for composition end.
 
       const inputType = e.inputType || "";
+      if (
+        inputType === "insertCompositionText" ||
+        inputType === "insertFromComposition" ||
+        inputType === "deleteCompositionText"
+      ) {
+        if (!composition.active) {
+          composition.active = true;
+          composition.sent = "";
+        }
+        // Safari replaces the composition on commit with
+        // deleteCompositionText + insertFromComposition; only the final text
+        // matters, so the delete itself sends nothing.
+        if (inputType !== "deleteCompositionText") {
+          streamComposition(typeof e.data === "string" ? e.data : "");
+        }
+        lastValue = textarea.value || "";
+        return;
+      }
       if (inputType === "insertText") {
         const recent = performance.now() - lastCompositionCommitAt < 50;
         const sameData =
@@ -15254,9 +15281,48 @@ class TerminalManager {
           value: textarea.value,
         });
       }
+      if (type === "start" && shouldUseFallback()) {
+        composition.active = true;
+        composition.sent = "";
+      }
       if (type === "end") {
+        if (composition.active && shouldUseFallback()) {
+          finishComposition(
+            typeof e?.data === "string" ? e.data : composition.sent,
+          );
+          return;
+        }
+        composition.active = false;
+        composition.sent = "";
         commitTextareaValue("compositionend", e);
       }
+    };
+
+    // Keystroke bookkeeping for the arbiter. These listeners sit on the
+    // terminal element in the capture phase, so they run before xterm's own
+    // textarea listeners and before any stopPropagation of a handled key.
+    const keydownCapture = (e) => {
+      if (e.target !== textarea) return;
+      keystroke?.keydown();
+      // A real key (not an IME key, not a lone modifier) ends a composition.
+      // xterm would then resend the composed text from the textarea; it was
+      // already streamed.
+      if (
+        composition.active &&
+        shouldUseFallback() &&
+        e.keyCode !== 229 &&
+        e.keyCode !== 16 &&
+        e.keyCode !== 17 &&
+        e.keyCode !== 18
+      ) {
+        finishComposition(null);
+      }
+    };
+    const keypressCapture = (e) => {
+      if (e.target === textarea) keystroke?.keypress();
+    };
+    const keyupCapture = (e) => {
+      if (e.target === textarea) keystroke?.keyup();
     };
 
     const beforeInputHandler = (e) => {
@@ -15272,6 +15338,9 @@ class TerminalManager {
       if (!shouldUseFallback() || !e || e.isComposing) {
         return;
       }
+      // Text outside a composition while one is still marked active: the
+      // composition ended without compositionend. Drop the stale state.
+      if (composition.active) finishComposition(null);
 
       const inputType = e.inputType || "";
       if (inputType !== "insertText" && inputType !== "insertReplacementText") {
@@ -15284,6 +15353,12 @@ class TerminalManager {
       }
 
       e.preventDefault();
+      // xterm already sent this keystroke from its keypress handler (A-Z,
+      // space and keys with keyCode < 48 on a hardware keyboard or a soft
+      // keyboard that reports key codes): cancel the insertion, send nothing.
+      if (inputType === "insertText" && keystroke?.takeKeypressEcho()) {
+        return;
+      }
       sendCommittedData("beforeinput", inputType, data, e);
     };
 
@@ -15304,6 +15379,9 @@ class TerminalManager {
     );
     textarea.addEventListener("compositionend", compositionEndHandler, true);
     textarea.addEventListener("beforeinput", beforeInputHandler, true);
+    element.addEventListener("keydown", keydownCapture, true);
+    element.addEventListener("keypress", keypressCapture, true);
+    element.addEventListener("keyup", keyupCapture, true);
 
     return () => {
       textarea.removeEventListener("input", handler, true);
@@ -15323,6 +15401,9 @@ class TerminalManager {
         true,
       );
       textarea.removeEventListener("beforeinput", beforeInputHandler, true);
+      element.removeEventListener("keydown", keydownCapture, true);
+      element.removeEventListener("keypress", keypressCapture, true);
+      element.removeEventListener("keyup", keyupCapture, true);
     };
   }
 
@@ -16790,6 +16871,7 @@ class TerminalManager {
 
       const inputState = this.createInputState();
       const onDataDisposable = terminal.onData((data) => {
+        inputState.keystroke?.xtermData(data);
         // Debug: direct DOM update to see if onData fires at all
         const debugEl = document.getElementById("modifier-debug");
         if (debugEl) {
