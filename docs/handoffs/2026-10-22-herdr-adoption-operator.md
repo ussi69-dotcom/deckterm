@@ -1,7 +1,7 @@
 ---
 status: consumed
 updated: 2026-10-23
-next: In production since 2026-10-23 (PR #44 and #45, release 0766f80). Open - VAPID key rotation (owner chose "at promotion"; the tool and the client renewal ship in PR #46, then the owner runs two commands), a gated action seen live on production, and the Slack owner message about a PHP vulnerability. See "Promotion (2026-10-23)".
+next: In production since 2026-10-23, release 998c0a7 (PR #44 refused by the driver, #45 S3 table, #46 push renewal + rotation tool). Open - the owner runs the VAPID rotation (two commands in docs/operations-guide.md), then acknowledge Slack 321c58d9; a live gated action on production (none seen yet); restart deckterm-dev.service from a production or SSH shell (dev backend still runs the S3 column build). See "Promotion (2026-10-23)".
 ---
 
 # Operator state: DeckTerm phone repair, then herdr adoption (agent state, Agents panel, resume)
@@ -367,6 +367,7 @@ Build it as the report describes:
 - **Full e2e on dev:** 256 passed, 1 failed: `navigation-surface` "wraps desktop tabs ..." needs 8 terminals and dev's global cap of 10 is shared with 3 live sessions (HTTP 429). The same check passed as a standalone script on a private instance.
 - **First deploy refused** (run `39983689544`): the running release's driver rejected migration 11 (columns + index on `terminal_sessions`; SQLite puts an added column before the FOREIGN KEY clause). Production unchanged. Fix `858f08e`: S3 data in the new table `terminal_agent_sessions`, plus `backend/foundation-schema-rollback.test.ts` with the b04c791 schema fixture (red with the exact production errors, then green). Codex: no findings. `fbd6e4e`: 20 s timeout for two seed-heavy tests (about 4 s on CI before and after; one run hit 6.1 s).
 - **Second deploy** (run `39989049993`, PR #45): success. `prod/current` and the live process cwd are release `0766f80`; 4273 free; driver: "Verified: production is serving release 0766f80...". Journal: 16 service variables removed from the production tmux server's global environment (names only), no UNVERIFIED line, 1 session recovered, KillMode=process lifecycle line. The new release's schema contract has `terminal_agent_sessions` and no agent columns on `terminal_sessions`. No WebSocket connection was seen right after the restart: a live gated action is still to be observed.
+- **Third deploy** (run `39994008896`, PR #46): success, release `998c0a7` live (symlink, process cwd, driver verification); no new scrub needed; 1 session recovered; the tool is at `prod/current/scripts/rotate-vapid-keys.ts`. Codex on the push changes: four P2 fixed (`08fe6ad`), re-check: two more fixed (`c0d864e`), two not taken with reasons in PR #46.
 - **VAPID rotation, prepared:** `17c3703` renews a subscription made for an earlier server key (with permission granted, at start, no prompt); `f21f1eb` adds `scripts/rotate-vapid-keys.ts` (rewrites the two key lines, mode-600 backup, atomic, prints no secret; documented in `docs/operations-guide.md`). The owner runs it: the secret guard blocks the agent from env files, and the key must not enter a model context.
 
 ## Traps
