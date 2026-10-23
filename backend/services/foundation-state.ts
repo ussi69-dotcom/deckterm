@@ -63,18 +63,13 @@ const TERMINAL_TERMINATION_DEADLINE_MIGRATION = 9;
 // stored values through the HTTP API.
 const PUSH_SUBSCRIPTIONS_MIGRATION = 10;
 // S3 one-tap agent resume: which agent was alive in a session, its validated
-// conversation id and the folder it ran in. Written on the shell marker's
-// agent start, cleared on agent done, so an ENDED row that still carries an
-// agent is one whose agent was alive when the session died.
+// conversation id and the folder it ran in, one terminal_agent_sessions row
+// per session. Written on the shell marker's agent start, deleted on agent
+// done, so an ENDED session that still has a row is one whose agent was alive
+// when the session died. A table of its own, not columns on terminal_sessions:
+// the release driver only accepts new tables there (see
+// backend/foundation-schema-rollback.test.ts).
 const AGENT_RESUME_MIGRATION = 11;
-const AGENT_RESUME_COLUMNS = [
-  "agent_name",
-  "agent_session_id",
-  "agent_cwd",
-  "agent_session_updated_at",
-  // Set while one resume request hands this row over (one request wins).
-  "agent_resume_reserved_at",
-] as const;
 // A reservation left behind by a process that died frees itself after this.
 export const AGENT_RESUME_RESERVATION_TTL_MS = 60_000;
 
@@ -222,11 +217,6 @@ export function migrateFoundationDb(db: Database): void {
       last_event_id INTEGER NOT NULL DEFAULT 0,
       exec_kind TEXT,
       os_uid INTEGER,
-      agent_name TEXT,
-      agent_session_id TEXT,
-      agent_cwd TEXT,
-      agent_session_updated_at TEXT,
-      agent_resume_reserved_at TEXT,
       FOREIGN KEY(root_id) REFERENCES project_roots(id)
     );
 
@@ -465,21 +455,34 @@ export function migrateFoundationDb(db: Database): void {
     ).run(PUSH_SUBSCRIPTIONS_MIGRATION, new Date().toISOString());
   }
 
-  // Migration 11 (S3): four nullable TEXT columns, guarded per column like
-  // exec_kind / termination_scheduled_at, so an existing DB gains them once
-  // and a fresh DB (born with them via the boot DDL) skips the ALTERs.
-  for (const column of AGENT_RESUME_COLUMNS) {
-    if (!tableColumnExists(db, "terminal_sessions", column)) {
-      db.exec(`ALTER TABLE terminal_sessions ADD COLUMN ${column} TEXT`);
-    }
-  }
-  // "Another resumable or live Codex row in this folder for this actor" is
-  // asked per resumable row, uncapped: keep it an index lookup.
-  db.exec(
-    `CREATE INDEX IF NOT EXISTS idx_terminal_sessions_agent_cwd
-     ON terminal_sessions(actor_user_id, agent_cwd)
-     WHERE agent_name IS NOT NULL`,
-  );
+  // Migration 11 (S3): the agent alive in a session. No foreign key to
+  // terminal_sessions (the release driver refuses one from a new table to an
+  // existing one), so a row whose session the retention prune removed is
+  // deleted here at start; every read joins terminal_sessions anyway.
+  // agent_resume_reserved_at is set while one resume request hands the row
+  // over (one request wins).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS terminal_agent_sessions (
+      terminal_id TEXT PRIMARY KEY,
+      agent_name TEXT NOT NULL,
+      agent_session_id TEXT,
+      agent_cwd TEXT NOT NULL,
+      agent_session_updated_at TEXT NOT NULL,
+      agent_resume_reserved_at TEXT
+    );
+
+    -- "Another resumable or live Codex row in this folder" is asked per
+    -- resumable row, uncapped: keep it an index lookup.
+    CREATE INDEX IF NOT EXISTS idx_terminal_agent_sessions_cwd
+      ON terminal_agent_sessions(agent_cwd, agent_name);
+
+    DELETE FROM terminal_agent_sessions
+    WHERE terminal_id NOT IN (SELECT id FROM terminal_sessions);
+
+    -- The first S3 shape (dev only, 2026-10-22, never in production) kept
+    -- these as terminal_sessions columns; nothing reads them now.
+    DROP INDEX IF EXISTS idx_terminal_sessions_agent_cwd;
+  `);
   const agentResumeExisting = db
     .query("SELECT version FROM schema_migrations WHERE version = ?")
     .get(AGENT_RESUME_MIGRATION);
@@ -1058,36 +1061,38 @@ export function deletePushSubscriptionById(
   return result.changes > 0;
 }
 
-// S3: a session whose close the user scheduled (the 15-minute restore window
-// after closing its tab) ends without resume data, whatever ends it: the
-// user closed it. SET expressions read the row's OLD values, so the CASEs
-// see termination_scheduled_at before it is cleared.
-const CLEAR_AGENT_IF_CLOSE_SCHEDULED = AGENT_RESUME_COLUMNS.map(
-  (column) =>
-    `${column} = CASE WHEN termination_scheduled_at IS NOT NULL THEN NULL ELSE ${column} END`,
-).join(",\n         ");
-
 export function markTerminalSessionEnded(
   db: Database,
   id: string,
   now: Date = new Date(),
 ): void {
   const timestamp = isoDate(now);
-  db.query(
-    `UPDATE terminal_sessions
-     SET status = 'ended', updated_at = ?, ended_at = COALESCE(ended_at, ?),
-         ${CLEAR_AGENT_IF_CLOSE_SCHEDULED},
-         termination_scheduled_at = NULL
-     WHERE id = ?`,
-  ).run(timestamp, timestamp, id);
+  db.transaction(() => {
+    // S3: a session whose close the user scheduled (the 15-minute restore
+    // window after closing its tab) ends without resume data, whatever ends
+    // it: the user closed it. Read termination_scheduled_at before the
+    // UPDATE below clears it.
+    db.query(
+      `DELETE FROM terminal_agent_sessions
+       WHERE terminal_id = ?1
+         AND EXISTS (SELECT 1 FROM terminal_sessions
+                     WHERE id = ?1 AND termination_scheduled_at IS NOT NULL)`,
+    ).run(id);
+    db.query(
+      `UPDATE terminal_sessions
+       SET status = 'ended', updated_at = ?, ended_at = COALESCE(ended_at, ?),
+           termination_scheduled_at = NULL
+       WHERE id = ?`,
+    ).run(timestamp, timestamp, id);
+  })();
 }
 
 // S3: an agent started in this session. `sessionId` must already be a
 // validated UUID (or null when the start marker carried none). Touches only
-// the agent columns, so the session row's own lifecycle is unchanged. An
-// ENDED row is never written: a start marker whose write was still waiting
-// when the session ended (e.g. the user's scheduled close ran out) must not
-// bring resume data back.
+// the session's agent row, so the session row's own lifecycle is unchanged.
+// An ENDED session is never written: a start marker whose write was still
+// waiting when the session ended (e.g. the user's scheduled close ran out)
+// must not bring resume data back.
 export function recordAgentSession(
   db: Database,
   terminalId: string,
@@ -1100,10 +1105,17 @@ export function recordAgentSession(
 ): boolean {
   const result = db
     .query(
-      `UPDATE terminal_sessions
-       SET agent_name = ?, agent_session_id = ?, agent_cwd = ?,
-           agent_session_updated_at = ?, agent_resume_reserved_at = NULL
-       WHERE id = ? AND status != 'ended'`,
+      `INSERT INTO terminal_agent_sessions
+         (terminal_id, agent_name, agent_session_id, agent_cwd,
+          agent_session_updated_at, agent_resume_reserved_at)
+       SELECT id, ?, ?, ?, ?, NULL FROM terminal_sessions
+       WHERE id = ? AND status != 'ended'
+       ON CONFLICT(terminal_id) DO UPDATE SET
+         agent_name = excluded.agent_name,
+         agent_session_id = excluded.agent_session_id,
+         agent_cwd = excluded.agent_cwd,
+         agent_session_updated_at = excluded.agent_session_updated_at,
+         agent_resume_reserved_at = NULL`,
     )
     .run(
       agent.agentName,
@@ -1118,12 +1130,7 @@ export function recordAgentSession(
 // S3: the agent exited normally (or was resumed elsewhere): nothing to resume.
 export function clearAgentSession(db: Database, terminalId: string): boolean {
   const result = db
-    .query(
-      `UPDATE terminal_sessions
-       SET agent_name = NULL, agent_session_id = NULL, agent_cwd = NULL,
-           agent_session_updated_at = NULL, agent_resume_reserved_at = NULL
-       WHERE id = ?`,
-    )
+    .query("DELETE FROM terminal_agent_sessions WHERE terminal_id = ?")
     .run(terminalId);
   return result.changes > 0;
 }
@@ -1159,12 +1166,15 @@ export function reserveAgentResumeToken(
   );
   const result = db
     .query(
-      `UPDATE terminal_sessions
+      `UPDATE terminal_agent_sessions
        SET agent_resume_reserved_at = ?
-       WHERE id = ? AND status = 'ended'
+       WHERE terminal_id = ?
          AND agent_name = ? AND agent_session_id IS ? AND agent_cwd = ?
          AND (agent_resume_reserved_at IS NULL
-              OR agent_resume_reserved_at < ?)`,
+              OR agent_resume_reserved_at < ?)
+         AND EXISTS (SELECT 1 FROM terminal_sessions
+                     WHERE id = terminal_agent_sessions.terminal_id
+                       AND status = 'ended')`,
     )
     .run(
       token,
@@ -1185,7 +1195,7 @@ export function agentResumeReservedBy(
 ): boolean {
   const row = db
     .query(
-      "SELECT 1 AS owned FROM terminal_sessions WHERE id = ? AND agent_resume_reserved_at = ?",
+      "SELECT 1 AS owned FROM terminal_agent_sessions WHERE terminal_id = ? AND agent_resume_reserved_at = ?",
     )
     .get(terminalId, token) as { owned: number } | null;
   return row !== null;
@@ -1200,18 +1210,18 @@ export function releaseAgentResume(
 ): void {
   if (token === undefined) {
     db.query(
-      "UPDATE terminal_sessions SET agent_resume_reserved_at = NULL WHERE id = ?",
+      "UPDATE terminal_agent_sessions SET agent_resume_reserved_at = NULL WHERE terminal_id = ?",
     ).run(terminalId);
     return;
   }
   // Only the owner may release: a taken-over request leaves the row alone.
   db.query(
-    "UPDATE terminal_sessions SET agent_resume_reserved_at = NULL WHERE id = ? AND agent_resume_reserved_at = ?",
+    "UPDATE terminal_agent_sessions SET agent_resume_reserved_at = NULL WHERE terminal_id = ? AND agent_resume_reserved_at = ?",
   ).run(terminalId, token);
 }
 
 // S3: the rows of `actorUserId` other than `excludeId` that name a Codex
-// agent in `agentCwd`, uncapped (index idx_terminal_sessions_agent_cwd).
+// agent in `agentCwd`, uncapped (index idx_terminal_agent_sessions_cwd).
 // The caller keeps the live ones and the ended ones with valid data.
 export function listCodexAgentRowsInFolder(
   db: Database,
@@ -1226,12 +1236,13 @@ export function listCodexAgentRowsInFolder(
 > {
   const rows = db
     .query(
-      `SELECT id, status, agent_name, agent_session_id, agent_cwd
-       FROM terminal_sessions
-       WHERE actor_user_id = ? AND agent_cwd = ? AND agent_name = 'codex'
-         AND id != ?`,
+      `SELECT s.id, s.status, a.agent_name, a.agent_session_id, a.agent_cwd
+       FROM terminal_agent_sessions a
+       JOIN terminal_sessions s ON s.id = a.terminal_id
+       WHERE a.agent_cwd = ? AND a.agent_name = 'codex'
+         AND s.actor_user_id = ? AND s.id != ?`,
     )
-    .all(actorUserId, agentCwd, excludeId) as Array<{
+    .all(agentCwd, actorUserId, excludeId) as Array<{
     id: string;
     status: "active" | "ended";
     agent_name: string | null;
@@ -1273,17 +1284,30 @@ export function cancelTerminalSessionTermination(
   ).run(isoDate(now), id);
 }
 
+// A session row with its S3 agent row (alias s = terminal_sessions, a =
+// terminal_agent_sessions, LEFT JOINed: no agent row reads as NULLs).
+const SESSION_SELECT_COLUMNS = `s.id AS id, s.actor_user_id AS actor_user_id,
+       s.root_id AS root_id, s.cwd AS cwd, s.status AS status,
+       s.exec_kind AS exec_kind, s.os_uid AS os_uid,
+       s.created_at AS created_at, s.updated_at AS updated_at,
+       s.ended_at AS ended_at,
+       s.termination_scheduled_at AS termination_scheduled_at,
+       s.last_event_id AS last_event_id,
+       a.agent_name AS agent_name, a.agent_session_id AS agent_session_id,
+       a.agent_cwd AS agent_cwd,
+       a.agent_session_updated_at AS agent_session_updated_at,
+       a.agent_resume_reserved_at AS agent_resume_reserved_at`;
+
 export function getTerminalSession(
   db: Database,
   id: string,
 ): RecordedTerminalSession | null {
   const row = db
     .query(
-      `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id,
-              agent_name, agent_session_id, agent_cwd, agent_session_updated_at,
-              agent_resume_reserved_at
-       FROM terminal_sessions
-       WHERE id = ?`,
+      `SELECT ${SESSION_SELECT_COLUMNS}
+       FROM terminal_sessions s
+       LEFT JOIN terminal_agent_sessions a ON a.terminal_id = s.id
+       WHERE s.id = ?`,
     )
     .get(id) as {
     id: string;
@@ -1350,31 +1374,26 @@ export function listTerminalSessionsForActor(
     Number.isFinite(endedLimit) &&
     endedLimit >= 0;
   const query = capEnded
-    ? `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id,
-              agent_name, agent_session_id, agent_cwd, agent_session_updated_at,
-              agent_resume_reserved_at
-       FROM terminal_sessions
-       WHERE actor_user_id = ?1 AND status != 'ended'
+    ? `SELECT ${SESSION_SELECT_COLUMNS}
+       FROM terminal_sessions s
+       LEFT JOIN terminal_agent_sessions a ON a.terminal_id = s.id
+       WHERE s.actor_user_id = ?1 AND s.status != 'ended'
        UNION ALL
-       SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id,
-              agent_name, agent_session_id, agent_cwd, agent_session_updated_at,
-              agent_resume_reserved_at
+       SELECT ${SESSION_SELECT_COLUMNS}
        FROM (
-         SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id,
-              agent_name, agent_session_id, agent_cwd, agent_session_updated_at,
-              agent_resume_reserved_at
+         SELECT *
          FROM terminal_sessions
          WHERE actor_user_id = ?1 AND status = 'ended'
          ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
          LIMIT ?2
-       )
+       ) s
+       LEFT JOIN terminal_agent_sessions a ON a.terminal_id = s.id
        ORDER BY created_at DESC`
-    : `SELECT id, actor_user_id, root_id, cwd, status, exec_kind, os_uid, created_at, updated_at, ended_at, termination_scheduled_at, last_event_id,
-              agent_name, agent_session_id, agent_cwd, agent_session_updated_at,
-              agent_resume_reserved_at
-       FROM terminal_sessions
-       WHERE actor_user_id = ?
-       ORDER BY created_at DESC`;
+    : `SELECT ${SESSION_SELECT_COLUMNS}
+       FROM terminal_sessions s
+       LEFT JOIN terminal_agent_sessions a ON a.terminal_id = s.id
+       WHERE s.actor_user_id = ?
+       ORDER BY s.created_at DESC`;
   const rows = (
     capEnded
       ? db.query(query).all(actorUserId, Math.floor(endedLimit))
@@ -1430,10 +1449,11 @@ export function listResumableEndedSessionsForActor(
 ): RecordedTerminalSession[] {
   const rows = db
     .query(
-      `SELECT id FROM terminal_sessions
-       WHERE actor_user_id = ? AND status = 'ended'
-         AND agent_name IN ('claude', 'codex') AND agent_cwd IS NOT NULL
-       ORDER BY COALESCE(ended_at, updated_at, created_at) DESC
+      `SELECT s.id FROM terminal_sessions s
+       JOIN terminal_agent_sessions a ON a.terminal_id = s.id
+       WHERE s.actor_user_id = ? AND s.status = 'ended'
+         AND a.agent_name IN ('claude', 'codex')
+       ORDER BY COALESCE(s.ended_at, s.updated_at, s.created_at) DESC
        LIMIT ?`,
     )
     .all(actorUserId, Math.max(0, Math.floor(limit))) as Array<{ id: string }>;

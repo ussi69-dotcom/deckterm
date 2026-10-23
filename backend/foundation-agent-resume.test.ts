@@ -28,7 +28,7 @@ import {
 } from "./services/foundation-state";
 
 // S3 one-tap agent resume (design docs/plans/2026-10-22-agent-attention-
-// design.md section 6): migration 11, the agent columns, the `resume` field
+// design.md section 6): migration 11, the agent table, the `resume` field
 // of ended rows in GET /api/terminals and POST /api/terminals/:id/resume.
 //
 // Foundation state is a module-level singleton in server.ts, so this file
@@ -126,7 +126,7 @@ async function deleteTerminal(id: string) {
   );
 }
 
-// An ENDED session row of `actor` with the given agent columns.
+// An ENDED session row of `actor` with the given agent row.
 function seedEnded(
   id: string,
   agent: {
@@ -282,6 +282,7 @@ afterAll(async () => {
 // --- Migration 11 and the row helpers (no server involved) -----------------
 
 const AGENT_COLUMNS = [
+  "terminal_id",
   "agent_name",
   "agent_session_id",
   "agent_cwd",
@@ -289,15 +290,21 @@ const AGENT_COLUMNS = [
   "agent_resume_reserved_at",
 ];
 
-function sessionColumns(db: Database): string[] {
+function tableColumns(db: Database, table: string): string[] {
   return (
-    db.query("PRAGMA table_info(terminal_sessions)").all() as Array<{
+    db.query(`PRAGMA table_info(${table})`).all() as Array<{
       name: string;
     }>
   ).map((row) => row.name);
 }
 
-test("migration 11 on a fresh database: the four agent columns and the marker", async () => {
+function indexNames(db: Database, table: string): string[] {
+  return (
+    db.query(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>
+  ).map((row) => row.name);
+}
+
+test("migration 11 on a fresh database: the agent table, its index and the marker; terminal_sessions unchanged", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const state = await initializeFoundationState({
@@ -305,8 +312,20 @@ test("migration 11 on a fresh database: the four agent columns and the marker", 
       allowedFileRoots: [],
       env: {},
     });
-    expect(sessionColumns(state.db)).toEqual(
-      expect.arrayContaining(AGENT_COLUMNS),
+    expect(tableColumns(state.db, "terminal_agent_sessions")).toEqual(
+      AGENT_COLUMNS,
+    );
+    expect(indexNames(state.db, "terminal_agent_sessions")).toContain(
+      "idx_terminal_agent_sessions_cwd",
+    );
+    // The session table keeps its production shape (release driver rule).
+    expect(
+      tableColumns(state.db, "terminal_sessions").filter((c) =>
+        c.startsWith("agent_"),
+      ),
+    ).toEqual([]);
+    expect(indexNames(state.db, "terminal_sessions")).not.toContain(
+      "idx_terminal_sessions_agent_cwd",
     );
     expect(
       state.db
@@ -319,7 +338,7 @@ test("migration 11 on a fresh database: the four agent columns and the marker", 
   }
 });
 
-test("migration 11 on an existing (version 10) database adds the columns and keeps rows", async () => {
+test("migration 11 on an existing (version 10) database adds the table, keeps rows and drops orphans", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const first = await initializeFoundationState({
@@ -333,13 +352,9 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       cwd: "/srv/old",
       status: "ended",
     });
-    // Make it a version-10 database: no agent columns, no marker 11.
-    first.db.exec("DROP INDEX IF EXISTS idx_terminal_sessions_agent_cwd");
-    for (const column of AGENT_COLUMNS) {
-      first.db.exec(`ALTER TABLE terminal_sessions DROP COLUMN ${column}`);
-    }
+    // Make it a version-10 database: no agent table, no marker 11.
+    first.db.exec("DROP TABLE terminal_agent_sessions");
     first.db.exec("DELETE FROM schema_migrations WHERE version = 11");
-    expect(sessionColumns(first.db)).not.toContain("agent_name");
     first.db.close();
 
     const second = await initializeFoundationState({
@@ -347,8 +362,8 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       allowedFileRoots: [],
       env: {},
     });
-    expect(sessionColumns(second.db)).toEqual(
-      expect.arrayContaining(AGENT_COLUMNS),
+    expect(tableColumns(second.db, "terminal_agent_sessions")).toEqual(
+      AGENT_COLUMNS,
     );
     expect(getTerminalSession(second.db, "old-row")).toMatchObject({
       id: "old-row",
@@ -358,37 +373,40 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       agentSessionId: null,
       agentCwd: null,
       agentSessionUpdatedAt: null,
+      agentResumeReservedAt: null,
     });
     expect(
       second.db
         .query("SELECT version FROM schema_migrations WHERE version = 11")
         .all(),
     ).toHaveLength(1);
+    // An agent row whose session the retention prune removed.
+    second.db.exec(
+      `INSERT INTO terminal_agent_sessions
+         (terminal_id, agent_name, agent_session_id, agent_cwd, agent_session_updated_at)
+       VALUES ('pruned-row', 'claude', NULL, '/srv/gone', '2026-10-01T00:00:00.000Z')`,
+    );
     second.db.close();
 
-    // Idempotent: a third start changes nothing.
+    // Idempotent, and the next start drops the orphan.
     const third = await initializeFoundationState({
       stateDir: dir,
       allowedFileRoots: [],
       env: {},
     });
     expect(
-      sessionColumns(third.db).filter((c) => c.startsWith("agent_")),
-    ).toHaveLength(AGENT_COLUMNS.length);
-    // The same-folder Codex lookup has its own index.
-    const indexes = (
-      third.db.query("PRAGMA index_list(terminal_sessions)").all() as Array<{
-        name: string;
-      }>
-    ).map((row) => row.name);
-    expect(indexes).toContain("idx_terminal_sessions_agent_cwd");
+      third.db.query("SELECT terminal_id FROM terminal_agent_sessions").all(),
+    ).toEqual([]);
+    expect(indexNames(third.db, "terminal_agent_sessions")).toContain(
+      "idx_terminal_agent_sessions_cwd",
+    );
     third.db.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("recordAgentSession and clearAgentSession touch only the agent columns", async () => {
+test("recordAgentSession and clearAgentSession touch only the agent row", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const { db } = await initializeFoundationState({
@@ -419,7 +437,7 @@ test("recordAgentSession and clearAgentSession touch only the agent columns", as
       agentCwd: "/w/proj",
       agentSessionUpdatedAt: "2026-10-22T10:00:00.000Z",
     });
-    // The session's own upsert and its end keep the agent columns.
+    // The session's own upsert and its end keep the agent row.
     recordTerminalSession(db, {
       id: "t1",
       actorUserId: "u1",
@@ -862,7 +880,9 @@ test("a tampered stored id, agent or folder is refused", async () => {
     });
     withDb((db) =>
       db
-        .query(`UPDATE terminal_sessions SET ${column} = ? WHERE id = ?`)
+        .query(
+          `UPDATE terminal_agent_sessions SET ${column} = ? WHERE terminal_id = ?`,
+        )
         .run(value, id),
     );
     for (const body of [{ dryRun: true }, {}]) {
