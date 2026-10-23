@@ -287,7 +287,6 @@ test.describe("Shell action hierarchy on desktop", () => {
     await page.getByRole("button", { name: "Reset defaults" }).click();
 
     await expectButtonLabelsExactly(desktopPrimaryActions, [
-      "Agents",
       "Files",
       "Git",
       "Palette",

@@ -10,7 +10,7 @@ Běh podle `docs/handoffs/2026-10-22-herdr-adoption-operator.md`; kontrakty v `d
 - **S0 (bezpečnost):** shelly a tmux server už nedědí klíč Web Push ani nastavení služby (jeden testovaný deny-list, čištění běžícího tmux serveru).
 - **S1a/S1:** stav agenta z obrazovky (pravidla z herdru, Apache-2.0, převedená na lineární čas; reálné fixtury Claude 2.1.308 / Codex 0.163): „čeká na tebe“ → jedna push notifikace s deep linkem na session.
 - **S2:** panel Agents vlevo v běžném zobrazení (zapnutý, skrytelný, roztažitelný, souhrn + Next + skupiny podle projektu), pohled Agents v IDE, štítek na telefonu, „viděno“ sdílené přes server.
-- **Přepínač panelu (2026-10-23, přání vlastníka):** panel Agents se skrývá a zobrazuje tlačítkem, které je vždy první vlevo nahoře v liště a v obou stavech zůstává na stejném místě. Nahradilo skrývací tlačítko v hlavičce panelu. Test v `tests/agents-panel.spec.ts`.
+- **Přepínač panelu (2026-10-23, přání vlastníka):** panel Agents se skrývá a zobrazuje tlačítkem, které je vždy první vlevo nahoře v liště a v obou stavech zůstává na stejném místě. Nahradilo skrývací tlačítko v hlavičce panelu i připnuté tlačítko „Agents“ uprostřed lišty (akce zůstává v More, paletě a pod Ctrl+Shift+L). Test v `tests/agents-panel.spec.ts`.
 - **S3:** obnova konverzace agenta jedním ťuknutím po pádu tmuxu nebo restartu (Claude `--session-id` přes vlastní wrapper, Codex `resume --last`/picker); nikdy automaticky.
 - Brány: unit 2092/0, plná e2e 256/256 na 4174, Codex + adversariální review každé části.
 
