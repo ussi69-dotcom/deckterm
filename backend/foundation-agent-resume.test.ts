@@ -28,7 +28,7 @@ import {
 } from "./services/foundation-state";
 
 // S3 one-tap agent resume (design docs/plans/2026-10-22-agent-attention-
-// design.md section 6): migration 11, the agent columns, the `resume` field
+// design.md section 6): migration 11, the agent table, the `resume` field
 // of ended rows in GET /api/terminals and POST /api/terminals/:id/resume.
 //
 // Foundation state is a module-level singleton in server.ts, so this file
@@ -126,7 +126,7 @@ async function deleteTerminal(id: string) {
   );
 }
 
-// An ENDED session row of `actor` with the given agent columns.
+// An ENDED session row of `actor` with the given agent row.
 function seedEnded(
   id: string,
   agent: {
@@ -282,6 +282,7 @@ afterAll(async () => {
 // --- Migration 11 and the row helpers (no server involved) -----------------
 
 const AGENT_COLUMNS = [
+  "terminal_id",
   "agent_name",
   "agent_session_id",
   "agent_cwd",
@@ -289,15 +290,21 @@ const AGENT_COLUMNS = [
   "agent_resume_reserved_at",
 ];
 
-function sessionColumns(db: Database): string[] {
+function tableColumns(db: Database, table: string): string[] {
   return (
-    db.query("PRAGMA table_info(terminal_sessions)").all() as Array<{
+    db.query(`PRAGMA table_info(${table})`).all() as Array<{
       name: string;
     }>
   ).map((row) => row.name);
 }
 
-test("migration 11 on a fresh database: the four agent columns and the marker", async () => {
+function indexNames(db: Database, table: string): string[] {
+  return (
+    db.query(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>
+  ).map((row) => row.name);
+}
+
+test("migration 11 on a fresh database: the agent table, its index and the marker; terminal_sessions unchanged", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const state = await initializeFoundationState({
@@ -305,8 +312,20 @@ test("migration 11 on a fresh database: the four agent columns and the marker", 
       allowedFileRoots: [],
       env: {},
     });
-    expect(sessionColumns(state.db)).toEqual(
-      expect.arrayContaining(AGENT_COLUMNS),
+    expect(tableColumns(state.db, "terminal_agent_sessions")).toEqual(
+      AGENT_COLUMNS,
+    );
+    expect(indexNames(state.db, "terminal_agent_sessions")).toContain(
+      "idx_terminal_agent_sessions_cwd",
+    );
+    // The session table keeps its production shape (release driver rule).
+    expect(
+      tableColumns(state.db, "terminal_sessions").filter((c) =>
+        c.startsWith("agent_"),
+      ),
+    ).toEqual([]);
+    expect(indexNames(state.db, "terminal_sessions")).not.toContain(
+      "idx_terminal_sessions_agent_cwd",
     );
     expect(
       state.db
@@ -319,7 +338,7 @@ test("migration 11 on a fresh database: the four agent columns and the marker", 
   }
 });
 
-test("migration 11 on an existing (version 10) database adds the columns and keeps rows", async () => {
+test("migration 11 on an existing (version 10) database adds the table, keeps rows and drops orphans", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const first = await initializeFoundationState({
@@ -333,13 +352,9 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       cwd: "/srv/old",
       status: "ended",
     });
-    // Make it a version-10 database: no agent columns, no marker 11.
-    first.db.exec("DROP INDEX IF EXISTS idx_terminal_sessions_agent_cwd");
-    for (const column of AGENT_COLUMNS) {
-      first.db.exec(`ALTER TABLE terminal_sessions DROP COLUMN ${column}`);
-    }
+    // Make it a version-10 database: no agent table, no marker 11.
+    first.db.exec("DROP TABLE terminal_agent_sessions");
     first.db.exec("DELETE FROM schema_migrations WHERE version = 11");
-    expect(sessionColumns(first.db)).not.toContain("agent_name");
     first.db.close();
 
     const second = await initializeFoundationState({
@@ -347,8 +362,8 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       allowedFileRoots: [],
       env: {},
     });
-    expect(sessionColumns(second.db)).toEqual(
-      expect.arrayContaining(AGENT_COLUMNS),
+    expect(tableColumns(second.db, "terminal_agent_sessions")).toEqual(
+      AGENT_COLUMNS,
     );
     expect(getTerminalSession(second.db, "old-row")).toMatchObject({
       id: "old-row",
@@ -358,37 +373,40 @@ test("migration 11 on an existing (version 10) database adds the columns and kee
       agentSessionId: null,
       agentCwd: null,
       agentSessionUpdatedAt: null,
+      agentResumeReservedAt: null,
     });
     expect(
       second.db
         .query("SELECT version FROM schema_migrations WHERE version = 11")
         .all(),
     ).toHaveLength(1);
+    // An agent row whose session the retention prune removed.
+    second.db.exec(
+      `INSERT INTO terminal_agent_sessions
+         (terminal_id, agent_name, agent_session_id, agent_cwd, agent_session_updated_at)
+       VALUES ('pruned-row', 'claude', NULL, '/srv/gone', '2026-10-01T00:00:00.000Z')`,
+    );
     second.db.close();
 
-    // Idempotent: a third start changes nothing.
+    // Idempotent, and the next start drops the orphan.
     const third = await initializeFoundationState({
       stateDir: dir,
       allowedFileRoots: [],
       env: {},
     });
     expect(
-      sessionColumns(third.db).filter((c) => c.startsWith("agent_")),
-    ).toHaveLength(AGENT_COLUMNS.length);
-    // The same-folder Codex lookup has its own index.
-    const indexes = (
-      third.db.query("PRAGMA index_list(terminal_sessions)").all() as Array<{
-        name: string;
-      }>
-    ).map((row) => row.name);
-    expect(indexes).toContain("idx_terminal_sessions_agent_cwd");
+      third.db.query("SELECT terminal_id FROM terminal_agent_sessions").all(),
+    ).toEqual([]);
+    expect(indexNames(third.db, "terminal_agent_sessions")).toContain(
+      "idx_terminal_agent_sessions_cwd",
+    );
     third.db.close();
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
 });
 
-test("recordAgentSession and clearAgentSession touch only the agent columns", async () => {
+test("recordAgentSession and clearAgentSession touch only the agent row", async () => {
   const dir = await mkdtemp(join(process.env.HOME || "/tmp", ".deckterm-m11-"));
   try {
     const { db } = await initializeFoundationState({
@@ -419,7 +437,7 @@ test("recordAgentSession and clearAgentSession touch only the agent columns", as
       agentCwd: "/w/proj",
       agentSessionUpdatedAt: "2026-10-22T10:00:00.000Z",
     });
-    // The session's own upsert and its end keep the agent columns.
+    // The session's own upsert and its end keep the agent row.
     recordTerminalSession(db, {
       id: "t1",
       actorUserId: "u1",
@@ -862,7 +880,9 @@ test("a tampered stored id, agent or folder is refused", async () => {
     });
     withDb((db) =>
       db
-        .query(`UPDATE terminal_sessions SET ${column} = ? WHERE id = ?`)
+        .query(
+          `UPDATE terminal_agent_sessions SET ${column} = ? WHERE terminal_id = ?`,
+        )
         .run(value, id),
     );
     for (const body of [{ dryRun: true }, {}]) {
@@ -1117,107 +1137,124 @@ test("a resume whose terminal dies before the Enter keeps the data for a retry",
   expect(dry.status).toBe(200);
 });
 
+// The next two seed hundreds of ended rows and then list them through the
+// real server: about 4 s on a CI runner, close to bun's 5 s default (one run
+// hit 6.1 s, 2026-10-23).
+const SEED_HEAVY_TIMEOUT_MS = 20_000;
+
 // Last in the file: it buries every earlier ended row under 205 newer ones.
-test("resumable rows are listed beyond the ended-row cap, newest 50", async () => {
-  const folder = join(allowedRoot, "proj-a");
-  // 55 resumable rows that ended long ago, then 205 plain ended rows that
-  // ended later: the normal listing (newest 200 here) holds none of the 55.
-  withDb((db) => {
-    for (let i = 0; i < 55; i += 1) {
-      const id = `cap-r-${String(i).padStart(2, "0")}`;
-      recordTerminalSession(db, {
-        id,
-        actorUserId: ownerId,
-        cwd: allowedRoot,
-        status: "active",
-      });
-      recordAgentSession(db, id, {
-        agentName: "claude",
-        sessionId: U1,
+test(
+  "resumable rows are listed beyond the ended-row cap, newest 50",
+  async () => {
+    const folder = join(allowedRoot, "proj-a");
+    // 55 resumable rows that ended long ago, then 205 plain ended rows that
+    // ended later: the normal listing (newest 200 here) holds none of the 55.
+    withDb((db) => {
+      for (let i = 0; i < 55; i += 1) {
+        const id = `cap-r-${String(i).padStart(2, "0")}`;
+        recordTerminalSession(db, {
+          id,
+          actorUserId: ownerId,
+          cwd: allowedRoot,
+          status: "active",
+        });
+        recordAgentSession(db, id, {
+          agentName: "claude",
+          sessionId: U1,
+          cwd: folder,
+        });
+        markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 0, 1, 0, i)));
+      }
+      for (let i = 0; i < 205; i += 1) {
+        const id = `cap-p-${String(i).padStart(3, "0")}`;
+        recordTerminalSession(db, {
+          id,
+          actorUserId: ownerId,
+          cwd: allowedRoot,
+          status: "active",
+        });
+        markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 5, 1, 0, i)));
+      }
+    });
+    const rows = await listTerminals();
+    const ids = new Set(rows.map((row) => row.id));
+    const resumable = rows.filter((row) => row.resume);
+    expect(resumable).toHaveLength(50);
+    // Newest first: the oldest resumable rows fall off the 50 cap.
+    const listedCap = [...ids].filter((id) => id.startsWith("cap-r-")).sort();
+    const otherResumable = resumable.filter(
+      (row) => !row.id.startsWith("cap-r-"),
+    );
+    // The newest cap rows fill what the newer resumable rows leave of the 50.
+    const expectedCap = Array.from(
+      { length: 50 - otherResumable.length },
+      (_, k) => `cap-r-${String(54 - k).padStart(2, "0")}`,
+    ).sort();
+    expect(listedCap).toEqual(expectedCap);
+    expect(ids.has("cap-r-00")).toBe(false);
+    for (const row of rows.filter((r) => r.id.startsWith("cap-r-"))) {
+      expect(row.resume).toEqual({
+        agent: "claude",
+        mode: "exact",
         cwd: folder,
       });
-      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 0, 1, 0, i)));
     }
-    for (let i = 0; i < 205; i += 1) {
-      const id = `cap-p-${String(i).padStart(3, "0")}`;
-      recordTerminalSession(db, {
-        id,
-        actorUserId: ownerId,
-        cwd: allowedRoot,
-        status: "active",
-      });
-      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 5, 1, 0, i)));
-    }
-  });
-  const rows = await listTerminals();
-  const ids = new Set(rows.map((row) => row.id));
-  const resumable = rows.filter((row) => row.resume);
-  expect(resumable).toHaveLength(50);
-  // Newest first: the oldest resumable rows fall off the 50 cap.
-  const listedCap = [...ids].filter((id) => id.startsWith("cap-r-")).sort();
-  const otherResumable = resumable.filter(
-    (row) => !row.id.startsWith("cap-r-"),
-  );
-  // The newest cap rows fill what the newer resumable rows leave of the 50.
-  const expectedCap = Array.from(
-    { length: 50 - otherResumable.length },
-    (_, k) => `cap-r-${String(54 - k).padStart(2, "0")}`,
-  ).sort();
-  expect(listedCap).toEqual(expectedCap);
-  expect(ids.has("cap-r-00")).toBe(false);
-  for (const row of rows.filter((r) => r.id.startsWith("cap-r-"))) {
-    expect(row.resume).toEqual({ agent: "claude", mode: "exact", cwd: folder });
-  }
-  // The normal cap still bounds plain ended rows.
-  expect([...ids].filter((id) => id.startsWith("cap-p-")).length).toBeLessThan(
-    205,
-  );
-});
+    // The normal cap still bounds plain ended rows.
+    expect(
+      [...ids].filter((id) => id.startsWith("cap-p-")).length,
+    ).toBeLessThan(205);
+  },
+  SEED_HEAVY_TIMEOUT_MS,
+);
 
 // After the cap test: a resumable Codex row in the same folder that the
 // capped catalog no longer lists must still make the visible one a picker.
-test("the Codex same-folder check sees resumable rows outside the catalog", async () => {
-  const folder = join(allowedRoot, "proj-codex-hidden");
-  mkdirSync(folder);
-  withDb((db) => {
-    recordTerminalSession(db, {
-      id: "codex-hidden",
-      actorUserId: ownerId,
-      cwd: allowedRoot,
-      status: "active",
+test(
+  "the Codex same-folder check sees resumable rows outside the catalog",
+  async () => {
+    const folder = join(allowedRoot, "proj-codex-hidden");
+    mkdirSync(folder);
+    withDb((db) => {
+      recordTerminalSession(db, {
+        id: "codex-hidden",
+        actorUserId: ownerId,
+        cwd: allowedRoot,
+        status: "active",
+      });
+      recordAgentSession(db, "codex-hidden", {
+        agentName: "codex",
+        sessionId: null,
+        cwd: folder,
+      });
+      markTerminalSessionEnded(
+        db,
+        "codex-hidden",
+        new Date(Date.UTC(2025, 0, 1)),
+      );
     });
-    recordAgentSession(db, "codex-hidden", {
+    seedEnded("codex-visible", {
       agentName: "codex",
       sessionId: null,
       cwd: folder,
     });
-    markTerminalSessionEnded(
-      db,
-      "codex-hidden",
-      new Date(Date.UTC(2025, 0, 1)),
-    );
-  });
-  seedEnded("codex-visible", {
-    agentName: "codex",
-    sessionId: null,
-    cwd: folder,
-  });
-  const rows = await listTerminals();
-  expect(rows.some((row) => row.id === "codex-hidden")).toBe(false);
-  expect(rows.find((row) => row.id === "codex-visible")?.resume).toEqual({
-    agent: "codex",
-    mode: "pick",
-    cwd: folder,
-  });
-  const dry = await post("/api/terminals/codex-visible/resume", {
-    dryRun: true,
-  });
-  expect(await json(dry)).toEqual({
-    command: "codex resume",
-    cwd: folder,
-    mode: "pick",
-  });
-});
+    const rows = await listTerminals();
+    expect(rows.some((row) => row.id === "codex-hidden")).toBe(false);
+    expect(rows.find((row) => row.id === "codex-visible")?.resume).toEqual({
+      agent: "codex",
+      mode: "pick",
+      cwd: folder,
+    });
+    const dry = await post("/api/terminals/codex-visible/resume", {
+      dryRun: true,
+    });
+    expect(await json(dry)).toEqual({
+      command: "codex resume",
+      cwd: folder,
+      mode: "pick",
+    });
+  },
+  SEED_HEAVY_TIMEOUT_MS,
+);
 
 // Codex re-check: while one Codex row of a folder is handed over, the new
 // terminal's start marker has not arrived yet, so another row of the same
