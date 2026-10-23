@@ -97,7 +97,16 @@ DECKTERM_VAPID_PRIVATE_KEY=<privateKey>
 DECKTERM_VAPID_SUBJECT=mailto:<operational-contact>
 ```
 
-The private key is a secret: do not commit it, paste it into issues, or rotate it casually. Replacing the key pair invalidates existing browser subscriptions, so every device must enable push again. The public key endpoint intentionally returns only the public half.
+The private key is a secret: do not commit it, paste it into issues, or rotate it casually. Replacing the key pair invalidates existing browser subscriptions. The public key endpoint intentionally returns only the public half.
+
+**Rotating the key pair.** Run the release's tool against the environment file, then restart the service:
+
+```bash
+bun /home/deploy/apps/deckterm/prod/current/scripts/rotate-vapid-keys.ts /home/deploy/apps/deckterm/shared/prod.env
+systemctl --user restart deckterm.service
+```
+
+The tool keeps every other line and writes a mode-600 backup next to the file (`prod.env.vapid-backup-<UTC>`). It prints only the backup path and the first characters of the new public key, never a secret. A device whose notifications are allowed renews its subscription with the new key the next time it opens DeckTerm (`web/push-notifications.js`). Other devices enable push again in **Settings → Notifications**. Delete the backup once push works, because it holds the old private key.
 
 After changing the runtime environment, restart the relevant service and verify `GET /api/notifications/push` reports `configured: true` while authenticated. On iPhone/iPad, add DeckTerm to the Home Screen, open that installed app, then enable push from its Settings; a normal Safari tab cannot receive background Web Push.
 
