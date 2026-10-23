@@ -1137,107 +1137,124 @@ test("a resume whose terminal dies before the Enter keeps the data for a retry",
   expect(dry.status).toBe(200);
 });
 
+// The next two seed hundreds of ended rows and then list them through the
+// real server: about 4 s on a CI runner, close to bun's 5 s default (one run
+// hit 6.1 s, 2026-10-23).
+const SEED_HEAVY_TIMEOUT_MS = 20_000;
+
 // Last in the file: it buries every earlier ended row under 205 newer ones.
-test("resumable rows are listed beyond the ended-row cap, newest 50", async () => {
-  const folder = join(allowedRoot, "proj-a");
-  // 55 resumable rows that ended long ago, then 205 plain ended rows that
-  // ended later: the normal listing (newest 200 here) holds none of the 55.
-  withDb((db) => {
-    for (let i = 0; i < 55; i += 1) {
-      const id = `cap-r-${String(i).padStart(2, "0")}`;
-      recordTerminalSession(db, {
-        id,
-        actorUserId: ownerId,
-        cwd: allowedRoot,
-        status: "active",
-      });
-      recordAgentSession(db, id, {
-        agentName: "claude",
-        sessionId: U1,
+test(
+  "resumable rows are listed beyond the ended-row cap, newest 50",
+  async () => {
+    const folder = join(allowedRoot, "proj-a");
+    // 55 resumable rows that ended long ago, then 205 plain ended rows that
+    // ended later: the normal listing (newest 200 here) holds none of the 55.
+    withDb((db) => {
+      for (let i = 0; i < 55; i += 1) {
+        const id = `cap-r-${String(i).padStart(2, "0")}`;
+        recordTerminalSession(db, {
+          id,
+          actorUserId: ownerId,
+          cwd: allowedRoot,
+          status: "active",
+        });
+        recordAgentSession(db, id, {
+          agentName: "claude",
+          sessionId: U1,
+          cwd: folder,
+        });
+        markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 0, 1, 0, i)));
+      }
+      for (let i = 0; i < 205; i += 1) {
+        const id = `cap-p-${String(i).padStart(3, "0")}`;
+        recordTerminalSession(db, {
+          id,
+          actorUserId: ownerId,
+          cwd: allowedRoot,
+          status: "active",
+        });
+        markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 5, 1, 0, i)));
+      }
+    });
+    const rows = await listTerminals();
+    const ids = new Set(rows.map((row) => row.id));
+    const resumable = rows.filter((row) => row.resume);
+    expect(resumable).toHaveLength(50);
+    // Newest first: the oldest resumable rows fall off the 50 cap.
+    const listedCap = [...ids].filter((id) => id.startsWith("cap-r-")).sort();
+    const otherResumable = resumable.filter(
+      (row) => !row.id.startsWith("cap-r-"),
+    );
+    // The newest cap rows fill what the newer resumable rows leave of the 50.
+    const expectedCap = Array.from(
+      { length: 50 - otherResumable.length },
+      (_, k) => `cap-r-${String(54 - k).padStart(2, "0")}`,
+    ).sort();
+    expect(listedCap).toEqual(expectedCap);
+    expect(ids.has("cap-r-00")).toBe(false);
+    for (const row of rows.filter((r) => r.id.startsWith("cap-r-"))) {
+      expect(row.resume).toEqual({
+        agent: "claude",
+        mode: "exact",
         cwd: folder,
       });
-      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 0, 1, 0, i)));
     }
-    for (let i = 0; i < 205; i += 1) {
-      const id = `cap-p-${String(i).padStart(3, "0")}`;
-      recordTerminalSession(db, {
-        id,
-        actorUserId: ownerId,
-        cwd: allowedRoot,
-        status: "active",
-      });
-      markTerminalSessionEnded(db, id, new Date(Date.UTC(2026, 5, 1, 0, i)));
-    }
-  });
-  const rows = await listTerminals();
-  const ids = new Set(rows.map((row) => row.id));
-  const resumable = rows.filter((row) => row.resume);
-  expect(resumable).toHaveLength(50);
-  // Newest first: the oldest resumable rows fall off the 50 cap.
-  const listedCap = [...ids].filter((id) => id.startsWith("cap-r-")).sort();
-  const otherResumable = resumable.filter(
-    (row) => !row.id.startsWith("cap-r-"),
-  );
-  // The newest cap rows fill what the newer resumable rows leave of the 50.
-  const expectedCap = Array.from(
-    { length: 50 - otherResumable.length },
-    (_, k) => `cap-r-${String(54 - k).padStart(2, "0")}`,
-  ).sort();
-  expect(listedCap).toEqual(expectedCap);
-  expect(ids.has("cap-r-00")).toBe(false);
-  for (const row of rows.filter((r) => r.id.startsWith("cap-r-"))) {
-    expect(row.resume).toEqual({ agent: "claude", mode: "exact", cwd: folder });
-  }
-  // The normal cap still bounds plain ended rows.
-  expect([...ids].filter((id) => id.startsWith("cap-p-")).length).toBeLessThan(
-    205,
-  );
-});
+    // The normal cap still bounds plain ended rows.
+    expect(
+      [...ids].filter((id) => id.startsWith("cap-p-")).length,
+    ).toBeLessThan(205);
+  },
+  SEED_HEAVY_TIMEOUT_MS,
+);
 
 // After the cap test: a resumable Codex row in the same folder that the
 // capped catalog no longer lists must still make the visible one a picker.
-test("the Codex same-folder check sees resumable rows outside the catalog", async () => {
-  const folder = join(allowedRoot, "proj-codex-hidden");
-  mkdirSync(folder);
-  withDb((db) => {
-    recordTerminalSession(db, {
-      id: "codex-hidden",
-      actorUserId: ownerId,
-      cwd: allowedRoot,
-      status: "active",
+test(
+  "the Codex same-folder check sees resumable rows outside the catalog",
+  async () => {
+    const folder = join(allowedRoot, "proj-codex-hidden");
+    mkdirSync(folder);
+    withDb((db) => {
+      recordTerminalSession(db, {
+        id: "codex-hidden",
+        actorUserId: ownerId,
+        cwd: allowedRoot,
+        status: "active",
+      });
+      recordAgentSession(db, "codex-hidden", {
+        agentName: "codex",
+        sessionId: null,
+        cwd: folder,
+      });
+      markTerminalSessionEnded(
+        db,
+        "codex-hidden",
+        new Date(Date.UTC(2025, 0, 1)),
+      );
     });
-    recordAgentSession(db, "codex-hidden", {
+    seedEnded("codex-visible", {
       agentName: "codex",
       sessionId: null,
       cwd: folder,
     });
-    markTerminalSessionEnded(
-      db,
-      "codex-hidden",
-      new Date(Date.UTC(2025, 0, 1)),
-    );
-  });
-  seedEnded("codex-visible", {
-    agentName: "codex",
-    sessionId: null,
-    cwd: folder,
-  });
-  const rows = await listTerminals();
-  expect(rows.some((row) => row.id === "codex-hidden")).toBe(false);
-  expect(rows.find((row) => row.id === "codex-visible")?.resume).toEqual({
-    agent: "codex",
-    mode: "pick",
-    cwd: folder,
-  });
-  const dry = await post("/api/terminals/codex-visible/resume", {
-    dryRun: true,
-  });
-  expect(await json(dry)).toEqual({
-    command: "codex resume",
-    cwd: folder,
-    mode: "pick",
-  });
-});
+    const rows = await listTerminals();
+    expect(rows.some((row) => row.id === "codex-hidden")).toBe(false);
+    expect(rows.find((row) => row.id === "codex-visible")?.resume).toEqual({
+      agent: "codex",
+      mode: "pick",
+      cwd: folder,
+    });
+    const dry = await post("/api/terminals/codex-visible/resume", {
+      dryRun: true,
+    });
+    expect(await json(dry)).toEqual({
+      command: "codex resume",
+      cwd: folder,
+      mode: "pick",
+    });
+  },
+  SEED_HEAVY_TIMEOUT_MS,
+);
 
 // Codex re-check: while one Codex row of a folder is handed over, the new
 // terminal's start marker has not arrived yet, so another row of the same
