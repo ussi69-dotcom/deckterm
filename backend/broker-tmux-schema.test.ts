@@ -63,3 +63,18 @@ test("broker tmux schema allows only bounded copy-mode scrolling", () => {
   ]);
   expect(oversized.exitCode).not.toBe(0);
 });
+
+test("broker tmux schema accepts the visible-only capture the agent screen rules use", () => {
+  const visible = validateTmuxArgs("capture-pane", [
+    "-p",
+    "-t",
+    "deckterm_agent_test",
+  ]);
+  expect(visible.exitCode).toBe(0);
+  expect(JSON.parse(new TextDecoder().decode(visible.stdout))).toEqual([
+    "capture-pane",
+    "-p",
+    "-t",
+    "deckterm_agent_test",
+  ]);
+});

@@ -156,6 +156,13 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
       .filter((c) => c.fn === "brokerExec")
       .map((c) => c.opts.profileArgs),
   ).toEqual([
+    [
+      "display-message",
+      "-t",
+      "deckterm_decktermdev_s1",
+      "-p",
+      "#{alternate_on}",
+    ],
     ["copy-mode", "-e", "-t", "deckterm_decktermdev_s1"],
     [
       "send-keys",
@@ -172,7 +179,7 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
   expect(
     await b.scrollHistory("deckterm_decktermdev_s1", "down", 12),
   ).toBe(true);
-  expect(calls[0]?.opts.profileArgs).toEqual([
+  expect(calls[1]?.opts.profileArgs).toEqual([
     "send-keys",
     "-X",
     "-N",
@@ -181,6 +188,37 @@ test("scrollHistory enters tmux copy mode and bounds the line count", async () =
     "deckterm_decktermdev_s1",
     "scroll-down",
   ]);
+});
+
+test("scrollHistory refuses copy-mode on the alternate screen", async () => {
+  const b = backend();
+  execResult = { code: 0, stdout: "1\n", stderr: "" };
+  expect(await b.scrollHistory("deckterm_decktermdev_s1", "up", 5)).toBe(
+    false,
+  );
+  expect(
+    calls.filter((c) => c.opts.profileArgs?.[0] === "copy-mode"),
+  ).toHaveLength(0);
+
+  // An unreadable state keeps today's behaviour (scroll) rather than refusing.
+  calls.length = 0;
+  execResult = { code: 71, stdout: "", stderr: "not permitted" };
+  await b.scrollHistory("deckterm_decktermdev_s1", "up", 5);
+  expect(
+    calls.filter((c) => c.opts.profileArgs?.[0] === "copy-mode"),
+  ).toHaveLength(1);
+});
+
+test("brokered backend opts out of scroll control and never asks the broker for it", async () => {
+  const b = backend();
+  // The broker refuses display-message formats, goto-line and copy-mode -q:
+  // the server must route touch drags to scrollHistory and skip the rest.
+  expect(b.supportsScrollControl).toBe(false);
+  expect(await b.readScrollState()).toBeNull();
+  expect(await b.scrollToPosition()).toBe(false);
+  expect(await b.exitScroll()).toBe(false);
+  expect(await b.cancelScroll()).toBe(false);
+  expect(calls).toHaveLength(0);
 });
 
 test("cache returns one backend instance per uid", () => {

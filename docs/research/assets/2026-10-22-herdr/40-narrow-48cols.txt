@@ -1,0 +1,40 @@
+ ◐ proj-alpha             tab 1 · 1/2 │        ×
+ × 1 blocked · ✓ 1 done · ◐ 1 working │ switch
+┌──────────────────────┐┌──────────────────────┐
+│To run a command as a ││ ▐▛███▜▌   Claude Cod │
+│dministrator (user "r ││e (fake, review only) │
+│oot"), use "sudo <com ││                      │
+│mand>".               ││> refactor the parser │
+│See "man sudo_root" f ││                      │
+│or details.           ││✻ Pondering… (12s · ↓ │
+│                      ││ 300 tokens · esc to  │
+│user@host: ││interrupt)            │
+│user@host: ││                      │
+│~/proj-alpha$         ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+│                      ││                      │
+└──────────────────────┘└──────────────────────┘

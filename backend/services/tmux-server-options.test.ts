@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TmuxTerminalBackend } from "./tmux-terminal-backend";
@@ -38,7 +38,7 @@ function tmuxVersion(): number {
 }
 
 test.skipIf(!TMUX_AVAILABLE)(
-  "createSession pins mouse off, history-limit and (tmux >= 3.8) theme terminal",
+  "createSession pins mouse off, history-limit and (tmux >= 3.8) theme terminal + copy-mode-line-numbers off",
   async () => {
     const root = await mkdtemp(join(tmpdir(), "dtso-"));
     roots.push(root);
@@ -51,12 +51,37 @@ test.skipIf(!TMUX_AVAILABLE)(
       env: { PATH: process.env.PATH, HOME: root },
     });
 
+    if (tmuxVersion() >= 3.08) {
+      // Start from the non-default numbering to prove createSession pins it.
+      await mkdir(join(root, "tmux"), { recursive: true });
+      Bun.spawnSync([
+        "tmux",
+        "-f",
+        "/dev/null",
+        "-S",
+        socket,
+        "new-session",
+        "-d",
+        "-s",
+        "pre",
+        ";",
+        "set-option",
+        "-g",
+        "copy-mode-line-numbers",
+        "absolute",
+      ]);
+      expect(showGlobal(socket, "copy-mode-line-numbers")).toBe("absolute");
+    }
+
     await backend.createSession("opts", root, 80, 24, "owner", "o@example");
 
     expect(showGlobal(socket, "mouse")).toBe("off");
     expect(showGlobal(socket, "history-limit")).toBe("10000");
     if (tmuxVersion() >= 3.08) {
       expect(showGlobal(socket, "theme")).toBe("terminal");
+      // goto-line (the scroll indicator's absolute jump) counts from the
+      // bottom only while this is off.
+      expect(showGlobal(socket, "copy-mode-line-numbers")).toBe("off");
     }
   },
 );

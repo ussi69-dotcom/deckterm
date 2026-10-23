@@ -18,6 +18,7 @@ import type {
   TerminalScrollDirection,
 } from "./terminal-backend";
 import type { TmuxPipeDelta, TmuxSessionInfo } from "./tmux-terminal-backend";
+import type { TmuxScrollState } from "./tmux-scroll-state";
 
 /**
  * B2 brokered tmux backend (design §5). A per-uid `TerminalBackend` whose every
@@ -47,6 +48,11 @@ const MAX_PIPE_DELTA_BYTES = 1024 * 1024;
 
 export class BrokeredTmuxBackend implements TerminalBackend {
   readonly mode = "tmux" as const;
+  // The broker refuses every display-message format operand, `goto-line` and
+  // `copy-mode -q`, so the pane state can be neither read nor positioned:
+  // touch drags use the plain scrollHistory below, scroll-to/scroll-latest are
+  // ignored and no scroll-position frames are sent (no input barrier either).
+  readonly supportsScrollControl = false;
   readonly namespace: string;
   readonly captureRoot: string;
   /** The mapped identity this backend is permanently bound to (per-uid cache
@@ -187,6 +193,17 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     return res.code === 0 ? res.stdout : "";
   }
 
+  // The broker's tmux schema already accepts `capture-pane -p -t <name>`
+  // (backend/broker-tmux-schema.test.ts).
+  async captureVisible(sessionName: string): Promise<string | null> {
+    const res = await this.control(
+      sessionName,
+      ["capture-pane", "-p", "-t", sessionName],
+      5_000,
+    );
+    return res.code === 0 ? res.stdout : null;
+  }
+
   async resize(
     sessionName: string,
     cols: number,
@@ -221,6 +238,19 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     lines: number,
   ): Promise<boolean> {
     const count = Math.max(1, Math.min(100, Math.trunc(lines)));
+    // Same guard as TmuxTerminalBackend.scrollHistory: the alternate screen
+    // has no tmux history, and an empty copy-mode there steals input. Unlike
+    // there, an unreadable state does not refuse: the broker's display-message
+    // parser currently rejects every format operand, and refusing on that
+    // would take away the scrolling brokered terminals have today.
+    const altState = await this.control(sessionName, [
+      "display-message",
+      "-t",
+      sessionName,
+      "-p",
+      "#{alternate_on}",
+    ]);
+    if (altState.code === 0 && altState.stdout.trim() === "1") return false;
     if (direction === "up") {
       const copyMode = await this.control(sessionName, [
         "copy-mode",
@@ -241,6 +271,24 @@ export class BrokeredTmuxBackend implements TerminalBackend {
       direction === "up" ? "scroll-up" : "scroll-down",
     ]);
     return scroll.code === 0;
+  }
+
+  // supportsScrollControl is false: the controller never calls these. They
+  // answer "unknown" without a broker round trip that would only be refused.
+  async readScrollState(): Promise<TmuxScrollState | null> {
+    return null;
+  }
+
+  async scrollToPosition(): Promise<boolean> {
+    return false;
+  }
+
+  async exitScroll(): Promise<boolean> {
+    return false;
+  }
+
+  async cancelScroll(): Promise<boolean> {
+    return false;
   }
 
   async kill(sessionName: string): Promise<void> {

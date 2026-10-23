@@ -27,6 +27,7 @@ import {
   getTmuxSocketPath,
   resolveTmuxSessionNamespace,
 } from "./tmux-session-names";
+import { sanitizeTerminalEnv } from "./services/terminal-env";
 
 export const TMUX_SERVER_LAUNCH_LOG_PREFIX = "[tmux-server]";
 
@@ -133,18 +134,27 @@ export async function killTmuxServer(
 /**
  * Starts the server and returns its exit code. tmux daemonises itself, so the
  * spawned client exits promptly and the unit is Type=forking.
+ *
+ * The socket is derived from the FULL environment (state dir, port,
+ * namespace), but the server is started with the sanitized one: tmux keeps
+ * the environment it starts with as its global environment and gives it to
+ * every pane, so service-only variables (push key, CF Access config, DeckTerm
+ * switches — see terminal-env.ts) must not be in it.
  */
 export async function launchTmuxServer(
   env: Record<string, string | undefined> = process.env,
-  spawn: (argv: string[]) => { exited: Promise<number> } = (argv) =>
-    Bun.spawn(argv, { stdout: "inherit", stderr: "inherit" }),
+  spawn: (
+    argv: string[],
+    spawnEnv: Record<string, string | undefined>,
+  ) => { exited: Promise<number> } = (argv, spawnEnv) =>
+    Bun.spawn(argv, { stdout: "inherit", stderr: "inherit", env: spawnEnv }),
 ): Promise<number> {
   const plan = buildTmuxServerLaunchPlan(env);
   await ensureSocketDirectory(plan.socketDir);
   console.log(
     `${TMUX_SERVER_LAUNCH_LOG_PREFIX} starting on ${plan.socketPath} (exit-empty off)`,
   );
-  const proc = spawn(plan.argv);
+  const proc = spawn(plan.argv, sanitizeTerminalEnv(env));
   return await proc.exited;
 }
 

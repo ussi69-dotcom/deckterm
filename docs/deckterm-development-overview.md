@@ -1,6 +1,18 @@
 # DeckTerm — přehled vývoje a stav projektu
 
-> **Datum:** 2026-05-29 · **Delta 2026-07-05 viz sekce 0y**
+> **Datum:** 2026-05-29 · **Delta 2026-10-22 viz sekce 0x** (mezitím: QoL 2026-10-12 a tmux 3.8 2026-10-13 jsou v `docs/handoffs/` a v OpenKnowledge)
+
+## 0x. Delta 2026-10-22 — oprava mobilu + funkce z herdru (na `dev`, ne v produkci)
+
+Běh podle `docs/handoffs/2026-10-22-herdr-adoption-operator.md`; kontrakty v `docs/plans/2026-10-22-mobile-touch-repair-design.md` a `docs/plans/2026-10-22-agent-attention{-design,}.md`, revize mobilu v `docs/audits/2026-10-22-mobile-usability-review.md`.
+
+- **M0 (mobil):** tah jedním prstem posouvá skutečnou historii (server podle stavu tmux pane pošle kolečko aplikaci s myší, šipky alt-screenu, jinak tmux copy-mode), úchyt + „↓ Latest“, psaní ve scrollu nejdřív vrátí na konec, fokus už neskáče po zavření klávesnice a pohled neskáče dolů při čtení. **F17:** dotykové psaní posílá každý znak jednou (velká písmena, mezery, IME slova).
+- **S0 (bezpečnost):** shelly a tmux server už nedědí klíč Web Push ani nastavení služby (jeden testovaný deny-list, čištění běžícího tmux serveru).
+- **S1a/S1:** stav agenta z obrazovky (pravidla z herdru, Apache-2.0, převedená na lineární čas; reálné fixtury Claude 2.1.308 / Codex 0.163): „čeká na tebe“ → jedna push notifikace s deep linkem na session.
+- **S2:** panel Agents vlevo v běžném zobrazení (zapnutý, skrytelný, roztažitelný, souhrn + Next + skupiny podle projektu), pohled Agents v IDE, štítek na telefonu, „viděno“ sdílené přes server.
+- **Přepínač panelu (2026-10-23, přání vlastníka):** panel Agents se skrývá a zobrazuje tlačítkem, které je vždy první vlevo nahoře v liště a v obou stavech zůstává na stejném místě. Nahradilo skrývací tlačítko v hlavičce panelu i připnuté tlačítko „Agents“ uprostřed lišty (akce zůstává v More, paletě a pod Ctrl+Shift+L). Test v `tests/agents-panel.spec.ts`.
+- **S3:** obnova konverzace agenta jedním ťuknutím po pádu tmuxu nebo restartu (Claude `--session-id` přes vlastní wrapper, Codex `resume --last`/picker); nikdy automaticky.
+- Brány: unit 2092/0, plná e2e 256/256 na 4174, Codex + adversariální review každé části.
 
 ## 0y. Delta 2026-07-05 — Traycer patterns HOTOVÉ (harness registry · A2A task messaging · tool telemetrie)
 

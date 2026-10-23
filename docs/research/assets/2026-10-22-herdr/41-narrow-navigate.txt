@@ -1,0 +1,40 @@
+ switch                               │  close
+                                      │    ×
+────────────────────────────────────────────────
+  agents
+   ◐ Local · proj-alpha
+   1 · working · claude
+   ○ Local · proj-alpha
+   tests · idle · claude
+   × Local · proj-beta
+   blocked · claude
+   ✓ Local · api-server
+   done · claude
+  spaces
+   + new workspace
+   ◐ Local · proj-alpha
+   master · tab 1 · 1/2
+   × Local · proj-beta
+   master · tab 1
+   ✓ Local · api-server
+   master · tab 1
+  tabs
+   + new tab
+   tab 1
+   2 · tests
+  menu
+   settings
+   keybinds
+   reload config
+   detach
+
+
+
+
+
+
+
+
+
+
+

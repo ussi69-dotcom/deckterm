@@ -30,7 +30,7 @@ test.describe("Tmux Rich Mode", () => {
     );
 
     await expect(page.locator("#linked-view-btn")).toHaveCount(0);
-    await page.getByRole("button", { name: "More" }).click();
+    await page.getByRole("button", { name: "More", exact: true }).click();
     const linkedViewButton = page
       .locator("#tools-sheet")
       .getByRole("button", { name: "Linked View" });

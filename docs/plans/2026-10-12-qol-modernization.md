@@ -1,7 +1,8 @@
 # QoL and modernization pass — delivery record (2026-10-12)
 
 Design and decisions: [2026-10-12-qol-modernization-design.md](./2026-10-12-qol-modernization-design.md).
-Scope: dev only (4174, branch `dev`); nothing was promoted to `main` or production.
+Scope: built and tested on dev (4174, branch `dev`); promoted to production on 2026-10-13 (see
+[Promotion](#promotion-2026-10-13)).
 
 ## Result
 
@@ -122,10 +123,32 @@ More sheet), a "What's what" section in Help and short tips on the empty-workspa
 A live look at dev also showed that turning the extra-keys bar on with a phone showed it on the desktop
 too (one setting per account); phones/tablets and desktop now remember it separately.
 
+## Promotion (2026-10-13)
+
+The owner approved the promotion on 2026-10-13 ("vypada ok, nasad na prod"). Pull request #43 promoted
+`dev` (tree identical to the tested `3c6631e`; `6493574` only merged the README badge commits that `main` already
+had) to `main` as `b04c791`. Its PR checks (unit, smoke-e2e, isolation-e2e) were green, and so was the
+`Deploy Main` run 38377043778 (verify-and-package, deploy).
+
+Checked on the host after the deploy:
+
+- `prod/current` points at `releases/b04c791…` and `previous` points at `c9be750…`. The service main process
+  runs from the new release, and the candidate port 4273 is free again.
+- The production tmux server kept its process across the restart. The journal shows `[shutdown] SIGTERM:
+  detaching 1 terminal(s) (tmux sessions preserved)`, `[tmux] Recovered 1 session(s)`, and the open tab
+  reconnecting its WebSocket.
+- Before the merge, the `deckterm.service.d/idle-timeout.conf` drop-in (24 h idle / 72 h detached) was
+  removed, as the owner decided. The journal now shows `[reaper] policy idle=never detached=never`, which
+  matches the 2026-08-30 "only an explicit close ends a session" decision. Both the old and the new code
+  default to "never", so a rollback would not have brought the reapers back.
+- Production keeps the system tmux 3.4 for this release. The owner then asked for the 3.8 switch right
+  away; it ran at 10:03 UTC, and the operator session continued under the same terminal ID
+  ([tmux plan](./2026-10-13-tmux-3.8-upgrade.md), step 3).
+- `Deploy Main` deploys to a single host (the `DEPLOY_HOST` secret, this OVH host). The owner's separate
+  dedicated server runs its own git checkout under a system-level unit, so this deploy did not touch it.
+
 ## Follow-ups noticed
 
-- Production still runs the `deckterm.service.d/idle-timeout.conf` drop-in (24 h idle / 72 h detached
-  reapers), which contradicts the 2026-08-30 "only an explicit close ends a session" decision.
 - The interactive review agents found remaining polish: Settings has a single Appearance option, the IDE
   bottom terminal has no panel header, the explorer is a flat list rather than a tree, IDE search groups lack
   paths and match highlighting.

@@ -31,6 +31,21 @@
       <header class="toolbar">
         <!-- ROW 1: Always visible - toggle, new, tabs, status -->
         <div class="toolbar-row-1">
+          <!-- Desktop: the Agents panel toggle, always the top-left control,
+               in the same place whether the panel is shown or hidden. -->
+          <button
+            id="agents-panel-toggle"
+            class="btn-icon agents-panel-toggle"
+            type="button"
+            title="Hide the Agents panel (Ctrl+Shift+L)"
+            aria-label="Hide the Agents panel"
+            aria-controls="agents-panel"
+            aria-pressed="true"
+          >
+            <i data-lucide="panel-left-close" class="agents-panel-toggle-hide"></i>
+            <i data-lucide="panel-left-open" class="agents-panel-toggle-show"></i>
+          </button>
+
           <button
             id="toolbar-toggle"
             class="toolbar-toggle"
@@ -77,6 +92,17 @@
                 hidden
               ></span>
             </button>
+
+            <!-- Phones and tablets: agents summary (● needs you · ✓ done ·
+                 ◐ working); tapping it opens the sorted Sessions sheet. -->
+            <button
+              id="agents-summary-chip"
+              class="agents-summary-chip"
+              type="button"
+              aria-haspopup="dialog"
+              aria-controls="sessions-panel"
+              hidden
+            ></button>
 
             <button
               id="notification-sound-toggle"
@@ -486,6 +512,21 @@
             </div>
           </div>
           <div class="sessions-panel-body">
+            <div id="sessions-agents-bar" class="sessions-agents-bar">
+              <span
+                id="sessions-agents-summary"
+                class="sessions-agents-summary"
+              ></span>
+              <button
+                id="sessions-next-agent"
+                class="btn agents-next-btn"
+                type="button"
+                data-agents-next
+                disabled
+              >
+                Next
+              </button>
+            </div>
             <div id="sessions-list" class="task-list">
               <!-- Dynamically loaded sessions -->
             </div>
@@ -613,18 +654,45 @@
         </section>
       </div>
 
-      <!-- Workspace area: terminal tiles + floating surface windows layer -->
-      <div id="workspace-area">
-        <!-- Terminal container - tiles created dynamically by TileManager -->
-        <div id="terminal-container">
-          <!-- Tiles will be created dynamically -->
-        </div>
-        <div id="surface-windows-layer"></div>
+      <!-- Workspace row: the Agents panel (desktop default view, web/
+           agent-overview.js), its resize sash, then the workspace area. The
+           panel takes no space when hidden (IDE mode, touch, < 768 px, or
+           turned off). -->
+      <div id="workspace-row">
+        <aside
+          id="agents-panel"
+          class="agents-panel"
+          aria-label="Agents"
+          hidden
+        >
+          <!-- Hidden and shown from the toolbar's top-left toggle. -->
+          <div class="agents-panel-header">
+            <h3 class="agents-panel-title">Agents</h3>
+          </div>
+          <div id="agents-panel-body" class="agents-panel-body"></div>
+        </aside>
         <div
-          id="dock-sash"
-          class="dock-sash"
+          id="agents-panel-sash"
+          class="agents-panel-sash"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the Agents panel"
           title="Drag to resize, double-click to reset"
+          hidden
         ></div>
+        <!-- Workspace area: terminal tiles + floating surface windows layer -->
+        <div id="workspace-area">
+          <!-- Terminal container - tiles created dynamically by TileManager -->
+          <div id="terminal-container">
+            <!-- Tiles will be created dynamically -->
+          </div>
+          <div id="surface-windows-layer"></div>
+          <div
+            id="dock-sash"
+            class="dock-sash"
+            title="Drag to resize, double-click to reset"
+          ></div>
+        </div>
       </div>
 
       <!-- Extra Keys Bar (Termux style) - using spans to prevent focus stealing -->
@@ -885,6 +953,7 @@
     <script src="/keyboard-shortcuts.js?v=20261012a"></script>
     <script src="/feature-guide.js?v=20261013a"></script>
     <script src="/workspace-launcher.js?v=20261012a"></script>
+    <script src="/agent-overview.js?v=20261022a"></script>
     <script src="/task-signals.js?v=20260611a"></script>
     <script src="/notification-sounds.js?v=20260719a"></script>
     <script src="/push-notifications.js?v=20260719a"></script>
@@ -916,8 +985,10 @@
     <script src="/file-explorer.js?v=20260829a"></script>
     <script src="/file-editor.js?v=20260705a"></script>
     <script src="/editor-tabs.js?v=20260705a"></script>
-    <script src="/input-fallback.js?v=20260415a"></script>
+    <script src="/input-fallback.js?v=20261022c"></script>
     <script src="/extra-keys-scroll.js?v=20260618a"></script>
+    <script src="/touch-scroll.js?v=20261022a"></script>
+    <script src="/scroll-indicator.js?v=20261022a"></script>
     <script src="/mobile-layout.js?v=20261012a"></script>
     <script src="/quick-replies.js?v=20261012a"></script>
     <script src="/compose-sheet.js?v=20261012a"></script>

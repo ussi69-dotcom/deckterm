@@ -306,7 +306,9 @@ test("retention prune: chunked deletion crosses chunk boundaries correctly", asy
   expect(countRows(db, "terminal_events")).toBe(0);
 
   db.close();
-});
+  // 257 single-row inserts each sync the WAL; on a busy disk that alone can
+  // pass Bun's 5 s default, which stops the chained test:unit script.
+}, 30_000);
 
 test("wal checkpoint job records a completed run", async () => {
   const { state } = await setupState();

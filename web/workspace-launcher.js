@@ -66,9 +66,15 @@
     return session?.sessionStatus !== "ended" && session?.status !== "inactive";
   }
 
+  // An ended row whose agent can be resumed with one tap (slice S3).
+  function isResumable(session) {
+    return !isLive(session) && Boolean(session?.resume);
+  }
+
   // Sessions the launcher offers: not already open in this browser, live ones
-  // (attach / restore a recently closed tab) before ended ones (open a fresh
-  // terminal in that directory), newest activity first.
+  // (attach / restore a recently closed tab) first, then ended ones whose
+  // agent can be resumed, then other ended ones (open a fresh terminal in
+  // that directory), newest activity first.
   function planLauncherSessions(catalog, options = {}) {
     const {
       openIds = [],
@@ -83,6 +89,8 @@
     list.sort((a, b) => {
       const liveDiff = Number(isLive(b)) - Number(isLive(a));
       if (liveDiff) return liveDiff;
+      const resumeDiff = Number(isResumable(b)) - Number(isResumable(a));
+      if (resumeDiff) return resumeDiff;
       return activityOf(b) - activityOf(a);
     });
     return list.slice(0, Math.max(0, limit)).map((session) => {
@@ -209,7 +217,13 @@
       row.dataset.sessionId = session.id;
       row.title = `${session.actionLabel} ${session.cwd || session.title}`;
       row.appendChild(
-        icon(session.kind === "open-here" ? "terminal-square" : "history"),
+        icon(
+          session.kind === "open-here"
+            ? "terminal-square"
+            : session.kind === "resume"
+              ? "rotate-ccw"
+              : "history",
+        ),
       );
       const text = el("span", "launcher-row-text");
       text.appendChild(el("span", "launcher-row-title", session.title));

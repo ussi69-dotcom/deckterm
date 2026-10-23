@@ -170,6 +170,11 @@ test("foundation C1 records and ends terminal session metadata", async () => {
     lastEventId: 0,
     execKind: null,
     osUid: null,
+    agentName: null,
+    agentSessionId: null,
+    agentCwd: null,
+    agentSessionUpdatedAt: null,
+    agentResumeReservedAt: null,
   });
 
   scheduleTerminalSessionTermination(
@@ -333,6 +338,11 @@ test("foundation C1 exposes a minimal route capability registry", () => {
   });
   expect(getRouteCapability("DELETE", "/api/terminals/term_123")).toEqual({
     capability: "terminal.manage",
+    resourceType: "terminal",
+    resourceId: "term_123",
+  });
+  expect(getRouteCapability("POST", "/api/terminals/term_123/resume")).toEqual({
+    capability: "terminal.create",
     resourceType: "terminal",
     resourceId: "term_123",
   });

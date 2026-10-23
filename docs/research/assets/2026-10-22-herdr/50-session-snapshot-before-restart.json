@@ -1,0 +1,135 @@
+{
+  "version": 3,
+  "workspaces": [
+    {
+      "id": "w1",
+      "custom_name": null,
+      "identity_cwd": "<review-dir>/home/proj-alpha",
+      "public_pane_numbers": {
+        "4": 2,
+        "5": 3,
+        "1": 1
+      },
+      "next_public_pane_number": 4,
+      "public_tab_numbers": [
+        1,
+        2
+      ],
+      "next_public_tab_number": 3,
+      "tabs": [
+        {
+          "custom_name": null,
+          "layout": {
+            "Split": {
+              "direction": "Horizontal",
+              "ratio": 0.5,
+              "first": {
+                "Pane": 1
+              },
+              "second": {
+                "Pane": 5
+              }
+            }
+          },
+          "panes": {
+            "5": {
+              "cwd": "<review-dir>/home/proj-alpha"
+            },
+            "1": {
+              "cwd": "<review-dir>/home/proj-alpha"
+            }
+          },
+          "zoomed": false,
+          "focused": 1,
+          "root_pane": 1
+        },
+        {
+          "custom_name": "tests",
+          "layout": {
+            "Pane": 4
+          },
+          "panes": {
+            "4": {
+              "cwd": "<review-dir>/home/proj-alpha"
+            }
+          },
+          "zoomed": false,
+          "focused": 4,
+          "root_pane": 4
+        }
+      ],
+      "active_tab": 0
+    },
+    {
+      "id": "w2",
+      "custom_name": "proj-beta",
+      "identity_cwd": "<review-dir>/home/proj-beta",
+      "public_pane_numbers": {
+        "2": 1
+      },
+      "next_public_pane_number": 2,
+      "public_tab_numbers": [
+        1
+      ],
+      "next_public_tab_number": 2,
+      "tabs": [
+        {
+          "custom_name": null,
+          "layout": {
+            "Pane": 2
+          },
+          "panes": {
+            "2": {
+              "cwd": "<review-dir>/home/proj-beta",
+              "agent_session": {
+                "source": "herdr:claude",
+                "agent": "claude",
+                "kind": "id",
+                "value": "11111111-2222-3333-4444-555555555555"
+              }
+            }
+          },
+          "zoomed": false,
+          "focused": 2,
+          "root_pane": 2
+        }
+      ],
+      "active_tab": 0
+    },
+    {
+      "id": "w3",
+      "custom_name": "api-server",
+      "identity_cwd": "<review-dir>/home/proj-alpha",
+      "public_pane_numbers": {
+        "3": 1
+      },
+      "next_public_pane_number": 2,
+      "public_tab_numbers": [
+        1
+      ],
+      "next_public_tab_number": 2,
+      "tabs": [
+        {
+          "custom_name": null,
+          "layout": {
+            "Pane": 3
+          },
+          "panes": {
+            "3": {
+              "cwd": "<review-dir>/home/proj-alpha"
+            }
+          },
+          "zoomed": false,
+          "focused": 3,
+          "root_pane": 3
+        }
+      ],
+      "active_tab": 0
+    }
+  ],
+  "active": 0,
+  "selected": 0,
+  "sidebar_width": null,
+  "sidebar_section_split": null,
+  "collapsed_space_keys": []
+}

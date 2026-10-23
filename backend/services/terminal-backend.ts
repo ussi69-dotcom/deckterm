@@ -1,7 +1,15 @@
 import type { Subprocess } from "bun";
+import type { TmuxScrollState } from "./tmux-scroll-state";
 
 export type TerminalBackendMode = "raw" | "tmux";
 export type TerminalScrollDirection = "up" | "down";
+
+/**
+ * Options for the tmux calls the scroll controller makes. Aborting `signal`
+ * kills the tmux client process, so a timed-out command cannot run later
+ * and break the controller's queue order.
+ */
+export type TerminalScrollCallOptions = { signal?: AbortSignal };
 
 export type TerminalBackendSession = {
   id: string;
@@ -57,6 +65,15 @@ export type TerminalBackendAttachResult = {
 export interface TerminalBackend {
   readonly mode: TerminalBackendMode;
 
+  /**
+   * True when this backend can read the pane's scroll state and position
+   * copy-mode itself (readScrollState, scrollToPosition, exitScroll,
+   * cancelScroll). False (brokered tmux, raw): touch-scroll falls back to
+   * scrollHistory, scroll-to / scroll-latest are ignored, no
+   * `scroll-position` frames and no input barrier.
+   */
+  readonly supportsScrollControl: boolean;
+
   createSession(
     id: string,
     cwd: string,
@@ -70,12 +87,50 @@ export interface TerminalBackend {
 
   capture(sessionName: string): Promise<string>;
 
+  /**
+   * The visible screen only, as plain text (`capture-pane -p -t <session>`:
+   * no escapes, no history, wrapped lines kept as separate rows). Input for
+   * the agent screen rules. Null when the backend has no screen to read
+   * (raw PTY) or the capture failed.
+   */
+  captureVisible(sessionName: string): Promise<string | null>;
+
   resize(sessionName: string, cols: number, rows: number): Promise<void>;
 
   scrollHistory(
     sessionName: string,
     direction: TerminalScrollDirection,
     lines: number,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
+
+  /** The pane's live scroll state, or null when it cannot be read. */
+  readScrollState(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
+  ): Promise<TmuxScrollState | null>;
+
+  /**
+   * Shows the history `position` lines above the live bottom (tmux copy-mode,
+   * clamped by tmux to the available history). 0 or less leaves copy-mode.
+   * Refused (false) on the alternate screen, which has no history.
+   */
+  scrollToPosition(
+    sessionName: string,
+    position: number,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
+
+  /** Leaves copy-mode; succeeds when the pane was not scrolled back either. */
+  exitScroll(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
+  ): Promise<boolean>;
+
+  /** `send -X cancel`: the fallback when exitScroll left the pane in a mode. */
+  cancelScroll(
+    sessionName: string,
+    options?: TerminalScrollCallOptions,
   ): Promise<boolean>;
 
   kill(sessionName: string): Promise<void>;

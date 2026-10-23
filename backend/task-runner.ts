@@ -9,6 +9,7 @@ import {
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { getAgentHarness } from "./services/agent-harnesses";
+import { sanitizeTerminalEnv } from "./services/terminal-env";
 import { writeTaskFileAtomic } from "./task-file-io";
 import {
   appendTaskMessageEvent,
@@ -232,7 +233,12 @@ export async function detectVerificationCommands(
     }));
 }
 
-async function defaultRunCommand({
+/**
+ * Runs a task check (e.g. the project's `bun run test:unit`). That is user
+ * project code, so it gets the sanitized environment, never the service's
+ * secrets (terminal-env.ts). Exported for the spawn-env test.
+ */
+export async function defaultRunCommand({
   cwd,
   args,
   timeoutMs = 120_000,
@@ -241,6 +247,7 @@ async function defaultRunCommand({
     cwd,
     stdout: "pipe",
     stderr: "pipe",
+    env: sanitizeTerminalEnv(process.env),
   });
   const timeout = setTimeout(() => proc.kill(), timeoutMs);
   const [stdout, stderr, exitCode] = await Promise.all([

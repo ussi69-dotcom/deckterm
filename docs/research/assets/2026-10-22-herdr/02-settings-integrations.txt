@@ -1,0 +1,50 @@
+ spaces                  │   1      +
+                         │To run a command as administrator (user "root"), use "sudo <command>".
+ · proj-alpha            │See "man sudo_root" for details.
+   master                │
+                         │user@host:~/proj-alpha$
+                         │
+                         │
+                         │
+                         │
+                         │                                    ┌──────────────────────────────────────────────────────────────────────────┐
+                         │                                    │ settings                                                                 │
+                         │                                    │ theme   indicators   sound   toasts   integrations                       │
+                         │                                    │──────────────────────────────────────────────────────────────────────────│
+                         │                                    │                                                                          │
+                         │                                    │agent integrations                                                        │
+                         │                                    │enable session restore and, where supported, direct status updates        │
+                         │                                    │                                                                          │
+                         │                                    │ – pi         not found                                                   │
+                         │                                    │ – omp        not found                                                   │
+                         │                                    │ – claude     not found                                                   │
+                         │                                    │ – codex      not found                                                   │
+                         │                                    │ – copilot    not found                                                   │
+                         │                                    │ – devin      not found                                                   │
+                         │                                    │ – droid      not found                                                   │
+ new                 menu│                                    │ – kimi       not found                                                   │
+─────────────────────────│                                    │ – opencode   not found                                                   │
+ agents           grouped│                                    │ – kilo       not found                                                   │
+                         │                                    │ – hermes     not found                                                   │
+                         │                                    │ – qodercli   not found                                                   │
+                         │                                    │ – qwen       not found                                                   │
+                         │                                    │ – cursor     not found                                                   │
+                         │                                    │ – mastracode not found                                                   │
+                         │                                    │ – antigravitynot found                                                   │
+                         │                                    │ – grok       not found                                                   │
+                         │                                    │                                                                          │
+                         │                                    │                                                                          │
+                         │                                    │                                                                          │
+                         │                                    │ ↑↓ select  tab section                                                   │
+                         │                                    │                                esc close                                 │
+                         │                                    └──────────────────────────────────────────────────────────────────────────┘
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                         │
+                        «│

@@ -9,8 +9,8 @@ test.describe("Onboarding setup surface", () => {
   });
 
   test("runs the deployment doctor from the More sheet", async ({ page }) => {
-    await page.getByRole("button", { name: "More" }).click();
-    await page.getByRole("button", { name: "Setup" }).click();
+    await page.getByRole("button", { name: "More", exact: true }).click();
+    await page.getByRole("button", { name: "Setup", exact: true }).click();
 
     const panel = page.locator("#setup-panel");
     await expect(panel).toBeVisible();
@@ -62,8 +62,8 @@ test.describe("Onboarding setup surface", () => {
   test("generates Cloudflare setup snippets and remediation rows", async ({
     page,
   }) => {
-    await page.getByRole("button", { name: "More" }).click();
-    await page.getByRole("button", { name: "Setup" }).click();
+    await page.getByRole("button", { name: "More", exact: true }).click();
+    await page.getByRole("button", { name: "Setup", exact: true }).click();
 
     const panel = page.locator("#setup-panel");
     await expect(panel).toBeVisible();

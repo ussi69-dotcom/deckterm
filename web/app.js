@@ -334,6 +334,13 @@ if (!window.TerminalColors) {
   window.TerminalColors = TerminalColors;
 }
 
+// Input types that belong to an IME composition (see the touch fallback).
+const COMPOSITION_INPUT_TYPES = new Set([
+  "insertCompositionText",
+  "deleteCompositionText",
+  "insertFromComposition",
+]);
+
 const inputFallbackHelpers =
   window.InputFallback ||
   (() => {
@@ -377,6 +384,15 @@ const describeFeature = (actionId) =>
   window.FeatureGuide?.describeAction?.(actionId) || "";
 
 const ACTION_BUTTON_CONFIG = Object.freeze({
+  agents: Object.freeze({
+    label: "Agents",
+    icon: "bot",
+    action: "agents",
+    desktopId: "desktop-agents-btn",
+    toolsId: "tools-sheet-agents",
+    desktopTone: "secondary",
+    description: describeFeature("agents"),
+  }),
   files: Object.freeze({
     label: "Files",
     icon: "folder-open",
@@ -560,7 +576,18 @@ class ReconnectingWebSocket {
     // intentional close or after the terminal ended.
     this.inputQueue = window.InputQueue ? new window.InputQueue() : null;
     this.inputQueueTimer = null;
+    // Touch-layout pages open the socket with `scroll=1` and then receive
+    // {type:"scroll-position"} frames: whether the tmux pane is scrolled back
+    // (copy-mode) and where. Desktop pages never opt in and keep this null.
+    this.scrollState =
+      ReconnectingWebSocket.wantsScrollPosition(url) && window.ScrollIndicator
+        ? window.ScrollIndicator.createScrollPositionState()
+        : null;
     this.connect();
+  }
+
+  static wantsScrollPosition(url) {
+    return /[?&]scroll=1(?:&|$)/.test(String(url || ""));
   }
 
   connect() {
@@ -588,6 +615,8 @@ class ReconnectingWebSocket {
     socket.onopen = () => {
       if (!this.isCurrentSocket(socket)) return;
       this.startHeartbeat(socket);
+      // A new transport may restart the server's scroll-position sequence.
+      this.scrollState?.resetSequence();
       this.openedOnce = true;
       this.awaitingReconnectReady = isReconnectTransport;
       this.callbacks.onTransportOpen?.(isReconnectTransport);
@@ -633,6 +662,18 @@ class ReconnectingWebSocket {
         }
         if (data.type === "terminal_state") {
           this.callbacks.onTerminalState?.(data);
+          return;
+        }
+        if (data.type === "agents_changed") {
+          // Content-free (agents=1 sockets only): an agent's screen-rule
+          // status changed, so the page refetches /api/terminals now.
+          window.dispatchEvent(new Event("deckterm:agents-changed"));
+          return;
+        }
+        if (data.type === "scroll-position") {
+          // Never terminal text. Stale or malformed frames are dropped.
+          const state = this.scrollState?.apply(data);
+          if (state) this.callbacks.onScrollPosition?.(state);
           return;
         }
         if (data.type === "exit") {
@@ -849,6 +890,7 @@ class ReconnectingWebSocket {
       this.ws?.readyState === WebSocket.OPEN &&
       !(queue && queue.length > 0);
     if (canSendNow || !queue) {
+      this.leaveScrollbackBeforeInput(this.ws, data);
       return this.send(JSON.stringify({ type: "input", data }));
     }
     if (this.intentionallyClosed) return false;
@@ -871,8 +913,58 @@ class ReconnectingWebSocket {
     const { items, dropped } = queue.drain();
     if (dropped > 0) this.callbacks.onInputDropped?.(dropped);
     for (const data of items) {
+      // Terminal replies queued ahead of the first real keystroke go out
+      // as they are; the first keystroke leaves scrollback first.
+      this.leaveScrollbackBeforeInput(socket, data);
       socket.send(JSON.stringify({ type: "input", data }));
     }
+  }
+
+  // Keys typed into a pane that is scrolled back would be eaten by tmux
+  // copy-mode. When the pane is or may be scrolled back (a frame said so, or
+  // a touch-scroll / scroll-to went out that no inMode=false frame has
+  // answered yet), stop any touch fling and ask the server to return to the
+  // latest output first; it writes the input that follows only after that
+  // exit finished, so nothing is reordered. One scroll-latest per leave:
+  // markLeft() clears the state until the next scroll. Terminal replies
+  // (cursor reports, focus reports, ...) are not typing and never leave.
+  leaveScrollbackBeforeInput(socket = this.ws, data) {
+    const helpers = window.ScrollIndicator;
+    if (!this.scrollState || !helpers) return false;
+    if (helpers.isTerminalReply(data)) return false;
+    // Real typing ends a fling even before it was confirmed by the server.
+    this.callbacks.onHaltTouchScroll?.();
+    if (!helpers.shouldLeaveScrollbackForInput(this.scrollState, data)) {
+      return false;
+    }
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify({ type: "scroll-latest" }));
+    this.callbacks.onScrollPosition?.(this.scrollState.markLeft());
+    return true;
+  }
+
+  // Touch scroll controls (touch-scroll, scroll-to, scroll-latest). Only
+  // sent while the socket is open: a scroll gesture is not worth queueing.
+  // A jump (scroll-to, scroll-latest) first stops any touch fling, so a late
+  // touch-scroll batch cannot land after it.
+  sendScrollControl(message) {
+    if (!message || typeof message.type !== "string") return false;
+    if (message.type === "scroll-latest") {
+      this.callbacks.onHaltTouchScroll?.();
+      if (!this.send(JSON.stringify({ type: "scroll-latest" }))) return false;
+      if (this.scrollState) {
+        this.callbacks.onScrollPosition?.(this.scrollState.markLeft());
+      }
+      return true;
+    }
+    if (message.type === "scroll-to") {
+      this.callbacks.onHaltTouchScroll?.();
+    }
+    // scroll-to 0 can only leave scrollback; anything else may enter it.
+    this.scrollState?.markScrollIntent({
+      mayEnter: !(message.type === "scroll-to" && message.position === 0),
+    });
+    return this.send(JSON.stringify(message));
   }
 
   discardQueuedInput({ notify = false } = {}) {
@@ -1504,6 +1596,16 @@ class TileManager {
   }
 
   ensureTileVisible(terminalId) {
+    // Touch layouts (phones, touch tablets) never scroll here: on a phone
+    // the tile stack is always in view and a scrollIntoView only panned the
+    // page (iOS) under the keyboard. Same test as
+    // TerminalManager.isTouchLayout(). Desktop keeps its smooth scroll.
+    if (
+      platformDetector.isMobile ||
+      (platformDetector.hasTouch && platformDetector.isCoarsePointer)
+    ) {
+      return;
+    }
     const tile = this.tiles.get(terminalId);
     if (!tile || tile.element.style.display === "none") return;
     tile.element.scrollIntoView({
@@ -2285,10 +2387,17 @@ class ExtraKeysManager {
     // past EK_SWIPE_SLOP_PX turns the touch into a row scroll, not a key.
     const EK_SWIPE_SLOP_PX = 8;
     let swipe = null;
+    // Whether the terminal had focus (keyboard up) when the finger landed.
+    // On touch layouts only then does touchend hand focus back: a tap with
+    // the keyboard closed must not open it. Other layouts always refocus.
+    let refocusOnTouchEnd = false;
 
     extraKeys.addEventListener(
       "touchstart",
       (e) => {
+        refocusOnTouchEnd =
+          !this.tm?.isTouchLayout?.() ||
+          Boolean(this.tm?.isTerminalInputFocused?.());
         const btn = e.target.closest(".ek-btn, .ek-toggle");
         dbg("[ExtraKeys] touchstart, btn:", btn?.dataset?.key || btn?.id);
         if (btn) {
@@ -2344,7 +2453,10 @@ class ExtraKeysManager {
           }
           touchedKey = null;
         }
-        setTimeout(() => this.refocusTerminal(), 10);
+        if (refocusOnTouchEnd) {
+          refocusOnTouchEnd = false;
+          setTimeout(() => this.refocusTerminal(), 10);
+        }
       },
       { passive: false, capture: true },
     );
@@ -2657,6 +2769,7 @@ class ExtraKeysManager {
       touchLayout: Boolean(this.tm?.isTouchLayout?.()),
       agentName: active?.agentName ?? null,
       agentState: active?.agentState ?? null,
+      agentStatus: active?.agentStatus ?? null,
       attention: active?.attention ?? null,
       attentionBaselineSeq: active?.quickReplyAttentionBaseline ?? null,
     });
@@ -6018,6 +6131,7 @@ class TerminalManager {
     this.initSessionsDock();
     this.initSettingsRuntime();
     this.initIdeShell();
+    this.initAgentsOverview();
 
     // Button handlers
     document
@@ -6375,6 +6489,8 @@ class TerminalManager {
     // Bootstrap may end with zero terminals (nothing to restore and the
     // create failed): show the launcher instead of a blank canvas.
     if (!isPending) this.syncWorkspaceLauncher();
+    // The session the page settled on is the one the user sees.
+    if (!isPending && this.agentsRenderedHtml) this.syncAttentionIndicators();
   }
 
   // --- Zero-terminal launcher -------------------------------------------------
@@ -6556,7 +6672,7 @@ class TerminalManager {
       requestAnimationFrame(() => {
         this.performReconnectLayoutSync(this.activeId, {
           forceResize: true,
-          scrollToPrompt: platformDetector.hasTouch,
+          scrollToPrompt: this.getReconnectScrollToPrompt(),
         });
       });
     };
@@ -7379,6 +7495,10 @@ class TerminalManager {
       } else if (actionId === "ide") {
         button.classList.toggle("active", ideMode);
         button.setAttribute("aria-pressed", ideMode ? "true" : "false");
+      } else if (actionId === "agents") {
+        const agentsShown = this.isAgentsOverviewShown();
+        button.classList.toggle("active", agentsShown);
+        button.setAttribute("aria-pressed", agentsShown ? "true" : "false");
       }
       // Files/Git toolbar buttons are toggles: announce the state too.
       if (
@@ -7391,6 +7511,22 @@ class TerminalManager {
         );
       }
     });
+
+    const agentsToggle = this.agentsPanelToggle;
+    if (agentsToggle) {
+      const agentsShown = this.isAgentsOverviewShown();
+      const label = agentsShown
+        ? "Hide the Agents panel"
+        : "Show the Agents panel";
+      agentsToggle.setAttribute("aria-pressed", agentsShown ? "true" : "false");
+      agentsToggle.setAttribute("aria-label", label);
+      agentsToggle.title = `${label} (Ctrl+Shift+L)`;
+      // IDE mode drives its Agents view, not the hidden desktop panel.
+      agentsToggle.setAttribute(
+        "aria-controls",
+        ideMode ? "agents-ide-view" : "agents-panel",
+      );
+    }
   }
 
   async handleSurfaceAction(action, button) {
@@ -7413,6 +7549,7 @@ class TerminalManager {
     else if (action === "wrap-lines") this.toggleWrapLines();
     else if (action === "dock-sessions") this.toggleSessionsDock();
     else if (action === "toggle-ide") this.toggleIdeMode();
+    else if (action === "agents") this.toggleAgentsPanel();
     else if (action === "help") this.openHelp();
     else if (action === "palette") this.toggleCommandPalette();
 
@@ -7729,6 +7866,13 @@ class TerminalManager {
       event.preventDefault();
       void this.handleSessionRowActivate(row.dataset.sessionId);
     });
+    panel
+      .querySelector("#sessions-next-agent")
+      ?.addEventListener("click", () => {
+        void this.goToNextAgent().then((went) => {
+          if (went) this.closeSessionsPanel({ restoreFocus: false });
+        });
+      });
   }
 
   getSessionsFocusableElements() {
@@ -7774,9 +7918,65 @@ class TerminalManager {
       case "open-here":
         await this.createTerminal(false, { cwd: session.cwd });
         break;
+      case "resume":
+        await this.resumeAgentSession(sessionId);
+        break;
     }
     this.updateSessionsAvailableBadge();
     this.closeSessionsPanel({ restoreFocus: false });
+  }
+
+  // S3 one-tap resume: the server reopens the agent conversation of an ENDED
+  // session in a new terminal in the agent's folder (POST
+  // /api/terminals/:id/resume, through the normal create path). Only ever
+  // called from a tap or a key press on a "Resume" control, never at boot
+  // or on reconnect.
+  async resumeAgentSession(sessionId) {
+    const session = (this._sessionCatalog || []).find(
+      (s) => s?.id === sessionId,
+    );
+    const resume = window.SessionActions?.resumeInfo?.(session);
+    if (!session || !resume) {
+      await this.refreshSessionsPanel();
+      return false;
+    }
+    // A double tap must not start the agent twice.
+    this.agentResumesInFlight ||= new Set();
+    if (this.agentResumesInFlight.has(sessionId)) return false;
+    this.agentResumesInFlight.add(sessionId);
+    const url = `/api/terminals/${encodeURIComponent(sessionId)}/resume`;
+    let result = null;
+    try {
+      result = await this.createTerminal(false, {
+        cwd: resume.cwd,
+        createRequest: ({ cols, rows }) =>
+          fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cols, rows }),
+          }),
+      });
+    } finally {
+      this.agentResumesInFlight.delete(sessionId);
+    }
+    if (result?.resumed && result.resumed.typed === false) {
+      this.notify({
+        key: "agent-resume-folder",
+        kind: "info",
+        title: "Opened a shell without resuming",
+        body: `${resume.cwd} is no longer available, so ${resume.agent} was not started.`,
+      });
+    }
+    if (result?.resumed?.typed) {
+      // The server cleared the ended row's resume data: drop the button now
+      // instead of waiting for the next catalog refresh.
+      this._sessionCatalog = (this._sessionCatalog || []).map((s) =>
+        s?.id === sessionId ? { ...s, resume: null } : s,
+      );
+    }
+    this.renderAgentsOverview();
+    this.queueTelemetryRefresh(0);
+    return Boolean(result);
   }
 
   // Desktop: Sessions is a SurfaceWindow (non-modal, terminals stay usable);
@@ -7829,9 +8029,10 @@ class TerminalManager {
 
   focusSessionsWindowAfterRender(panel, listState, parked) {
     if (panel.classList.contains("hidden")) return;
-    // "Open here" rows create a terminal on Enter; never land on one.
+    // "Open here" and "Resume" rows create a terminal on Enter; never land
+    // on one.
     const safeRow = panel.querySelector(
-      '#sessions-list .session-row:not([data-row-action="open-here"])',
+      '#sessions-list .session-row:not([data-row-action="open-here"]):not([data-row-action="resume"])',
     );
     const target = window.SurfaceWindows?.planSessionsWindowFocus?.({
       listState,
@@ -7863,7 +8064,7 @@ class TerminalManager {
     else if (plan === "front") {
       this.surfaceWindowManager?.bringToFront("sessions");
       const row = panel.querySelector(
-        '#sessions-list .session-row:not([data-row-action="open-here"])',
+        '#sessions-list .session-row:not([data-row-action="open-here"]):not([data-row-action="resume"])',
       );
       if (row) row.focus({ preventScroll: true });
       else panel.querySelector("#sessions-refresh-btn")?.focus();
@@ -7934,6 +8135,7 @@ class TerminalManager {
       // Keep the catalog so the click handler can resolve cwd/flags per row.
       this._sessionCatalog = sessions;
       this.updateSessionsAvailableBadge(sessions);
+      this.renderAgentsOverview();
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
         return "empty";
@@ -7942,8 +8144,11 @@ class TerminalManager {
       const signals = window.TaskSignals;
       const seen = this.getAttentionSeenMap();
       const now = Date.now();
+      // Agents overview order (needs you > done > working > idle > shell).
+      const overview = window.AgentOverview;
+      const tierOptions = { activeVisibleId: this.getActiveVisibleTerminalId() };
       const ordered = signals?.orderSessionsForPanel
-        ? signals.orderSessionsForPanel(sessions, seen)
+        ? signals.orderSessionsForPanel(sessions, seen, tierOptions)
         : sessions;
       list.innerHTML = ordered
         .map((s) => {
@@ -7961,6 +8166,12 @@ class TerminalManager {
             : "";
           const title =
             signals?.sessionDisplayTitle?.(s) || s.cwd || "Terminal";
+          const tier = overview?.statusTier?.(s, seen, tierOptions) ?? null;
+          const tierIcon =
+            tier !== null &&
+            (tier <= overview.TIER_IDLE || tier === overview.TIER_RESUMABLE)
+              ? `<span class="agent-tier-icon" data-tier="${tier}" role="img" aria-label="${esc(overview.TIER_LABELS[tier])}" title="${esc(overview.tooltipFor(s, tier))}">${overview.TIER_ICONS[tier]}</span>`
+              : "";
           const unseen = signals?.hasUnseenAttention?.(s, seen[s.id], {
             isActiveVisible: s.id === this.getActiveVisibleTerminalId(),
           });
@@ -7978,16 +8189,29 @@ class TerminalManager {
             attentionAt > 0 &&
             String(s.agentState || "").toLowerCase() !== "responding" &&
             (Number(s.lastActivityAt) || 0) <= attentionAt + 15_000;
-          const agentState = !freshNeedsInput
-            ? String(s.agentState || "").toLowerCase()
-            : attentionKind === "needs-input"
-              ? "" // the attention chip already says "Needs your input"
-              : "needs input";
+          // The screen-rule status, when the server has one, wins over
+          // agentState (which only says whether output is flowing).
+          const statusWord = {
+            blocked: "needs you",
+            working: "working",
+            idle: "idle",
+          }[s.agentStatus];
+          const agentState = statusWord
+            ? attentionKind === "needs-input" && s.agentStatus === "blocked"
+              ? ""
+              : statusWord
+            : !freshNeedsInput
+              ? String(s.agentState || "").toLowerCase()
+              : attentionKind === "needs-input"
+                ? "" // the attention chip already says "Needs your input"
+                : "needs input";
           const agentChip = s.agentName
             ? `<span class="session-chip session-chip-agent">${esc(s.agentName)}${agentState ? ` · ${esc(agentState)}` : ""}</span>`
-            : s.running
-              ? `<span class="session-chip session-chip-running">Running</span>`
-              : "";
+            : action.kind === "resume"
+              ? `<span class="session-chip session-chip-agent session-chip-resume">${esc(action.agent)} · was running</span>`
+              : s.running
+                ? `<span class="session-chip session-chip-running">Running</span>`
+                : "";
           const attentionChip = attentionKind
             ? `<span class="session-chip session-chip-attention" data-kind="${esc(attentionKind)}">${esc(ATTENTION_KIND_LABELS[attentionKind] || "Attention")}</span>`
             : "";
@@ -8004,9 +8228,13 @@ class TerminalManager {
           ]
             .filter(Boolean)
             .join(" · ");
-          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" title="${esc(`Session ${s.id}`)}">
+          const rowTitle =
+            action.kind === "resume"
+              ? overview?.resumeTooltip?.(s) || action.label
+              : `Session ${s.id}`;
+          return `<div class="session-row" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="${esc(action.kind)}" data-attention="${esc(attentionKind)}" data-tier="${tier ?? ""}" title="${esc(rowTitle)}">
           <div class="session-row-main">
-            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> <span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
+            <strong class="session-row-title"><span class="session-badge ${action.statusClass}">${dot}</span> ${tierIcon}<span class="session-row-name">${esc(title)}</span>${attentionChip}${agentChip}</strong>
             <div class="session-row-cwd">${cwd}</div>
             ${attentionText ? `<div class="session-row-attention">${esc(attentionText)}</div>` : ""}
             <small>${meta}</small>
@@ -8237,6 +8465,9 @@ class TerminalManager {
         // the desktop default (nor shows a desktop's via the touch default).
         ...this.createExtraKeysVisibilitySideEffects(),
         "tasks.view": (value) => this.applyTaskView(value),
+        // Agents overview: each device class reads only its own key.
+        "agents.panelVisible": () => this.syncAgentsPanelVisibility(),
+        "agents.summaryVisibleTouch": () => this.renderAgentsOverview(),
         "files.defaultCwd": (value) => this.applyDefaultCwd(value),
         "editor.autosave": (value) => this.applyEditorAutosave(value),
         "terminal.renderer": (value) => this.applyRendererSetting(value),
@@ -10787,6 +11018,24 @@ class TerminalManager {
         run: () => this.createTerminal(),
       },
       {
+        id: "agents",
+        title: "Agents Panel",
+        group: "Views",
+        icon: "bot",
+        keywords: ["agents", "overview", "sessions", "projects", "needs you"],
+        priority: 46,
+        run: () => this.toggleAgentsPanel(),
+      },
+      {
+        id: "next-agent",
+        title: "Next Agent",
+        group: "Actions",
+        icon: "skip-forward",
+        keywords: ["agent", "needs you", "attention", "done", "next"],
+        priority: 47,
+        run: () => this.goToNextAgent(),
+      },
+      {
         id: "split-workspace",
         title: "Split Workspace",
         group: "Actions",
@@ -11649,6 +11898,17 @@ class TerminalManager {
     }
   }
 
+  // /ws/terminals/:id socket URL. Touch-layout pages add `scroll=1` so the
+  // server sends them scroll-position frames for the touch scroll indicator.
+  // Desktop pages never do (a page without the handler would print the
+  // frames as terminal text). Every page that knows `agents_changed` adds
+  // `agents=1` (same opt-in mechanism, design 1.8).
+  terminalSocketUrl(id) {
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const scroll = this.isTouchLayout() ? "&scroll=1" : "";
+    return `${protocol}//${location.host}/ws/terminals/${id}?clientId=${encodeURIComponent(this.clientInstanceId)}${scroll}&agents=1`;
+  }
+
   bindTerminalActivation(id, element) {
     if (!element) return null;
     const activate = () => this.activateTerminal(id);
@@ -11866,6 +12126,7 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
+          terminal.agentStatus = next.agentStatus ?? null;
           this.applyTerminalAttention(terminal, next, id);
           // Under tmux the server reads the pane's live cwd on every poll, so
           // it is authoritative (bash emits no OSC 7 and tmux would not
@@ -12365,34 +12626,79 @@ class TerminalManager {
     }
   }
 
+  // Seen map (terminal id -> highest attention seq seen), shared by every
+  // device of the actor through the server setting `attention.seen`, which
+  // the server merges per id by max (design section 3). Kept in memory here;
+  // writes go through settingsStore (debounced PUT).
   getAttentionSeenMap() {
     if (!this._attentionSeen) {
-      let raw = null;
-      try {
-        raw = localStorage.getItem(
-          window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
-            "deckterm.attention.seen.v1",
-        );
-      } catch {
-        raw = null;
-      }
-      this._attentionSeen = window.TaskSignals?.parseSeenMap?.(raw) || {};
+      this._attentionSeen =
+        window.AgentOverview?.sanitizeSeenMap?.(
+          this.settingsStore?.get?.("attention.seen", null),
+        ) || {};
     }
     return this._attentionSeen;
   }
 
   saveAttentionSeenMap() {
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    const value = merge
+      ? merge(this._attentionSeen || {}, {})
+      : this._attentionSeen || {};
+    this.settingsStore?.set?.("attention.seen", value);
+  }
+
+  // One-time import of the old per-browser seen map (localStorage
+  // deckterm.attention.seen.v1) into the server setting, then the local key
+  // is removed. Runs once settings have loaded.
+  importLegacyAttentionSeen() {
+    const key =
+      window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
+      "deckterm.attention.seen.v1";
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    // Anything marked before the settings arrived joins the loaded value.
+    const early = this._attentionSeen || {};
+    this._attentionSeen = null;
+    if (merge) {
+      this._attentionSeen = merge(this.getAttentionSeenMap(), early);
+    }
+    let raw = null;
     try {
-      localStorage.setItem(
-        window.TaskSignals?.ATTENTION_SEEN_STORAGE_KEY ||
-          "deckterm.attention.seen.v1",
-        JSON.stringify(this._attentionSeen || {}),
-      );
+      raw = localStorage.getItem(key);
     } catch {
-      // Private mode / quota: unseen state just stays in memory.
+      return;
+    }
+    if (!raw) return;
+    const legacy = window.TaskSignals?.parseSeenMap?.(raw) || {};
+    if (Object.keys(legacy).length && merge) {
+      this._attentionSeen = merge(this.getAttentionSeenMap(), legacy);
+      this.saveAttentionSeenMap();
+    }
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // Private mode: the import simply runs again next time.
     }
   }
 
+  // Coming back to the page: fold the server's seen map (another device may
+  // have viewed a session meanwhile) into ours by max, then re-render.
+  async refreshAttentionSeenFromServer() {
+    const merge = window.AgentOverview?.mergeSeenMaps;
+    if (!this.settingsStore?.refresh || !merge) return;
+    const local = this.getAttentionSeenMap();
+    const merged = await this.settingsStore.refresh(
+      "attention.seen",
+      (cached, server) => merge(merge(cached, server), local),
+    );
+    this._attentionSeen = window.AgentOverview.sanitizeSeenMap(merged);
+    this.updateTabGroups();
+    this.renderAgentsOverview();
+  }
+
+  // Ids the catalog no longer lists are dropped from memory only: the server
+  // keeps the 200 most recent entries itself, and a write could not remove
+  // them anyway (it merges by max).
   pruneAttentionSeen(catalog) {
     if (!Array.isArray(catalog) || catalog.length === 0) return;
     const seen = this.getAttentionSeenMap();
@@ -12402,7 +12708,6 @@ class TerminalManager {
     );
     if (pruned && Object.keys(pruned).length !== Object.keys(seen).length) {
       this._attentionSeen = pruned;
-      this.saveAttentionSeenMap();
     }
   }
 
@@ -12433,7 +12738,13 @@ class TerminalManager {
   // Marks the active, visible session as seen and refreshes the app badge.
   syncAttentionIndicators() {
     const activeVisibleId = this.getActiveVisibleTerminalId();
-    if (activeVisibleId) this.markAttentionSeen(activeVisibleId);
+    // While the page attaches its sessions one by one at load, each becomes
+    // active for a moment; only the one it settles on counts as seen.
+    if (activeVisibleId && !this.bootstrapPending) {
+      this.markAttentionSeen(activeVisibleId);
+    }
+    // Seen and "active, visible" both feed the Agents overview tiers.
+    this.renderAgentsOverview();
     const signals = window.TaskSignals;
     if (typeof signals?.countUnseenAttention !== "function") return;
     const sessions = new Map();
@@ -13201,6 +13512,488 @@ class TerminalManager {
     this.settingsStore?.set("ide.sidebarWidth", null);
   }
 
+  // --- Agents overview (S2): desktop panel, IDE view, phone chip -----------
+  // Design docs/plans/2026-10-22-agent-attention-design.md section 2. The
+  // view model is web/agent-overview.js; this wires it to the DOM, the
+  // settings (agents.panelVisible desktop, agents.summaryVisibleTouch touch,
+  // agents.panelWidth, attention.seen) and the IDE sidebar sash contract.
+
+  initAgentsOverview() {
+    this.agentsPanel = document.getElementById("agents-panel");
+    this.agentsPanelBody = document.getElementById("agents-panel-body");
+    this.agentsPanelSash = document.getElementById("agents-panel-sash");
+    this.agentsSummaryChip = document.getElementById("agents-summary-chip");
+    // Agents panel width in px; null = the CSS default (240 px).
+    this.agentsPanelWidthPx = null;
+    this.agentsIdeContainer = null;
+    this.agentsPanelShown = false;
+    this.agentsRenderedHtml = new WeakMap();
+
+    this.agentsPanelSash?.addEventListener("pointerdown", (e) =>
+      this.startAgentsPanelSashDrag(e),
+    );
+    this.agentsPanelSash?.addEventListener("dblclick", () =>
+      this.resetAgentsPanelSash(),
+    );
+    // The toolbar's top-left toggle: same as Ctrl+Shift+L, and it stays in
+    // place while the panel is hidden.
+    this.agentsPanelToggle = document.getElementById("agents-panel-toggle");
+    this.agentsPanelToggle?.addEventListener("click", () =>
+      this.toggleAgentsPanel(),
+    );
+    const onListClick = (event) => {
+      if (event.target.closest("[data-agents-next]")) {
+        void this.goToNextAgent();
+        return;
+      }
+      const row = event.target.closest("[data-agent-session-id]");
+      if (!row) return;
+      // The "Resume" group: one tap reopens the agent conversation.
+      if (row.dataset.agentResume === "1") {
+        void this.resumeAgentSession(row.dataset.agentSessionId);
+        return;
+      }
+      void this.activateAgentSession(row.dataset.agentSessionId);
+    };
+    this.agentsPanelBody?.addEventListener("click", onListClick);
+    this.onAgentsListClick = onListClick;
+    this.agentsSummaryChip?.addEventListener("click", () => {
+      void this.openSessionsPanel();
+    });
+
+    window.addEventListener("deckterm:agents-changed", () =>
+      this.queueTelemetryRefresh(0),
+    );
+    window.addEventListener("resize", () => {
+      // Re-clamp (not saved) so the panel never exceeds half of a shrunken
+      // window, and re-check the 768 px breakpoint.
+      if (Number.isFinite(this.agentsPanelWidthPx)) this.applyAgentsPanelWidth();
+      this.syncAgentsPanelVisibility();
+    });
+    platformDetector.onChange(() => {
+      this.syncAgentsPanelVisibility();
+      this.renderAgentsOverview();
+    });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState !== "visible") return;
+      void this.refreshAttentionSeenFromServer();
+    });
+    // Push deep link: the service worker posts the session to an open window.
+    navigator.serviceWorker?.addEventListener?.("message", (event) => {
+      if (event.data?.type !== "deckterm-open-session") return;
+      void this.openSessionFromDeepLink(event.data.terminalId);
+    });
+
+    void this.settingsReady.then(() => {
+      this.agentsPanelWidthPx = window.AgentOverview?.storedPanelWidth?.(
+        this.settingsStore?.get("agents.panelWidth", null),
+      );
+      this.applyAgentsPanelWidth();
+      this.importLegacyAttentionSeen();
+      this.syncAgentsPanelVisibility({ refit: false });
+      // A saved "hidden" changes nothing above, so set the toggle state here.
+      this.syncSurfaceButtonState();
+      this.renderAgentsOverview();
+    });
+    // A boot URL `/?session=<id>` (push deep link with no window open).
+    void (this.bootstrapPromise || Promise.resolve()).then(() =>
+      this.consumeSessionBootParam(),
+    );
+  }
+
+  // Fullscreen hides the panel too: not eligible there, so the panel state,
+  // the toolbar's aria-pressed and the terminal width follow reality.
+  isAgentsPanelEligible() {
+    return (
+      !platformDetector.isMobile &&
+      window.innerWidth >= 768 &&
+      !document.body.classList.contains("ide-mode") &&
+      !document.body.classList.contains("chrome-mobile") &&
+      !document.body.classList.contains("fullscreen")
+    );
+  }
+
+  // desktop reads only agents.panelVisible (never the touch key), with its
+  // own default, so a cleared store shows the panel.
+  readAgentsPanelSetting() {
+    return this.settingsStore?.get("agents.panelVisible", true) !== false;
+  }
+
+  readAgentsChipSetting() {
+    return this.settingsStore?.get("agents.summaryVisibleTouch", true) !== false;
+  }
+
+  // Panel or IDE view currently on screen (toolbar button state).
+  isAgentsOverviewShown() {
+    if (this.isIdeModeActive?.() && this.ideShell) {
+      return (
+        this.ideShell.activeView?.() === "agents" &&
+        !this.ideShell.isSidebarCollapsed?.()
+      );
+    }
+    return Boolean(this.agentsPanelShown);
+  }
+
+  syncAgentsPanelVisibility({ refit = true } = {}) {
+    const panel = this.agentsPanel;
+    if (!panel) return;
+    const show = this.isAgentsPanelEligible() && this.readAgentsPanelSetting();
+    panel.hidden = !show;
+    if (this.agentsPanelSash) this.agentsPanelSash.hidden = !show;
+    const changed = show !== this.agentsPanelShown;
+    this.agentsPanelShown = show;
+    if (show && changed) this.renderAgentsOverview();
+    if (changed) {
+      this.syncSurfaceButtonState();
+      if (refit) this.refitVisibleTerminalsForAgentsPanel();
+    }
+  }
+
+  // Same settle as the IDE sidebar sash drag end: a synthetic resize, then
+  // an explicit refit of every visible terminal.
+  refitVisibleTerminalsForAgentsPanel() {
+    window.dispatchEvent(new Event("resize"));
+    requestAnimationFrame(() => {
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    });
+  }
+
+  setAgentsPanelVisible(visible) {
+    const value = Boolean(visible);
+    if (this.settingsRuntime) {
+      this.settingsRuntime.apply("agents.panelVisible", value);
+    } else {
+      this.settingsStore?.set("agents.panelVisible", value);
+      this.syncAgentsPanelVisibility();
+    }
+    // A deliberate layout choice: save it now, not after the debounce, so a
+    // reload right after the toggle keeps it.
+    void this.settingsStore?.flush?.().catch(() => {});
+    if (!value) this.focusActiveTerminalSoft?.();
+  }
+
+  // Toolbar button, palette action and Ctrl+Shift+L. Desktop default view:
+  // flip agents.panelVisible. IDE mode: show or collapse the Agents activity
+  // view. Phones and narrow windows (no panel there): the sorted Sessions
+  // sheet.
+  toggleAgentsPanel() {
+    // Fullscreen hides the panel: a toggle there would flip the saved setting
+    // with nothing on screen, so it does nothing.
+    if (document.body.classList.contains("fullscreen")) return;
+    if (this.isIdeModeActive?.() && this.ideShell) {
+      this.ideShell.onActivityClick?.("agents");
+      this.syncSurfaceButtonState();
+      return;
+    }
+    if (!this.isAgentsPanelEligible()) {
+      void this.openSessionsPanel();
+      return;
+    }
+    this.setAgentsPanelVisible(!this.readAgentsPanelSetting());
+  }
+
+  agentsOverviewOptions() {
+    return { activeVisibleId: this.getActiveVisibleTerminalId() };
+  }
+
+  // Render the panel, the IDE view, the phone chip and the Sessions bar from
+  // the last /api/terminals catalog. Cheap: DOM is touched only on change.
+  renderAgentsOverview() {
+    const overview = window.AgentOverview;
+    if (!overview || !this.agentsRenderedHtml) return;
+    const sessions = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    const seen = this.getAttentionSeenMap();
+    const opts = this.agentsOverviewOptions();
+    const signals = window.TaskSignals;
+    const now = Date.now();
+    const listOptions = {
+      ...opts,
+      getTitle: (s) =>
+        signals?.sessionDisplayTitle?.(s) || s?.cwd || "Terminal",
+      getAge: (s) => {
+        const at = signals?.sessionActivityAt?.(s) || 0;
+        return at ? signals?.formatActivityAge?.(now - at) || "" : "";
+      },
+    };
+    const targets = [];
+    if (this.agentsPanelShown && this.agentsPanelBody) {
+      targets.push(this.agentsPanelBody);
+    }
+    if (this.agentsIdeContainer?.isConnected) targets.push(this.agentsIdeContainer);
+    if (targets.length) {
+      const html = overview.renderAgentListHtml(sessions, seen, listOptions);
+      for (const el of targets) {
+        // Unchanged model, unchanged DOM. The row age is minute-grained
+        // ("just now", "3 min ago"), so it changes the HTML at most once a
+        // minute per row.
+        if (this.agentsRenderedHtml.get(el) === html) continue;
+        this.agentsRenderedHtml.set(el, html);
+        this.replaceAgentsListHtml(el, html);
+      }
+    }
+
+    const counts = overview.summaryCounts(sessions, seen, opts);
+    const next = overview.nextTarget(sessions, seen, opts);
+
+    const chip = this.agentsSummaryChip;
+    if (chip) {
+      const showChip =
+        platformDetector.isMobile &&
+        this.readAgentsChipSetting() &&
+        overview.showSummaryChip(counts);
+      chip.hidden = !showChip;
+      if (showChip) {
+        const phone = overview.summaryText(counts, "phone");
+        if (chip.textContent !== phone.text) chip.textContent = phone.text;
+        chip.setAttribute("aria-label", `${phone.label}. Open Sessions`);
+        chip.title = phone.label;
+        chip.dataset.attention =
+          counts.needsYou > 0 ? "needs-you" : counts.done > 0 ? "done" : "";
+      }
+    }
+
+    const bar = document.getElementById("sessions-agents-bar");
+    if (bar) {
+      const summary = document.getElementById("sessions-agents-summary");
+      if (summary) summary.textContent = overview.summaryText(counts).text;
+      const nextBtn = document.getElementById("sessions-next-agent");
+      if (nextBtn) {
+        nextBtn.disabled = !next;
+        const label = next
+          ? `Go to ${listOptions.getTitle(next)}`
+          : "Nothing needs you";
+        nextBtn.title = label;
+        nextBtn.setAttribute(
+          "aria-label",
+          next ? `Next agent: ${label}` : `Next agent: ${label}`,
+        );
+      }
+    }
+  }
+
+  // Rebuild an Agents list (panel or IDE view) and keep keyboard focus: when
+  // focus was on a button inside it, the button with the same key (same
+  // session and role) gets it back, else the one now at its old position.
+  agentsListFocusables(el) {
+    return Array.from(
+      el.querySelectorAll("button:not([disabled]), a[href], [tabindex]"),
+    );
+  }
+
+  replaceAgentsListHtml(el, html) {
+    const overview = window.AgentOverview;
+    const focused = document.activeElement;
+    const hadFocus =
+      focused && focused !== el && el.contains(focused) && overview?.focusKeyOf;
+    const previousKeys = hadFocus
+      ? this.agentsListFocusables(el).map((node) =>
+          overview.focusKeyOf(node.dataset),
+        )
+      : null;
+    const previousKey = hadFocus ? overview.focusKeyOf(focused.dataset) : null;
+    el.innerHTML = html;
+    if (!hadFocus) return;
+    const items = this.agentsListFocusables(el);
+    const index = overview.pickFocusIndex(
+      previousKeys,
+      previousKey,
+      items.map((node) => overview.focusKeyOf(node.dataset)),
+    );
+    if (index >= 0) items[index].focus({ preventScroll: true });
+  }
+
+  // Focus a session from the panel, Next or a deep link: switch to an open
+  // tab, or attach a live session that is not open here. Ended rows are
+  // never re-created from here.
+  async activateAgentSession(sessionId) {
+    if (!sessionId) return false;
+    if (this.terminals.has(sessionId)) {
+      this.switchTo(sessionId);
+      this.markAttentionSeen(sessionId);
+      this.renderAgentsOverview();
+      return true;
+    }
+    const session = (this._sessionCatalog || []).find(
+      (s) => s?.id === sessionId,
+    );
+    if (!session) return false;
+    const action = window.SessionActions?.planSessionRowAction?.(session, {
+      isLocallyOpen: false,
+    });
+    if (action?.kind !== "attach") return false;
+    await this.cancelScheduledTerminalClose(sessionId);
+    await this.reconnectToTerminal(
+      sessionId,
+      session.cwd,
+      this.sessionRegistry.get(sessionId),
+      {
+        backendMode: session.backendMode || null,
+        supportsLinkedView: Boolean(session.supportsLinkedView),
+      },
+    );
+    this.switchTo(sessionId);
+    this.updateSessionsAvailableBadge();
+    this.queueTelemetryRefresh(0);
+    return true;
+  }
+
+  // "Next": needs you first, then done-unseen, skipping the active, visible
+  // session. Visiting a done session marks it seen, so the next press moves
+  // on. Returns whether it went somewhere.
+  async goToNextAgent() {
+    const overview = window.AgentOverview;
+    if (!overview) return false;
+    const target = overview.nextTarget(
+      this._sessionCatalog || [],
+      this.getAttentionSeenMap(),
+      this.agentsOverviewOptions(),
+    );
+    if (!target) {
+      this.notify?.({
+        key: "agents-next",
+        kind: "info",
+        title: "Nothing needs you",
+        body: "No agent is waiting for an answer or finished unseen.",
+      });
+      return false;
+    }
+    const went = await this.activateAgentSession(target.id);
+    if (went) this.focusActiveTerminalSoft?.();
+    return went;
+  }
+
+  // Push deep link (service-worker message or boot `?session=`): only a UUID
+  // that is in this actor's own /api/terminals list is acted on.
+  async openSessionFromDeepLink(rawId) {
+    const id = window.AgentOverview?.sessionIdFromDeepLink?.(rawId);
+    if (!id) return false;
+    try {
+      const res = await fetch("/api/terminals", {
+        headers: { "x-deckterm-client-id": this.clientInstanceId },
+      });
+      if (!res.ok) return false;
+      const sessions = await res.json();
+      if (!Array.isArray(sessions)) return false;
+      this._sessionCatalog = sessions;
+    } catch {
+      return false;
+    }
+    if (!(this._sessionCatalog || []).some((s) => s?.id === id)) return false;
+    return this.activateAgentSession(id);
+  }
+
+  consumeSessionBootParam() {
+    let url;
+    try {
+      url = new URL(window.location.href);
+    } catch {
+      return;
+    }
+    if (!url.searchParams.has("session")) return;
+    const raw = url.searchParams.get("session");
+    url.searchParams.delete("session");
+    try {
+      history.replaceState(
+        history.state,
+        "",
+        `${url.pathname}${url.search}${url.hash}`,
+      );
+    } catch {
+      // Keep going: the parameter is harmless if it stays.
+    }
+    void this.openSessionFromDeepLink(raw);
+  }
+
+  // --- Agents panel width (right-edge sash, IDE sidebar sash contract) ------
+
+  clampAgentsPanelWidth(px) {
+    return (
+      window.AgentOverview?.clampPanelWidth?.(px, window.innerWidth) ??
+      this.clampIdeSidebarWidth(px)
+    );
+  }
+
+  applyAgentsPanelWidth() {
+    const root = document.documentElement;
+    if (Number.isFinite(this.agentsPanelWidthPx)) {
+      root.style.setProperty(
+        "--agents-panel-width",
+        `${this.clampAgentsPanelWidth(this.agentsPanelWidthPx)}px`,
+      );
+    } else {
+      root.style.removeProperty("--agents-panel-width");
+    }
+  }
+
+  startAgentsPanelSashDrag(e) {
+    e.preventDefault();
+    const panel = this.agentsPanel;
+    if (!panel || panel.hidden) return;
+    const rect = panel.getBoundingClientRect();
+    const sash = this.agentsPanelSash;
+    sash?.classList.add("dragging");
+    const apply = (clientX) => {
+      this.agentsPanelWidthPx = this.clampAgentsPanelWidth(clientX - rect.left);
+      this.applyAgentsPanelWidth();
+      window.dispatchEvent(new Event("resize"));
+    };
+    const onMove = (ev) => apply(ev.clientX);
+    const onEnd = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onEnd);
+      document.removeEventListener("pointercancel", onEnd);
+      sash?.classList.remove("dragging");
+      this.settingsStore?.set("agents.panelWidth", this.agentsPanelWidthPx);
+      void this.settingsStore?.flush?.().catch(() => {});
+      for (const [id, t] of this.terminals) {
+        if (!t?.element || t.element.offsetParent === null) continue;
+        this.performReconnectLayoutSync(id, { forceResize: true });
+      }
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onEnd);
+    document.addEventListener("pointercancel", onEnd);
+  }
+
+  resetAgentsPanelSash() {
+    this.agentsPanelWidthPx = null;
+    this.applyAgentsPanelWidth();
+    this.settingsStore?.set("agents.panelWidth", null);
+    void this.settingsStore?.flush?.().catch(() => {});
+    this.refitVisibleTerminalsForAgentsPanel();
+  }
+
+  // IDE mode: the same list as an activity-bar view (design 2.5). It uses the
+  // IDE sidebar and its width; agents.panelVisible does not affect it.
+  initAgentsIdeView() {
+    if (!this.ideShell) return;
+    this.ideShell.addView({
+      id: "agents",
+      icon: "bot",
+      title: "Agents",
+      mount: (container) => {
+        const view = document.createElement("div");
+        view.className = "agents-ide-view";
+        // The corner toggle's aria-controls target in IDE mode.
+        view.id = "agents-ide-view";
+        view.addEventListener("click", (event) => this.onAgentsListClick?.(event));
+        container.replaceChildren(view);
+        this.agentsIdeContainer = view;
+        this.renderAgentsOverview();
+      },
+      unmount: () => {
+        this.agentsIdeContainer?.remove();
+        this.agentsIdeContainer = null;
+      },
+      resize: () => this.renderAgentsOverview(),
+    });
+  }
+
   applyDockState({ persist = true } = {}) {
     const enabled = this.dockState.enabled && this.isWindowedSurfaces();
     document.body.classList.toggle("sessions-docked", enabled);
@@ -13363,6 +14156,7 @@ class TerminalManager {
     this.initScmView();
     this.initTasksView();
     this.initSearchView();
+    this.initAgentsIdeView();
     // The IDE toggle is desktop-only; reveal/hide it as the viewport crosses the
     // breakpoint and re-apply the resolved mode (a narrow viewport renders
     // terminal WITHOUT overwriting the stored desktop preference).
@@ -13966,6 +14760,7 @@ class TerminalManager {
     this.closeTerminalSearch();
     this.applyIdeDockHeight();
     this.ensureIdeExplorerLoaded();
+    this.syncAgentsPanelVisibility({ refit: false });
   }
 
   // Leaving IDE mode: removing `body.ide-mode` (by the controller) restores the
@@ -13977,6 +14772,8 @@ class TerminalManager {
     // TileManager layout, so any open search overlay must be disposed rather
     // than left bound to a container it's about to leave.
     this.closeTerminalSearch();
+    // The Agents panel returns according to its setting.
+    this.syncAgentsPanelVisibility({ refit: false });
   }
 
   // In IDE mode the Explorer lives permanently in the sidebar, so it must load the
@@ -14387,6 +15184,17 @@ class TerminalManager {
         e.preventDefault();
         this.splitWorkspace();
       }
+      // Agents panel (Ctrl+Shift+L) and Next agent (Ctrl+Shift+X): like every
+      // Ctrl+Shift+letter they produce no terminal input, so they work inside
+      // a terminal too.
+      if (e.ctrlKey && e.shiftKey && !e.altKey && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        this.toggleAgentsPanel();
+      }
+      if (e.ctrlKey && e.shiftKey && !e.altKey && e.key.toLowerCase() === "x") {
+        e.preventDefault();
+        void this.goToNextAgent();
+      }
       if (e.ctrlKey && e.key >= "1" && e.key <= "9") {
         e.preventDefault();
         this.switchToIndex(parseInt(e.key));
@@ -14693,8 +15501,7 @@ class TerminalManager {
       );
     }
 
-    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const wsUrl = `${protocol}//${location.host}/ws/terminals/${id}?clientId=${encodeURIComponent(this.clientInstanceId)}`;
+    const wsUrl = this.terminalSocketUrl(id);
     dbg(`[reconnect] WebSocket URL: ${wsUrl}`);
 
     const ws = new ReconnectingWebSocket(wsUrl, id, {
@@ -14717,6 +15524,9 @@ class TerminalManager {
       onTerminalState: (message) => {
         this.applyTerminalRuntimeState(id, message);
       },
+      onScrollPosition: (state) =>
+        this.terminals.get(id)?.touchScroll?.render(state),
+      onHaltTouchScroll: () => this.terminals.get(id)?.touchScroll?.halt(),
       onInputDropped: () => this.showInputDroppedNotice(id),
       getReconnectBehavior: () => this.reconnectBehavior,
     });
@@ -14728,22 +15538,18 @@ class TerminalManager {
       if (dbg)
         dbg.textContent = `onData1: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
 
+      // xterm reads an emptied helper textarea as "" (see the touch
+      // fallback); there is nothing to forward.
+      if (!data) return;
+      // What xterm forwards claims the DOM event it came from (F17).
+      inputState.keystroke?.xtermData(data);
+
       if (inputState.pasteDepth > 0) {
-        inputState.lastOnDataAt = performance.now();
-        inputState.lastOnDataValue = data;
         ws.sendInput(data);
         return;
       }
 
-      const dedupedData = this.consumePendingFallbackEcho(inputState, data);
-      if (!dedupedData) {
-        if (dbg) dbg.textContent = "onData1: SKIP (fallback echo)";
-        return;
-      }
-
-      inputState.lastOnDataAt = performance.now();
-      inputState.lastOnDataValue = dedupedData;
-      const finalData = this.applyExtraKeyModifiers(dedupedData);
+      const finalData = this.applyExtraKeyModifiers(data);
       ws.sendInput(finalData);
     });
 
@@ -14764,6 +15570,11 @@ class TerminalManager {
       backendMode,
       () => terminal.modes?.mouseTrackingMode,
     );
+    const touchScroll = this.attachTouchScrollGesture(element, id, {
+      ws,
+      terminal,
+      backendMode,
+    });
     dbg("[ExtraKeys] attachMobileInputFallback (reconnect)", {
       id,
       attached: !!inputFallbackCleanup,
@@ -14806,6 +15617,7 @@ class TerminalManager {
       inputFallbackCleanup,
       pasteFallbackCleanup,
       tmuxScrollbackCleanup,
+      touchScroll,
       activationCleanup,
       selectionEdgeCleanup,
       inputState,
@@ -14868,59 +15680,10 @@ class TerminalManager {
 
   createInputState() {
     return {
-      lastOnDataAt: 0,
-      lastOnDataValue: "",
-      lastFallbackAt: 0,
-      lastFallbackData: "",
-      pendingFallbackEcho: "",
       pasteDepth: 0,
+      // Which path owns the current keystroke on touch layouts (F17).
+      keystroke: inputFallbackHelpers.createKeystrokeArbiter?.() || null,
     };
-  }
-
-  rememberFallbackEcho(inputState, data) {
-    if (!inputState || !data) return;
-
-    inputState.lastFallbackAt = performance.now();
-    inputState.lastFallbackData = data;
-    inputState.pendingFallbackEcho =
-      `${inputState.pendingFallbackEcho || ""}${data}`.slice(-256);
-  }
-
-  consumePendingFallbackEcho(inputState, data) {
-    if (!inputState || !data) return data;
-
-    let pending = inputState.pendingFallbackEcho || "";
-    let remainingData = data;
-
-    while (pending && remainingData) {
-      if (pending.startsWith(remainingData)) {
-        inputState.pendingFallbackEcho = pending.slice(remainingData.length);
-        return "";
-      }
-
-      if (remainingData.startsWith(pending)) {
-        remainingData = remainingData.slice(pending.length);
-        pending = "";
-        break;
-      }
-
-      let overlap = 0;
-      const limit = Math.min(pending.length, remainingData.length);
-      while (
-        overlap < limit &&
-        pending.charCodeAt(overlap) === remainingData.charCodeAt(overlap)
-      ) {
-        overlap += 1;
-      }
-
-      if (!overlap) break;
-
-      pending = pending.slice(overlap);
-      remainingData = remainingData.slice(overlap);
-    }
-
-    inputState.pendingFallbackEcho = pending;
-    return remainingData;
   }
 
   applyExtraKeyModifiers(data, options = {}) {
@@ -15018,8 +15781,10 @@ class TerminalManager {
     }
 
     let lastValue = textarea.value || "";
-    let lastCompositionCommitAt = 0;
-    let lastCompositionCommitData = "";
+    const keystroke = inputState?.keystroke || null;
+    // IME compositions are sent once, at commit; while composing, the text
+    // stays in the helper textarea and xterm's composition view shows it.
+    const composer = inputFallbackHelpers.createCompositionTracker?.() || null;
     const shouldUseFallback = () =>
       inputFallbackHelpers.shouldUseMobileInputFallback({
         isMobile: platformDetector.isMobile,
@@ -15029,16 +15794,26 @@ class TerminalManager {
         ),
       });
 
+    // The fallback always empties the helper textarea in the same event it
+    // sends from. xterm's own deferred readers (CompositionHelper after
+    // compositionend, the keyCode 229 diff) read the textarea on a zero
+    // timeout, so they find nothing and cannot send the text a second time.
+    const clearHelper = () => {
+      textarea.value = "";
+      lastValue = "";
+    };
+
     const sendCommittedData = (source, inputType, data, e) => {
       if (!data) {
         return false;
       }
 
-      // Track fallback-originated input so delayed xterm echoes can be skipped.
-      this.rememberFallbackEcho(inputState, data);
-
       const finalData = this.applyExtraKeyModifiers(data);
       ws.sendInput(finalData);
+      // Typing returns the view to the prompt. This path bypasses xterm's
+      // own scrollOnUserInput (it never reaches triggerDataEvent), and the
+      // viewport passes no longer snap to the bottom on touch.
+      if (this.isTouchLayout()) this.scrollActiveTerminalToPrompt();
 
       if (DEBUG) {
         dbg("[ExtraKeys] mobile input fallback:", {
@@ -15050,10 +15825,7 @@ class TerminalManager {
         });
       }
 
-      textarea.value = "";
-      lastValue = "";
-      lastCompositionCommitAt = performance.now();
-      lastCompositionCommitData = data;
+      clearHelper();
       return true;
     };
 
@@ -15101,6 +15873,9 @@ class TerminalManager {
           data: e?.data,
         });
       }
+      // Did xterm's own input listener already forward this event's text?
+      // (Asked for every event, so the claim never outlives it.)
+      const forwardedByXterm = keystroke?.takeInputEcho() || false;
       // Hybrid touch desktops should ignore the fallback and let xterm own input.
       if (!shouldUseFallback()) {
         lastValue = textarea.value || "";
@@ -15109,25 +15884,33 @@ class TerminalManager {
       if (!e) {
         return;
       }
-      // DON'T skip isComposing! Mobile keyboards use composition for ALL input.
-      // We need to process each character immediately, not wait for composition end.
 
       const inputType = e.inputType || "";
-      if (inputType === "insertText") {
-        const recent = performance.now() - lastCompositionCommitAt < 50;
-        const sameData =
-          typeof e.data === "string" && e.data === lastCompositionCommitData;
-        if (recent && sameData) {
-          return;
-        }
+      const data = typeof e.data === "string" ? e.data : null;
+      if (inputType === "insertCompositionText") {
+        // Composing: nothing is sent until the commit.
+        composer?.update(data ?? "");
+        lastValue = textarea.value || "";
+        return;
       }
-      if (inputType === "insertText" && inputState) {
-        const recent = performance.now() - (inputState.lastOnDataAt || 0) < 30;
-        const sameData =
-          typeof e.data === "string" && e.data === inputState.lastOnDataValue;
-        if (recent && sameData) {
-          return;
-        }
+      if (inputType === "deleteCompositionText") {
+        lastValue = textarea.value || "";
+        return;
+      }
+      if (inputType === "insertFromComposition" && composer) {
+        // WebKit's commit, before or after compositionend: sent once.
+        sendCommittedData(
+          "insertFromComposition",
+          inputType,
+          composer.commitFromInput(data),
+          e,
+        );
+        clearHelper();
+        return;
+      }
+      if (forwardedByXterm) {
+        clearHelper();
+        return;
       }
       commitTextareaValue("input", e);
     };
@@ -15142,9 +15925,65 @@ class TerminalManager {
           value: textarea.value,
         });
       }
-      if (type === "end") {
-        commitTextareaValue("compositionend", e);
+      if (!shouldUseFallback()) return;
+      if (type === "start") {
+        composer?.start();
       }
+      if (type === "end") {
+        if (!composer) {
+          commitTextareaValue("compositionend", e);
+          return;
+        }
+        sendCommittedData("compositionend", "", composer.end(e?.data), e);
+        clearHelper();
+      }
+    };
+
+    // Keystroke bookkeeping for the arbiter. These listeners sit on the
+    // terminal element in the capture phase, so they run before xterm's own
+    // textarea listeners and before any stopPropagation of a handled key.
+    const keydownCapture = (e) => {
+      if (e.target !== textarea) return;
+      keystroke?.keydown();
+      if (!composer || !shouldUseFallback()) return;
+      // A real key (not an IME key, not a lone modifier) ends a composition:
+      // commit its text here and empty the textarea before xterm's
+      // CompositionHelper would send the same text from it. IME keys
+      // (229 / isComposing) leave the composition and its confirmation alone.
+      const wasActive = composer.active;
+      const committed = composer.keydown({
+        keyCode: e.keyCode,
+        isComposing: e.isComposing,
+      });
+      if (wasActive && !composer.active) {
+        sendCommittedData("keydown", "", committed, e);
+        clearHelper();
+      }
+    };
+    const keypressCapture = (e) => {
+      if (e.target === textarea) keystroke?.keypress();
+    };
+    // Runs before xterm's own input listener, which forwards an uncancelled
+    // insertText by itself (after a keyup).
+    const inputCapture = (e) => {
+      if (e.target !== textarea) return;
+      keystroke?.inputEvent();
+      if (!composer || !shouldUseFallback()) return;
+      const inputType = e.inputType || "";
+      if (COMPOSITION_INPUT_TYPES.has(inputType)) return;
+      if (inputType === "insertText" && !e.isComposing) {
+        // A browser repeating the composition it just committed, with no
+        // (or a non-cancelable) beforeinput: stop it before xterm sends it.
+        if (composer.confirmText(typeof e.data === "string" ? e.data : "")) {
+          e.stopPropagation();
+          clearHelper();
+        }
+        return;
+      }
+      composer.edit();
+    };
+    const keyupCapture = (e) => {
+      if (e.target === textarea) keystroke?.keyup();
     };
 
     const beforeInputHandler = (e) => {
@@ -15162,8 +16001,10 @@ class TerminalManager {
       }
 
       const inputType = e.inputType || "";
-      if (inputType !== "insertText" && inputType !== "insertReplacementText") {
-        return;
+      if (inputType !== "insertText") {
+        // Any edit other than a confirmation closes the confirmation window.
+        if (!COMPOSITION_INPUT_TYPES.has(inputType)) composer?.edit();
+        if (inputType !== "insertReplacementText") return;
       }
 
       const data = typeof e.data === "string" ? e.data : "";
@@ -15171,7 +16012,29 @@ class TerminalManager {
         return;
       }
 
+      // Plain text while a composition is still marked active: it ended
+      // without compositionend (the text it carries is sent below).
+      if (composer?.active) composer.abandon();
+
+      // A browser repeating the composition it just committed. If this
+      // beforeinput cannot be cancelled, the input event that follows is the
+      // confirmation and inputCapture stops it before xterm sends it.
+      if (inputType === "insertText" && composer?.matchesConfirmation(data)) {
+        if (e.cancelable) {
+          e.preventDefault();
+          composer.confirmText(data);
+        }
+        return;
+      }
+      if (inputType === "insertText") composer?.confirmText(data);
+
       e.preventDefault();
+      // xterm already sent this keystroke from its keypress handler (A-Z,
+      // space and keys with keyCode < 48 on a hardware keyboard or a soft
+      // keyboard that reports key codes): cancel the insertion, send nothing.
+      if (inputType === "insertText" && keystroke?.takeKeypressEcho()) {
+        return;
+      }
       sendCommittedData("beforeinput", inputType, data, e);
     };
 
@@ -15192,6 +16055,10 @@ class TerminalManager {
     );
     textarea.addEventListener("compositionend", compositionEndHandler, true);
     textarea.addEventListener("beforeinput", beforeInputHandler, true);
+    element.addEventListener("keydown", keydownCapture, true);
+    element.addEventListener("keypress", keypressCapture, true);
+    element.addEventListener("keyup", keyupCapture, true);
+    element.addEventListener("input", inputCapture, true);
 
     return () => {
       textarea.removeEventListener("input", handler, true);
@@ -15211,6 +16078,10 @@ class TerminalManager {
         true,
       );
       textarea.removeEventListener("beforeinput", beforeInputHandler, true);
+      element.removeEventListener("keydown", keydownCapture, true);
+      element.removeEventListener("keypress", keypressCapture, true);
+      element.removeEventListener("keyup", keyupCapture, true);
+      element.removeEventListener("input", inputCapture, true);
     };
   }
 
@@ -15298,6 +16169,301 @@ class TerminalManager {
     return () => {
       if (pendingFrame) cancelAnimationFrame(pendingFrame);
       element.removeEventListener("wheel", wheelHandler, true);
+    };
+  }
+
+  // One-finger vertical drags on touch layouts (phones, touch tablets). The
+  // page only turns the drag into whole lines and sends
+  // {type:"touch-scroll", direction, lines, col, row}; the server routes it
+  // from tmux's live pane state (history, wheel reports for a mouse app, or
+  // arrow keys for a full-screen app), because the browser's own xterm buffer
+  // and mouse-mode state are not reliable under tmux. Pure maths:
+  // web/touch-scroll.js. Returns { render(state), halt(), cleanup() } or
+  // null. halt() stops the fling and drops every line not yet sent; the
+  // socket calls it (onHaltTouchScroll) before a jump or before typing leaves
+  // scrollback, and render() calls it when the server says the pane is no
+  // longer scrolled back.
+  attachTouchScrollGesture(element, terminalId, { ws, terminal, backendMode }) {
+    const TouchScroll = window.TouchScroll;
+    if (!TouchScroll || !element || !ws || !terminal) return null;
+    if (backendMode !== "tmux" || !this.isTouchLayout()) return null;
+
+    const tracker = TouchScroll.createTouchScrollTracker();
+    let cell = null;
+    let lockedVertical = false;
+    const pump = TouchScroll.createTouchScrollPump({
+      tracker,
+      send: (message) => ws.sendScrollControl(message),
+      getCell: () => cell,
+      requestFrame: (fn) => requestAnimationFrame(fn),
+      cancelFrame: (id) => cancelAnimationFrame(id),
+      now: () => performance.now(),
+    });
+    const halt = () => pump.halt();
+    const indicator = this.createTouchScrollIndicator(
+      element.parentElement,
+      ws,
+      { onUserControl: halt },
+    );
+    const queueLines = (lines) => pump.queue(lines);
+    const stopMomentum = () => pump.stopMomentum();
+
+    const screenRect = () =>
+      element.querySelector(".xterm-screen")?.getBoundingClientRect() || null;
+
+    // Capture phase on the wrapper: runs before xterm's own touch handlers on
+    // .xterm and before the #terminal-container swipe/pan listeners.
+    const onTouchStart = (event) => {
+      stopMomentum();
+      lockedVertical = false;
+      if (event.touches.length !== 1) {
+        // A second finger belongs to the two-finger pan.
+        tracker.cancel();
+        return;
+      }
+      const touch = event.touches[0];
+      const rect = screenRect();
+      cell = TouchScroll.cellFromPoint({
+        x: touch.clientX,
+        y: touch.clientY,
+        rect,
+        cols: terminal.cols,
+        rows: terminal.rows,
+      });
+      tracker.start({
+        x: touch.clientX,
+        y: touch.clientY,
+        t: event.timeStamp,
+        rowHeight: rect && terminal.rows ? rect.height / terminal.rows : 16,
+      });
+    };
+    const onTouchMove = (event) => {
+      if (event.touches.length !== 1) {
+        tracker.cancel();
+        return;
+      }
+      const touch = event.touches[0];
+      const { phase, linesDelta } = tracker.move({
+        x: touch.clientX,
+        y: touch.clientY,
+        t: event.timeStamp,
+      });
+      // Pending (maybe a tap) and sideways swipes are left alone.
+      if (phase !== "vertical") return;
+      lockedVertical = true;
+      // No native pan, no pull-to-refresh, no xterm local touch scroll.
+      if (event.cancelable) event.preventDefault();
+      event.stopPropagation();
+      queueLines(linesDelta);
+    };
+    const onTouchEnd = (event) => {
+      if (event.touches.length > 0) return;
+      if (lockedVertical && event.cancelable) {
+        // A drag is not a tap: no compat mousedown, so xterm does not focus
+        // its textarea and the keyboard stays closed.
+        event.preventDefault();
+      }
+      lockedVertical = false;
+      const { momentum } = tracker.end({ t: event.timeStamp });
+      if (momentum) pump.startMomentum();
+    };
+    const onTouchCancel = () => {
+      lockedVertical = false;
+      tracker.cancel();
+    };
+
+    element.dataset.touchScroll = "on";
+    element.addEventListener("touchstart", onTouchStart, {
+      capture: true,
+      passive: true,
+    });
+    element.addEventListener("touchmove", onTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    element.addEventListener("touchend", onTouchEnd, {
+      capture: true,
+      passive: false,
+    });
+    element.addEventListener("touchcancel", onTouchCancel, {
+      capture: true,
+      passive: true,
+    });
+
+    return {
+      render: (state) => {
+        // The pane is back at the latest output (Jump to latest, typing,
+        // tmux leaving copy-mode at the bottom, another viewer): nothing
+        // still in flight may take it back into the history.
+        if (state && !state.inMode) halt();
+        indicator.render(state);
+      },
+      halt,
+      cleanup: () => {
+        halt();
+        element.removeEventListener("touchstart", onTouchStart, true);
+        element.removeEventListener("touchmove", onTouchMove, true);
+        element.removeEventListener("touchend", onTouchEnd, true);
+        element.removeEventListener("touchcancel", onTouchCancel, true);
+        delete element.dataset.touchScroll;
+        indicator.destroy();
+      },
+    };
+  }
+
+  // Right-edge scroll handle plus a "Jump to latest" pill, shown on a touch
+  // tile while its tmux pane is scrolled back. It sits above the tile's
+  // resize edges and keeps its touches to itself, so dragging it never
+  // resizes the tile or switches sessions. Geometry: web/scroll-indicator.js.
+  createTouchScrollIndicator(tileElement, ws, { onUserControl } = {}) {
+    const helpers = window.ScrollIndicator;
+    const root = document.createElement("div");
+    root.className = "touch-scroll-indicator";
+    root.hidden = true;
+
+    const track = document.createElement("div");
+    track.className = "touch-scroll-track";
+    const handle = document.createElement("div");
+    handle.className = "touch-scroll-handle";
+    handle.setAttribute("role", "scrollbar");
+    handle.setAttribute("aria-orientation", "vertical");
+    handle.setAttribute("aria-label", "Scroll position in the session history");
+    handle.title = describeFeature("scroll-handle");
+    const thumb = document.createElement("div");
+    thumb.className = "touch-scroll-thumb";
+    handle.appendChild(thumb);
+    track.appendChild(handle);
+
+    const latest = document.createElement("button");
+    latest.type = "button";
+    latest.className = "touch-scroll-latest";
+    latest.setAttribute("aria-label", "Jump to latest");
+    latest.title = describeFeature("jump-to-latest");
+    const arrow = document.createElement("span");
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "↓";
+    latest.append(arrow, document.createTextNode(" Latest"));
+
+    root.append(track, latest);
+    tileElement?.appendChild(root);
+
+    let state = { inMode: false, position: 0, total: 0, rows: 0 };
+    let drag = null;
+
+    const place = (position) => {
+      const geometry = helpers.computeIndicatorGeometry({
+        position,
+        total: state.total,
+        rows: state.rows,
+        trackPx: track.clientHeight,
+      });
+      handle.style.height = `${geometry.handlePx}px`;
+      handle.style.transform = `translateY(${geometry.offsetPx}px)`;
+      handle.setAttribute("aria-valuemin", "0");
+      handle.setAttribute("aria-valuemax", String(state.total));
+      handle.setAttribute("aria-valuenow", String(state.total - position));
+      return geometry;
+    };
+
+    const render = (next) => {
+      if (next) state = { ...state, ...next };
+      root.hidden = !state.inMode && !drag;
+      if (root.hidden) return;
+      place(drag ? drag.position : state.position);
+    };
+
+    const throttle = helpers.createLatestWinsThrottle({
+      send: (position) =>
+        ws.sendScrollControl({ type: "scroll-to", position }),
+    });
+    // The track changes height with the keyboard and is 0 while the tile is
+    // hidden; re-place the handle whenever it does.
+    const trackObserver =
+      typeof ResizeObserver === "function"
+        ? new ResizeObserver(() => {
+            if (!root.hidden) place(drag ? drag.position : state.position);
+          })
+        : null;
+    trackObserver?.observe(track);
+
+    // Keep every touch on the indicator away from the terminal, the tile
+    // resize edges and the session swipe.
+    const stop = (event) => event.stopPropagation();
+    const stopAndPrevent = (event) => {
+      event.stopPropagation();
+      if (event.cancelable) event.preventDefault();
+    };
+    for (const type of ["touchstart", "touchmove", "touchend", "mousedown"]) {
+      handle.addEventListener(type, stopAndPrevent, { passive: false });
+    }
+    for (const type of ["touchstart", "touchmove", "touchend", "pointerdown"]) {
+      latest.addEventListener(type, stop, { passive: true });
+    }
+    // Touching the pill or the handle ends any fling still running on the
+    // terminal, so it cannot pull the pane back into the history.
+    latest.addEventListener("touchstart", () => onUserControl?.(), {
+      passive: true,
+    });
+    // Tapping the pill must not take focus from the terminal (keyboard).
+    latest.addEventListener("mousedown", (event) => event.preventDefault());
+    latest.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onUserControl?.();
+      throttle.cancel();
+      ws.sendScrollControl({ type: "scroll-latest" });
+    });
+
+    handle.addEventListener("pointerdown", (event) => {
+      event.stopPropagation();
+      event.preventDefault();
+      onUserControl?.();
+      const geometry = place(state.position);
+      drag = {
+        pointerId: event.pointerId,
+        startY: event.clientY,
+        startPosition: state.position,
+        travelPx: geometry.travelPx,
+        position: state.position,
+      };
+      handle.classList.add("dragging");
+      try {
+        handle.setPointerCapture(event.pointerId);
+      } catch {}
+    });
+    handle.addEventListener("pointermove", (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      event.stopPropagation();
+      const position = helpers.positionFromHandleDrag({
+        startPosition: drag.startPosition,
+        deltaPx: event.clientY - drag.startY,
+        total: state.total,
+        travelPx: drag.travelPx,
+      });
+      if (position === drag.position) return;
+      drag.position = position;
+      place(position);
+      throttle.push(position);
+    });
+    const endDrag = (event) => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      event.stopPropagation();
+      throttle.flush();
+      // Show where the handle was let go until the server's next frame.
+      state = { ...state, position: drag.position };
+      drag = null;
+      handle.classList.remove("dragging");
+      render();
+    };
+    handle.addEventListener("pointerup", endDrag);
+    handle.addEventListener("pointercancel", endDrag);
+
+    return {
+      render,
+      destroy: () => {
+        throttle.cancel();
+        trackObserver?.disconnect();
+        root.remove();
+      },
     };
   }
 
@@ -15886,7 +17052,7 @@ class TerminalManager {
 
       this.performReconnectLayoutSync(id, {
         forceResize: true,
-        scrollToPrompt: platformDetector.hasTouch,
+        scrollToPrompt: this.getReconnectScrollToPrompt(),
       });
     } else if (waitingForReplay) {
       dbg(`[reconnect] Transport connected for ${id}, waiting for ready`);
@@ -15931,6 +17097,22 @@ class TerminalManager {
     });
   }
 
+  // Touch layouts keep a reader who scrolled back where they are on
+  // reconnect and tab return; only a view already at the prompt is pinned
+  // there. Other layouts keep the old rule (touch-capable: always snap).
+  getReconnectScrollToPrompt() {
+    if (this.isTouchLayout()) return "if-at-bottom";
+    return platformDetector.hasTouch;
+  }
+
+  isTerminalAtBottom(t) {
+    const buffer = t?.terminal?.buffer?.active;
+    if (!buffer) return true;
+    return buffer.viewportY >= buffer.baseY;
+  }
+
+  // scrollToPrompt: true, false, or "if-at-bottom" (decided before the
+  // re-fit, which can move the viewport).
   performReconnectLayoutSync(
     id,
     { forceResize = false, scrollToPrompt = false } = {},
@@ -15941,6 +17123,9 @@ class TerminalManager {
     requestAnimationFrame(() => {
       if (t.disposed) return;
       try {
+        if (scrollToPrompt === "if-at-bottom") {
+          scrollToPrompt = this.isTerminalAtBottom(t);
+        }
         this.fitTerminalState(t);
         this.sendResize(id, t.terminal.cols, t.terminal.rows, {
           force: forceResize,
@@ -15985,6 +17170,19 @@ class TerminalManager {
     if (message.phase === "ready") {
       t.awaitingReconnectReady = false;
       if (id === this.activeId) {
+        if (this.isTouchLayout()) {
+          // On touch, focus means the keyboard: a reconnect never opens it.
+          // Re-assert focus only when this terminal already had it, and keep
+          // a reader who scrolled back where they are.
+          if (this.getTerminalTextarea(t) === document.activeElement) {
+            this.focusTerminal(id, {
+              syncSize: false,
+              scrollToPrompt: this.isTerminalAtBottom(t),
+              ensureVisible: false,
+            });
+          }
+          return;
+        }
         this.focusTerminal(id, {
           syncSize: false,
           scrollToPrompt: platformDetector.hasTouch,
@@ -16006,6 +17204,16 @@ class TerminalManager {
   showDimensionOverlay(id) {
     const t = this.terminals.get(id);
     if (!t?.dimensionOverlay || !t.terminal) return;
+    // Touch layouts: the keyboard or the extra-keys row resizing the grid
+    // is expected; a COLSxROWS badge mid-screen there is only noise (the
+    // viewport pass sets this window, see handleViewportResize).
+    if (
+      this.isTouchLayout() &&
+      performance.now() < (this.dimensionOverlaySuppressedUntil || 0)
+    ) {
+      if (this.debugMode) this.updateDebugOverlay(id);
+      return;
+    }
 
     const cols = t.terminal.cols;
     const rows = t.terminal.rows;
@@ -16185,7 +17393,13 @@ class TerminalManager {
 
   // Create a new terminal in a new workspace (split=false) or current workspace (split=true)
   async createTerminal(split = false, options = {}) {
-    const { skipBootstrapWait = false, cwd: cwdOverride } = options;
+    // `createRequest({ cols, rows })` replaces the POST /api/terminals call
+    // (S3 resume: the server creates the terminal and types the command).
+    const {
+      skipBootstrapWait = false,
+      cwd: cwdOverride,
+      createRequest = null,
+    } = options;
     if (!skipBootstrapWait) {
       await this.waitForBootstrap();
     }
@@ -16196,11 +17410,13 @@ class TerminalManager {
 
     try {
       const postTerminal = (requestCwd) =>
-        fetch("/api/terminals", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cwd: requestCwd, cols, rows }),
-        });
+        createRequest
+          ? createRequest({ cols, rows })
+          : fetch("/api/terminals", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ cwd: requestCwd, cols, rows }),
+            });
       let res = await postTerminal(cwd);
 
       if (!res.ok) {
@@ -16218,6 +17434,7 @@ class TerminalManager {
         // An implicit cwd (the field / saved default) outside the allowed
         // roots: start in the server's default root instead of failing.
         if (
+          !createRequest &&
           window.LiveCwd?.shouldRetryCreateWithoutCwd?.({
             status: res.status,
             reason: denialReason,
@@ -16317,9 +17534,8 @@ class TerminalManager {
       fitAddon.fit();
       this.normalizeTerminalGeometry({ terminal });
 
-      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const ws = new ReconnectingWebSocket(
-        `${protocol}//${location.host}/ws/terminals/${id}?clientId=${encodeURIComponent(this.clientInstanceId)}`,
+        this.terminalSocketUrl(id),
         id,
         {
           onMessage: (data) => {
@@ -16331,6 +17547,10 @@ class TerminalManager {
           onLifecycle: (message) => this.handleReconnectLifecycle(id, message),
           onTerminalState: (message) =>
             this.applyTerminalRuntimeState(id, message),
+          onScrollPosition: (state) =>
+            this.terminals.get(id)?.touchScroll?.render(state),
+          onHaltTouchScroll: () =>
+            this.terminals.get(id)?.touchScroll?.halt(),
           onInputDropped: () => this.showInputDroppedNotice(id),
           getReconnectBehavior: () => this.reconnectBehavior,
         },
@@ -16344,26 +17564,20 @@ class TerminalManager {
           debugEl.textContent = `onData: "${data}" | mods: ${JSON.stringify(this.extraKeys?.modifiers)}`;
         }
 
+        // xterm reads an emptied helper textarea as "" (see the touch
+        // fallback); there is nothing to forward.
+        if (!data) return;
+        // What xterm forwards claims the DOM event it came from (F17).
+        inputState.keystroke?.xtermData(data);
+
         if (inputState.pasteDepth > 0) {
-          inputState.lastOnDataAt = performance.now();
-          inputState.lastOnDataValue = data;
           ws.sendInput(data);
           return;
         }
 
-        const dedupedData = this.consumePendingFallbackEcho(inputState, data);
-        if (!dedupedData) {
-          if (debugEl) {
-            debugEl.textContent = "onData: SKIP (fallback echo)";
-          }
-          return;
-        }
-
         const mods = this.extraKeys?.modifiers;
-        dbg("[ExtraKeys] onData:", JSON.stringify(dedupedData), "mods:", mods);
-        inputState.lastOnDataAt = performance.now();
-        inputState.lastOnDataValue = dedupedData;
-        const finalData = this.applyExtraKeyModifiers(dedupedData, {
+        dbg("[ExtraKeys] onData:", JSON.stringify(data), "mods:", mods);
+        const finalData = this.applyExtraKeyModifiers(data, {
           log: true,
         });
         ws.sendInput(finalData);
@@ -16386,6 +17600,11 @@ class TerminalManager {
         terminalInfo.backendMode,
         () => terminal.modes?.mouseTrackingMode,
       );
+      const touchScroll = this.attachTouchScrollGesture(element, id, {
+        ws,
+        terminal,
+        backendMode: terminalInfo.backendMode,
+      });
       dbg("[ExtraKeys] attachMobileInputFallback (create)", {
         id,
         attached: !!inputFallbackCleanup,
@@ -16430,6 +17649,7 @@ class TerminalManager {
         inputFallbackCleanup,
         pasteFallbackCleanup,
         tmuxScrollbackCleanup,
+        touchScroll,
         activationCleanup,
         selectionEdgeCleanup,
         inputState,
@@ -16460,9 +17680,11 @@ class TerminalManager {
 
       // Disable mobile keyboard autocorrect etc.
       setTimeout(() => this.disableMobileKeyboardFeatures(element), 100);
+      return terminalInfo;
     } catch (err) {
       console.error("Failed to create terminal:", err);
       alert("Failed to create terminal: " + err.message);
+      return null;
     }
   }
 
@@ -17025,6 +18247,7 @@ class TerminalManager {
     t.inputFallbackCleanup?.();
     t.pasteFallbackCleanup?.();
     t.tmuxScrollbackCleanup?.();
+    t.touchScroll?.cleanup();
     t.activationCleanup?.();
     t.selectionEdgeCleanup?.();
     if (t.resizeObserver) t.resizeObserver.disconnect();
@@ -17284,13 +18507,17 @@ class TerminalManager {
   // Layout pass for touch devices. Sizes the app shell from the visual
   // viewport (so the on-screen keyboard really shrinks the terminal instead
   // of covering it), flags keyboard-open / phone-landscape for the compact
-  // chrome CSS, then re-fits the active terminal and keeps its prompt in
-  // view. Pure decisions live in mobile-layout.js (window.MobileLayout).
+  // chrome CSS, then re-fits the active terminal. Pure decisions live in
+  // mobile-layout.js (window.MobileLayout).
   //
-  // fromViewportEvent: viewport/focus listeners pass true and the pass is
+  // fromViewportEvent: viewport/focus listeners pass true and the re-fit is
   // skipped when nothing changed (visualViewport scroll fires often while
   // panning). Direct callers (extra-keys toggles, action-bar changes) omit
   // it: their chrome change needs the re-fit even at the same viewport size.
+  //
+  // On touch layouts a viewport pass never moves focus (focus follows taps
+  // only: pulling it back re-opened the keyboard the user just dismissed)
+  // and scrolls to the prompt only when the keyboard has just opened.
   handleViewportResize({ fromViewportEvent = false } = {}) {
     const helpers = window.MobileLayout;
     if (!helpers) return;
@@ -17304,6 +18531,7 @@ class TerminalManager {
       innerWidth: window.innerWidth,
       innerHeight: window.innerHeight,
     });
+    const inputFocused = this.isEditableElementFocused();
     const layout = helpers.computeViewportLayout({
       touch,
       orientation,
@@ -17311,7 +18539,7 @@ class TerminalManager {
       visualHeight: viewport?.height,
       visualOffsetTop: viewport?.offsetTop,
       visualScale: viewport?.scale,
-      inputFocused: this.isEditableElementFocused(),
+      inputFocused,
       baselines: this.viewportBaselines,
     });
     this.viewportBaselines = layout.baselines;
@@ -17331,15 +18559,31 @@ class TerminalManager {
     this.extraKeys?.syncQuickReplies?.({ relayout: false });
     this.syncBottomChromeInset();
 
-    const layoutKey = [
-      layout.appHeight,
-      layout.appTop,
-      layout.keyboardOpen,
-      layout.phoneLandscape,
-      this.extraKeys?.quickRepliesEl?.hidden,
-    ].join("|");
-    const changed = layoutKey !== this.viewportLayoutKey;
-    this.viewportLayoutKey = layoutKey;
+    const sample = {
+      appHeight: layout.appHeight,
+      appTop: layout.appTop,
+      keyboardOpen: layout.keyboardOpen,
+      phoneLandscape: layout.phoneLandscape,
+      chipsHidden: Boolean(this.extraKeys?.quickRepliesEl?.hidden),
+      inputFocused,
+    };
+    const decision = helpers.getViewportPassDecision(
+      this.viewportLayoutSample || null,
+      sample,
+      { direct: !fromViewportEvent },
+    );
+    this.viewportLayoutSample = sample;
+    const changed = decision.refitKey !== this.viewportLayoutKey;
+    this.viewportLayoutKey = decision.refitKey;
+    if (touch) {
+      // The keyboard (or the key row) changing the grid is not news to the
+      // user: keep the COLSxROWS badge hidden while it settles.
+      if (decision.keyboardResize) {
+        this.dimensionOverlaySuppressedUntil = performance.now() + 1000;
+      }
+      if (decision.keyboardOpened) this.viewportScrollToPromptPending = true;
+      if (!layout.keyboardOpen) this.viewportScrollToPromptPending = false;
+    }
     if (fromViewportEvent && !changed) return;
 
     // Mobile tiles use pixel geometry from the container rect; refresh it so
@@ -17360,6 +18604,17 @@ class TerminalManager {
         this.viewportFocusTimer = null;
         const active = this.terminals.get(activeId);
         if (!active || activeId !== this.activeId) return;
+        if (this.isTouchLayout()) {
+          // Re-fit only. Focus stays where the user put it, and the view
+          // moves to the prompt only because the keyboard just opened.
+          const scrollToPrompt = Boolean(this.viewportScrollToPromptPending);
+          this.viewportScrollToPromptPending = false;
+          this.fitTerminalState(active);
+          this.syncTerminalSize(activeId);
+          if (scrollToPrompt) this.scrollActiveTerminalToPrompt();
+          this.disableMobileKeyboardFeatures(active.element);
+          return;
+        }
         const scrollToPrompt = layout.keyboardOpen || platformDetector.hasTouch;
         if (
           this.isEditableElementFocused() &&
@@ -17570,6 +18825,10 @@ class TerminalManager {
         "hidden",
         !document.body.classList.contains("fullscreen"),
       );
+    // The Agents panel is not eligible in fullscreen: hide it on enter and
+    // bring the saved choice back on exit (refits the visible terminals when
+    // the panel's width comes or goes).
+    this.syncAgentsPanelVisibility?.();
     const active = this.terminals.get(this.activeId);
     if (active)
       setTimeout(() => {

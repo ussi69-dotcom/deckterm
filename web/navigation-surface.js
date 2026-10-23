@@ -7,9 +7,13 @@ const ACTION_RECENT_WORKSPACES_STORAGE_KEY = "deckterm.recentWorkspaces.v1";
 const ACTION_RECENT_WORKSPACES_MAX_ENTRIES = 10;
 
 const NAVIGATION_SURFACE_HIERARCHY = Object.freeze({
+  // "agents" (show/hide the Agents panel) is not pinned on desktop: the
+  // toolbar's top-left toggle (#agents-panel-toggle) does it there. It stays
+  // in More and can be pinned from the layout editor.
   desktopPrimary: Object.freeze(["files", "git", "palette", "more"]),
   mobilePrimary: Object.freeze(["files", "git", "paste", "compose", "more"]),
   overflow: Object.freeze([
+    "agents",
     "palette",
     "compose",
     "setup",

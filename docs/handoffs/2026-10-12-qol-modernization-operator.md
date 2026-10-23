@@ -1,7 +1,7 @@
 ---
 status: consumed
-updated: 2026-10-12
-next: Run complete on dev (not promoted). Owner decisions and follow-ups live in docs/plans/2026-10-12-qol-modernization.md ("Not done here") and the KB backlog section "Follow-ups from the 2026-10-12 QoL pass". A new session needs no state from this file.
+updated: 2026-10-13
+next: Done. Promoted to production 2026-10-13 (PR #43, main b04c791) and production switched to tmux 3.8 at 10:03 UTC (operator session carried over; docs/plans/2026-10-13-tmux-3.8-upgrade.md step 3). Next own slices, each after owner go - OSC 133 hooks, then xterm.js 6; backlog finding - shells inherit the service environment incl. the Web Push private key. A new session needs no state from this file.
 ---
 
 # Operator state — DeckTerm QoL + modernization run (2026-10-12)

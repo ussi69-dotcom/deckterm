@@ -330,12 +330,7 @@ test("pinLayoutAction treats the combined font stepper as one desktop item", () 
   const state = getDefaultActionLayoutState();
   const next = pinLayoutAction(state, "desktop", "font-size", 1);
 
-  expect(next.desktopPinned).toEqual([
-    "files",
-    "font-size",
-    "git",
-    "palette",
-  ]);
+  expect(next.desktopPinned).toEqual(["files", "font-size", "git", "palette"]);
   expect(next.mobilePinned).toEqual(state.mobilePinned);
 });
 
@@ -601,7 +596,11 @@ test("desktop tab layout fails closed for invalid inputs", () => {
 
 test("overflow actions contain the secondary utilities", () => {
   const overflow = getOverflowActionIds();
-  expect(overflow).toHaveLength(12);
+  expect(overflow).toHaveLength(13);
+  // The Agents panel action is always reachable in More; on desktop the
+  // toolbar's top-left toggle replaces a pinned button.
+  expect(overflow[0]).toBe("agents");
+  expect(getDesktopPrimaryActionIds()).not.toContain("agents");
   expect(overflow).toContain("palette");
   expect(overflow).toContain("compose");
   expect(overflow).toContain("setup");

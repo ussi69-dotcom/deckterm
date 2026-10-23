@@ -33,6 +33,13 @@ import {
   type ProcessSnapshot,
 } from "./services/runtime-sync-cache";
 import { createCpuUsageMeter } from "./services/cpu-usage";
+import { ATTENTION_SEEN_KEY, mergeSeenMaps } from "./services/attention-seen";
+import {
+  isAgentSessionId,
+  planAgentResume,
+  typeAgentResumeCommand,
+  type AgentResumeDecision,
+} from "./agent-resume";
 import {
   NO_STORE_CACHE_CONTROL,
   createBuildFingerprint,
@@ -55,6 +62,7 @@ import {
   opendir,
   lstat,
   realpath,
+  rename,
 } from "node:fs/promises";
 import {
   readFileSync,
@@ -68,20 +76,46 @@ import { assertPortAvailable } from "./port-probe";
 import { cpus } from "node:os";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import {
+  applyAgentAttention,
   applyTerminalNotificationEvents,
   classifyAgentOutputPhase,
   createAttentionTracker,
+  createGitProjectRootDetector,
   createGitWorktreeDetector,
+  createOscTitleParseState,
   createTerminalNotificationParseState,
+  formatProgressPayload,
   getTerminalTelemetry,
   inferTmuxRuntimeState,
   nextAgentMarkerActive,
+  parseLatestOscTitle,
   parseShellIntegrationChunk,
   parseTerminalNotifications,
   resolveAgentOutputState,
   type AttentionTracker,
+  type OscTitleParseState,
   type TerminalNotificationParseState,
 } from "./telemetry";
+import { evaluate as evaluateAgentScreen } from "./agent-screen-rules";
+import {
+  AGENT_SCREEN_CONCURRENCY,
+  agentScreenEvaluationDue,
+  createBoundedScheduler,
+  pumpPipeDeltas,
+  resumeAgentScreenState,
+  runAgentScreenEvaluation,
+  type AgentScreenDeps,
+} from "./agent-screen-runner";
+import {
+  createAgentsChangedCoalescer,
+  markBlockedEpisodePushed,
+  selectAgentsChangedSockets,
+  shouldSendNotificationInputPush,
+  socketWantsAgentsFrames,
+  syncAgentStatusAgent,
+  type AgentStatusEffect,
+  type AgentStatusRecord,
+} from "./agent-status";
 import { isCloudflareAudienceAllowed } from "./cloudflare-access-guards";
 import {
   applyOnboardingProfile,
@@ -91,6 +125,12 @@ import {
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
 import {
+  sanitizeTerminalEnv,
+  scrubTmuxEnvironmentWithRetry,
+  terminalEnvironmentErrorResponse,
+  TmuxEnvironmentUnverifiedError,
+} from "./services/terminal-env";
+import {
   TmuxTerminalBackend,
   type TmuxSessionLiveness,
 } from "./services/tmux-terminal-backend";
@@ -99,6 +139,18 @@ import type {
   TerminalBackendAttachResult,
 } from "./services/terminal-backend";
 import { formatTmuxCaptureForTerminal } from "./services/terminal-replay";
+import {
+  isReadOnlyAllowedMessageType,
+  isScrollControlMessageType,
+  parseScrollControlMessage,
+  selectScrollSubscribers,
+  socketWantsScrollFrames,
+  TerminalScrollController,
+} from "./services/terminal-scroll-control";
+import {
+  normalizeTerminalSize,
+  resolveTerminalSize,
+} from "./services/terminal-size";
 import {
   TaskRunnerError,
   buildJudgeCommand,
@@ -166,11 +218,18 @@ import {
   listFoundationUsers,
   listScopedGrants,
   listTerminalEventsAfter,
+  listResumableEndedSessionsForActor,
   listTerminalSessionsForActor,
   listWildcardGrantPrincipals,
+  clearAgentSession,
+  listCodexAgentRowsInFolder,
   markTerminalSessionEnded,
   markUserReviewed,
+  recordAgentSession,
   recordTerminalSession,
+  agentResumeReservedBy,
+  releaseAgentResume,
+  reserveAgentResumeToken,
   resolveUserForActor,
   revokeScopedCapability,
   scheduleTerminalSessionTermination,
@@ -249,7 +308,10 @@ import {
   hasExplicitLegacyDevActorMode,
   type DeckTermActor,
 } from "./services/foundation-actors";
-import { buildBashIntegrationRcContents } from "./shell-integration";
+import {
+  bashIntegrationRcPath,
+  buildBashIntegrationRcContents,
+} from "./shell-integration";
 import { hardenGitInvocation } from "./git-readonly";
 import {
   TMUX_REATTACH_BACKOFF_MS,
@@ -336,6 +398,22 @@ type Terminal = {
   notificationParse: TerminalNotificationParseState;
   attention: AttentionTracker;
   lastCompletionPushAt?: number;
+  // Last `input` push for this terminal (agent notification or title/screen).
+  lastInputPushAt?: number;
+  // Latest OSC 0/2 window title from the same raw source as notifications;
+  // sanitized, capped at 256 characters, cleared when the agent changes.
+  agentOscTitle: string;
+  oscTitleParse: OscTitleParseState;
+  // Latest OSC 9;4 payload rebuilt as `4;<state>[;<percent>]` for the
+  // osc_progress screen-rule region; cleared when the agent changes.
+  agentOscProgress: string;
+  // S1 screen-rule agent status (design 1.1-1.6). Untrusted, display and
+  // alert only: never in the terminal_state frame or the persisted events.
+  agentStatusRecord: AgentStatusRecord;
+  // The pane printed something since the last screen-rule evaluation.
+  agentScreenDirty: boolean;
+  agentStatusBusy: boolean;
+  agentStatusRecheckTimer: ReturnType<typeof setTimeout> | null;
   tmuxPipeRead?: Promise<string>;
   shellIntegrationCarry: string;
   lastTmuxCapture: string;
@@ -346,8 +424,12 @@ type Terminal = {
   // to the same broker path instead of the legacy service-account backend.
   exec?: BrokeredExecContext;
   backend?: TerminalBackend;
-  scrollHistoryPending?: number;
-  scrollHistoryRunning?: Promise<void>;
+  // S3: the session row's agent columns are written one after another per
+  // terminal (a quick start + done must never end as a recorded agent).
+  agentResumeWrite?: Promise<void>;
+  // S3: the user closed this terminal (DELETE, or the close-later window
+  // expired): a late agent start must not record resume data again.
+  agentResumeClosedByUser?: boolean;
 };
 
 type TerminalWsData = {
@@ -359,6 +441,12 @@ type TerminalWsData = {
   protocol: "legacy" | "v2";
   clientId: string | null;
   lastEventId: number | null;
+  // `scroll=1` in the socket URL: this page understands `scroll-position`
+  // frames. Older pages would print them into the terminal as text.
+  scroll?: boolean;
+  // `agents=1` in the socket URL: this page understands the content-free
+  // `agents_changed` frame (same opt-in mechanism as `scroll=1`).
+  agents?: boolean;
 };
 export type WsData = TerminalWsData;
 
@@ -375,6 +463,20 @@ const MAX_TERMINALS_PER_USER = parseInt(
 // Cap on ended sessions in GET /api/terminals (recent-history rows in the
 // sessions drawer). Ended rows past the cap stay in the DB for their B6
 // retention TTL — this only bounds the listing and its per-row telemetry.
+// S3: gap between the typed resume command and its separate Enter, the
+// same 300 ms Task Runner uses for its pointer line (POINTER_SUBMIT_DELAY_MS).
+const AGENT_RESUME_SUBMIT_DELAY_MS = 300;
+// S3: ended rows a resume request in THIS process is handing over right now.
+const agentResumesInProgress = new Set<string>();
+// S3: Codex resumes being handed over, keyed by owner and folder, until the
+// new terminal's own start marker shows the agent (or the window passes). A
+// second `codex resume --last` in the same folder meanwhile would open the
+// conversation that is being resumed, so it is offered the picker instead.
+const codexResumeHandoffs = new Map<string, number>();
+const CODEX_RESUME_HANDOFF_MS = 30_000;
+function codexHandoffKey(ownerId: string, cwd: string): string {
+  return `${ownerId}\u0000${cwd}`;
+}
 const TERMINAL_LIST_ENDED_LIMIT = (() => {
   const parsed = parseInt(
     process.env.DECKTERM_TERMINAL_LIST_ENDED_LIMIT || "10",
@@ -785,6 +887,7 @@ function applyParsedShellIntegrationState(
       clearAgentRespondingTimer(term);
     }
     term.agentName = parsed.state.agentName;
+    onTerminalAgentChanged(term);
     if (parsed.state.agentName) {
       term.agentHasUserPrompt = false;
     }
@@ -843,6 +946,7 @@ function applyParsedShellIntegrationState(
       recordToolEvent(term, event);
     }
   }
+  recordAgentResumeEvents(term, parsed.events);
 
   if (emitOutput && parsed.output) {
     // Live PTY output is a liveness signal for the reapers: an unattended
@@ -851,7 +955,79 @@ function applyParsedShellIntegrationState(
     term.lastOutputAt = Date.now();
     appendScrollback(term.id, parsed.output);
     broadcastTerminalOutput(term.id, parsed.output);
+    // While scrolled back, output can end copy-mode (-e at the bottom, `q`,
+    // another viewer): refresh the indicator on a trailing throttle.
+    terminalScrollControllers.get(term)?.onOutput();
   }
+}
+
+// S3 one-tap resume (design 6). The session row remembers the agent that is
+// alive in it: recorded on the shell marker's agent start (name, validated
+// id, folder), cleared on agent done. An ENDED row that still names an agent
+// therefore had its agent alive when the session died (tmux crash, reboot).
+// The marker is forgeable pane output: the parser keeps only a UUID id, and
+// the resume route validates every stored value again.
+function recordAgentResumeEvents(
+  term: Terminal,
+  events: ReturnType<typeof parseShellIntegrationChunk>["events"],
+) {
+  for (const event of events) {
+    if (event.type === "agent-start") {
+      const agentName = event.agentName;
+      const sessionId = isAgentSessionId(event.sessionId)
+        ? event.sessionId
+        : null;
+      queueAgentResumeWrite(term, async (db) => {
+        const cwd = await resolveAgentStartCwd(term);
+        if (term.agentResumeClosedByUser) return;
+        recordAgentSession(db, term.id, { agentName, sessionId, cwd });
+      });
+    } else if (event.type === "agent-done") {
+      queueAgentResumeWrite(term, (db) => {
+        clearAgentSession(db, term.id);
+      });
+    }
+  }
+}
+
+function queueAgentResumeWrite(
+  term: Terminal,
+  write: (db: FoundationState["db"]) => Promise<void> | void,
+) {
+  const previous = term.agentResumeWrite || Promise.resolve();
+  term.agentResumeWrite = previous
+    .then(async () => {
+      const state = await getFoundationState();
+      await write(state.db);
+    })
+    .catch((err) => {
+      debug(`[resume] agent row write failed for ${term.id}:`, err);
+    });
+}
+
+// The folder the agent runs in: the tmux pane's current path (the agent's own
+// cwd while it runs in the foreground), else the terminal's last known cwd.
+async function resolveAgentStartCwd(term: Terminal): Promise<string> {
+  if (TMUX_BACKEND && term.sessionName && !term.exec) {
+    try {
+      const info = await getTmuxSessionInfo(term.sessionName);
+      if (info.cwd && info.cwd.startsWith("/")) return info.cwd;
+    } catch {
+      // Fall back to the last known cwd below.
+    }
+  }
+  return term.cwd;
+}
+
+// S3 (operator decision): Resume is only for sessions that ended without
+// the user closing them. An explicit close (DELETE, or the close-later window
+// the user started running out) drops the row's resume data.
+function forgetAgentResumeOnUserClose(
+  db: FoundationState["db"],
+  term: Terminal,
+) {
+  term.agentResumeClosedByUser = true;
+  clearAgentSession(db, term.id);
 }
 
 function processShellIntegrationChunk(
@@ -868,6 +1044,7 @@ function processShellIntegrationChunk(
     agentState: term.agentState || null,
   });
   applyParsedShellIntegrationState(term, parsed, options);
+  if (options.source === "pipe" && chunk) term.agentScreenDirty = true;
   processTerminalNotifications(term, chunk, options.source || "live");
   if (
     term.attention.progress &&
@@ -891,6 +1068,7 @@ function processTerminalNotifications(
 ) {
   const expectedSource = term.tmuxPipePath ? "pipe" : "live";
   if (source !== expectedSource) return;
+  processTerminalTitle(term, chunk);
   const parsed = parseTerminalNotifications(chunk, term.notificationParse);
   term.notificationParse = parsed.state;
   if (parsed.events.length === 0) return;
@@ -900,13 +1078,58 @@ function processTerminalNotifications(
     { now: Date.now(), agentName: term.agentName },
   );
   term.attention = applied.tracker;
+  for (const event of parsed.events) {
+    if (event.type === "progress") {
+      term.agentOscProgress = formatProgressPayload(event);
+    }
+  }
   for (const attention of applied.accepted) {
     if (attention.kind === "needs-input") {
-      notifyCompletionPush(term, "input");
+      // Once per blocked episode: the screen rule may already have pushed
+      // for this prompt (design 1.6).
+      if (shouldSendNotificationInputPush(term.agentStatusRecord)) {
+        notifyCompletionPush(term, "input");
+        term.agentStatusRecord = markBlockedEpisodePushed(
+          term.agentStatusRecord,
+        );
+      }
     } else if (attention.kind === "done") {
       notifyCompletionPush(term, "agent");
     }
   }
+}
+
+// The window title, the progress and the screen-rule status belong to the
+// agent that produced them.
+function onTerminalAgentChanged(term: Terminal) {
+  term.agentOscTitle = "";
+  term.agentOscProgress = "";
+  syncAgentStatusRecord(term);
+}
+
+// New agent: reset and start the 3 s grace. No agent: clear, raise nothing.
+function syncAgentStatusRecord(term: Terminal) {
+  const step = syncAgentStatusAgent(
+    term.agentStatusRecord,
+    term.agentName,
+    Date.now(),
+  );
+  term.agentStatusRecord = step.record;
+  if (term.agentStatusRecheckTimer) {
+    clearTimeout(term.agentStatusRecheckTimer);
+    term.agentStatusRecheckTimer = null;
+  }
+  runAgentStatusEffects(term, step.effects);
+}
+
+// The latest OSC 0/2 title, input of the osc_title screen-rule region. (S1a
+// raised Codex "Action Required" here; the vendored codex.toml rule
+// osc_title_blocked now does that through the screen-rule evaluator.)
+function processTerminalTitle(term: Terminal, chunk: string) {
+  const parsed = parseLatestOscTitle(chunk, term.oscTitleParse);
+  term.oscTitleParse = parsed.state;
+  if (parsed.title === null) return;
+  term.agentOscTitle = parsed.title;
 }
 
 function clearAgentRespondingTimer(term: Terminal) {
@@ -1445,6 +1668,16 @@ type TmuxPipeResume = {
   offset: number;
   shellIntegrationCarry: string;
   notificationParse: TerminalNotificationParseState;
+  oscTitleParse: OscTitleParseState;
+  agentOscTitle: string;
+  // S1: the screen-rule record (blocked episode, whether it pushed), the
+  // attention it raised and the last pushes survive a re-attach of the same
+  // agent (resumeAgentScreenState).
+  agentStatusRecord: AgentStatusRecord;
+  attention: AttentionTracker;
+  agentOscProgress: string;
+  lastInputPushAt?: number;
+  lastCompletionPushAt?: number;
 };
 const tmuxPipeResume = new Map<string, TmuxPipeResume>();
 
@@ -1455,6 +1688,13 @@ function rememberTmuxPipeResume(term: Terminal) {
     offset: term.tmuxPipeOffset,
     shellIntegrationCarry: term.shellIntegrationCarry,
     notificationParse: term.notificationParse,
+    oscTitleParse: term.oscTitleParse,
+    agentOscTitle: term.agentOscTitle,
+    agentStatusRecord: term.agentStatusRecord,
+    attention: term.attention,
+    agentOscProgress: term.agentOscProgress,
+    lastInputPushAt: term.lastInputPushAt,
+    lastCompletionPushAt: term.lastCompletionPushAt,
   });
 }
 
@@ -1592,6 +1832,7 @@ function notifyCompletionPush(
     return;
   }
   term.lastCompletionPushAt = now;
+  if (kind === "input") term.lastInputPushAt = now;
   void getFoundationState()
     .then((state) =>
       dispatchCompletionPush({
@@ -2616,7 +2857,11 @@ async function runScopedSearch(opts: {
     stderr: "ignore",
     // Sanitized PATH (not the possibly-poisoned process.env.PATH); the binary
     // itself is absolute, this just hardens any grep-internal subprocess.
-    env: { ...process.env, PATH: SEARCH_SAFE_PATH, LC_ALL: "C" },
+    env: {
+      ...sanitizeTerminalEnv(process.env),
+      PATH: SEARCH_SAFE_PATH,
+      LC_ALL: "C",
+    },
   });
   inFlightSearches.set(ownerId, proc);
 
@@ -3767,7 +4012,7 @@ async function runTreeGit(
       stdout: "pipe",
       stderr: "ignore",
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         GIT_OPTIONAL_LOCKS: "0",
       },
@@ -4304,6 +4549,9 @@ async function getDefaultBrowseRoot(): Promise<string> {
 const detectGitWorktree = createGitWorktreeDetector({
   resolveAllowedPath,
 });
+const detectGitProjectRoot = createGitProjectRootDetector({
+  resolveAllowedPath,
+});
 
 let accessVerifier: ReturnType<typeof cloudflareAccess> | undefined;
 function getAccessVerifier() {
@@ -4665,6 +4913,16 @@ function supportsLinkedView(term: Terminal): boolean {
   });
 }
 
+function serializeAgentStatus(record: AgentStatusRecord) {
+  const committed = record.agentName !== null && record.status !== null;
+  return {
+    agentStatus: committed ? record.status : null,
+    agentStatusRule: committed ? record.rule : null,
+    agentStatusChangedAt: committed ? record.changedAt : null,
+    agentRulesVersion: committed ? record.rulesVersion : null,
+  };
+}
+
 function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
   const socketStats = getTerminalSocketStats(term, requestingClientId);
   return {
@@ -4678,6 +4936,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentName: term.agentName,
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
+    ...serializeAgentStatus(term.agentStatusRecord),
     recentTools: term.recentTools,
     attention: term.attention.attention,
     progress: term.attention.progress,
@@ -4705,7 +4964,121 @@ function getRecordedSessionCatalogStatus(
   return session.status === "active" ? "detached" : "inactive";
 }
 
-function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
+// S3 (operator decision): ended rows with valid resume data are listed even
+// past the ended-row cap (DECKTERM_TERMINAL_LIST_ENDED_LIMIT), newest end
+// first, at most this many, in addition to the normal listing.
+const RESUMABLE_LIST_LIMIT = 50;
+// Candidates read to find them (a tampered row is a candidate, not listed).
+const RESUMABLE_CANDIDATE_LIMIT = 4 * RESUMABLE_LIST_LIMIT;
+
+// The sessions GET /api/terminals lists for an owner: the normal listing
+// (live rows + the newest ended rows) plus the newest resumable ended rows,
+// in the normal listing's order (created_at, newest first).
+function listCatalogSessions(
+  db: FoundationState["db"],
+  ownerId: string,
+): RecordedTerminalSession[] {
+  const listed = listTerminalSessionsForActor(db, ownerId, {
+    endedLimit: TERMINAL_LIST_ENDED_LIMIT,
+  });
+  const ids = new Set(listed.map((row) => row.id));
+  const extra = listResumableEndedSessionsForActor(
+    db,
+    ownerId,
+    RESUMABLE_CANDIDATE_LIMIT,
+  )
+    .filter(
+      (row) =>
+        planAgentResume({
+          agentName: row.agentName,
+          agentSessionId: row.agentSessionId,
+          agentCwd: row.agentCwd,
+        }).ok,
+    )
+    .slice(0, RESUMABLE_LIST_LIMIT)
+    .filter((row) => !ids.has(row.id));
+  if (extra.length === 0) return listed;
+  return [...listed, ...extra].sort((a, b) =>
+    a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0,
+  );
+}
+
+// S3: what a Resume tap on this ENDED row would reopen, or null.
+type AgentResumeSummary = {
+  agent: "claude" | "codex";
+  mode: "exact" | "last" | "pick";
+  cwd: string;
+};
+
+// Design 6: another resumable or live Codex row of this owner in the same
+// agent folder makes `codex resume --last` ambiguous, so that row opens
+// Codex's own picker instead. Asked per row against the WHOLE table (an
+// indexed lookup), not the capped catalog: a resumable row the listing no
+// longer shows still counts.
+function codexFolderShared(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): boolean {
+  if (session.agentName !== "codex" || !session.agentCwd) return false;
+  const cwd = session.agentCwd;
+  const handoffUntil = codexResumeHandoffs.get(codexHandoffKey(ownerId, cwd));
+  if (handoffUntil !== undefined) {
+    if (handoffUntil > Date.now()) return true;
+    codexResumeHandoffs.delete(codexHandoffKey(ownerId, cwd));
+  }
+  for (const term of terminals.values()) {
+    if (
+      term.id !== session.id &&
+      term.ownerId === ownerId &&
+      term.agentName === "codex" &&
+      term.cwd === cwd
+    ) {
+      return true;
+    }
+  }
+  return listCodexAgentRowsInFolder(db, ownerId, cwd, session.id).some(
+    (row) =>
+      row.status !== "ended" ||
+      planAgentResume({
+        agentName: row.agentName,
+        agentSessionId: row.agentSessionId,
+        agentCwd: row.agentCwd,
+      }).ok,
+  );
+}
+
+function decideAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): AgentResumeDecision {
+  return planAgentResume(
+    {
+      agentName: session.agentName,
+      agentSessionId: session.agentSessionId,
+      agentCwd: session.agentCwd,
+    },
+    { codexCwdShared: codexFolderShared(db, ownerId, session) },
+  );
+}
+
+function summarizeAgentResume(
+  db: FoundationState["db"],
+  ownerId: string,
+  session: RecordedTerminalSession,
+): AgentResumeSummary | null {
+  if (session.status !== "ended" || terminals.has(session.id)) return null;
+  const decision = decideAgentResume(db, ownerId, session);
+  if (!decision.ok) return null;
+  const { agent, mode, cwd } = decision.plan;
+  return { agent, mode, cwd };
+}
+
+function serializeRecordedTerminalSession(
+  session: RecordedTerminalSession,
+  { resume = null }: { resume?: AgentResumeSummary | null } = {},
+) {
   const status = getRecordedSessionCatalogStatus(session);
   const sharedSessionKey =
     TMUX_BACKEND && session.status === "active"
@@ -4730,6 +5103,10 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
     lastExitCode: session.status === "ended" ? 0 : null,
     agentName: null,
     agentState: null,
+    agentStatus: null,
+    agentStatusRule: null,
+    agentStatusChangedAt: null,
+    agentRulesVersion: null,
     backendMode: getBackendMode(),
     supportsLinkedView: Boolean(TMUX_BACKEND && sharedSessionKey),
     sharedSessionKey,
@@ -4738,6 +5115,7 @@ function serializeRecordedTerminalSession(session: RecordedTerminalSession) {
     active: false,
     status,
     sessionStatus: session.status,
+    resume,
   };
 }
 
@@ -4876,9 +5254,14 @@ async function ensureBashIntegrationRc(): Promise<string> {
   if (bashIntegrationRcPathPromise) return bashIntegrationRcPathPromise;
 
   bashIntegrationRcPathPromise = (async () => {
-    const rcPath = "/tmp/deckterm-bash-integration.rc";
     const rcContents = buildBashIntegrationRcContents();
-    await Bun.write(rcPath, rcContents);
+    // Content-addressed, so another DeckTerm version on this host never
+    // rewrites the rc this process's shells read; written to a temp name and
+    // renamed so a starting shell never reads a half-written file.
+    const rcPath = bashIntegrationRcPath(rcContents);
+    const tmpPath = `${rcPath}.${process.pid}.tmp`;
+    await Bun.write(tmpPath, rcContents);
+    await rename(tmpPath, rcPath);
     return rcPath;
   })();
 
@@ -4892,6 +5275,14 @@ async function resolveShellCommand(): Promise<string[]> {
   return bashRcPath && isBashShell
     ? [shell, "--rcfile", bashRcPath, "-i"]
     : [shell, "-il"];
+}
+
+function logTerminalEnvironmentRefusal(err: unknown) {
+  const detail =
+    err instanceof TmuxEnvironmentUnverifiedError ? err.detail : String(err);
+  console.error(
+    `[tmux] environment: refused a new terminal, environment unverified (${detail})`,
+  );
 }
 
 function createTerminalHandle(id: string, cols: number, rows: number) {
@@ -5301,42 +5692,87 @@ function requestTerminalResize(
   return run({ cols, rows });
 }
 
+// Scroll control (slice M0): one ordered scroll queue per tmux-backed
+// terminal. It coalesces wheel/PgUp history scrolls (±100), routes touch
+// drags from tmux's live pane state, holds input behind a pending "back to
+// latest" and sends `scroll-position` frames to `scroll=1` sockets. Keyed by
+// the handle, so a re-attach (new Terminal object) starts clean.
+const terminalScrollControllers = new WeakMap<
+  Terminal,
+  TerminalScrollController
+>();
+
+function scrollSubscribers(term: Terminal): ServerWebSocket<WsData>[] {
+  const sockets = terminalSockets.get(term.id);
+  if (!sockets) return [];
+  return selectScrollSubscribers(sockets, (ws) => {
+    const reconnectState = socketReconnectState.get(ws);
+    return Boolean(reconnectState?.pendingReady || reconnectState?.replaying);
+  });
+}
+
+function writeTerminalInputNow(term: Terminal, data: string) {
+  try {
+    term.terminal.write(data);
+  } catch (err) {
+    debug(`Write error for ${term.id}:`, err);
+  }
+}
+
+function getScrollController(term: Terminal): TerminalScrollController | null {
+  if (!TMUX_BACKEND || !term.sessionName) return null;
+  const existing = terminalScrollControllers.get(term);
+  if (existing) return existing;
+  const backend = term.backend ?? tmuxTerminalBackend;
+  if (!backend) return null;
+  const sessionName = term.sessionName;
+  const controller = new TerminalScrollController(
+    {
+      readState: (signal) => backend.readScrollState(sessionName, { signal }),
+      scrollHistory: (direction, lines, signal) =>
+        backend.scrollHistory(sessionName, direction, lines, { signal }),
+      scrollToPosition: (position, signal) =>
+        backend.scrollToPosition(sessionName, position, { signal }),
+      exitScroll: (signal) => backend.exitScroll(sessionName, { signal }),
+      cancelScroll: (signal) => backend.cancelScroll(sessionName, { signal }),
+      writeInput: (data) => writeTerminalInputNow(term, data),
+      paneSize: () => ({ cols: term.cols, rows: term.rows }),
+      subscribers: () => scrollSubscribers(term),
+      isActive: () => terminals.get(term.id) === term,
+    },
+    {
+      // Brokered and raw backends cannot read or position the pane: plain
+      // history scrolling only, no frames, no input barrier.
+      scrollControl: backend.supportsScrollControl,
+      onError: (err) =>
+        debug(`[tmux] scroll control failed for ${term.id}:`, err),
+      // Drops and degraded exits; byte counts only, never input content.
+      log: (message) => console.warn(`[scroll] ${term.id}: ${message}`),
+    },
+  );
+  terminalScrollControllers.set(term, controller);
+  return controller;
+}
+
+// Every input path (JSON `input`, raw text, binary) goes through here so
+// input never overtakes a pending "back to latest". `scroll` is the socket's
+// `scroll=1` URL flag: only those (touch) sockets get the server barrier that
+// leaves copy-mode before typed input; desktop input keeps its old path.
+function writeTerminalInput(term: Terminal, data: string, scroll: boolean) {
+  const controller = terminalScrollControllers.get(term);
+  if (controller) {
+    controller.input(data, { scroll });
+    return;
+  }
+  writeTerminalInputNow(term, data);
+}
+
 async function scrollTmuxSessionHistory(
   term: Terminal,
   direction: "up" | "down",
   lines: number,
 ): Promise<void> {
-  if (!TMUX_BACKEND || !term.sessionName) return;
-  const backend = term.backend ?? tmuxTerminalBackend;
-  if (!backend) return;
-  const count = Math.max(1, Math.min(100, Math.trunc(lines)));
-  const signedCount = direction === "up" ? count : -count;
-  term.scrollHistoryPending = Math.max(
-    -100,
-    Math.min(100, (term.scrollHistoryPending ?? 0) + signedCount),
-  );
-  if (term.scrollHistoryRunning) {
-    await term.scrollHistoryRunning;
-    return;
-  }
-
-  const running = (async () => {
-    while (term.scrollHistoryPending) {
-      const pending = term.scrollHistoryPending;
-      term.scrollHistoryPending = 0;
-      await backend.scrollHistory(
-        term.sessionName!,
-        pending > 0 ? "up" : "down",
-        Math.abs(pending),
-      );
-    }
-  })();
-  term.scrollHistoryRunning = running;
-  await term.scrollHistoryRunning.finally(() => {
-    if (term.scrollHistoryRunning === running) {
-      delete term.scrollHistoryRunning;
-    }
-  });
+  await getScrollController(term)?.scrollRelative(direction, lines);
 }
 
 async function sendTmuxPaneCapture(
@@ -5459,6 +5895,15 @@ async function completeTmuxReconnectReplay(
   } finally {
     reconnectState.replaying = false;
     reconnectState.pendingReady = false;
+    // Copy-mode lives in tmux and survives the reconnect: tell this socket
+    // where the pane is before it starts handling output again.
+    if (ws.data.scroll && ws.readyState === 1) {
+      try {
+        await getScrollController(term)?.emit(ws);
+      } catch (err) {
+        debug(`[reconnect] scroll position failed for ${terminalId}`, err);
+      }
+    }
     sendReconnectLifecycle(ws, "ready");
     socketReconnectState.delete(ws);
   }
@@ -5485,20 +5930,119 @@ async function pumpTmuxPipeOutput(): Promise<void> {
   if (!TMUX_BACKEND || tmuxPipePumpRunning || shutdownInProgress) return;
   tmuxPipePumpRunning = true;
   try {
-    for (const term of Array.from(terminals.values())) {
-      if (!term.sessionName || !term.tmuxPipePath) continue;
-      const delta = await readTmuxPipeDelta(term).catch(() => "");
-      if (delta && terminals.get(term.id) === term) {
-        processShellIntegrationChunk(term, delta, {
-          emitOutput: false,
-          source: "pipe",
-        });
-      }
-    }
+    await pumpPipeDeltas(
+      Array.from(terminals.values()).filter(
+        (term) => term.sessionName && term.tmuxPipePath,
+      ),
+      {
+        readDelta: (term) => readTmuxPipeDelta(term),
+        isCurrent: (term) => terminals.get(term.id) === term,
+        processDelta: (term, delta) =>
+          processShellIntegrationChunk(term, delta, {
+            emitOutput: false,
+            source: "pipe",
+          }),
+        // Never awaited: a slow or wedged capture must not hold up the pipe
+        // processing of the other terminals (or this flag).
+        scheduleScreen: scheduleAgentScreenStatus,
+      },
+    );
   } finally {
     tmuxPipePumpRunning = false;
   }
 }
+
+// ---------------------------------------------------------------------------
+// S1 screen-rule agent status (design 1.2-1.8). Scheduled by the pipe pump
+// (and the working -> idle re-check) only when the pane printed something
+// since the last evaluation or a grace/hold is pending; run off the pump, at
+// most AGENT_SCREEN_CONCURRENCY captures at once and one per terminal. The
+// capture is held in memory for this one evaluation and never logged or
+// persisted.
+// ---------------------------------------------------------------------------
+
+let agentScreenRulesBroken = false;
+
+const agentScreenDeps: AgentScreenDeps<Terminal> = {
+  now: () => Date.now(),
+  capture: (term) =>
+    (term.backend ?? terminalBackend).captureVisible(term.sessionName!),
+  isCurrent: (term) => terminals.get(term.id) === term,
+  syncRecord: (term) => syncAgentStatusRecord(term),
+  evaluate: (agent, input) => evaluateAgentScreen(agent, input),
+  applyEffects: (term, effects) => runAgentStatusEffects(term, effects),
+  rulesBroken: () => agentScreenRulesBroken,
+  onRulesBroken: (err) => {
+    // A broken vendored manifest must not spam every tick; agentStatus
+    // stays null and everything falls back to today's behaviour.
+    agentScreenRulesBroken = true;
+    console.error("[agent-status] screen rules failed to load:", err);
+  },
+};
+
+const agentScreenScheduler = createBoundedScheduler<Terminal>({
+  concurrency: AGENT_SCREEN_CONCURRENCY,
+  run: async (term) => {
+    if (shutdownInProgress || terminals.get(term.id) !== term) return;
+    await runAgentScreenEvaluation(term, agentScreenDeps);
+  },
+  onError: (term, err) =>
+    debug(`[agent-status] evaluation failed for ${term.id}`, err),
+});
+
+function scheduleAgentScreenStatus(term: Terminal) {
+  if (agentScreenEvaluationDue(term, agentScreenDeps)) {
+    agentScreenScheduler.schedule(term);
+  }
+}
+
+function runAgentStatusEffects(term: Terminal, effects: AgentStatusEffect[]) {
+  for (const effect of effects) {
+    if (effect.type === "raise") {
+      const applied = applyAgentAttention(term.attention, effect.kind, {
+        now: Date.now(),
+        source: effect.source,
+        rule: effect.rule,
+        resolvesBlocked: effect.resolvesBlocked === true,
+      });
+      term.attention = applied.tracker;
+    } else if (effect.type === "push") {
+      notifyCompletionPush(term, effect.kind);
+    } else if (effect.type === "nudge") {
+      agentsChangedCoalescer.notify(term.ownerId);
+    } else if (effect.type === "recheck") {
+      if (term.agentStatusRecheckTimer) {
+        clearTimeout(term.agentStatusRecheckTimer);
+      }
+      term.agentStatusRecheckTimer = setTimeout(
+        () => {
+          term.agentStatusRecheckTimer = null;
+          if (terminals.get(term.id) !== term || shutdownInProgress) return;
+          scheduleAgentScreenStatus(term);
+        },
+        Math.max(0, effect.at - Date.now()),
+      );
+    }
+  }
+}
+
+// `{type:"agents_changed"}` to the owner's `agents=1` terminal sockets,
+// coalesced to at most one per 500 ms per owner. Content-free: the page
+// refetches /api/terminals.
+const AGENTS_CHANGED_FRAME = JSON.stringify({ type: "agents_changed" });
+const agentsChangedCoalescer = createAgentsChangedCoalescer({
+  send: (ownerId) => {
+    for (const sockets of terminalSockets.values()) {
+      for (const ws of selectAgentsChangedSockets(sockets, ownerId)) {
+        try {
+          ws.send(AGENTS_CHANGED_FRAME);
+        } catch {
+          // WebSocket closed
+        }
+      }
+    }
+  },
+});
 
 // Pass a snapshot to share one `ps` run across many sessions (GET
 // /api/terminals); without one a fresh snapshot is taken.
@@ -5583,7 +6127,10 @@ async function syncTmuxRuntimeState(
 
   term.running = nextRuntimeState.running;
   term.lastExitCode = nextRuntimeState.lastExitCode;
-  term.agentName = nextRuntimeState.agentName;
+  if (term.agentName !== nextRuntimeState.agentName) {
+    term.agentName = nextRuntimeState.agentName;
+    onTerminalAgentChanged(term);
+  }
   term.agentState = nextRuntimeState.agentState;
   term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
   if (!nextRuntimeState.agentName) {
@@ -5762,14 +6309,27 @@ async function createManagedTerminal({
   let tmuxPipeOffset = 0;
 
   if (createTmuxSession || !TMUX_BACKEND) {
-    const backendSession = await backend.createSession(
-      id,
-      cwd,
-      cols,
-      rows,
-      ownerId,
-      ownerEmail,
-    );
+    let backendSession: Awaited<ReturnType<TerminalBackend["createSession"]>>;
+    try {
+      backendSession = await backend.createSession(
+        id,
+        cwd,
+        cols,
+        rows,
+        ownerId,
+        ownerEmail,
+      );
+    } catch (err) {
+      // Nothing was registered yet: release the PTY handle so a refused
+      // create (e.g. an unverified tmux environment) leaks nothing.
+      markHandleSettled();
+      try {
+        terminal.close();
+      } catch {
+        // already closed
+      }
+      throw err;
+    }
     if (TMUX_BACKEND) {
       activeSessionName = backendSession.sessionName;
     }
@@ -5815,6 +6375,12 @@ async function createManagedTerminal({
   }
 
   const now = Date.now();
+  // Same agent on a re-attach: keep its episode instead of pushing again.
+  const agentResume = resumeAgentScreenState(
+    resumePipe,
+    initialRuntimeState?.agentName || null,
+    now,
+  );
   const managedTerminal: Terminal = {
     id,
     proc,
@@ -5847,7 +6413,20 @@ async function createManagedTerminal({
     toolRate: { windowStart: 0, count: 0 },
     notificationParse:
       resumePipe?.notificationParse ?? createTerminalNotificationParseState(),
-    attention: createAttentionTracker(),
+    attention:
+      agentResume.sameAgent && resumePipe
+        ? resumePipe.attention
+        : createAttentionTracker(),
+    lastInputPushAt: agentResume.lastInputPushAt,
+    lastCompletionPushAt: agentResume.lastCompletionPushAt,
+    agentOscTitle: resumePipe?.agentOscTitle ?? "",
+    oscTitleParse: resumePipe?.oscTitleParse ?? createOscTitleParseState(),
+    agentOscProgress:
+      agentResume.sameAgent && resumePipe ? resumePipe.agentOscProgress : "",
+    agentStatusRecord: agentResume.agentStatusRecord,
+    agentScreenDirty: agentResume.agentScreenDirty,
+    agentStatusBusy: false,
+    agentStatusRecheckTimer: null,
     shellIntegrationCarry: resumePipe?.shellIntegrationCarry ?? "",
     lastTmuxCapture: initialScrollback,
     tmuxPipePath,
@@ -6153,6 +6732,11 @@ export function createWebApp() {
   app.onError((err, c) => {
     if (err instanceof UnauthorizedRequestError) {
       return c.text(err.message, err.status);
+    }
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
     }
     console.error("[Hono] Route error:", err);
     const response: { error: string; message?: string } = {
@@ -7372,6 +7956,11 @@ export function createWebApp() {
   });
 
   function taskErrorResponse(c: any, err: unknown) {
+    const environmentError = terminalEnvironmentErrorResponse(err);
+    if (environmentError) {
+      logTerminalEnvironmentRefusal(err);
+      return c.json(environmentError.body, environmentError.status);
+    }
     if (err instanceof TaskRunnerError) {
       return c.json({ error: err.message }, err.status as never);
     }
@@ -7812,15 +8401,25 @@ export function createWebApp() {
     }
   });
 
-  // Create new terminal running shell
-  app.post("/api/terminals", async (c) => {
+  // The one terminal create path (root checks, capability grants, rate
+  // limits, isolation, audit). POST /api/terminals and the S3 resume route
+  // both go through it, so a resumed agent gets nothing a plain create
+  // would not.
+  type TerminalCreateOutcome =
+    | { ok: true; terminal: Terminal; ownerId: string; state: FoundationState }
+    | { ok: false; response: Response };
+  async function createTerminalThroughCreatePath(
+    c: any,
+    // Same shape the route always read: { cwd?, cols?, rows? }.
+    body: Record<string, any>,
+    routeCapability: { capability: ScopedGrantCapability },
+  ): Promise<TerminalCreateOutcome> {
+    const fail = (response: Response): TerminalCreateOutcome => ({
+      ok: false,
+      response,
+    });
     const actor = getCurrentActor(c);
     const ownerEmail = actor.email;
-    const body = await c.req.json().catch(() => ({}));
-    const routeCapability = getRouteCapability(c.req.method, c.req.url);
-    if (!routeCapability) {
-      return c.json({ error: "Missing route capability" }, 500);
-    }
     // No explicit cwd: start in the service home when it is an allowed root,
     // else in the first allowed root. Defaulting blindly to $HOME rejected a
     // fresh install's very first terminal ("Forbidden terminal root") whenever
@@ -7866,7 +8465,7 @@ export function createWebApp() {
         reason: pre.reason,
         data: { cwd: body.cwd ?? null },
       });
-      return c.json(
+      return fail(c.json(
         foundationGateJson({
           message: pre.message,
           reason: pre.reason,
@@ -7875,7 +8474,7 @@ export function createWebApp() {
           resourceId: "*",
         }),
         403,
-      );
+      ));
     }
     const actorOwnerId = pre.ownerId;
 
@@ -7891,7 +8490,7 @@ export function createWebApp() {
         reason: "forbidden_root",
         data: { cwd: requestedCwd },
       });
-      return c.json(
+      return fail(c.json(
         {
           error: "Forbidden terminal root",
           reason: "forbidden_root",
@@ -7904,7 +8503,7 @@ export function createWebApp() {
           }),
         },
         403,
-      );
+      ));
     }
 
     // Lexical (no realpath) root match, same helper requireFileAccess uses.
@@ -7921,14 +8520,14 @@ export function createWebApp() {
         reason: "no_matching_root",
         data: { cwd: resolvedCwd },
       });
-      return c.json(
+      return fail(c.json(
         {
           error: "Forbidden path (no matching registered root)",
           reason: "no_matching_root",
           ...forbiddenRootDetail({ path: resolvedCwd, subject: "terminal" }),
         },
         403,
-      );
+      ));
     }
 
     // terminal.create keyed on the resolved root (was terminal/"*"). Owner/admin
@@ -7943,7 +8542,7 @@ export function createWebApp() {
       data: { cwd: resolvedCwd },
     });
     if (!foundationAuth.ok) {
-      return c.json(foundationGateJson(foundationAuth), foundationAuth.status);
+      return fail(c.json(foundationGateJson(foundationAuth), foundationAuth.status));
     }
     // Canonical ownerId (plan §2, invariant §9.9): every downstream seam in
     // this handler — live-count checks, PTY spawn, session recording, audit
@@ -7958,12 +8557,12 @@ export function createWebApp() {
       data: { cwd: resolvedCwd },
     });
     if (!rootAuth.ok) {
-      return c.json(foundationGateJson(rootAuth), rootAuth.status);
+      return fail(c.json(foundationGateJson(rootAuth), rootAuth.status));
     }
 
     const creationError = getTerminalCreationError(ownerId);
     if (creationError) {
-      return c.json(creationError.body, creationError.status);
+      return fail(c.json(creationError.body, creationError.status));
     }
 
     // Pre-side-effect disabled re-check (invariant §9.2): closes the race
@@ -7979,7 +8578,7 @@ export function createWebApp() {
         reason: "user_disabled",
         data: { cwd: resolvedCwd },
       });
-      return c.json(
+      return fail(c.json(
         foundationGateJson({
           message: "DeckTerm account disabled",
           reason: "user_disabled",
@@ -7988,7 +8587,7 @@ export function createWebApp() {
           resourceId: "*",
         }),
         403,
-      );
+      ));
     }
 
     // B2 OS isolation (§4.3): resolve legacy vs brokered vs deny. Off ⇒ legacy
@@ -8001,15 +8600,14 @@ export function createWebApp() {
       resolvedCwd,
     );
     if (!execResolution.ok) {
-      return c.json(execResolution.body, execResolution.status);
+      return fail(c.json(execResolution.body, execResolution.status));
     }
     const exec = execResolution.exec;
 
     rateLimitState.record(ownerId);
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
-      cols: body.cols || 120,
-      rows: body.rows || 30,
+      ...resolveTerminalSize(body.cols, body.rows),
       ownerId,
       ownerEmail,
       exec,
@@ -8047,7 +8645,7 @@ export function createWebApp() {
           reason: "user_disabled_postcheck",
           data: { cwd: resolvedCwd },
         });
-        return c.json(
+        return fail(c.json(
           foundationGateJson({
             message: "DeckTerm account disabled",
             reason: "user_disabled_postcheck",
@@ -8056,7 +8654,7 @@ export function createWebApp() {
             resourceId: "*",
           }),
           403,
-        );
+        ));
       }
     }
 
@@ -8094,10 +8692,10 @@ export function createWebApp() {
           reason: "os_mapping_postcheck",
           data: { cwd: resolvedCwd, os_uid: exec.uid },
         });
-        return c.json(
+        return fail(c.json(
           { error: "OS isolation denied", reason: "os_mapping_postcheck" },
           403,
-        );
+        ));
       }
     }
 
@@ -8117,7 +8715,23 @@ export function createWebApp() {
         : { cwd: resolvedCwd },
     });
 
-    return c.json(serializeTerminal(terminal));
+    return { ok: true, terminal, ownerId, state };
+  }
+
+  // Create new terminal running shell
+  app.post("/api/terminals", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    const created = await createTerminalThroughCreatePath(
+      c,
+      body,
+      routeCapability,
+    );
+    if (!created.ok) return created.response;
+    return c.json(serializeTerminal(created.terminal));
   });
 
   app.post("/api/terminals/:id/linked-view", async (c) => {
@@ -8251,9 +8865,7 @@ export function createWebApp() {
       }
       throw err;
     }
-    const recordedSessions = listTerminalSessionsForActor(state.db, ownerId, {
-      endedLimit: TERMINAL_LIST_ENDED_LIMIT,
-    });
+    const recordedSessions = listCatalogSessions(state.db, ownerId);
     const seenIds = new Set<string>();
     // One `ps` snapshot per request, taken only if some session needs a
     // fresh runtime sync (cached syncs reuse their earlier result).
@@ -8282,6 +8894,7 @@ export function createWebApp() {
             ...serializeTerminal(restoredTerm, requestingClientId),
             ...(await getTerminalTelemetry(restoredTerm, backendMode, {
               detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
             })),
           };
         }
@@ -8296,7 +8909,9 @@ export function createWebApp() {
               : getTerminalSession(state.db, recordedSession.id) ||
                 recordedSession
             : recordedSession;
-        const serialized = serializeRecordedTerminalSession(effectiveSession);
+        const serialized = serializeRecordedTerminalSession(effectiveSession, {
+          resume: summarizeAgentResume(state.db, ownerId, effectiveSession),
+        });
         return {
           ...serialized,
           ...(await getTerminalTelemetry(
@@ -8313,7 +8928,10 @@ export function createWebApp() {
               agentState: null,
             },
             backendMode,
-            { detectWorktree: detectGitWorktree },
+            {
+              detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
+            },
           )),
           active: serialized.active,
           status: serialized.status,
@@ -8338,12 +8956,215 @@ export function createWebApp() {
             ...serializeTerminal(t, requestingClientId),
             ...(await getTerminalTelemetry(t, backendMode, {
               detectWorktree: detectGitWorktree,
+              detectProjectRoot: detectGitProjectRoot,
             })),
           };
         }),
     );
 
     return c.json([...list, ...memoryOnly]);
+  });
+
+  // S3 one-tap resume (design 6). Never automatic: only this explicit POST,
+  // sent by a tap on "Resume", reopens an agent conversation, in a NEW
+  // terminal created through the normal create path in the ended row's
+  // agent folder. `{ "dryRun": true }` answers { command, cwd, mode } and
+  // creates nothing.
+  app.post("/api/terminals/:id/resume", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json().catch(() => ({}));
+    const dryRun = body?.dryRun === true;
+    const actor = getCurrentActor(c);
+    const state = await getFoundationState();
+    let ownerId: string;
+    try {
+      ownerId = isFoundationLegacyBypassEnabled()
+        ? actor.id
+        : resolveCanonicalOwnerId(state, actor).ownerId;
+    } catch (err) {
+      if (err instanceof IdentityConflictError) {
+        return c.json(
+          {
+            error: "DeckTerm identity resolution conflict",
+            reason: "identity_conflict",
+          },
+          403,
+        );
+      }
+      throw err;
+    }
+    const row = getTerminalSession(state.db, id);
+    // Another actor's row answers exactly like a missing one; both refusals
+    // are audited, so probing for other sessions is traceable.
+    if (
+      !row ||
+      row.actorUserId !== ownerId ||
+      crossesE2ERunNamespaceForRequest({
+        actorId: actor.id,
+        resourceOwnerId: row.actorUserId,
+        requestUrl: c.req.url,
+        env: process.env,
+      })
+    ) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.resume",
+        resourceType: "terminal",
+        resourceId: id.slice(0, 128),
+        decision: "deny",
+        reason: row ? "foreign_session" : "not_found",
+      });
+      return c.json({ error: "Terminal not found" }, 404);
+    }
+    if (row.status !== "ended" || terminals.has(id)) {
+      return c.json(
+        {
+          error: "This session is still running: attach to it instead",
+          reason: "session_active",
+        },
+        409,
+      );
+    }
+    // The stored values are validated again here, whatever wrote them.
+    const decision = decideAgentResume(state.db, ownerId, row);
+    if (!decision.ok) {
+      if (decision.reason === "invalid_resume_data") {
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.resume",
+          resourceType: "terminal",
+          resourceId: id,
+          decision: "deny",
+          reason: "invalid_resume_data",
+        });
+      }
+      return c.json(
+        {
+          error:
+            decision.reason === "invalid_resume_data"
+              ? "The saved agent data for this session is not valid"
+              : "Nothing to resume in this session",
+          reason: decision.reason,
+        },
+        409,
+      );
+    }
+    const { plan } = decision;
+    if (dryRun) {
+      return c.json({ command: plan.command, cwd: plan.cwd, mode: plan.mode });
+    }
+
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    // One hand-over per row: an in-process reservation (this server) plus a
+    // conditional DB update that only one request can win (any process).
+    // Both are taken before anything is created, so two taps, two browsers
+    // or two direct calls never start two agents on one conversation.
+    const inProgress = () =>
+      c.json(
+        {
+          error: "This session is already being resumed",
+          reason: "resume_in_progress",
+        },
+        409,
+      );
+    if (agentResumesInProgress.has(id)) return inProgress();
+    agentResumesInProgress.add(id);
+    const handoffKey =
+      plan.agent === "codex" ? codexHandoffKey(ownerId, plan.cwd) : null;
+    try {
+      const token = reserveAgentResumeToken(state.db, id, {
+        agentName: plan.agent,
+        sessionId: row.agentSessionId,
+        cwd: plan.cwd,
+      });
+      if (token === null) return inProgress();
+      const handoffUntil = Date.now() + CODEX_RESUME_HANDOFF_MS;
+      if (handoffKey) codexResumeHandoffs.set(handoffKey, handoffUntil);
+      let handedOver = false;
+      try {
+        const created = await createTerminalThroughCreatePath(
+          c,
+          { cwd: plan.cwd, cols: body?.cols, rows: body?.rows },
+          routeCapability,
+        );
+        if (!created.ok) return created.response;
+        const terminal = created.terminal;
+        // The create path may fall back to a parent folder when the agent's
+        // folder is gone. Codex `resume --last` would then pick another
+        // folder's conversation, so nothing is typed there.
+        // A reservation taken over meanwhile (a stale one, by another
+        // process) must not type: the new owner does.
+        const stillOwner = agentResumeReservedBy(state.db, id, token);
+        const typeIt = terminal.cwd === plan.cwd && stillOwner;
+        // Typed through the shell functions (Codex keeps --no-alt-screen and
+        // the new run reports its id again), then a separate deferred Enter.
+        const typed =
+          typeIt &&
+          (await typeAgentResumeCommand(
+            (data) => terminal.terminal.write(data),
+            plan.command,
+            { delayMs: AGENT_RESUME_SUBMIT_DELAY_MS },
+          ));
+        if (typeIt && !typed) {
+          writeAuditEvent(state.db, {
+            actorUserId: created.ownerId,
+            action: "terminal.resume",
+            resourceType: "terminal",
+            resourceId: terminal.id,
+            decision: "deny",
+            reason: "resume_write_failed",
+            data: { from: id, agent: plan.agent, mode: plan.mode },
+          });
+          return c.json(
+            {
+              error:
+                "The new terminal closed before the resume command was sent; nothing ran, try again",
+              reason: "resume_write_failed",
+            },
+            500,
+          );
+        }
+        if (typed) {
+          // The command and its Enter reached the shell: hand the row over.
+          // The new terminal's own start marker records the new state.
+          clearAgentSession(state.db, id);
+          handedOver = true;
+        }
+        writeAuditEvent(state.db, {
+          actorUserId: created.ownerId,
+          action: "terminal.resume",
+          resourceType: "terminal",
+          resourceId: terminal.id,
+          decision: "allow",
+          data: {
+            from: id,
+            agent: plan.agent,
+            mode: plan.mode,
+            cwd: plan.cwd,
+            typed,
+          },
+        });
+        return c.json({
+          ...serializeTerminal(terminal),
+          resumed: { from: id, agent: plan.agent, mode: plan.mode, typed },
+        });
+      } finally {
+        // Nothing was handed over (refused, failed or not typed): the row
+        // stays resumable and a retry can reserve it again.
+        if (!handedOver) {
+          releaseAgentResume(state.db, id, token);
+          // Only our own entry: another hand-over in this folder keeps its.
+          if (handoffKey && codexResumeHandoffs.get(handoffKey) === handoffUntil) {
+            codexResumeHandoffs.delete(handoffKey);
+          }
+        }
+      }
+    } finally {
+      agentResumesInProgress.delete(id);
+    }
   });
 
   // Closing a browser tab first schedules termination instead of immediately
@@ -8458,6 +9279,7 @@ export function createWebApp() {
 
     const state = await getFoundationState();
     markTerminalSessionEnded(state.db, id);
+    forgetAgentResumeOnUserClose(state.db, term);
     closeTerminalSockets(id);
     removeTerminalState(id);
     await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
@@ -8495,8 +9317,7 @@ export function createWebApp() {
     }
 
     const body = await c.req.json();
-    const cols = body.cols || 120;
-    const rows = body.rows || 30;
+    const { cols, rows } = resolveTerminalSize(body?.cols, body?.rows);
     term.cols = cols;
     term.rows = rows;
 
@@ -9614,8 +10435,10 @@ export function createWebApp() {
       cwd,
       stdout: "pipe",
       stderr: "pipe",
+      // Git writes keep the user's repo hooks: user code, so no service
+      // secrets (terminal-env.ts).
       env: {
-        ...process.env,
+        ...sanitizeTerminalEnv(process.env),
         GIT_TERMINAL_PROMPT: "0",
         ...hardened.env,
         ...extraEnv,
@@ -9778,6 +10601,17 @@ export function createWebApp() {
       }
     }
     const state = await getFoundationState();
+    // `attention.seen` merges per id by max against the stored value, so a
+    // stale page cannot undo another device's "seen" (null still deletes).
+    if (
+      Object.prototype.hasOwnProperty.call(record, ATTENTION_SEEN_KEY) &&
+      record[ATTENTION_SEEN_KEY] !== null
+    ) {
+      record[ATTENTION_SEEN_KEY] = mergeSeenMaps(
+        getUserSettings(state.db, actor.id)[ATTENTION_SEEN_KEY],
+        record[ATTENTION_SEEN_KEY],
+      );
+    }
     setUserSettings(state.db, actor.id, record);
     return c.json({ settings: getUserSettings(state.db, actor.id) });
   });
@@ -10932,6 +11766,48 @@ export async function restoreRecordedTerminalAfterE2ERunBoundary<T>({
 // Keep the lease strongly reachable even when the entrypoint discards the Bun
 // server wrapper. Native server liveness is not a JavaScript GC ownership root.
 const activeStateOwners = new Set<{ release(): void }>();
+// Ends every terminal whose close-later restore window ran out (the user
+// closed its tab and did not come back). Run by startWebServer's sweep
+// timer; exported so the S3 test can drive one sweep at a chosen time.
+export async function reapScheduledTerminalClosures(
+  now: number = Date.now(),
+): Promise<void> {
+  const state = await getFoundationState();
+
+  for (const [id, term] of terminals) {
+    if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
+      continue;
+    }
+    const sockets = terminalSockets.get(id);
+    const activeSocketsCount = sockets ? sockets.size : 0;
+    if (activeSocketsCount > 0) {
+      // Defensive race handling: a restored tab always wins over the timer.
+      cancelTerminalSessionTermination(state.db, id);
+      term.terminationScheduledAt = undefined;
+      continue;
+    }
+
+    console.log(
+      `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
+    );
+    markTerminalSessionEnded(state.db, id);
+    // The user closed it: no Resume afterwards (S3).
+    forgetAgentResumeOnUserClose(state.db, term);
+    removeTerminalState(id);
+    try {
+      await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
+    } catch (err) {
+      debug(`[close-later] tmux kill-session error for ${id}:`, err);
+    }
+    try {
+      term.proc.kill();
+      term.terminal.close();
+    } catch (err) {
+      debug(`[close-later] cleanup error for ${id}:`, err);
+    }
+  }
+}
+
 export async function startWebServer(host: string, port: number) {
   const lease = acquireStateOwnership(DECKTERM_STATE_DIR);
   const ownership = {
@@ -11187,6 +12063,35 @@ async function startOwnedWebServer(
     console.log(
       "[tmux] TMUX_BACKEND enabled - checking for existing sessions...",
     );
+    // A tmux server started before environment hygiene still holds the
+    // service secrets in its global environment and would hand them to every
+    // new pane. Remove them now (names only are logged, never values).
+    // Running shells keep their copy until they are restarted.
+    // A failure is retried a few times; if it still cannot be verified the
+    // service keeps running, and every terminal creation re-runs the scrub
+    // and is refused (HTTP 503) until one succeeds.
+    if (tmuxTerminalBackend) {
+      const backend = tmuxTerminalBackend;
+      const { result, attempts } = await scrubTmuxEnvironmentWithRetry(
+        () => backend.scrubServerEnvironment(),
+        { attempts: 3, delayMs: 500 },
+      );
+      if (result.removed.length > 0) {
+        console.log(
+          `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
+        );
+      }
+      for (const { session, id, removed } of result.sessions) {
+        console.log(
+          `[tmux] environment: removed ${removed.length} service variable(s) from session ${id} (${session}): ${removed.join(", ")}`,
+        );
+      }
+      if (!result.ok) {
+        console.error(
+          `[tmux] environment: UNVERIFIED after ${attempts} attempt(s) (${result.error}). New terminals are refused until a scrub succeeds; each creation retries it.`,
+        );
+      }
+    }
     const recovered = await recoverTmuxSessions();
     if (recovered > 0) {
       console.log(`[tmux] Recovered ${recovered} session(s)`);
@@ -11398,6 +12303,8 @@ async function startOwnedWebServer(
             protocol: isV2 ? "v2" : "legacy",
             clientId,
             lastEventId: Number.isFinite(lastEventId) ? lastEventId : null,
+            scroll: socketWantsScrollFrames(url),
+            agents: socketWantsAgentsFrames(url),
           },
         });
         if (success) return undefined;
@@ -11511,7 +12418,7 @@ async function startOwnedWebServer(
             if (typeof message === "string") {
               try {
                 const parsed = JSON.parse(message);
-                if (parsed.type !== "ping" && parsed.type !== "resume-ready") {
+                if (!isReadOnlyAllowedMessageType(parsed.type)) {
                   debug(
                     `[ws-security] Blocked message type "${parsed.type}" for read-only actor ${data.actorUserId} on terminal ${terminalId}`,
                   );
@@ -11548,6 +12455,21 @@ async function startOwnedWebServer(
                 ws.send(JSON.stringify({ type: "pong" }));
                 return;
               }
+              if (isScrollControlMessageType(parsed.type)) {
+                const scrollMessage = parseScrollControlMessage(parsed);
+                const controller = scrollMessage
+                  ? getScrollController(term)
+                  : null;
+                if (scrollMessage && controller) {
+                  void controller.handle(scrollMessage).catch((err) => {
+                    debug(
+                      `[tmux] ${scrollMessage.type} failed for ${terminalId}:`,
+                      err,
+                    );
+                  });
+                }
+                return;
+              }
               if (parsed.type === "scrollback") {
                 const direction =
                   parsed.direction === "up" || parsed.direction === "down"
@@ -11573,10 +12495,16 @@ async function startOwnedWebServer(
                 return;
               }
               if (parsed.type === "resize") {
-                debug(`Resize ${terminalId}: ${parsed.cols}x${parsed.rows}`);
-                term.cols = parsed.cols;
-                term.rows = parsed.rows;
-                void requestTerminalResize(term, parsed.cols, parsed.rows);
+                // Whole numbers >= 1, clamped: the pane size bounds every
+                // capture and screen-rule evaluation of this terminal.
+                const size = normalizeTerminalSize(parsed.cols, parsed.rows);
+                if (!size) return;
+                debug(`Resize ${terminalId}: ${size.cols}x${size.rows}`);
+                term.cols = size.cols;
+                term.rows = size.rows;
+                void requestTerminalResize(term, size.cols, size.rows).then(
+                  () => terminalScrollControllers.get(term)?.onResize(),
+                );
                 return;
               }
               if (parsed.type === "input") {
@@ -11590,11 +12518,7 @@ async function startOwnedWebServer(
                     broadcastTerminalState(term);
                   }
                 }
-                try {
-                  term.terminal.write(parsed.data);
-                } catch (err) {
-                  debug(`Write error for ${terminalId}:`, err);
-                }
+                writeTerminalInput(term, parsed.data, data.scroll === true);
                 return;
               }
               if (parsed.type === "resume-ready") {
@@ -11611,21 +12535,17 @@ async function startOwnedWebServer(
             } catch {
               debug(`Raw input ${terminalId}`);
               term.lastActivityAt = Date.now();
-              try {
-                term.terminal.write(message);
-              } catch (err) {
-                debug(`Write error for ${terminalId}:`, err);
-              }
+              writeTerminalInput(term, message, data.scroll === true);
             }
           } else {
             const buf = message as unknown as Uint8Array;
             debug(`Binary input ${terminalId}: ${buf.byteLength} bytes`);
             term.lastActivityAt = Date.now();
-            try {
-              term.terminal.write(new TextDecoder().decode(buf));
-            } catch (err) {
-              debug(`Binary write error for ${terminalId}:`, err);
-            }
+            writeTerminalInput(
+              term,
+              new TextDecoder().decode(buf),
+              data.scroll === true,
+            );
           }
         } catch (err) {
           console.error("[WebSocket] Message handler error:", err);
@@ -11795,47 +12715,14 @@ async function startOwnedWebServer(
     }
   };
 
-  const reapScheduledTerminalClosures = async () => {
-    const now = Date.now();
-    const state = await getFoundationState();
-
-    for (const [id, term] of terminals) {
-      if (!term.terminationScheduledAt || term.terminationScheduledAt > now) {
-        continue;
-      }
-      const sockets = terminalSockets.get(id);
-      const activeSocketsCount = sockets ? sockets.size : 0;
-      if (activeSocketsCount > 0) {
-        // Defensive race handling: a restored tab always wins over the timer.
-        cancelTerminalSessionTermination(state.db, id);
-        term.terminationScheduledAt = undefined;
-        continue;
-      }
-
-      console.log(
-        `[close-later] Ending terminal ${id} after ${Math.round(TERMINAL_TAB_CLOSE_GRACE_MS / 60_000)}min restore window`,
-      );
-      markTerminalSessionEnded(state.db, id);
-      removeTerminalState(id);
-      try {
-        await killTmuxSessionIfLast(term.sessionName, undefined, term.backend);
-      } catch (err) {
-        debug(`[close-later] tmux kill-session error for ${id}:`, err);
-      }
-      try {
-        term.proc.kill();
-        term.terminal.close();
-      } catch (err) {
-        debug(`[close-later] cleanup error for ${id}:`, err);
-      }
-    }
-  };
-
   const lifecycleTimers = [
     setInterval(cleanupClipboardImages, 15 * 60 * 1000),
     setInterval(cleanupIdleTerminals, 5 * 60 * 1000),
     setInterval(reapDetachedSessions, 15 * 60 * 1000),
-    setInterval(reapScheduledTerminalClosures, TERMINAL_TAB_CLOSE_SWEEP_MS),
+    setInterval(
+      () => void reapScheduledTerminalClosures(),
+      TERMINAL_TAB_CLOSE_SWEEP_MS,
+    ),
     setInterval(() => {
       void pumpTmuxPipeOutput().catch((err) =>
         debug("[tmux] pipe pump failed:", err),

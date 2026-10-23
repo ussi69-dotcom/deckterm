@@ -152,11 +152,52 @@ function createSettingsStore({
     }
   }
 
+  // Refetch the server copy of one key and fold it into the cache without
+  // dropping a pending local write. `merge(local, server)` decides the value
+  // (attention.seen merges by max); without it a pending local value wins,
+  // otherwise the server value is taken. A merged value that differs from a
+  // pending one replaces it in the next PUT. Resolves to the new cached value
+  // (undefined when absent); a failed fetch leaves the cache untouched.
+  async function refresh(key, merge = null) {
+    if (typeof key !== "string" || !key || !fetchImpl) return get(key);
+    // An in-flight PUT may hold this key; read after it lands.
+    if (flushInFlight) await flushInFlight.catch(() => {});
+    let server;
+    try {
+      const res = await fetchImpl("/api/settings");
+      if (!res || !res.ok) return get(key);
+      const body = await res.json();
+      const settings = body && body.settings;
+      if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+        return get(key);
+      }
+      server = Object.prototype.hasOwnProperty.call(settings, key)
+        ? settings[key]
+        : undefined;
+    } catch {
+      return get(key);
+    }
+    const hasPending = Object.prototype.hasOwnProperty.call(pending, key);
+    const local = get(key);
+    let next;
+    if (typeof merge === "function") next = merge(local, server);
+    else next = hasPending ? local : server;
+    if (next === undefined || next === null) {
+      if (!hasPending) delete cache[key];
+    } else {
+      cache[key] = next;
+      if (hasPending && pending[key] !== null) pending[key] = next;
+    }
+    writeStorageCache();
+    return get(key);
+  }
+
   return {
     load,
     get,
     set,
     flush,
+    refresh,
     get isLoaded() {
       return loaded;
     },

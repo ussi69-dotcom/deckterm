@@ -1,0 +1,49 @@
+---
+agent: claude
+version: 2.1.308
+state: blocked
+rule: live_blocked_form
+title: ✳ Hello.txt file plan
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-10-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines); user name -> user
+notes: AskUserQuestion form (plan-mode session, after the plan was declined). Earlier plan text above it is in a rounded box; the scratch path inside the box was padded to keep the box width.
+---
+     │ Files                                                                                                           │
+     │                                                                                                                 │
+     │ - Create: /tmp/scratch/hello.txt                                                                                │
+     │ - No other files are touched.                                                                                   │
+     │                                                                                                                 │
+     │ Verification                                                                                                    │
+     │                                                                                                                 │
+     │ - cat /tmp/scratch/hello.txt prints hi.                                                                         │
+     │ - The directory listing shows only hello.txt.                                                                   │
+     │                                                                                                                 │
+     │ Open choice                                                                                                     │
+     │                                                                                                                 │
+     │ - Trailing newline: included by default (standard text-file convention). Say if you want no newline.            │
+     ╰─────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+✻ Sautéed for 7s · done 2:01 PM
+
+❯ Use your AskUserQuestion tool to ask me one multiple-choice question: which colour do I like, red, green or blue?
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Planning: /home/user/.claude/plans/make-a-short-plan-stateful-firefly.md
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Colour
+
+Which colour do I like: red, green or blue?
+
+❯ 1. Red
+     Red
+  2. Green
+     Green
+  3. Blue
+     Blue
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel

@@ -1,0 +1,50 @@
+ spaces                  │   1       tests    +
+                         │┌─────────────────────────────────────────────────────────────────────────────────────┐┌─────────────────────────────────────────────────────────────────────────────────────┐
+ ◐ proj-alpha            ││To run a command as administrator (user "root"), use "sudo <command>".               ││ ▐▛███▜▌   Claude Code (fake, review only)                                           │
+   master                ││See "man sudo_root" for details.                                                     ││                                                                                     │
+ × proj-beta             ││                                                                                     ││> refactor the parser                                                                │
+   master                ││user@host:~/proj-alpha$                                                   ││                                                                                     │
+ ✓ api-server            ││                                                                                     ││✻ Pondering… (12s · ↓ 300 tokens · esc to interrupt)                                 │
+   master                ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+ new                 menu││                                                                                     ││                                                                                     │
+─────────────────────────││                                                                                     ││                                                                                     │
+ agents           grouped││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+ ◐ proj-alpha · 1        ││                                                                                     ││                                                                                     │
+   claude                ││                                                                                     ││                                                                                     │
+ ○ proj-alpha · tests    ││                                                                                     ││                                                                                     │
+   claude                ││                                                                                     ││                                                                                     │
+ × proj-beta             ││                                                                                     ││                                                                                     │
+   claude                ││                                                                                     ││                                                                                     │
+ ✓ api-server            ││                                                                                     ││                                                                                     │
+   claude                ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                         ││                                                                                     ││                                                                                     │
+                        «│ NAVIGATE  esc back  ↑/↓ workspace  tab pane  ? keybinds

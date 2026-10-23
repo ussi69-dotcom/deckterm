@@ -1,5 +1,6 @@
 import type { Subprocess } from "bun";
 import { brokerKill, brokerSpawn } from "./broker-client";
+import { sanitizeTerminalEnv } from "./terminal-env";
 import type {
   BrokeredExecContext,
   TerminalBackend,
@@ -15,6 +16,8 @@ export type RawTerminalBackendOptions = {
 
 export class RawTerminalBackend implements TerminalBackend {
   readonly mode = "raw" as const;
+  // No server-side history to read or position (see readScrollState).
+  readonly supportsScrollControl = false;
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly processes = new Map<string, Subprocess>();
@@ -65,8 +68,10 @@ export class RawTerminalBackend implements TerminalBackend {
       options.shellCommand || (await this.shellCommandResolver());
     const proc = Bun.spawn(shellCommand, {
       cwd: options.cwd,
+      // Service-only variables (push key, CF Access config, DeckTerm switches)
+      // never reach the shell; per-terminal options.env is applied on top.
       env: {
-        ...this.baseEnv,
+        ...sanitizeTerminalEnv(this.baseEnv),
         ...options.env,
         TERM: "xterm-256color",
         COLORTERM: "truecolor",
@@ -108,6 +113,11 @@ export class RawTerminalBackend implements TerminalBackend {
     return "";
   }
 
+  // No screen to read: agentStatus stays null on the raw backend.
+  async captureVisible(_sessionName: string): Promise<string | null> {
+    return null;
+  }
+
   async resize(
     _sessionName: string,
     _cols: number,
@@ -117,6 +127,23 @@ export class RawTerminalBackend implements TerminalBackend {
   }
 
   async scrollHistory(): Promise<boolean> {
+    return false;
+  }
+
+  // A raw PTY has no server-side history: the browser's own scrollback is it.
+  async readScrollState(): Promise<null> {
+    return null;
+  }
+
+  async scrollToPosition(): Promise<boolean> {
+    return false;
+  }
+
+  async exitScroll(): Promise<boolean> {
+    return false;
+  }
+
+  async cancelScroll(): Promise<boolean> {
     return false;
   }
 

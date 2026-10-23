@@ -2,6 +2,14 @@ import type { Subprocess } from "bun";
 import { chmod, mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import {
+  sanitizeTerminalEnv,
+  readTmuxServerIdentity,
+  scrubTmuxEnvironment,
+  TmuxEnvironmentGuard,
+  type TmuxCommandRunner,
+  type TmuxScrubResult,
+} from "./terminal-env";
+import {
   parseTmuxWindowSize,
   planTmuxResize,
   syncTmuxSessionClients,
@@ -11,11 +19,17 @@ import {
   buildTmuxSessionName,
   getTmuxSessionPrefix,
 } from "../tmux-session-names";
+import {
+  parseTmuxScrollState,
+  TMUX_SCROLL_STATE_FORMAT,
+  type TmuxScrollState,
+} from "./tmux-scroll-state";
 import type {
   TerminalBackend,
   TerminalBackendAttachOptions,
   TerminalBackendAttachResult,
   TerminalBackendSession,
+  TerminalScrollCallOptions,
   TerminalScrollDirection,
 } from "./terminal-backend";
 
@@ -101,7 +115,21 @@ export type TmuxTerminalBackendOptions = {
   // When true, refuse to let tmux start the server implicitly. See
   // assertExternalServerRunning() for why that matters in production.
   requireExternalServer?: boolean;
+  // tmux config file passed as `-f` to every tmux call (only the call that
+  // starts the server reads it). Unset in production, which keeps tmux's
+  // default config lookup; tests pass /dev/null so a private server never
+  // loads the developer's own ~/.tmux.conf.
+  configFile?: string;
+  // Hard deadline for each tmux call the scroll controller makes; past it the
+  // tmux client is killed (SIGKILL). Default SCROLL_TMUX_TIMEOUT_MS.
+  scrollCommandTimeoutMs?: number;
 };
+
+// A tmux scroll call (display-message, copy-mode, send -X) answers in
+// milliseconds; one that takes seconds is talking to a wedged server.
+export const SCROLL_TMUX_TIMEOUT_MS = 3_000;
+
+type ScrollTmuxResult = { code: number | null; stdout: string };
 
 export class TmuxServerUnavailableError extends Error {
   readonly socketPath: string;
@@ -121,13 +149,34 @@ export class TmuxServerUnavailableError extends Error {
 
 export class TmuxTerminalBackend implements TerminalBackend {
   readonly mode = "tmux" as const;
+  readonly supportsScrollControl = true;
   readonly namespace: string;
   readonly socketPath: string;
   readonly pipeDir: string;
   private readonly shellCommandResolver: () => Promise<string[]>;
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly requireExternalServer: boolean;
+  private readonly configFile: string | undefined;
+  private readonly scrollCommandTimeoutMs: number;
   private socketDirectoryReady: Promise<void> | null = null;
+  // Gate in front of new-session: refuses to create a shell while the
+  // server's environment has not been verified free of service secrets.
+  private readonly runTmuxCommand: TmuxCommandRunner = async (args) => {
+    const proc = await this.spawnTmux(args, {
+      stdout: "pipe",
+      stderr: "pipe",
+      stdin: "ignore",
+    });
+    const [stdout, stderr] = await Promise.all([
+      new Response((proc as any).stdout).text(),
+      new Response((proc as any).stderr).text(),
+    ]);
+    return { code: await proc.exited, stdout, stderr };
+  };
+  private readonly environmentGuard = new TmuxEnvironmentGuard(
+    () => scrubTmuxEnvironment(this.runTmuxCommand),
+    () => readTmuxServerIdentity(this.runTmuxCommand),
+  );
 
   constructor(options: TmuxTerminalBackendOptions) {
     this.namespace = options.namespace;
@@ -136,6 +185,18 @@ export class TmuxTerminalBackend implements TerminalBackend {
     this.shellCommandResolver = options.shellCommandResolver;
     this.baseEnv = options.env || process.env;
     this.requireExternalServer = options.requireExternalServer === true;
+    this.configFile = options.configFile;
+    this.scrollCommandTimeoutMs =
+      options.scrollCommandTimeoutMs ?? SCROLL_TMUX_TIMEOUT_MS;
+  }
+
+  /**
+   * baseEnv minus the service-only variables (terminal-env.ts). Everything
+   * that can start the tmux server or reach a shell uses this. Computed per
+   * call so it follows baseEnv (process.env by default) like before.
+   */
+  private get shellEnv(): Record<string, string | undefined> {
+    return sanitizeTerminalEnv(this.baseEnv);
   }
 
   /**
@@ -179,6 +240,13 @@ export class TmuxTerminalBackend implements TerminalBackend {
     });
     const shellCommand = await this.shellCommandResolver();
     await this.assertExternalServerRunning();
+    // Throws TmuxEnvironmentUnverifiedError (HTTP 503) when the server may
+    // still hold service secrets; the next create tries again. Re-scrubs
+    // whenever a different server answers the socket than the one verified.
+    // Known gap (operator decision 2026-10-22): BrokeredTmuxBackend (per-uid
+    // servers, DECKTERM_OS_ISOLATION=1, off on dev and prod) has no such
+    // gate; the broker builds each child environment from scratch.
+    await this.environmentGuard.ensureVerified();
     const createProc = await this.spawnTmux(
       [
         "new-session",
@@ -194,8 +262,10 @@ export class TmuxTerminalBackend implements TerminalBackend {
         ...shellCommand,
       ],
       {
+        // new-session is the call that may start the tmux server, and the
+        // server hands its environment to every pane it ever creates.
         env: {
-          ...this.baseEnv,
+          ...this.shellEnv,
           TERM: "xterm-256color",
           COLORTERM: "truecolor",
         },
@@ -238,7 +308,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
     const proc = await this.spawnTmux(["attach-session", "-t", sessionName], {
       cwd: spawnCwd,
       env: {
-        ...this.baseEnv,
+        ...this.shellEnv,
         ...options.env,
         TERM: "xterm-256color",
         COLORTERM: "truecolor",
@@ -264,6 +334,18 @@ export class TmuxTerminalBackend implements TerminalBackend {
     const output = await new Response((captureProc as any).stdout).text();
     await captureProc.exited;
     return output;
+  }
+
+  // Bounded like the scroll commands: a wedged tmux server must not stall the
+  // pipe pump that calls this every tick.
+  async captureVisible(sessionName: string): Promise<string | null> {
+    const res = await this.runScrollTmux([
+      "capture-pane",
+      "-p",
+      "-t",
+      sessionName,
+    ]);
+    return res.code === 0 ? res.stdout : null;
   }
 
   async resize(
@@ -384,44 +466,172 @@ export class TmuxTerminalBackend implements TerminalBackend {
     await resizePaneProc.exited;
   }
 
+  /**
+   * One tmux call for the scroll controller, with a hard timeout and the
+   * caller's abort signal: either one kills the tmux client (SIGKILL), and
+   * the result only arrives once the process is gone. A signal that is
+   * already aborted spawns nothing. code null = not run, killed or failed.
+   */
+  private async runScrollTmux(
+    args: string[],
+    options: TerminalScrollCallOptions = {},
+  ): Promise<ScrollTmuxResult> {
+    const { signal } = options;
+    if (signal?.aborted) return { code: null, stdout: "" };
+    let proc: Subprocess;
+    try {
+      proc = await this.spawnTmux(args, {
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "ignore",
+        timeout: this.scrollCommandTimeoutMs,
+        killSignal: "SIGKILL",
+        ...(signal ? { signal } : {}),
+      });
+    } catch {
+      return { code: null, stdout: "" };
+    }
+    // The tmux client hands its stdout to the server, so a client killed
+    // while the server is wedged leaves the pipe open: never wait for EOF on
+    // a killed client, and bound the wait after a normal exit too.
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    const chunks: Uint8Array[] = [];
+    const reading = (async () => {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return true;
+        if (value) chunks.push(value);
+      }
+    })().catch(() => false);
+    const exitCode = await proc.exited;
+    if (proc.signalCode != null || signal?.aborted === true) {
+      void reader.cancel().catch(() => {});
+      return { code: null, stdout: "" };
+    }
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const finished = await Promise.race([
+      reading,
+      new Promise<false>((resolve) => {
+        graceTimer = setTimeout(
+          () => resolve(false),
+          this.scrollCommandTimeoutMs,
+        );
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (!finished) {
+      void reader.cancel().catch(() => {});
+      return { code: null, stdout: "" };
+    }
+    return { code: exitCode, stdout: Buffer.concat(chunks).toString("utf8") };
+  }
+
   async scrollHistory(
     sessionName: string,
     direction: TerminalScrollDirection,
     lines: number,
+    options: TerminalScrollCallOptions = {},
   ): Promise<boolean> {
     const count = Math.max(1, Math.min(100, Math.trunc(lines)));
     // Alternate-screen panes have no tmux history: copy-mode there is an
     // empty [0/0] dead end that also steals subsequent input. Refuse.
-    const stateProc = await this.spawnTmux([
-      "display-message",
-      "-p",
-      "-t",
-      sessionName,
-      "#{alternate_on}",
-    ]);
-    const stateExit = await stateProc.exited;
-    const paneState = await new Response((stateProc as any).stdout).text();
-    if (stateExit !== 0 || paneState.trim() === "1") return false;
+    const paneState = await this.runScrollTmux(
+      ["display-message", "-p", "-t", sessionName, "#{alternate_on}"],
+      options,
+    );
+    if (paneState.code !== 0 || paneState.stdout.trim() === "1") return false;
     if (direction === "up") {
-      const copyModeProc = await this.spawnTmux([
+      const copyMode = await this.runScrollTmux(
+        ["copy-mode", "-e", "-t", sessionName],
+        options,
+      );
+      if (copyMode.code !== 0) return false;
+    }
+
+    const scroll = await this.runScrollTmux(
+      [
+        "send-keys",
+        "-X",
+        "-N",
+        String(count),
+        "-t",
+        sessionName,
+        direction === "up" ? "scroll-up" : "scroll-down",
+      ],
+      options,
+    );
+    return scroll.code === 0;
+  }
+
+  async readScrollState(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<TmuxScrollState | null> {
+    const res = await this.runScrollTmux(
+      ["display-message", "-p", "-t", sessionName, TMUX_SCROLL_STATE_FORMAT],
+      options,
+    );
+    if (res.code !== 0) return null;
+    return parseTmuxScrollState(res.stdout);
+  }
+
+  // `goto-line N` puts the view N lines above the live bottom (tmux clamps it
+  // to the history), as long as copy-mode-line-numbers stays off (pinned in
+  // ensureServerOptions). It never leaves copy-mode itself, even at 0, so 0
+  // exits explicitly.
+  async scrollToPosition(
+    sessionName: string,
+    position: number,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<boolean> {
+    const target = Math.trunc(position);
+    if (!Number.isFinite(target) || target <= 0) {
+      return this.exitScroll(sessionName, options);
+    }
+    const state = await this.readScrollState(sessionName, options);
+    // Same dead end as scrollHistory: no copy-mode on the alternate screen.
+    if (!state || state.altScreen) return false;
+    const res = await this.runScrollTmux(
+      [
         "copy-mode",
         "-e",
         "-t",
         sessionName,
-      ]);
-      if ((await copyModeProc.exited) !== 0) return false;
-    }
+        ";",
+        "send-keys",
+        "-X",
+        "-t",
+        sessionName,
+        "goto-line",
+        String(target),
+      ],
+      options,
+    );
+    return res.code === 0;
+  }
 
-    const scrollProc = await this.spawnTmux([
-      "send-keys",
-      "-X",
-      "-N",
-      String(count),
-      "-t",
-      sessionName,
-      direction === "up" ? "scroll-up" : "scroll-down",
-    ]);
-    return (await scrollProc.exited) === 0;
+  // `copy-mode -q` exits every mode and returns 0 when there is none, unlike
+  // `send -X cancel` (rc 1 "not in a mode").
+  async exitScroll(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<boolean> {
+    const res = await this.runScrollTmux(
+      ["copy-mode", "-q", "-t", sessionName],
+      options,
+    );
+    return res.code === 0;
+  }
+
+  async cancelScroll(
+    sessionName: string,
+    options: TerminalScrollCallOptions = {},
+  ): Promise<boolean> {
+    const res = await this.runScrollTmux(
+      ["send-keys", "-X", "-t", sessionName, "cancel"],
+      options,
+    );
+    return res.code === 0;
   }
 
   async kill(sessionName: string): Promise<void> {
@@ -584,9 +794,36 @@ export class TmuxTerminalBackend implements TerminalBackend {
     }
   }
 
+  /**
+   * Removes the service-only variables (terminal-env.ts) from this tmux
+   * server's global environment and from every session's own environment, so
+   * panes created from now on do not inherit them. Needed for a server started
+   * before environment hygiene existed — tmux keeps the environment it was
+   * started with. Never throws: `ok: false` means the server could not be
+   * verified, and createSession then re-runs the scrub and refuses until it
+   * succeeds.
+   */
+  scrubServerEnvironment(): Promise<TmuxScrubResult> {
+    return this.environmentGuard.run();
+  }
+
+  /** True once a scrub verified a running server clean. */
+  get environmentVerified(): boolean {
+    return this.environmentGuard.isVerified;
+  }
+
   private async spawnTmux(args: string[], options?: any): Promise<Subprocess> {
     await this.ensureSocketDirectory();
-    return Bun.spawn(["tmux", "-S", this.socketPath, ...args], options);
+    // Callers that pass no env still get the sanitized one: a tmux client
+    // never needs the service secrets, and new-session (the only implicit
+    // server start) must not hand them to the server.
+    const spawnOptions =
+      options && options.env ? options : { ...options, env: this.shellEnv };
+    const config = this.configFile ? ["-f", this.configFile] : [];
+    return Bun.spawn(
+      ["tmux", ...config, "-S", this.socketPath, ...args],
+      spawnOptions,
+    );
   }
 
   private async ensureSocketDirectory(): Promise<void> {
@@ -619,6 +856,9 @@ export class TmuxTerminalBackend implements TerminalBackend {
   //   (including completed Codex/Claude responses).
   // - mouse off: tmux 3.8 turned mouse on by default, which sends wheel and
   //   drag to tmux copy mode instead of DeckTerm's own scrollback/selection.
+  // - copy-mode-line-numbers off: tmux 3.8 can number copy-mode lines from
+  //   the top of history instead, which changes what `goto-line` (the scroll
+  //   indicator's absolute jump) means. -q: tmux < 3.8 has no such option.
   // - theme terminal: tmux 3.8 re-colours its own UI by default; -q keeps
   //   tmux < 3.8 (no such option) quiet. Last in the chain on purpose.
   private async ensureServerOptions(): Promise<void> {
@@ -631,6 +871,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
       "set-option",
       "-g",
       "mouse",
+      "off",
+      ";",
+      "set-option",
+      "-gq",
+      "copy-mode-line-numbers",
       "off",
       ";",
       "set-option",
