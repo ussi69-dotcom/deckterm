@@ -8,6 +8,23 @@ function base64UrlToUint8Array(value) {
   return Uint8Array.from(raw, (character) => character.charCodeAt(0));
 }
 
+// True when `subscription` was made for a different server key than
+// `publicKey` (the VAPID key pair was rotated): the push service refuses every
+// push signed with the new key for it, while the page would still show
+// "enabled". False when the browser does not report the key.
+function subscriptionKeyMismatch(subscription, publicKey) {
+  const key = subscription?.options?.applicationServerKey;
+  if (!key || !publicKey) return false;
+  const current = base64UrlToUint8Array(publicKey);
+  const stored = new Uint8Array(key);
+  if (stored.length !== current.length) return true;
+  return stored.some((byte, index) => byte !== current[index]);
+}
+
+// Set while a subscription made for an earlier key has been dropped and not
+// yet renewed, so a renewal that failed is retried on the next load.
+const RENEW_PENDING_KEY = "deckterm.push.renewPending";
+
 class PushNotificationManager {
   constructor({ windowRef, navigatorRef, fetchImpl, onChange } = {}) {
     this.windowRef =
@@ -23,6 +40,7 @@ class PushNotificationManager {
     this.config = null;
     this.state = "loading";
     this.error = null;
+    this.renewPendingInPage = false;
   }
 
   supported() {
@@ -84,6 +102,45 @@ class PushNotificationManager {
     return this.config;
   }
 
+  // Drops a subscription made for an earlier server key: the server row
+  // first (as disable() does), then the browser's. Best effort: a failure
+  // leaves a row whose pushes the push service refuses.
+  async dropStaleSubscription(subscription) {
+    await this.fetchImpl("/api/notifications/push", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint: subscription.endpoint }),
+    }).catch(() => null);
+    await subscription.unsubscribe().catch(() => false);
+  }
+
+  // The mark lives in localStorage so it survives a reload; this page also
+  // keeps it in memory for a browser where storage is unavailable.
+  renewPending() {
+    if (this.renewPendingInPage) return true;
+    try {
+      return this.windowRef?.localStorage?.getItem(RENEW_PENDING_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  setRenewPending(pending) {
+    this.renewPendingInPage = Boolean(pending);
+    try {
+      if (pending)
+        this.windowRef?.localStorage?.setItem(RENEW_PENDING_KEY, "1");
+      else this.windowRef?.localStorage?.removeItem(RENEW_PENDING_KEY);
+    } catch {}
+  }
+
+  async subscribeWithKey(registration, publicKey) {
+    return registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64UrlToUint8Array(publicKey),
+    });
+  }
+
   async ensureRegistration() {
     if (this.registration) return this.registration;
     this.registration = await this.navigatorRef.serviceWorker.register(
@@ -123,9 +180,33 @@ class PushNotificationManager {
       }
       const registration = await this.ensureRegistration();
       this.subscription = await registration.pushManager.getSubscription();
+      if (
+        this.subscription &&
+        subscriptionKeyMismatch(this.subscription, config.publicKey)
+      ) {
+        // The server key was rotated: drop the old subscription, remember
+        // that it needs renewing, and renew below.
+        this.setRenewPending(true);
+        await this.dropStaleSubscription(this.subscription);
+        this.subscription = null;
+      }
+      if (
+        !this.subscription &&
+        this.renewPending() &&
+        this.windowRef.Notification.permission === "granted"
+      ) {
+        // Permission is granted, so no prompt. A failure keeps the mark and
+        // the next load tries again; without permission the device is
+        // offered Enable (permission is asked only from enable()).
+        this.subscription = await this.subscribeWithKey(
+          registration,
+          config.publicKey,
+        ).catch(() => null);
+      }
       if (this.subscription) {
         // Heal a server row lost to a restore or database rollback.
         await this.persistSubscription(this.subscription);
+        this.setRenewPending(false);
         this.setState("enabled");
       } else {
         this.setState("ready");
@@ -159,15 +240,23 @@ class PushNotificationManager {
       }
       const registration = await this.ensureRegistration();
       let subscription = await registration.pushManager.getSubscription();
+      if (
+        subscription &&
+        subscriptionKeyMismatch(subscription, config.publicKey)
+      ) {
+        await this.dropStaleSubscription(subscription);
+        subscription = null;
+      }
       if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: base64UrlToUint8Array(config.publicKey),
-        });
+        subscription = await this.subscribeWithKey(
+          registration,
+          config.publicKey,
+        );
         created = subscription;
       }
       await this.persistSubscription(subscription);
       this.subscription = subscription;
+      this.setRenewPending(false);
       this.setState("enabled");
       return true;
     } catch (error) {
@@ -241,6 +330,7 @@ class PushNotificationManager {
 
 const PushNotifications = {
   base64UrlToUint8Array,
+  subscriptionKeyMismatch,
   PushNotificationManager,
 };
 

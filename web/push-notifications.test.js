@@ -1,6 +1,7 @@
 const { describe, expect, test } = require("bun:test");
 const {
   base64UrlToUint8Array,
+  subscriptionKeyMismatch,
   PushNotificationManager,
 } = require("./push-notifications.js");
 
@@ -13,7 +14,16 @@ function response(body, ok = true) {
   };
 }
 
-function createHarness({ postOk = true, config = null } = {}) {
+// `existingKey`: the browser already holds a subscription made for this
+// server key (bytes); `permission`: the notification permission at start;
+// `subscribeFailures`: how many subscribe() calls reject first.
+function createHarness({
+  postOk = true,
+  config = null,
+  existingKey = null,
+  permission = "default",
+  subscribeFailures = 0,
+} = {}) {
   const calls = [];
   let permissionRequests = 0;
   let subscribeCalls = 0;
@@ -33,13 +43,31 @@ function createHarness({ postOk = true, config = null } = {}) {
       return true;
     },
   };
-  let currentSubscription = null;
+  let currentSubscription = existingKey
+    ? {
+        endpoint: "https://push.example.test/old-device",
+        options: { applicationServerKey: Uint8Array.from(existingKey).buffer },
+        toJSON: () => ({ endpoint: "https://push.example.test/old-device" }),
+        unsubscribe: async () => {
+          unsubscribeCalls += 1;
+          currentSubscription = null;
+          return true;
+        },
+      }
+    : null;
   const registration = {
     pushManager: {
       getSubscription: async () => currentSubscription,
       subscribe: async (options) => {
         subscribeCalls += 1;
         calls.push(["subscribe", options]);
+        if (subscribeFailures > 0) {
+          subscribeFailures -= 1;
+          throw new Error("push service unreachable");
+        }
+        subscription.options = {
+          applicationServerKey: options.applicationServerKey.buffer,
+        };
         currentSubscription = subscription;
         return subscription;
       },
@@ -47,7 +75,7 @@ function createHarness({ postOk = true, config = null } = {}) {
     showNotification: async (...args) => calls.push(["show", ...args]),
   };
   class MockNotification {
-    static permission = "default";
+    static permission = permission;
     static async requestPermission() {
       permissionRequests += 1;
       MockNotification.permission = "granted";
@@ -62,15 +90,31 @@ function createHarness({ postOk = true, config = null } = {}) {
     if (options.method === "DELETE") return response({ ok: true });
     return response(config || { configured: true, publicKey });
   };
-  const manager = new PushNotificationManager({
-    windowRef: { Notification: MockNotification, PushManager: class {} },
-    navigatorRef: {
-      serviceWorker: { register: async () => registration },
-    },
-    fetchImpl,
-  });
+  const storage = new Map();
+  const localStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+  };
+  // A page load: a fresh manager on the same browser (registration,
+  // permission and localStorage).
+  const load = () =>
+    new PushNotificationManager({
+      windowRef: {
+        Notification: MockNotification,
+        PushManager: class {},
+        localStorage,
+      },
+      navigatorRef: {
+        serviceWorker: { register: async () => registration },
+      },
+      fetchImpl,
+    });
+  const manager = load();
   return {
     manager,
+    load,
+    storage,
     calls,
     subscription,
     get permissionRequests() {
@@ -109,6 +153,116 @@ describe("PushNotificationManager", () => {
     expect(JSON.parse(post[2]).subscription.endpoint).toBe(
       harness.subscription.endpoint,
     );
+  });
+
+  test("a subscription made for an earlier server key is renewed at start without a prompt", async () => {
+    // The VAPID key pair was rotated: the push service would refuse every
+    // push for the old subscription while the page showed "enabled".
+    const harness = createHarness({
+      existingKey: Buffer.alloc(65, 9),
+      permission: "granted",
+    });
+    await harness.manager.initialize();
+    const deleted = harness.calls.find((call) => call[1] === "DELETE");
+    expect(JSON.parse(deleted[2]).endpoint).toBe(
+      "https://push.example.test/old-device",
+    );
+    expect(harness.unsubscribeCalls).toBe(1);
+    expect(harness.subscribeCalls).toBe(1);
+    const subscribe = harness.calls.find((call) => call[0] === "subscribe");
+    expect(subscribe[1].applicationServerKey).toEqual(
+      base64UrlToUint8Array(publicKey),
+    );
+    const post = harness.calls.find((call) => call[1] === "POST");
+    expect(JSON.parse(post[2]).subscription.endpoint).toBe(
+      harness.subscription.endpoint,
+    );
+    expect(harness.permissionRequests).toBe(0);
+    expect(harness.manager.getStatus().state).toBe("enabled");
+  });
+
+  test("a renewal that fails is retried on the next page load", async () => {
+    const harness = createHarness({
+      existingKey: Buffer.alloc(65, 9),
+      permission: "granted",
+      subscribeFailures: 1,
+    });
+    await harness.manager.initialize();
+    expect(harness.unsubscribeCalls).toBe(1);
+    expect(harness.manager.getStatus().state).toBe("ready");
+    expect(harness.storage.get("deckterm.push.renewPending")).toBe("1");
+
+    const next = harness.load();
+    await next.initialize();
+    expect(harness.subscribeCalls).toBe(2);
+    expect(harness.permissionRequests).toBe(0);
+    expect(next.getStatus().state).toBe("enabled");
+    expect(harness.storage.has("deckterm.push.renewPending")).toBe(false);
+
+    // Renewed: a later load changes nothing.
+    await harness.load().initialize();
+    expect(harness.subscribeCalls).toBe(2);
+  });
+
+  test("without a pending renewal a page load never subscribes on its own", async () => {
+    const harness = createHarness({ permission: "granted" });
+    await harness.manager.initialize();
+    expect(harness.subscribeCalls).toBe(0);
+    expect(harness.manager.getStatus().state).toBe("ready");
+  });
+
+  test("an old-key subscription without granted permission is dropped and Enable is offered", async () => {
+    const harness = createHarness({ existingKey: Buffer.alloc(65, 9) });
+    await harness.manager.initialize();
+    expect(harness.unsubscribeCalls).toBe(1);
+    expect(harness.subscribeCalls).toBe(0);
+    expect(harness.permissionRequests).toBe(0);
+    expect(harness.manager.getStatus().state).toBe("ready");
+
+    expect(await harness.manager.enable()).toBe(true);
+    expect(harness.subscribeCalls).toBe(1);
+    expect(harness.manager.getStatus().state).toBe("enabled");
+  });
+
+  test("enable() replaces a subscription made for an earlier server key", async () => {
+    const harness = createHarness({ existingKey: Buffer.alloc(65, 9) });
+    expect(await harness.manager.enable()).toBe(true);
+    expect(harness.unsubscribeCalls).toBe(1);
+    expect(harness.subscribeCalls).toBe(1);
+    expect(harness.manager.getStatus().enabled).toBe(true);
+  });
+
+  test("a subscription made for the current key is kept and re-saved", async () => {
+    const harness = createHarness({
+      existingKey: Buffer.alloc(65, 7),
+      permission: "granted",
+    });
+    await harness.manager.initialize();
+    expect(harness.calls.some((call) => call[1] === "DELETE")).toBe(false);
+    expect(harness.unsubscribeCalls).toBe(0);
+    expect(harness.subscribeCalls).toBe(0);
+    expect(harness.calls.some((call) => call[1] === "POST")).toBe(true);
+    expect(harness.manager.getStatus().state).toBe("enabled");
+  });
+
+  test("subscriptionKeyMismatch is false when the browser does not report the key", () => {
+    expect(subscriptionKeyMismatch({ endpoint: "x" }, publicKey)).toBe(false);
+    expect(
+      subscriptionKeyMismatch(
+        { options: { applicationServerKey: null } },
+        publicKey,
+      ),
+    ).toBe(false);
+    expect(
+      subscriptionKeyMismatch(
+        {
+          options: {
+            applicationServerKey: Uint8Array.from(Buffer.alloc(65, 7)).buffer,
+          },
+        },
+        publicKey,
+      ),
+    ).toBe(false);
   });
 
   test("deletes the server row before unsubscribing locally", async () => {
