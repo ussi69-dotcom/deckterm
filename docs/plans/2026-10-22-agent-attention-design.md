@@ -209,6 +209,7 @@ One pure view model, `web/agent-overview.js`, used by the panel, the IDE view, t
 
 | Surface | Id or key |
 | --- | --- |
+| Corner toggle (desktop, added 2026-10-23 at the owner's request) | `#agents-panel-toggle`, the first control of the toolbar, in the same top-left place whether the panel is shown or hidden; `aria-pressed` and the icon follow the state; in IDE mode it shows or collapses the Agents view. Hidden on phones and below 768 px. It replaced the hide button in the panel header: once the panel was hidden, the owner had to hunt for the way back. |
 | Toolbar button (desktop, pinned by default) | action `agents`, added first to `desktopPrimary` and to `overflow` in `web/navigation-surface.js:9-25`. Saved custom layouts keep their pins; the action stays in More. |
 | Palette and action registry | `agents` ("Show or hide the Agents panel") and `next-agent` ("Go to the next agent that needs you") |
 | Keyboard | `Ctrl+Shift+L` toggles the panel; `Ctrl+Shift+X` is Next. Both are new rows in `web/keyboard-shortcuts.js:40-193`, with `actionId`, so Help and the palette list them. S2 checks that Chromium and Firefox deliver both to the page; if not, it picks another free `Ctrl+Shift+letter` and updates the rows. |
