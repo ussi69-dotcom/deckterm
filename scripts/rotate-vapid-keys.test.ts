@@ -184,3 +184,27 @@ test("a directory writable by everyone is refused", () => {
     chmodSync(dir, 0o700);
   }
 });
+
+test("a second run in the same second keeps the first backup and changes nothing", () => {
+  const { dir, path } = envFile(
+    "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test\n",
+  );
+  const now = new Date("2026-10-23T18:00:00.000Z");
+  const first = rotateVapidKeys(path, { now });
+  const backup = readFileSync(first.backupPath, "utf8");
+  const afterFirst = readFileSync(path, "utf8");
+  expect(() => rotateVapidKeys(path, { now })).toThrow();
+  expect(readFileSync(first.backupPath, "utf8")).toBe(backup);
+  expect(readFileSync(path, "utf8")).toBe(afterFirst);
+  expect(readdirSync(dir).sort()).toEqual(
+    ["prod.env", "prod.env.vapid-backup-20261023T180000Z"].sort(),
+  );
+});
+
+test("a FIFO in place of the file is refused at once", () => {
+  const dir = mkdtempSync(join(tmpdir(), "dt-vapid-"));
+  dirs.push(dir);
+  const fifo = join(dir, "prod.env");
+  Bun.spawnSync(["mkfifo", fifo]);
+  expect(() => rotateVapidKeys(fifo)).toThrow(/not a regular file/);
+});

@@ -74,7 +74,11 @@ function assertSingleLineValues(lines: string[], envPath: string): void {
 function readRegularFile(path: string): string {
   let fd: number;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    // O_NONBLOCK: a FIFO in its place is refused below instead of blocking.
+    fd = openSync(
+      path,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch (error) {
     if ((error as { code?: string }).code === "ELOOP") {
       throw new Error(`${path} is a symlink (symlinks are refused).`);
@@ -207,8 +211,18 @@ export function rotateVapidKeys(
   const backupPath = `${envPath}.vapid-backup-${utcStamp(now)}`;
   const tempPath = `${envPath}.tmp-${randomBytes(6).toString("hex")}`;
   let committed = false;
+  // Only files this run created are removed on failure (an earlier run's
+  // backup with the same name stays).
+  const created: string[] = [];
   try {
-    writeNewFile(backupPath, original, write);
+    created.push(backupPath);
+    try {
+      writeNewFile(backupPath, original, write);
+    } catch (error) {
+      if ((error as { code?: string }).code === "EEXIST") created.pop();
+      throw error;
+    }
+    created.push(tempPath);
     writeNewFile(tempPath, next.join("\n"), write);
     beforeCommit?.();
     // Someone changed the file since it was read: keep their version.
@@ -220,10 +234,7 @@ export function rotateVapidKeys(
     renameSync(tempPath, envPath);
     committed = true;
   } finally {
-    if (!committed) {
-      removeQuietly(tempPath);
-      removeQuietly(backupPath);
-    }
+    if (!committed) for (const path of created) removeQuietly(path);
   }
   const dirFd = openSync(dir, "r");
   try {
