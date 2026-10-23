@@ -1,7 +1,7 @@
 ---
 status: consumed
-updated: 2026-10-22
-next: Run done on dev (nothing on main or production). Open owner items only - the phone checklist answer (Slack thread 1792678234.328939; a reported failure becomes a new fix/mobile-* slice with a test), promotion of dev to main, and the VAPID key rotation decision. See "Final state".
+updated: 2026-10-23
+next: In production since 2026-10-23 (PR #44 and #45, release 0766f80). Open - VAPID key rotation (owner chose "at promotion"; the tool and the client renewal ship in PR #46, then the owner runs two commands), a gated action seen live on production, and the Slack owner message about a PHP vulnerability. See "Promotion (2026-10-23)".
 ---
 
 # Operator state: DeckTerm phone repair, then herdr adoption (agent state, Agents panel, resume)
@@ -358,6 +358,16 @@ Build it as the report describes:
 - **Owner decisions open (tier 3, Slack questions `44a35f00` promotion and `321c58d9` VAPID rotation, recommended "after the phone test" and "rotate at promotion"):** promotion of `dev` to `main` (it would bring: a one-time tmux env scrub of the production tmux server, DB migration 11 with two columns and an index, the content-hashed rc file name with the old `/tmp/deckterm-bash-integration.rc` left behind, push deep links); VAPID key rotation (recommended at promotion: the private key was readable by every DeckTerm shell until S0; every phone must re-subscribe).
 - **Disclosed side effects.** The 16:11 UTC rc-file incident (above). Claude Code wrote folder-trust entries for three scratch folders when the capture and acceptance sessions accepted its trust prompt (Claude's own write, not DeckTerm's). The S2 agent installed Firefox (~100 MB) into `~/.cache/ms-playwright`, and Chromium 1228 was deleted and reinstalled. 15 short agent sessions used (Claude haiku, Codex gpt-5.6-luna low), the plan's ceiling.
 - **Measurements.** About 7 h wall time. API-equivalent cost from `agent_cost.py --since 2026-10-22T12:27:00Z`: 194 USD (Opus 91 %, Fable advisor 5 %, Sonnet 3 %); 2 advisor calls; 0 compactions. Codex reviews: 13 (S0 2, M0 2, F17 2, S1 2, S2 2, S3 2, plus one partial S2 run), every P1 fixed or rejected with written reasons. Review rework after merge: M0 (two fix rounds), S1 (one), S2 (one), S3 (one), F17 (two).
+
+## Promotion (2026-10-23)
+
+- **Owner, terminal, verbatim:** "vypada dobre, nasad na prod ale s upravou, ze chci mit sidebar togglovanej tlacitkem co bude v levem hornim rohu vzdy, ted kdyz ho togglem schovam tak hledam tlacitkoi na jeho reapear". Slack: `44a35f00` decided `after-test` (acknowledged), `321c58d9` decided `at-promotion` (open until the rotation is done).
+- **This session is hosted on the dev tmux server** (`$TMUX` under `~/.deckterm-dev`), so the dev service was not restarted: dev still runs the S3 column build in its backend; the web files are current.
+- **Corner toggle** (`07639c8`, `bb530be`, `1cb4cbc`): `#agents-panel-toggle` is the first toolbar control, same place in both states, drives the IDE Agents view in IDE mode; it replaced the panel-header hide button and the pinned "Agents" toolbar button (the toggle's 44 px had pushed two tab-layout specs over their thresholds). Codex: P2 `aria-controls` in IDE mode, P3 label after reload, both fixed.
+- **Full e2e on dev:** 256 passed, 1 failed: `navigation-surface` "wraps desktop tabs ..." needs 8 terminals and dev's global cap of 10 is shared with 3 live sessions (HTTP 429). The same check passed as a standalone script on a private instance.
+- **First deploy refused** (run `39983689544`): the running release's driver rejected migration 11 (columns + index on `terminal_sessions`; SQLite puts an added column before the FOREIGN KEY clause). Production unchanged. Fix `858f08e`: S3 data in the new table `terminal_agent_sessions`, plus `backend/foundation-schema-rollback.test.ts` with the b04c791 schema fixture (red with the exact production errors, then green). Codex: no findings. `fbd6e4e`: 20 s timeout for two seed-heavy tests (about 4 s on CI before and after; one run hit 6.1 s).
+- **Second deploy** (run `39989049993`, PR #45): success. `prod/current` and the live process cwd are release `0766f80`; 4273 free; driver: "Verified: production is serving release 0766f80...". Journal: 16 service variables removed from the production tmux server's global environment (names only), no UNVERIFIED line, 1 session recovered, KillMode=process lifecycle line. The new release's schema contract has `terminal_agent_sessions` and no agent columns on `terminal_sessions`. No WebSocket connection was seen right after the restart: a live gated action is still to be observed.
+- **VAPID rotation, prepared:** `17c3703` renews a subscription made for an earlier server key (with permission granted, at start, no prompt); `f21f1eb` adds `scripts/rotate-vapid-keys.ts` (rewrites the two key lines, mode-600 backup, atomic, prints no secret; documented in `docs/operations-guide.md`). The owner runs it: the secret guard blocks the agent from env files, and the key must not enter a model context.
 
 ## Traps
 
