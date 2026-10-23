@@ -8,6 +8,19 @@ function base64UrlToUint8Array(value) {
   return Uint8Array.from(raw, (character) => character.charCodeAt(0));
 }
 
+// True when `subscription` was made for a different server key than
+// `publicKey` (the VAPID key pair was rotated): the push service refuses every
+// push signed with the new key for it, while the page would still show
+// "enabled". False when the browser does not report the key.
+function subscriptionKeyMismatch(subscription, publicKey) {
+  const key = subscription?.options?.applicationServerKey;
+  if (!key || !publicKey) return false;
+  const current = base64UrlToUint8Array(publicKey);
+  const stored = new Uint8Array(key);
+  if (stored.length !== current.length) return true;
+  return stored.some((byte, index) => byte !== current[index]);
+}
+
 class PushNotificationManager {
   constructor({ windowRef, navigatorRef, fetchImpl, onChange } = {}) {
     this.windowRef =
@@ -84,6 +97,25 @@ class PushNotificationManager {
     return this.config;
   }
 
+  // Drops a subscription made for an earlier server key: the server row
+  // first (as disable() does), then the browser's. Best effort: a failure
+  // leaves a row whose pushes the push service refuses.
+  async dropStaleSubscription(subscription) {
+    await this.fetchImpl("/api/notifications/push", {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ endpoint: subscription.endpoint }),
+    }).catch(() => null);
+    await subscription.unsubscribe().catch(() => false);
+  }
+
+  async subscribeWithKey(registration, publicKey) {
+    return registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: base64UrlToUint8Array(publicKey),
+    });
+  }
+
   async ensureRegistration() {
     if (this.registration) return this.registration;
     this.registration = await this.navigatorRef.serviceWorker.register(
@@ -123,6 +155,22 @@ class PushNotificationManager {
       }
       const registration = await this.ensureRegistration();
       this.subscription = await registration.pushManager.getSubscription();
+      if (
+        this.subscription &&
+        subscriptionKeyMismatch(this.subscription, config.publicKey)
+      ) {
+        // The server key was rotated. With permission granted the
+        // subscription is renewed with the current key without a prompt;
+        // otherwise the device is offered Enable again (no prompt here:
+        // permission is asked only from enable()).
+        await this.dropStaleSubscription(this.subscription);
+        this.subscription =
+          this.windowRef.Notification.permission === "granted"
+            ? await this.subscribeWithKey(registration, config.publicKey).catch(
+                () => null,
+              )
+            : null;
+      }
       if (this.subscription) {
         // Heal a server row lost to a restore or database rollback.
         await this.persistSubscription(this.subscription);
@@ -159,11 +207,18 @@ class PushNotificationManager {
       }
       const registration = await this.ensureRegistration();
       let subscription = await registration.pushManager.getSubscription();
+      if (
+        subscription &&
+        subscriptionKeyMismatch(subscription, config.publicKey)
+      ) {
+        await this.dropStaleSubscription(subscription);
+        subscription = null;
+      }
       if (!subscription) {
-        subscription = await registration.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: base64UrlToUint8Array(config.publicKey),
-        });
+        subscription = await this.subscribeWithKey(
+          registration,
+          config.publicKey,
+        );
         created = subscription;
       }
       await this.persistSubscription(subscription);
@@ -241,6 +296,7 @@ class PushNotificationManager {
 
 const PushNotifications = {
   base64UrlToUint8Array,
+  subscriptionKeyMismatch,
   PushNotificationManager,
 };
 
