@@ -222,6 +222,8 @@ test.describe("Agents summary chip (phone)", () => {
     await expect(chip(page)).toBeVisible({ timeout: 20_000 });
     await expect(page.locator("#agents-panel")).toBeHidden();
     await expect(page.locator("#agents-panel-sash")).toBeHidden();
+    // The desktop corner toggle stays off the phone toolbar (the chip is it).
+    await expect(page.locator("#agents-panel-toggle")).toBeHidden();
     expect(await page.locator("#agents-panel").boundingBox()).toBeNull();
     expect(await page.locator("#agents-panel-sash").boundingBox()).toBeNull();
     const area = await page.locator("#workspace-area").boundingBox();

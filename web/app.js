@@ -7511,6 +7511,17 @@ class TerminalManager {
         );
       }
     });
+
+    const agentsToggle = this.agentsPanelToggle;
+    if (agentsToggle) {
+      const agentsShown = this.isAgentsOverviewShown();
+      const label = agentsShown
+        ? "Hide the Agents panel"
+        : "Show the Agents panel";
+      agentsToggle.setAttribute("aria-pressed", agentsShown ? "true" : "false");
+      agentsToggle.setAttribute("aria-label", label);
+      agentsToggle.title = `${label} (Ctrl+Shift+L)`;
+    }
   }
 
   async handleSurfaceAction(action, button) {
@@ -13519,9 +13530,12 @@ class TerminalManager {
     this.agentsPanelSash?.addEventListener("dblclick", () =>
       this.resetAgentsPanelSash(),
     );
-    document
-      .getElementById("agents-panel-close")
-      ?.addEventListener("click", () => this.setAgentsPanelVisible(false));
+    // The toolbar's top-left toggle: same as Ctrl+Shift+L, and it stays in
+    // place while the panel is hidden.
+    this.agentsPanelToggle = document.getElementById("agents-panel-toggle");
+    this.agentsPanelToggle?.addEventListener("click", () =>
+      this.toggleAgentsPanel(),
+    );
     const onListClick = (event) => {
       if (event.target.closest("[data-agents-next]")) {
         void this.goToNextAgent();
@@ -13572,6 +13586,8 @@ class TerminalManager {
       this.applyAgentsPanelWidth();
       this.importLegacyAttentionSeen();
       this.syncAgentsPanelVisibility({ refit: false });
+      // A saved "hidden" changes nothing above, so set the toggle state here.
+      this.syncSurfaceButtonState();
       this.renderAgentsOverview();
     });
     // A boot URL `/?session=<id>` (push deep link with no window open).

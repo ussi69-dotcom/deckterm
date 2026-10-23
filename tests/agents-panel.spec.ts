@@ -136,6 +136,13 @@ const panel = (page: Page) => page.locator("#agents-panel");
 const sash = (page: Page) => page.locator("#agents-panel-sash");
 const toolbarButton = (page: Page) =>
   page.locator('[data-action="agents"]:visible').first();
+const cornerToggle = (page: Page) => page.locator("#agents-panel-toggle");
+// The toggle's box with the pointer elsewhere (buttons lift 1 px on hover).
+async function restingBox(page: Page) {
+  await page.mouse.move(700, 500);
+  await page.waitForTimeout(300);
+  return cornerToggle(page).boundingBox();
+}
 
 test.describe("Agents panel (desktop default view)", () => {
   test.use({ viewport: { width: 1440, height: 900 } });
@@ -190,6 +197,53 @@ test.describe("Agents panel (desktop default view)", () => {
     await page.reload();
     await waitForTerminal(page);
     await expect(panel(page)).toBeVisible();
+  });
+
+  test("the top-left corner toggle hides and shows the panel without moving; it is the only hide button", async ({
+    page,
+  }) => {
+    const corner = cornerToggle(page);
+    await expect(corner).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-pressed", "true");
+    await expect(corner).toHaveAttribute("aria-label", "Hide the Agents panel");
+    // The first control of the toolbar, in the top-left corner.
+    const shownBox = await restingBox(page);
+    expect(shownBox!.x).toBeLessThan(24);
+    expect(shownBox!.y).toBeLessThan(24);
+    const first = await page.evaluate(
+      () => document.querySelector(".toolbar-row-1 > :not([hidden])")?.id,
+    );
+    expect(first).toBe("agents-panel-toggle");
+    // The panel header no longer carries its own hide button.
+    await expect(page.locator("#agents-panel-close")).toHaveCount(0);
+
+    const hidden = settingSaved(page, "agents.panelVisible");
+    await corner.click();
+    await expect(panel(page)).toBeHidden();
+    await expect(sash(page)).toBeHidden();
+    await expect(corner).toHaveAttribute("aria-pressed", "false");
+    await expect(corner).toHaveAttribute("aria-label", "Show the Agents panel");
+    await expect(toolbarButton(page)).toHaveAttribute("aria-pressed", "false");
+    await hidden;
+    // Same place with the panel hidden, so the way back is where it was.
+    expect(await restingBox(page)).toEqual(shownBox);
+
+    await page.reload();
+    await waitForTerminal(page);
+    await expect(corner).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-pressed", "false");
+    expect(await restingBox(page)).toEqual(shownBox);
+
+    // The shortcut and the corner toggle agree.
+    await page.locator(".tile.active .xterm").first().click();
+    await page.keyboard.press("Control+Shift+L");
+    await expect(panel(page)).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-pressed", "true");
+    await corner.click();
+    await expect(panel(page)).toBeHidden();
+    await corner.click();
+    await expect(panel(page)).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-pressed", "true");
   });
 
   test("the sash resizes the panel and the terminals; the width survives a reload; double-click resets", async ({
@@ -422,6 +476,18 @@ test.describe("Agents panel (desktop default view)", () => {
         ).sort(),
       )
       .toEqual([...panelRows].sort());
+    await expect(page.locator(".agents-ide-view .agents-summary")).toBeVisible();
+
+    // The corner toggle stays in IDE mode and collapses and reopens the
+    // Agents activity view.
+    const corner = cornerToggle(page);
+    await expect(corner).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-pressed", "true");
+    await corner.click();
+    await expect(corner).toHaveAttribute("aria-pressed", "false");
+    await expect(page.locator(".agents-ide-view")).toBeHidden();
+    await corner.click();
+    await expect(corner).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator(".agents-ide-view .agents-summary")).toBeVisible();
 
     await page.click("#ide-toggle-btn");

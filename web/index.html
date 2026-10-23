@@ -31,6 +31,21 @@
       <header class="toolbar">
         <!-- ROW 1: Always visible - toggle, new, tabs, status -->
         <div class="toolbar-row-1">
+          <!-- Desktop: the Agents panel toggle, always the top-left control,
+               in the same place whether the panel is shown or hidden. -->
+          <button
+            id="agents-panel-toggle"
+            class="btn-icon agents-panel-toggle"
+            type="button"
+            title="Hide the Agents panel (Ctrl+Shift+L)"
+            aria-label="Hide the Agents panel"
+            aria-controls="agents-panel"
+            aria-pressed="true"
+          >
+            <i data-lucide="panel-left-close" class="agents-panel-toggle-hide"></i>
+            <i data-lucide="panel-left-open" class="agents-panel-toggle-show"></i>
+          </button>
+
           <button
             id="toolbar-toggle"
             class="toolbar-toggle"
@@ -650,17 +665,9 @@
           aria-label="Agents"
           hidden
         >
+          <!-- Hidden and shown from the toolbar's top-left toggle. -->
           <div class="agents-panel-header">
             <h3 class="agents-panel-title">Agents</h3>
-            <button
-              id="agents-panel-close"
-              class="btn-icon agents-panel-close"
-              type="button"
-              title="Hide the Agents panel (Ctrl+Shift+L)"
-              aria-label="Hide the Agents panel"
-            >
-              <i data-lucide="panel-left-close"></i>
-            </button>
           </div>
           <div id="agents-panel-body" class="agents-panel-body"></div>
         </aside>

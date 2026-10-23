@@ -7993,6 +7993,8 @@ body.fullscreen .agents-panel-sash {
   padding: 6px 6px 6px 12px;
   border-bottom: 1px solid var(--border-primary);
   flex: 0 0 auto;
+  /* The height it had with its own hide button (now the toolbar toggle). */
+  min-height: 41px;
 }
 
 .agents-panel-title {
@@ -8004,9 +8006,30 @@ body.fullscreen .agents-panel-sash {
   color: var(--text-secondary);
 }
 
-.agents-panel-close {
-  width: 28px;
-  height: 28px;
+/* The toolbar's top-left toggle (desktop chrome only; phones have the chip).
+   The icon follows aria-pressed: "close" while shown, "open" while hidden. */
+.agents-panel-toggle .agents-panel-toggle-show,
+.agents-panel-toggle[aria-pressed="false"] .agents-panel-toggle-hide {
+  display: none;
+}
+
+.agents-panel-toggle[aria-pressed="false"] .agents-panel-toggle-show {
+  display: block;
+}
+
+.agents-panel-toggle[aria-pressed="true"] {
+  border-color: var(--accent-blue);
+  color: var(--text-primary);
+}
+
+body.chrome-mobile .agents-panel-toggle {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .agents-panel-toggle {
+    display: none;
+  }
 }
 
 .agents-panel-body,
