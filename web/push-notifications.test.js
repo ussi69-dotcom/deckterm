@@ -15,12 +15,14 @@ function response(body, ok = true) {
 }
 
 // `existingKey`: the browser already holds a subscription made for this
-// server key (bytes); `permission`: the notification permission at start.
+// server key (bytes); `permission`: the notification permission at start;
+// `subscribeFailures`: how many subscribe() calls reject first.
 function createHarness({
   postOk = true,
   config = null,
   existingKey = null,
   permission = "default",
+  subscribeFailures = 0,
 } = {}) {
   const calls = [];
   let permissionRequests = 0;
@@ -59,6 +61,10 @@ function createHarness({
       subscribe: async (options) => {
         subscribeCalls += 1;
         calls.push(["subscribe", options]);
+        if (subscribeFailures > 0) {
+          subscribeFailures -= 1;
+          throw new Error("push service unreachable");
+        }
         subscription.options = {
           applicationServerKey: options.applicationServerKey.buffer,
         };
@@ -84,15 +90,31 @@ function createHarness({
     if (options.method === "DELETE") return response({ ok: true });
     return response(config || { configured: true, publicKey });
   };
-  const manager = new PushNotificationManager({
-    windowRef: { Notification: MockNotification, PushManager: class {} },
-    navigatorRef: {
-      serviceWorker: { register: async () => registration },
-    },
-    fetchImpl,
-  });
+  const storage = new Map();
+  const localStorage = {
+    getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+    setItem: (key, value) => storage.set(key, String(value)),
+    removeItem: (key) => storage.delete(key),
+  };
+  // A page load: a fresh manager on the same browser (registration,
+  // permission and localStorage).
+  const load = () =>
+    new PushNotificationManager({
+      windowRef: {
+        Notification: MockNotification,
+        PushManager: class {},
+        localStorage,
+      },
+      navigatorRef: {
+        serviceWorker: { register: async () => registration },
+      },
+      fetchImpl,
+    });
+  const manager = load();
   return {
     manager,
+    load,
+    storage,
     calls,
     subscription,
     get permissionRequests() {
@@ -157,6 +179,36 @@ describe("PushNotificationManager", () => {
     );
     expect(harness.permissionRequests).toBe(0);
     expect(harness.manager.getStatus().state).toBe("enabled");
+  });
+
+  test("a renewal that fails is retried on the next page load", async () => {
+    const harness = createHarness({
+      existingKey: Buffer.alloc(65, 9),
+      permission: "granted",
+      subscribeFailures: 1,
+    });
+    await harness.manager.initialize();
+    expect(harness.unsubscribeCalls).toBe(1);
+    expect(harness.manager.getStatus().state).toBe("ready");
+    expect(harness.storage.get("deckterm.push.renewPending")).toBe("1");
+
+    const next = harness.load();
+    await next.initialize();
+    expect(harness.subscribeCalls).toBe(2);
+    expect(harness.permissionRequests).toBe(0);
+    expect(next.getStatus().state).toBe("enabled");
+    expect(harness.storage.has("deckterm.push.renewPending")).toBe(false);
+
+    // Renewed: a later load changes nothing.
+    await harness.load().initialize();
+    expect(harness.subscribeCalls).toBe(2);
+  });
+
+  test("without a pending renewal a page load never subscribes on its own", async () => {
+    const harness = createHarness({ permission: "granted" });
+    await harness.manager.initialize();
+    expect(harness.subscribeCalls).toBe(0);
+    expect(harness.manager.getStatus().state).toBe("ready");
   });
 
   test("an old-key subscription without granted permission is dropped and Enable is offered", async () => {

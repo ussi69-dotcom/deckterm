@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import {
+  chmodSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -7,6 +8,7 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,4 +113,74 @@ test("refuses without a subject, and refuses a symlink, changing nothing", () =>
   symlinkSync(path, link);
   expect(() => rotateVapidKeys(link)).toThrow(/symlinks are refused/);
   expect(readFileSync(path, "utf8")).toBe(original);
+});
+
+test("short writes are completed, never left truncated", () => {
+  const original =
+    "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test\nPORT=4173\n";
+  const { path } = envFile(original);
+  // At most three bytes per call, as a full disk or a signal could cause.
+  const result = rotateVapidKeys(path, {
+    write: (fd, data, offset) =>
+      writeSync(fd, data, offset, Math.min(3, data.length - offset)),
+  });
+  expect(readFileSync(result.backupPath, "utf8")).toBe(original);
+  const env = parse(path);
+  expect(env.PORT).toBe("4173");
+  expect(resolveWebPushConfig(env)).not.toBeNull();
+});
+
+test("a write that makes no progress aborts and leaves the file alone", () => {
+  const original = "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test\n";
+  const { dir, path } = envFile(original);
+  expect(() => rotateVapidKeys(path, { write: () => 0 })).toThrow(
+    /Could not write/,
+  );
+  expect(readFileSync(path, "utf8")).toBe(original);
+  expect(readdirSync(dir)).toEqual(["prod.env"]);
+});
+
+test("a change to the file during the rotation wins; nothing is replaced", () => {
+  const original = "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test\n";
+  const { dir, path } = envFile(original);
+  const edited = `${original}ADDED_MEANWHILE=1\n`;
+  expect(() =>
+    rotateVapidKeys(path, {
+      beforeCommit: () => writeFileSync(path, edited),
+    }),
+  ).toThrow(/changed while/);
+  expect(readFileSync(path, "utf8")).toBe(edited);
+  expect(readdirSync(dir)).toEqual(["prod.env"]);
+});
+
+test("a multi-line quoted value is refused before anything changes", () => {
+  const original = [
+    "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test",
+    'CERT="-----BEGIN-----',
+    "DECKTERM_VAPID_PRIVATE_KEY=inside-a-quoted-value",
+    '-----END-----"',
+    "",
+  ].join("\n");
+  const { dir, path } = envFile(original);
+  expect(() => rotateVapidKeys(path)).toThrow(/multi-line value \(CERT\)/);
+  expect(readFileSync(path, "utf8")).toBe(original);
+  expect(readdirSync(dir)).toEqual(["prod.env"]);
+  // Quoted single-line values, escaped quotes included, are fine.
+  const { path: other } = envFile(
+    'DECKTERM_VAPID_SUBJECT="mailto:ops@example.test"\nNOTE="say \\"hi\\""\n',
+  );
+  expect(() => rotateVapidKeys(other)).not.toThrow();
+  expect(parse(other).NOTE).toBe('"say \\"hi\\""');
+});
+
+test("a directory writable by everyone is refused", () => {
+  const original = "DECKTERM_VAPID_SUBJECT=mailto:ops@example.test\n";
+  const { dir, path } = envFile(original);
+  chmodSync(dir, 0o777);
+  try {
+    expect(() => rotateVapidKeys(path)).toThrow(/writable by others/);
+    expect(readFileSync(path, "utf8")).toBe(original);
+  } finally {
+    chmodSync(dir, 0o700);
+  }
 });

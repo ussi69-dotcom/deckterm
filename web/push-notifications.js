@@ -21,6 +21,10 @@ function subscriptionKeyMismatch(subscription, publicKey) {
   return stored.some((byte, index) => byte !== current[index]);
 }
 
+// Set while a subscription made for an earlier key has been dropped and not
+// yet renewed, so a renewal that failed is retried on the next load.
+const RENEW_PENDING_KEY = "deckterm.push.renewPending";
+
 class PushNotificationManager {
   constructor({ windowRef, navigatorRef, fetchImpl, onChange } = {}) {
     this.windowRef =
@@ -36,6 +40,7 @@ class PushNotificationManager {
     this.config = null;
     this.state = "loading";
     this.error = null;
+    this.renewPendingInPage = false;
   }
 
   supported() {
@@ -109,6 +114,26 @@ class PushNotificationManager {
     await subscription.unsubscribe().catch(() => false);
   }
 
+  // The mark lives in localStorage so it survives a reload; this page also
+  // keeps it in memory for a browser where storage is unavailable.
+  renewPending() {
+    if (this.renewPendingInPage) return true;
+    try {
+      return this.windowRef?.localStorage?.getItem(RENEW_PENDING_KEY) === "1";
+    } catch {
+      return false;
+    }
+  }
+
+  setRenewPending(pending) {
+    this.renewPendingInPage = Boolean(pending);
+    try {
+      if (pending)
+        this.windowRef?.localStorage?.setItem(RENEW_PENDING_KEY, "1");
+      else this.windowRef?.localStorage?.removeItem(RENEW_PENDING_KEY);
+    } catch {}
+  }
+
   async subscribeWithKey(registration, publicKey) {
     return registration.pushManager.subscribe({
       userVisibleOnly: true,
@@ -159,21 +184,29 @@ class PushNotificationManager {
         this.subscription &&
         subscriptionKeyMismatch(this.subscription, config.publicKey)
       ) {
-        // The server key was rotated. With permission granted the
-        // subscription is renewed with the current key without a prompt;
-        // otherwise the device is offered Enable again (no prompt here:
-        // permission is asked only from enable()).
+        // The server key was rotated: drop the old subscription, remember
+        // that it needs renewing, and renew below.
+        this.setRenewPending(true);
         await this.dropStaleSubscription(this.subscription);
-        this.subscription =
-          this.windowRef.Notification.permission === "granted"
-            ? await this.subscribeWithKey(registration, config.publicKey).catch(
-                () => null,
-              )
-            : null;
+        this.subscription = null;
+      }
+      if (
+        !this.subscription &&
+        this.renewPending() &&
+        this.windowRef.Notification.permission === "granted"
+      ) {
+        // Permission is granted, so no prompt. A failure keeps the mark and
+        // the next load tries again; without permission the device is
+        // offered Enable (permission is asked only from enable()).
+        this.subscription = await this.subscribeWithKey(
+          registration,
+          config.publicKey,
+        ).catch(() => null);
       }
       if (this.subscription) {
         // Heal a server row lost to a restore or database rollback.
         await this.persistSubscription(this.subscription);
+        this.setRenewPending(false);
         this.setState("enabled");
       } else {
         this.setState("ready");
@@ -223,6 +256,7 @@ class PushNotificationManager {
       }
       await this.persistSubscription(subscription);
       this.subscription = subscription;
+      this.setRenewPending(false);
       this.setState("enabled");
       return true;
     } catch (error) {
