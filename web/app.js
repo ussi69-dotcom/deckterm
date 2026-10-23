@@ -7521,6 +7521,11 @@ class TerminalManager {
       agentsToggle.setAttribute("aria-pressed", agentsShown ? "true" : "false");
       agentsToggle.setAttribute("aria-label", label);
       agentsToggle.title = `${label} (Ctrl+Shift+L)`;
+      // IDE mode drives its Agents view, not the hidden desktop panel.
+      agentsToggle.setAttribute(
+        "aria-controls",
+        ideMode ? "agents-ide-view" : "agents-panel",
+      );
     }
   }
 
@@ -13974,6 +13979,8 @@ class TerminalManager {
       mount: (container) => {
         const view = document.createElement("div");
         view.className = "agents-ide-view";
+        // The corner toggle's aria-controls target in IDE mode.
+        view.id = "agents-ide-view";
         view.addEventListener("click", (event) => this.onAgentsListClick?.(event));
         container.replaceChildren(view);
         this.agentsIdeContainer = view;

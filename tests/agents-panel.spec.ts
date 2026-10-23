@@ -236,6 +236,11 @@ test.describe("Agents panel (desktop default view)", () => {
     await waitForTerminal(page);
     await expect(corner).toBeVisible();
     await expect(corner).toHaveAttribute("aria-pressed", "false");
+    await expect(corner).toHaveAttribute("aria-label", "Show the Agents panel");
+    await expect(corner).toHaveAttribute(
+      "title",
+      "Show the Agents panel (Ctrl+Shift+L)",
+    );
     expect(await restingBox(page)).toEqual(shownBox);
 
     // The shortcut and the corner toggle agree.
@@ -489,6 +494,8 @@ test.describe("Agents panel (desktop default view)", () => {
     const corner = cornerToggle(page);
     await expect(corner).toBeVisible();
     await expect(corner).toHaveAttribute("aria-pressed", "true");
+    await expect(corner).toHaveAttribute("aria-controls", "agents-ide-view");
+    await expect(page.locator("#agents-ide-view")).toBeVisible();
     await corner.click();
     await expect(corner).toHaveAttribute("aria-pressed", "false");
     await expect(page.locator(".agents-ide-view")).toBeHidden();
@@ -503,6 +510,7 @@ test.describe("Agents panel (desktop default view)", () => {
       () => !document.body.classList.contains("ide-mode"),
     );
     await expect(panel(page)).toBeVisible();
+    await expect(corner).toHaveAttribute("aria-controls", "agents-panel");
   });
   test("a refresh keeps keyboard focus on the same row and on Next; an unchanged model leaves the DOM alone", async ({
     page,
