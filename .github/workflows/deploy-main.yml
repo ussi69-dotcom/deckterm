@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   verify-and-package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       release_id: ${{ steps.release.outputs.release_id }}
 
@@ -108,7 +108,7 @@ jobs:
   deploy:
     needs: verify-and-package
     if: ${{ vars.ENABLE_PROD_DEPLOY == '1' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: production
 
@@ -177,7 +177,7 @@ jobs:
   deploy-disabled:
     needs: verify-and-package
     if: ${{ vars.ENABLE_PROD_DEPLOY != '1' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Report deploy skip
