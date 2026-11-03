@@ -12118,6 +12118,9 @@ class TerminalManager {
         this.terminals.forEach((terminal, id) => {
           const next = telemetryById.get(id);
           if (!next) return;
+          // Before the runtime-state render, so the tab badge dot uses this
+          // poll's screen status, not the previous one.
+          terminal.agentStatus = next.agentStatus ?? null;
           this.applyTerminalRuntimeState(id, {
             running: Boolean(next.running ?? next.busy),
             lastExitCode:
@@ -12133,7 +12136,6 @@ class TerminalManager {
           terminal.recentTools = Array.isArray(next.recentTools)
             ? next.recentTools
             : [];
-          terminal.agentStatus = next.agentStatus ?? null;
           this.applyTerminalAttention(terminal, next, id);
           // Under tmux the server reads the pane's live cwd on every poll, so
           // it is authoritative (bash emits no OSC 7 and tmux would not
@@ -12254,6 +12256,10 @@ class TerminalManager {
       : terminals.find((terminal) => terminal.agentState) || null;
     const agentName = agentTerminal?.agentName || null;
     const agentState = agentTerminal?.agentState || null;
+    const agentStatus = agentTerminal?.agentStatus || null;
+    const agentWorking = TerminalColors.isAgentWorking
+      ? TerminalColors.isAgentWorking({ agentStatus, agentState })
+      : ["thinking", "responding"].includes(String(agentState || ""));
     const recentTools = agentTerminal?.recentTools || [];
     const isWorktree = terminals.some((terminal) =>
       Boolean(terminal.isWorktree),
@@ -12312,6 +12318,8 @@ class TerminalManager {
       running,
       agentName,
       agentState,
+      agentStatus,
+      agentWorking,
       recentTools,
       ports,
       isWorktree,
@@ -12389,6 +12397,7 @@ class TerminalManager {
     tab.dataset.busy = snapshot.running ? "true" : "false";
     tab.dataset.agentName = snapshot.agentName || "";
     tab.dataset.agentState = snapshot.agentState || "none";
+    tab.dataset.agentWorking = snapshot.agentWorking ? "true" : "false";
     tab.dataset.ports = snapshot.ports.join(",");
     tab.dataset.isWorktree = snapshot.isWorktree ? "true" : "false";
     tab.dataset.exitStatus = snapshot.exitStatus || "";

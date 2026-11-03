@@ -159,6 +159,17 @@ function getPrimaryWorkspaceSignal({
   };
 }
 
+// Whether an agent is doing work right now (drives the pulsing badge dot).
+// The server's screen-rule status (working / blocked / idle) wins: it reads
+// the agent's own screen. agentState (thinking / responding) only says that
+// output is flowing, so it is the fallback when no screen status exists yet.
+function isAgentWorking({ agentStatus = null, agentState = null } = {}) {
+  const status = String(agentStatus || "").trim().toLowerCase();
+  if (status) return status === "working";
+  const state = String(agentState || "").trim().toLowerCase();
+  return state === "thinking" || state === "responding";
+}
+
 if (typeof window !== "undefined") {
   window.TerminalColors = {
     hashCwdToColor,
@@ -167,6 +178,7 @@ if (typeof window !== "undefined") {
     getWorkspaceSignalDescriptors,
     getPrimaryWorkspaceSignal,
     formatRecentToolsTooltip,
+    isAgentWorking,
   };
 }
 
@@ -178,6 +190,7 @@ if (typeof module !== "undefined" && module.exports) {
     getWorkspaceSignalDescriptors,
     getPrimaryWorkspaceSignal,
     formatRecentToolsTooltip,
+    isAgentWorking,
   };
 }
 
@@ -188,4 +201,5 @@ if (typeof exports !== "undefined") {
   exports.getWorkspaceSignalDescriptors = getWorkspaceSignalDescriptors;
   exports.getPrimaryWorkspaceSignal = getPrimaryWorkspaceSignal;
   exports.formatRecentToolsTooltip = formatRecentToolsTooltip;
+  exports.isAgentWorking = isAgentWorking;
 }
