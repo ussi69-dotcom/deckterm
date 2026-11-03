@@ -5,6 +5,7 @@ import {
   getWorkspaceSignalDescriptors,
   getPrimaryWorkspaceSignal,
   formatRecentToolsTooltip,
+  isAgentWorking,
 } from "./terminal-colors";
 
 test("hashCwdToColor is stable", () => {
@@ -156,4 +157,16 @@ test("formatRecentToolsTooltip respects a custom limit", () => {
   expect(formatRecentToolsTooltip(recentTools, { limit: 2 })).toBe(
     ["Two", "Three"].join("\n"),
   );
+});
+
+test("isAgentWorking follows the screen status and falls back to output flow", () => {
+  expect(isAgentWorking({ agentStatus: "working", agentState: null })).toBe(true);
+  // An idle or blocked agent whose spinner still streams output is not working.
+  expect(isAgentWorking({ agentStatus: "idle", agentState: "thinking" })).toBe(false);
+  expect(isAgentWorking({ agentStatus: "blocked", agentState: "responding" })).toBe(false);
+  // No screen status yet: output flow decides.
+  expect(isAgentWorking({ agentStatus: null, agentState: "responding" })).toBe(true);
+  expect(isAgentWorking({ agentStatus: null, agentState: "thinking" })).toBe(true);
+  expect(isAgentWorking({ agentStatus: null, agentState: null })).toBe(false);
+  expect(isAgentWorking()).toBe(false);
 });

@@ -717,9 +717,9 @@ body {
   color: #f2cf7f;
 }
 
-/* Agent badges carry the same leading dot as Running: it pulses while the
-   agent works (thinking/responding) and stays still while it waits, so the
-   badge says more than its colour. */
+/* Agent badges carry the same leading dot as Running: it pulses only while
+   the agent works (screen status "working"; output flow when the server has
+   no screen status yet) and stays still while it waits or needs you. */
 .tab[data-primary-signal^="agent"] .tab-signal-badge {
   gap: 5px;
 }
@@ -735,9 +735,7 @@ body {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .tab[data-primary-signal^="agent"][data-agent-state="thinking"]
-    .tab-signal-badge::before,
-  .tab[data-primary-signal^="agent"][data-agent-state="responding"]
+  .tab[data-primary-signal^="agent"][data-agent-working="true"]
     .tab-signal-badge::before {
     animation: tab-running-pulse 1.6s ease-in-out infinite;
   }
