@@ -464,6 +464,59 @@ test("desktop action density tiers resolve from width from largest to smallest f
   ).toBe("icon-only");
 });
 
+test("desktop action density tiers step up only past a margin and step down at once", () => {
+  const widths = {
+    normalWidth: 400,
+    compactWidth: 300,
+    tightWidth: 200,
+    iconOnlyWidth: 80,
+    upgradeMargin: 24,
+  };
+  // No previous tier: the plain width rule, no margin.
+  expect(
+    getDesktopActionDensityTierByWidth({ ...widths, availableWidth: 300 }),
+  ).toBe("compact");
+  // Upgrading needs the margin: 3px past the compact boundary stays tight.
+  expect(
+    getDesktopActionDensityTierByWidth({
+      ...widths,
+      availableWidth: 303,
+      previousTier: "tight",
+    }),
+  ).toBe("tight");
+  expect(
+    getDesktopActionDensityTierByWidth({
+      ...widths,
+      availableWidth: 324,
+      previousTier: "tight",
+    }),
+  ).toBe("compact");
+  // A large jump may skip a tier on the way up.
+  expect(
+    getDesktopActionDensityTierByWidth({
+      ...widths,
+      availableWidth: 500,
+      previousTier: "icon-only",
+    }),
+  ).toBe("normal");
+  // Downgrading applies as soon as the current tier no longer fits.
+  expect(
+    getDesktopActionDensityTierByWidth({
+      ...widths,
+      availableWidth: 299,
+      previousTier: "compact",
+    }),
+  ).toBe("tight");
+  // Staying put needs no margin.
+  expect(
+    getDesktopActionDensityTierByWidth({
+      ...widths,
+      availableWidth: 300,
+      previousTier: "compact",
+    }),
+  ).toBe("compact");
+});
+
 test("desktop action density tiers fall back safely for invalid width inputs", () => {
   expect(getDesktopActionDensityTierByWidth()).toBe("normal");
   expect(getDesktopActionDensityTierByWidth(null)).toBe("normal");
