@@ -717,6 +717,32 @@ body {
   color: #f2cf7f;
 }
 
+/* Agent badges carry the same leading dot as Running: it pulses while the
+   agent works (thinking/responding) and stays still while it waits, so the
+   badge says more than its colour. */
+.tab[data-primary-signal^="agent"] .tab-signal-badge {
+  gap: 5px;
+}
+
+.tab[data-primary-signal^="agent"] .tab-signal-badge::before {
+  content: "";
+  flex: 0 0 6px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.85;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .tab[data-primary-signal^="agent"][data-agent-state="thinking"]
+    .tab-signal-badge::before,
+  .tab[data-primary-signal^="agent"][data-agent-state="responding"]
+    .tab-signal-badge::before {
+    animation: tab-running-pulse 1.6s ease-in-out infinite;
+  }
+}
+
 .tab[data-primary-signal="agent-responding"] {
   border-color: rgba(63, 185, 80, 0.42);
 }

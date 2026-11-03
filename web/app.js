@@ -7186,6 +7186,7 @@ class TerminalManager {
 
     if (this.getActiveChromeMode() !== "desktop") {
       delete toolbar.dataset.tabDensity;
+      this.lastDesktopDensityTier = null;
       this.syncDesktopTabLayout();
       this.syncToolbarOverlayOffset();
       return;
@@ -7220,9 +7221,15 @@ class TerminalManager {
         compactWidth: widthsByTier.compact,
         tightWidth: widthsByTier.tight,
         iconOnlyWidth: widthsByTier["icon-only"],
+        // Hysteresis against the tier this method last chose (not the
+        // initial render's guess), so a window near a boundary keeps one
+        // tier instead of moving every tab 35-55px on each sync.
+        previousTier: this.lastDesktopDensityTier || null,
+        upgradeMargin: 24,
       });
 
     const density = nextDensity || fallbackDensity;
+    if (nextDensity) this.lastDesktopDensityTier = nextDensity;
     actionBar.dataset.density = density;
     toolbar.dataset.tabDensity = density;
 

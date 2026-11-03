@@ -1,8 +1,11 @@
 ---
-status: open
-updated: 2026-08-26
-next: On the dedicated server, gather journal evidence of WHAT kills sessions (reaper vs. service restart vs. reboot) before changing anything; then apply the one-line proven fix (KillMode=process) at a restart moment the owner picks.
+status: consumed
+updated: 2026-10-23
+next: Nothing. The dedicated server is the R9700 box; its tmux server runs in its own unit deckterm-tmux.service (since 2026-10-01), needrestart excludes ^deckterm units, automatic reboot is off, and on 2026-10-23 three restarts of deckterm.service kept the session. It runs main 998c0a7 since that day (see docs/handoffs/2026-10-22-herdr-adoption-operator.md, "Promotion").
 ---
+
+> **Outcome (2026-10-23):** superseded by the split-unit layout that is now live on
+> R9700. The body below is the original 2026-08-26 brief, kept for its reasoning.
 
 # Dedicated server "sessions get killed regularly": handover
 

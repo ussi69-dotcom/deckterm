@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   unit:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
@@ -57,7 +57,7 @@ jobs:
 
   smoke-e2e:
     needs: unit
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -121,7 +121,7 @@ jobs:
     # MUST be the GitHub-hosted VM runner (real systemd + passwordless sudo), not
     # a job container — the broker needs `sudo systemd-run --scope`. run.sh
     # preflights and FAILS LOUD (never skips) if the host can't support it.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:

@@ -491,11 +491,24 @@ function getDesktopActionDensityTierByWidth(footprintWidths = {}) {
     return "icon-only";
   }
 
-  if (availableWidth >= normalWidth) return "normal";
-  if (availableWidth >= compactWidth) return "compact";
-  if (availableWidth >= tightWidth) return "tight";
-  if (availableWidth >= iconOnlyWidth) return "icon-only";
-  return "icon-only";
+  const order = ["normal", "compact", "tight", "icon-only"];
+  const tierWidths = [normalWidth, compactWidth, tightWidth, iconOnlyWidth];
+  const fitIndex = tierWidths.findIndex((width) => availableWidth >= width);
+  const nextIndex = fitIndex === -1 ? order.length - 1 : fitIndex;
+
+  // Hysteresis: a step to a ROOMIER tier must clear that tier's width by
+  // upgradeMargin; a step down (the current tier stopped fitting) applies at
+  // once. Without it a window within a few pixels of a boundary flipped the
+  // tier on every sync, and each flip moved every desktop tab by 35-55px.
+  const previousIndex = order.indexOf(widths.previousTier);
+  const margin = Math.max(0, Number(widths.upgradeMargin) || 0);
+  if (previousIndex === -1 || nextIndex >= previousIndex || margin === 0) {
+    return order[nextIndex];
+  }
+  for (let index = 0; index < previousIndex; index += 1) {
+    if (availableWidth >= tierWidths[index] + margin) return order[index];
+  }
+  return order[previousIndex];
 }
 
 function getDesktopTabLayoutByWidth(options = {}) {
