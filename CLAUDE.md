@@ -40,7 +40,7 @@ cd tests && PW_BASE_URL=http://localhost:4174 npx playwright test some.spec.ts
 
 - `index.ts` — thin entry, calls `startWebServer(host, port)`.
 - `server.ts` — **~12k lines, the entire HTTP/WS surface.** Seams: `createWebApp()` (Hono routes), `startWebServer()` (`Bun.serve` + WS handlers), `reconcileSessionsOnStartup()`. All terminal/file/git/task/onboarding routes live here.
-- `task-runner.ts` — supervised Codex/Claude task workspaces (worker/judge terminals, checks, optional git worktrees).
+- `task-runner.ts` — supervised Codex/Claude task workspaces (worker/judge terminals, checks, optional git worktrees). Every status change goes through the table in `task-status.ts`.
 - `telemetry.ts` — agent output-phase classification, tmux state, shell-integration parsing, worktree detection (powers agent badges).
 - `onboarding-doctor.ts` — Setup wizard: profiles, health checks, `applyOnboardingRemediation()`.
 - Helpers with co-located `*.test.ts`: `cloudflare-access-guards.ts`, `terminal-capabilities.ts`, `tmux-*.ts`.

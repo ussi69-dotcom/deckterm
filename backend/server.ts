@@ -8281,21 +8281,24 @@ export function createWebApp() {
       if (creationError) {
         return c.json(creationError.body, creationError.status);
       }
-      rateLimitState.record(ownerId);
-      const terminal = await createOwnedTerminal({
-        cwd: task.workingDirectory,
-        cols: 120,
-        rows: 30,
-        ownerId,
-        ownerEmail,
-      });
-      terminal.terminal.write(`${buildWorkerCommand(task)}\n`);
-      const updated = await taskRunner.markWorkerStarted(
+      const {
+        task: updated,
+        launched: { terminal },
+      } = await taskRunner.launchWorker(
         task.id,
-        {
-          ownerId,
+        { ownerId },
+        async (current) => {
+          rateLimitState.record(ownerId);
+          const terminal = await createOwnedTerminal({
+            cwd: current.workingDirectory,
+            cols: 120,
+            rows: 30,
+            ownerId,
+            ownerEmail,
+          });
+          terminal.terminal.write(`${buildWorkerCommand(current)}\n`);
+          return { terminalId: terminal.id, terminal };
         },
-        terminal.id,
       );
       return c.json({ task: updated, terminal: serializeTerminal(terminal) });
     } catch (err) {
@@ -8321,26 +8324,29 @@ export function createWebApp() {
     try {
       const task = await taskRunner.getTask(c.req.param("id"), { ownerId });
       const prompt = await taskRunner.buildJudgePrompt(task.id, { ownerId });
-      await writeFile(task.controlFiles.judgePromptFile, prompt);
       const creationError = getTerminalCreationError(ownerId);
       if (creationError) {
         return c.json(creationError.body, creationError.status);
       }
-      rateLimitState.record(ownerId);
-      const terminal = await createOwnedTerminal({
-        cwd: task.workingDirectory,
-        cols: 120,
-        rows: 30,
-        ownerId,
-        ownerEmail,
-      });
-      terminal.terminal.write(`${buildJudgeCommand(task)}\n`);
-      const updated = await taskRunner.markJudgeStarted(
+      const {
+        task: updated,
+        launched: { terminal },
+      } = await taskRunner.launchJudge(
         task.id,
-        {
-          ownerId,
+        { ownerId },
+        async (current) => {
+          await writeFile(current.controlFiles.judgePromptFile, prompt);
+          rateLimitState.record(ownerId);
+          const terminal = await createOwnedTerminal({
+            cwd: current.workingDirectory,
+            cols: 120,
+            rows: 30,
+            ownerId,
+            ownerEmail,
+          });
+          terminal.terminal.write(`${buildJudgeCommand(current)}\n`);
+          return { terminalId: terminal.id, terminal };
         },
-        terminal.id,
       );
       return c.json({
         task: updated,

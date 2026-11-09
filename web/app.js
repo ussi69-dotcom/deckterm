@@ -9836,10 +9836,7 @@ class TerminalManager {
     actions.className = "task-actions";
     // Mirror the IDE sidebar: a running phase disables its trigger so the
     // primary button reflects the live status.
-    const taskRunning =
-      task.status === "worker-running" ||
-      task.status === "checks-running" ||
-      task.status === "judge-running";
+    const availability = window.TaskSignals.taskActionAvailability(task.status);
     [
       ["start", "Start Worker"],
       ["checks", "Run Checks"],
@@ -9850,8 +9847,7 @@ class TerminalManager {
       button.className = action === "start" ? "btn btn-primary" : "btn";
       button.dataset.taskAction = action;
       button.textContent = label;
-      button.disabled =
-        taskRunning || (action === "start" && task.status === "complete");
+      button.disabled = !availability[action];
       actions.appendChild(button);
     });
 

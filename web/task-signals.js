@@ -11,6 +11,18 @@ const RUNNING_STATUSES = new Set([
 
 const ATTENTION_STATUSES = new Set(["needs-user", "needs-judge"]);
 
+// Which task buttons are enabled. While any phase runs, nothing starts; a
+// finished task can be checked and judged again, but not re-worked. Mirrors
+// TASK_TRANSITIONS in backend/task-status.ts (task-status.test.ts checks it).
+function taskActionAvailability(status) {
+  const running = RUNNING_STATUSES.has(status);
+  return {
+    start: !running && status !== "complete",
+    checks: !running,
+    judge: !running,
+  };
+}
+
 // Transitions worth a toast: a previously running task that now needs the
 // user or reached a terminal state.
 const NOTABLE_TARGETS = new Set(["needs-user", "complete", "failed"]);
@@ -278,6 +290,8 @@ function describeAttentionToast(attention, { sessionId = "", label = "" } = {}) 
 }
 
 const TaskSignals = {
+  RUNNING_STATUSES,
+  taskActionAvailability,
   computeTaskSignals,
   diffTaskTransitions,
   ATTENTION_SEEN_STORAGE_KEY,
@@ -307,6 +321,8 @@ if (typeof module !== "undefined" && module.exports) {
 }
 
 if (typeof exports !== "undefined") {
+  exports.RUNNING_STATUSES = RUNNING_STATUSES;
+  exports.taskActionAvailability = taskActionAvailability;
   exports.computeTaskSignals = computeTaskSignals;
   exports.diffTaskTransitions = diffTaskTransitions;
   exports.ATTENTION_SEEN_STORAGE_KEY = ATTENTION_SEEN_STORAGE_KEY;
