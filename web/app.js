@@ -8198,11 +8198,9 @@ class TerminalManager {
             (Number(s.lastActivityAt) || 0) <= attentionAt + 15_000;
           // The screen-rule status, when the server has one, wins over
           // agentState (which only says whether output is flowing).
-          const statusWord = {
-            blocked: "needs you",
-            working: "working",
-            idle: "idle",
-          }[s.agentStatus];
+          const statusWord = TerminalColors.agentActivityWord?.({
+            agentStatus: s.agentStatus,
+          });
           const agentState = statusWord
             ? attentionKind === "needs-input" && s.agentStatus === "blocked"
               ? ""
@@ -11984,26 +11982,22 @@ class TerminalManager {
   }
 
   getPaneActivityState(terminal) {
-    const agentState = String(terminal?.agentState || "")
-      .trim()
-      .toLowerCase();
+    const signals = {
+      agentStatus: terminal?.agentStatus,
+      agentState: terminal?.agentState,
+    };
+    const activity = TerminalColors.agentActivity?.(signals) ?? null;
     const rawAgentName = String(terminal?.agentName || "").trim();
     const agentName = rawAgentName
       ? rawAgentName.charAt(0).toUpperCase() + rawAgentName.slice(1)
       : "Agent";
 
-    if (agentState === "responding") {
+    if (activity) {
+      const word = TerminalColors.agentActivityWord(signals);
       return {
-        key: "responding",
-        label: "Responding",
-        accessibleLabel: `${agentName} responding`,
-      };
-    }
-    if (agentState === "thinking") {
-      return {
-        key: "thinking",
-        label: "Thinking",
-        accessibleLabel: `${agentName} thinking`,
+        key: activity,
+        label: word.charAt(0).toUpperCase() + word.slice(1),
+        accessibleLabel: `${agentName} ${word}`,
       };
     }
     if (terminal?.running || terminal?.busy) {
@@ -12280,6 +12274,7 @@ class TerminalManager {
       running,
       agentName,
       agentState,
+      agentStatus,
       ports,
       isWorktree,
     });
@@ -12287,6 +12282,7 @@ class TerminalManager {
       running,
       agentName,
       agentState,
+      agentStatus,
       ports,
       isWorktree,
       cwd,

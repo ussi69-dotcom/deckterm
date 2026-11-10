@@ -292,6 +292,14 @@ function basenameOf(path) {
   return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
 }
 
+// Bun tests have no window; the browser loads terminal-colors.js first.
+function resolveTerminalColors() {
+  if (typeof window !== "undefined" && window.TerminalColors) {
+    return window.TerminalColors;
+  }
+  return require("./terminal-colors");
+}
+
 // Palette row for an "@" session entry: a human title (session name or cwd
 // basename), the agent/run state and cwd as dim detail, and the row action
 // as the right-hand hint. The raw session id is never shown.
@@ -300,12 +308,13 @@ function describePaletteSession(session, plan = {}) {
     String(session?.name || "").trim() || basenameOf(session?.cwd) || "Terminal";
   const state = [];
   const agentName = String(session?.agentName || "").trim();
-  const agentState = String(session?.agentState || "")
-    .trim()
-    .toLowerCase();
   if (agentName) {
     state.push(agentName);
-    if (agentState) state.push(agentState);
+    const word = resolveTerminalColors().agentActivityWord({
+      agentStatus: session?.agentStatus,
+      agentState: session?.agentState,
+    });
+    if (word) state.push(word);
   } else if (plan.statusClass === "ended") {
     state.push("ended");
   } else if (session?.running) {

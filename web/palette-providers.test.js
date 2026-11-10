@@ -411,3 +411,18 @@ test("filterQuickOpenFiles ranks recently opened files above equal matches", () 
   });
   expect(boosted[0].relativePath).toBe("src/alpha.js");
 });
+
+test("describePaletteSession shows the screen status over output flow", () => {
+  const detailOf = (fields) =>
+    describePaletteSession({ agentName: "claude", ...fields }, {}).detail;
+  expect(detailOf({ agentState: "responding", agentStatus: "blocked" })).toBe(
+    "claude · needs you",
+  );
+  expect(detailOf({ agentState: "thinking", agentStatus: "idle" })).toBe(
+    "claude · idle",
+  );
+  expect(detailOf({ agentState: "thinking", agentStatus: null })).toBe(
+    "claude · thinking",
+  );
+  expect(detailOf({ agentState: null, agentStatus: null })).toBe("claude");
+});
