@@ -79,6 +79,7 @@ function getWorkspaceSignalDescriptors({
   busy = false,
   agentName = null,
   agentState = null,
+  agentStatus = null,
   ports = [],
   isWorktree = false,
 } = {}) {
@@ -86,9 +87,12 @@ function getWorkspaceSignalDescriptors({
   const descriptors = [];
   const agentLabel = formatAgentLabel(agentName, agentState);
   if (agentLabel) {
-    const normalizedAgentState = String(agentState).trim().toLowerCase();
+    const activity = agentActivity({ agentStatus, agentState });
     descriptors.push({
-      key: normalizedAgentState === "responding" ? "agent-responding" : "agent",
+      key:
+        activity === "responding" || activity === "working"
+          ? "agent-responding"
+          : "agent",
       label: agentLabel,
       priority: SIGNAL_PRIORITIES.agent,
     });
@@ -141,6 +145,7 @@ function getPrimaryWorkspaceSignal({
   busy = false,
   agentName = null,
   agentState = null,
+  agentStatus = null,
   ports = [],
   isWorktree = false,
   cwd,
@@ -153,6 +158,7 @@ function getPrimaryWorkspaceSignal({
         busy,
         agentName,
         agentState,
+        agentStatus,
         ports,
         isWorktree,
       })[0] || null,
@@ -163,11 +169,38 @@ function getPrimaryWorkspaceSignal({
 // The server's screen-rule status (working / blocked / idle) wins: it reads
 // the agent's own screen. agentState (thinking / responding) only says that
 // output is flowing, so it is the fallback when no screen status exists yet.
-function isAgentWorking({ agentStatus = null, agentState = null } = {}) {
+// What the agent is doing, with one answer for every surface. The server's
+// screen status (blocked / working / idle) wins. agentState only says whether
+// output is flowing, so it decides only while no screen status exists yet.
+function agentActivity({ agentStatus = null, agentState = null } = {}) {
   const status = String(agentStatus || "").trim().toLowerCase();
-  if (status) return status === "working";
+  if (status === "blocked" || status === "working" || status === "idle") {
+    return status;
+  }
   const state = String(agentState || "").trim().toLowerCase();
-  return state === "thinking" || state === "responding";
+  return state === "thinking" || state === "responding" ? state : null;
+}
+
+const AGENT_ACTIVITY_WORDS = {
+  blocked: "needs you",
+  working: "working",
+  idle: "idle",
+  thinking: "thinking",
+  responding: "responding",
+};
+
+/** The word to show for agentActivity, or "" when the agent has none. */
+function agentActivityWord(signals) {
+  return AGENT_ACTIVITY_WORDS[agentActivity(signals)] || "";
+}
+
+function isAgentWorking(signals) {
+  const activity = agentActivity(signals);
+  return (
+    activity === "working" ||
+    activity === "thinking" ||
+    activity === "responding"
+  );
 }
 
 if (typeof window !== "undefined") {
@@ -179,6 +212,8 @@ if (typeof window !== "undefined") {
     getPrimaryWorkspaceSignal,
     formatRecentToolsTooltip,
     isAgentWorking,
+    agentActivity,
+    agentActivityWord,
   };
 }
 
@@ -191,6 +226,8 @@ if (typeof module !== "undefined" && module.exports) {
     getPrimaryWorkspaceSignal,
     formatRecentToolsTooltip,
     isAgentWorking,
+    agentActivity,
+    agentActivityWord,
   };
 }
 
@@ -202,4 +239,6 @@ if (typeof exports !== "undefined") {
   exports.getPrimaryWorkspaceSignal = getPrimaryWorkspaceSignal;
   exports.formatRecentToolsTooltip = formatRecentToolsTooltip;
   exports.isAgentWorking = isAgentWorking;
+  exports.agentActivity = agentActivity;
+  exports.agentActivityWord = agentActivityWord;
 }

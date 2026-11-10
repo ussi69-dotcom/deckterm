@@ -859,6 +859,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
   // - copy-mode-line-numbers off: tmux 3.8 can number copy-mode lines from
   //   the top of history instead, which changes what `goto-line` (the scroll
   //   indicator's absolute jump) means. -q: tmux < 3.8 has no such option.
+  // - set-clipboard on: tmux's default (external) drops OSC 52 written by
+  //   programs in a pane, and a tmux attached inside a DeckTerm terminal is
+  //   such a program, so its copies never reached the browser. With "on",
+  //   program output can write the browser clipboard, as it already can on
+  //   the raw backend. Reading it stays impossible (handleOsc52 only writes).
   // - theme terminal: tmux 3.8 re-colours its own UI by default; -q keeps
   //   tmux < 3.8 (no such option) quiet. Last in the chain on purpose.
   private async ensureServerOptions(): Promise<void> {
@@ -877,6 +882,11 @@ export class TmuxTerminalBackend implements TerminalBackend {
       "-gq",
       "copy-mode-line-numbers",
       "off",
+      ";",
+      "set-option",
+      "-s",
+      "set-clipboard",
+      "on",
       ";",
       "set-option",
       "-gq",

@@ -6,6 +6,8 @@ import {
   getPrimaryWorkspaceSignal,
   formatRecentToolsTooltip,
   isAgentWorking,
+  agentActivity,
+  agentActivityWord,
 } from "./terminal-colors";
 
 test("hashCwdToColor is stable", () => {
@@ -169,4 +171,45 @@ test("isAgentWorking follows the screen status and falls back to output flow", (
   expect(isAgentWorking({ agentStatus: null, agentState: "thinking" })).toBe(true);
   expect(isAgentWorking({ agentStatus: null, agentState: null })).toBe(false);
   expect(isAgentWorking()).toBe(false);
+});
+
+test("agentActivity prefers the screen status over output flow", () => {
+  expect(agentActivity({ agentStatus: "blocked", agentState: "responding" })).toBe("blocked");
+  expect(agentActivity({ agentStatus: "idle", agentState: "thinking" })).toBe("idle");
+  expect(agentActivity({ agentStatus: "working", agentState: null })).toBe("working");
+  expect(agentActivity({ agentStatus: null, agentState: "Responding" })).toBe("responding");
+  expect(agentActivity({ agentStatus: null, agentState: null })).toBeNull();
+  expect(agentActivity()).toBeNull();
+});
+
+test("agentActivityWord names every activity and nothing otherwise", () => {
+  expect(agentActivityWord({ agentStatus: "blocked" })).toBe("needs you");
+  expect(agentActivityWord({ agentStatus: "working" })).toBe("working");
+  expect(agentActivityWord({ agentState: "thinking" })).toBe("thinking");
+  expect(agentActivityWord({})).toBe("");
+});
+
+test("the tab highlight agrees with the dot", () => {
+  const key = (signals) =>
+    getWorkspaceSignalDescriptors({ agentName: "claude", ...signals })[0].key;
+  // Output is flowing, but the screen says the agent waits: no highlight.
+  expect(key({ agentState: "responding", agentStatus: "idle" })).toBe("agent");
+  expect(key({ agentState: "responding", agentStatus: "blocked" })).toBe("agent");
+  expect(key({ agentState: "thinking", agentStatus: "working" })).toBe("agent-responding");
+  // No screen status yet: output flow still decides.
+  expect(key({ agentState: "responding" })).toBe("agent-responding");
+  expect(key({ agentState: "thinking" })).toBe("agent");
+});
+
+test("every working signal maps to the same highlight as isAgentWorking for screen statuses", () => {
+  for (const agentStatus of ["blocked", "working", "idle"]) {
+    const [descriptor] = getWorkspaceSignalDescriptors({
+      agentName: "codex",
+      agentState: "thinking",
+      agentStatus,
+    });
+    expect(descriptor.key === "agent-responding").toBe(
+      isAgentWorking({ agentStatus, agentState: "thinking" }),
+    );
+  }
 });

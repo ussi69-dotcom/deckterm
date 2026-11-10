@@ -19,19 +19,17 @@ import {
   taskMessagesPath,
   workerPromptPath,
 } from "./task-messages";
+import {
+  canSetTaskStatusManually,
+  isTaskStatus,
+  nextTaskStatus,
+  TASK_TRANSITIONS,
+  type TaskEvent,
+  type TaskStatus,
+} from "./task-status";
 
+export type { TaskStatus } from "./task-status";
 export type TaskProvider = "codex" | "claude";
-export type TaskStatus =
-  | "draft"
-  | "ready"
-  | "worker-running"
-  | "checks-running"
-  | "needs-judge"
-  | "judge-running"
-  | "needs-user"
-  | "complete"
-  | "failed"
-  | "paused";
 
 export interface VerificationCommand {
   id?: string;
@@ -81,6 +79,9 @@ export interface TaskRecord {
   // processed (idempotency marker). Legacy records normalize to 0/null on load.
   round: number;
   processedVerdictAtRound: number | null;
+  // Identifies the check run that owns "checks-running". Only that run may
+  // finish the phase; absent on records written before this field existed.
+  activeCheckRunId?: string | null;
   lastCheckRun: {
     startedAt: string;
     finishedAt: string;
@@ -440,6 +441,12 @@ export function createTaskRunner(options: TaskRunnerOptions) {
   // load-mutate-save cycles. Callers RE-LOAD the task inside the critical
   // section; state read before the lock is treated as a hint only.
   const taskLocks = new Map<string, Promise<unknown>>();
+
+  // Check runs alive in THIS process. A task on "checks-running" whose run is
+  // not here was started by a process that no longer exists, so nothing will
+  // ever finish it. Worker and judge phases live in tmux and survive a restart;
+  // only checks are tied to this process.
+  const liveCheckRuns = new Set<string>();
   async function runExclusive<T>(
     taskId: string,
     fn: () => Promise<T>,
@@ -458,6 +465,18 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         taskLocks.delete(taskId);
       }
     }
+  }
+
+  // Moves the task along the lifecycle table, or refuses with 409.
+  function applyTaskEvent(task: TaskRecord, event: TaskEvent): void {
+    const next = nextTaskStatus(task.status, event);
+    if (!next) {
+      throw new TaskRunnerError(
+        `Task is ${task.status}; cannot ${event} now`,
+        409,
+      );
+    }
+    task.status = next;
   }
 
   async function findTaskJsonPath(
@@ -491,6 +510,9 @@ export function createTaskRunner(options: TaskRunnerOptions) {
   async function hydrateTask(task: TaskRecord): Promise<TaskRecord> {
     return {
       ...task,
+      // The status API used to accept any string. A stored value outside the
+      // table goes to the status that asks a person to look at the task.
+      status: isTaskStatus(task.status) ? task.status : "needs-user",
       // Legacy records (pre-verdict-loop) lack the round fields.
       round: Number.isInteger(task.round) && task.round >= 0 ? task.round : 0,
       processedVerdictAtRound:
@@ -534,6 +556,91 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     } catch {
       return [];
     }
+  }
+
+  function hasOrphanedChecks(task: TaskRecord): boolean {
+    if (task.status !== "checks-running") return false;
+    return !task.activeCheckRunId || !liveCheckRuns.has(task.activeCheckRunId);
+  }
+
+  // Must run inside runExclusive on a freshly loaded task.
+  async function settleOrphanedChecks(task: TaskRecord): Promise<TaskRecord> {
+    applyTaskEvent(task, "checks-interrupted");
+    task.activeCheckRunId = null;
+    await appendJsonLine(task.controlFiles.roundsFile, {
+      type: "checks-interrupted",
+      at: new Date().toISOString(),
+      status: task.status,
+    });
+    return saveTask(task);
+  }
+
+  // Read paths call this so a task left behind by a restart unlocks the next
+  // time anyone looks at it. A failure leaves the record as it was read.
+  async function recoverOrphanedChecks(task: TaskRecord): Promise<TaskRecord> {
+    if (!hasOrphanedChecks(task)) return task;
+    try {
+      return await runExclusive(task.id, async () => {
+        const fresh = await loadTask(task.id, task.ownerId);
+        return hasOrphanedChecks(fresh) ? settleOrphanedChecks(fresh) : fresh;
+      });
+    } catch {
+      return task;
+    }
+  }
+
+  // Claims a phase, launches it and records the result under one lock, so two
+  // concurrent starts cannot both launch. `launch` runs only when the table
+  // allows the start.
+  async function launchPhase<T extends { terminalId: string }>(
+    id: string,
+    actor: ActorContext,
+    event: "start-worker" | "start-judge",
+    launch: (task: TaskRecord) => Promise<T>,
+    record: (task: TaskRecord, terminalId: string) => Promise<TaskRecord>,
+  ): Promise<{ task: TaskRecord; launched: T }> {
+    return runExclusive(id, async () => {
+      const task = await loadTask(id, actor.ownerId);
+      if (hasOrphanedChecks(task)) await settleOrphanedChecks(task);
+      if (!nextTaskStatus(task.status, event)) applyTaskEvent(task, event);
+      const launched = await launch(task);
+      return { task: await record(task, launched.terminalId), launched };
+    });
+  }
+
+  async function recordWorkerStarted(
+    task: TaskRecord,
+    terminalId: string,
+  ): Promise<TaskRecord> {
+    task.terminalId = terminalId;
+    task.status = TASK_TRANSITIONS["start-worker"].to;
+    await appendJsonLine(task.controlFiles.roundsFile, {
+      type: "worker-started",
+      at: new Date().toISOString(),
+      terminalId,
+    });
+    return saveTask(task);
+  }
+
+  async function recordJudgeStarted(
+    task: TaskRecord,
+    terminalId: string,
+  ): Promise<TaskRecord> {
+    // Freshness: a verdict file left over from an aborted judge attempt
+    // (or pre-created by another agent) must never satisfy THIS attempt —
+    // strict round matching alone can't prove freshness (Codex S6
+    // review, HIGH). rm handles symlinks by removing the link itself.
+    await rm(join(task.taskDir, `verdict-r${task.round}.json`), {
+      force: true,
+    });
+    task.judgeTerminalId = terminalId;
+    task.status = TASK_TRANSITIONS["start-judge"].to;
+    await appendJsonLine(task.controlFiles.roundsFile, {
+      type: "judge-started",
+      at: new Date().toISOString(),
+      terminalId,
+    });
+    return saveTask(task);
   }
 
   async function writeControlFiles(task: TaskRecord): Promise<void> {
@@ -627,9 +734,9 @@ export function createTaskRunner(options: TaskRunnerOptions) {
 
     let continueRound = false;
     if (verdict.verdict === "PASS") {
-      task.status = "complete";
+      applyTaskEvent(task, "verdict-pass");
     } else if (verdict.verdict === "BLOCKED") {
-      task.status = "needs-user";
+      applyTaskEvent(task, "verdict-blocked");
     } else if (judgedRound + 1 < maxRounds) {
       // NEEDS_WORK with rounds remaining: hand the judge feedback to the next
       // worker round via the server-rendered prompt + an internal judge
@@ -665,10 +772,10 @@ export function createTaskRunner(options: TaskRunnerOptions) {
           `Task ${task.id}: failed to record judge feedback message for round ${judgedRound}`,
         );
       }
-      task.status = "ready";
+      applyTaskEvent(task, "verdict-next-round");
       continueRound = true;
     } else {
-      task.status = "needs-user";
+      applyTaskEvent(task, "verdict-rounds-exhausted");
     }
 
     task.processedVerdictAtRound = judgedRound;
@@ -778,7 +885,8 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     },
 
     async listTasks(ownerId: string): Promise<TaskRecord[]> {
-      return scanOwnerTasks(ownerId);
+      const tasks = await scanOwnerTasks(ownerId);
+      return Promise.all(tasks.map(recoverOrphanedChecks));
     },
 
     // A worker/judge terminal that exits never moves the task off its *-running
@@ -821,7 +929,7 @@ export function createTaskRunner(options: TaskRunnerOptions) {
           const processed = await applyJudgeVerdict(task, terminalId);
           if (processed) return processed;
         }
-        task.status = "needs-user";
+        applyTaskEvent(task, isWorkerExit ? "worker-exited" : "judge-exited");
         await appendJsonLine(task.controlFiles.roundsFile, {
           type: isWorkerExit ? "worker-exited" : "judge-exited",
           at: new Date().toISOString(),
@@ -869,7 +977,7 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         // Judge finished without a valid verdict for this round: same
         // needs-user semantics as today's no-verdict exit path, recorded as
         // its own event type (the terminal is still alive here).
-        task.status = "needs-user";
+        applyTaskEvent(task, "judge-no-verdict");
         await appendJsonLine(task.controlFiles.roundsFile, {
           type: "judge-done",
           at: new Date().toISOString(),
@@ -881,7 +989,7 @@ export function createTaskRunner(options: TaskRunnerOptions) {
     },
 
     async getTask(id: string, actor: ActorContext): Promise<TaskRecord> {
-      return loadTask(id, actor.ownerId);
+      return recoverOrphanedChecks(await loadTask(id, actor.ownerId));
     },
 
     async updateTask(
@@ -894,26 +1002,35 @@ export function createTaskRunner(options: TaskRunnerOptions) {
         checks?: VerificationCommand[];
       },
     ): Promise<TaskRecord> {
-      const task = await loadTask(id, actor.ownerId);
-      if (typeof input.title === "string" && input.title.trim()) {
-        task.title = input.title.trim();
+      if (input.status !== undefined && !canSetTaskStatusManually(input.status)) {
+        throw new TaskRunnerError(
+          `Task status cannot be set to ${String(input.status)}`,
+          400,
+        );
       }
-      if (typeof input.description === "string" && input.description.trim()) {
-        task.description = input.description.trim();
-      }
-      if (typeof input.status === "string") {
-        task.status = input.status;
-      }
-      if (Array.isArray(input.checks)) {
-        task.checks = normalizeChecks(input.checks);
-      }
-      await writeControlFiles(task);
-      await appendJsonLine(task.controlFiles.roundsFile, {
-        type: "updated",
-        at: new Date().toISOString(),
-        status: task.status,
+      return runExclusive(id, async () => {
+        const task = await loadTask(id, actor.ownerId);
+        if (typeof input.title === "string" && input.title.trim()) {
+          task.title = input.title.trim();
+        }
+        if (typeof input.description === "string" && input.description.trim()) {
+          task.description = input.description.trim();
+        }
+        if (input.status !== undefined) {
+          task.status = input.status;
+          task.activeCheckRunId = null;
+        }
+        if (Array.isArray(input.checks)) {
+          task.checks = normalizeChecks(input.checks);
+        }
+        await writeControlFiles(task);
+        await appendJsonLine(task.controlFiles.roundsFile, {
+          type: "updated",
+          at: new Date().toISOString(),
+          status: task.status,
+        });
+        return saveTask(task);
       });
-      return saveTask(task);
     },
 
     async deleteTask(id: string, actor: ActorContext): Promise<{ ok: true }> {
@@ -935,22 +1052,34 @@ export function createTaskRunner(options: TaskRunnerOptions) {
       return { ok: true };
     },
 
+    // Starts a phase through the lifecycle table: `launch` creates the terminal
+    // and returns its id. HTTP routes use these.
+    launchWorker<T extends { terminalId: string }>(
+      id: string,
+      actor: ActorContext,
+      launch: (task: TaskRecord) => Promise<T>,
+    ) {
+      return launchPhase(id, actor, "start-worker", launch, recordWorkerStarted);
+    },
+
+    launchJudge<T extends { terminalId: string }>(
+      id: string,
+      actor: ActorContext,
+      launch: (task: TaskRecord) => Promise<T>,
+    ) {
+      return launchPhase(id, actor, "start-judge", launch, recordJudgeStarted);
+    },
+
+    // Record a start that already happened, without asking the table. Only
+    // tests use these, to reach states the routes cannot.
     async markWorkerStarted(
       id: string,
       actor: ActorContext,
       terminalId: string,
     ): Promise<TaskRecord> {
-      return runExclusive(id, async () => {
-        const task = await loadTask(id, actor.ownerId);
-        task.terminalId = terminalId;
-        task.status = "worker-running";
-        await appendJsonLine(task.controlFiles.roundsFile, {
-          type: "worker-started",
-          at: new Date().toISOString(),
-          terminalId,
-        });
-        return saveTask(task);
-      });
+      return runExclusive(id, async () =>
+        recordWorkerStarted(await loadTask(id, actor.ownerId), terminalId),
+      );
     },
 
     async markJudgeStarted(
@@ -958,57 +1087,68 @@ export function createTaskRunner(options: TaskRunnerOptions) {
       actor: ActorContext,
       terminalId: string,
     ): Promise<TaskRecord> {
-      return runExclusive(id, async () => {
-        const task = await loadTask(id, actor.ownerId);
-        // Freshness: a verdict file left over from an aborted judge attempt
-        // (or pre-created by another agent) must never satisfy THIS attempt —
-        // strict round matching alone can't prove freshness (Codex S6
-        // review, HIGH). rm handles symlinks by removing the link itself.
-        await rm(join(task.taskDir, `verdict-r${task.round}.json`), {
-          force: true,
-        });
-        task.judgeTerminalId = terminalId;
-        task.status = "judge-running";
-        await appendJsonLine(task.controlFiles.roundsFile, {
-          type: "judge-started",
-          at: new Date().toISOString(),
-          terminalId,
-        });
-        return saveTask(task);
-      });
+      return runExclusive(id, async () =>
+        recordJudgeStarted(await loadTask(id, actor.ownerId), terminalId),
+      );
     },
 
+    // The lock is held to claim the phase and to finish it, never while the
+    // commands run: they can take minutes, and pause, reset and messages must
+    // still get through.
     async runChecks(id: string, actor: ActorContext): Promise<TaskRecord> {
-      const task = await loadTask(id, actor.ownerId);
+      const runId = crypto.randomUUID();
       const startedAt = new Date().toISOString();
-      task.status = "checks-running";
-      await saveTask(task);
-
-      const results = [];
-      for (const check of task.checks) {
-        const result = await runCommand({
-          cwd: task.workingDirectory,
-          args: ["bash", "-lc", check.command],
-          timeoutMs: 120_000,
-        });
-        results.push({ ...check, ...result });
-      }
-
-      const success = results.every((result) => result.exitCode === 0);
-      task.lastCheckRun = {
-        startedAt,
-        finishedAt: new Date().toISOString(),
-        success,
-        results,
-      };
-      task.status = success ? "needs-judge" : "needs-user";
-      await appendJsonLine(task.controlFiles.roundsFile, {
-        type: "checks",
-        at: task.lastCheckRun.finishedAt,
-        success,
-        results,
+      const claimed = await runExclusive(id, async () => {
+        const task = await loadTask(id, actor.ownerId);
+        if (hasOrphanedChecks(task)) await settleOrphanedChecks(task);
+        applyTaskEvent(task, "start-checks");
+        task.activeCheckRunId = runId;
+        liveCheckRuns.add(runId);
+        return saveTask(task);
       });
-      return saveTask(task);
+
+      try {
+        const results: NonNullable<TaskRecord["lastCheckRun"]>["results"] = [];
+        for (const check of claimed.checks) {
+          const result = await runCommand({
+            cwd: claimed.workingDirectory,
+            args: ["bash", "-lc", check.command],
+            timeoutMs: 120_000,
+          }).catch(
+            (err): CommandResult => ({
+              exitCode: 127,
+              stdout: "",
+              stderr: `Could not run the check: ${String(err)}`,
+            }),
+          );
+          results.push({ ...check, ...result });
+        }
+
+        const success = results.every((result) => result.exitCode === 0);
+        const finishedAt = new Date().toISOString();
+        return await runExclusive(id, async () => {
+          const task = await loadTask(id, actor.ownerId);
+          const ownsPhase = task.activeCheckRunId === runId;
+          // A pause, reset or newer run took over meanwhile: the result is
+          // still history, but it no longer decides the status.
+          if (ownsPhase || !task.activeCheckRunId) {
+            task.lastCheckRun = { startedAt, finishedAt, success, results };
+          }
+          if (ownsPhase) {
+            applyTaskEvent(task, success ? "checks-passed" : "checks-failed");
+            task.activeCheckRunId = null;
+          }
+          await appendJsonLine(task.controlFiles.roundsFile, {
+            type: "checks",
+            at: finishedAt,
+            success,
+            results,
+          });
+          return saveTask(task);
+        });
+      } finally {
+        liveCheckRuns.delete(runId);
+      }
     },
 
     async buildJudgePrompt(id: string, actor: ActorContext): Promise<string> {

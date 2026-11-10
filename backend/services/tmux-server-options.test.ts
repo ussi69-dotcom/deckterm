@@ -77,6 +77,19 @@ test.skipIf(!TMUX_AVAILABLE)(
 
     expect(showGlobal(socket, "mouse")).toBe("off");
     expect(showGlobal(socket, "history-limit")).toBe("10000");
+    // Without this, copies from a tmux attached inside a terminal are lost.
+    expect(
+      Bun.spawnSync([
+        "tmux",
+        "-S",
+        socket,
+        "show-options",
+        "-sv",
+        "set-clipboard",
+      ])
+        .stdout.toString()
+        .trim(),
+    ).toBe("on");
     if (tmuxVersion() >= 3.08) {
       expect(showGlobal(socket, "theme")).toBe("terminal");
       // goto-line (the scroll indicator's absolute jump) counts from the

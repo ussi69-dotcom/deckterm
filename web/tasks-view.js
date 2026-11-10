@@ -130,6 +130,14 @@ function tasksTotalCount(tasks) {
   return Array.isArray(tasks) ? tasks.length : 0;
 }
 
+// Bun tests have no window; the browser loads task-signals.js first.
+function resolveTaskSignals() {
+  if (typeof window !== "undefined" && window.TaskSignals) {
+    return window.TaskSignals;
+  }
+  return require("./task-signals");
+}
+
 // The set of task statuses that are safe to use verbatim as the trailing token
 // of a `ide-tasks-badge-<token>` CSS class. Mirrors task-board.js's column
 // status truth (draft/ready/paused/worker-running/checks-running/judge-running/
@@ -568,13 +576,10 @@ class TasksViewController {
     // A phase that is already running disables its own trigger (and Start
     // while ANY phase runs) so the primary button reflects reality instead
     // of offering a second worker for a running task.
-    const running =
-      statusText === "worker-running" ||
-      statusText === "checks-running" ||
-      statusText === "judge-running";
-    const startDisabled = running || statusText === "complete";
-    const checksDisabled = running;
-    const judgeDisabled = running;
+    const availability = resolveTaskSignals().taskActionAvailability(statusText);
+    const startDisabled = !availability.start;
+    const checksDisabled = !availability.checks;
+    const judgeDisabled = !availability.judge;
     detail.innerHTML = `
       <div class="ide-tasks-detail-header">
         <span class="ide-tasks-detail-title" title="${this.esc(title)}">${this.esc(title)}</span>
