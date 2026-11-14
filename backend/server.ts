@@ -123,6 +123,8 @@ import {
   applyOnboardingRemediation,
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
+import { isPrimarySessionHandle } from "./services/session-handles";
+import { runWithDeadline } from "./services/startup-deadline";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
 import {
   sanitizeTerminalEnv,
@@ -971,6 +973,8 @@ function recordAgentResumeEvents(
   term: Terminal,
   events: ReturnType<typeof parseShellIntegrationChunk>["events"],
 ) {
+  // The resume record belongs to the session, not to each view of it.
+  if (!isPrimaryHandle(term)) return;
   for (const event of events) {
     if (event.type === "agent-start") {
       const agentName = event.agentName;
@@ -1399,6 +1403,15 @@ export async function reconcileSessionsOnStartup(
   return fixed;
 }
 
+// A stopped or wedged tmux server whose socket still exists never answers;
+// startup waits this long for the environment scrub and for session recovery
+// each, then opens the port anyway.
+const STARTUP_TMUX_TIMEOUT_MS =
+  Number(process.env.DECKTERM_STARTUP_TMUX_TIMEOUT_MS) > 0
+    ? Number(process.env.DECKTERM_STARTUP_TMUX_TIMEOUT_MS)
+    : 15_000;
+let startupTmuxRecoveryAbandoned = false;
+
 // Recover existing tmux sessions on startup (for TMUX_BACKEND)
 async function recoverTmuxSessions(): Promise<number> {
   if (!TMUX_BACKEND) return 0;
@@ -1420,6 +1433,9 @@ async function recoverTmuxSessions(): Promise<number> {
     const state = await getFoundationState();
 
     for (const sessionName of sessions) {
+      // Startup gave up waiting on tmux: the port is open and lazy restore
+      // owns these sessions now.
+      if (startupTmuxRecoveryAbandoned) break;
       // One session that fails to attach must not strand every session
       // listed after it.
       try {
@@ -1453,9 +1469,20 @@ async function recoverTmuxSession(
     return false;
   }
   if (recordedSession.status !== "active") {
-    console.warn(
-      `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
-    );
+    // Its row is ended, so no surface can ever reach this session again. It
+    // outlived its row only because another handle (a linked view) still
+    // used it when the row ended; once no handle in this process uses it,
+    // nothing would ever stop the shell or the agent in it.
+    if (!hasOtherTerminalForSession(sessionName)) {
+      console.warn(
+        `[tmux] Session ${sessionName} outlived its ${recordedSession.status} row and no view uses it; ending it`,
+      );
+      await killTmuxSessionIfLast(sessionName);
+    } else {
+      console.warn(
+        `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
+      );
+    }
     return false;
   }
   if (terminals.has(id)) return false;
@@ -1819,10 +1846,20 @@ async function getFoundationState(): Promise<FoundationState> {
 // needs-input push is never swallowed by an earlier completion push.
 const COMPLETION_PUSH_DEDUPE_MS = 5_000;
 
+// A linked view is a second handle on the same tmux session and reads the
+// same output: session-level effects go through one handle only.
+function isPrimaryHandle(term: Terminal): boolean {
+  const own = term.sessionName
+    ? parseTmuxSessionName(term.sessionName, TMUX_SESSION_PREFIX)?.terminalId
+    : null;
+  return isPrimarySessionHandle(term, terminals.values(), own);
+}
+
 function notifyCompletionPush(
   term: Terminal,
   kind: "agent" | "command" | "input",
 ) {
+  if (!isPrimaryHandle(term)) return;
   const now = Date.now();
   if (
     kind !== "input" &&
@@ -12148,12 +12185,26 @@ async function startOwnedWebServer(
     // A failure is retried a few times; if it still cannot be verified the
     // service keeps running, and every terminal creation re-runs the scrub
     // and is refused (HTTP 503) until one succeeds.
-    if (tmuxTerminalBackend) {
-      const backend = tmuxTerminalBackend;
-      const { result, attempts } = await scrubTmuxEnvironmentWithRetry(
-        () => backend.scrubServerEnvironment(),
-        { attempts: 3, delayMs: 500 },
+    const scrub = tmuxTerminalBackend
+      ? await runWithDeadline(() => {
+          const backend = tmuxTerminalBackend!;
+          return scrubTmuxEnvironmentWithRetry(
+            () => backend.scrubServerEnvironment(),
+            { attempts: 3, delayMs: 500 },
+          );
+        }, STARTUP_TMUX_TIMEOUT_MS)
+      : null;
+    if (scrub && !scrub.ok) {
+      // Unverified, so every terminal creation re-runs the scrub and is
+      // refused until one succeeds.
+      console.error(
+        scrub.timedOut
+          ? `[tmux] environment: no answer from tmux within ${STARTUP_TMUX_TIMEOUT_MS} ms (stopped or wedged server?); starting without the scrub. New terminals are refused until a scrub succeeds.`
+          : `[tmux] environment: scrub failed at startup: ${String(scrub.error)}`,
       );
+    }
+    if (scrub?.ok) {
+      const { result, attempts } = scrub.value;
       if (result.removed.length > 0) {
         console.log(
           `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
@@ -12170,9 +12221,17 @@ async function startOwnedWebServer(
         );
       }
     }
-    const recovered = await recoverTmuxSessions();
-    if (recovered > 0) {
-      console.log(`[tmux] Recovered ${recovered} session(s)`);
+    const recovery = await runWithDeadline(
+      () => recoverTmuxSessions(),
+      STARTUP_TMUX_TIMEOUT_MS,
+    );
+    if (!recovery.ok && recovery.timedOut) {
+      startupTmuxRecoveryAbandoned = true;
+      console.error(
+        `[tmux] session recovery got no answer from tmux within ${STARTUP_TMUX_TIMEOUT_MS} ms (stopped or wedged server?); starting without it. Recorded sessions are restored when they are next opened.`,
+      );
+    } else if (recovery.ok && recovery.value > 0) {
+      console.log(`[tmux] Recovered ${recovery.value} session(s)`);
     }
   }
 
