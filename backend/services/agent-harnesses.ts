@@ -34,7 +34,7 @@ export interface ProbeDeps {
   now?: () => number;
 }
 
-// Mirrors shellQuote in backend/task-runner.ts:331-333 verbatim (kept
+// Mirrors shellQuote in backend/task-runner.ts:381-383 verbatim (kept
 // duplicated on purpose -- S2 will invert the dependency).
 function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, "'\\''")}'`;

@@ -35,8 +35,8 @@ Current product pillars:
 4. File and git operations close to the terminal
 5. Safe promotion from `dev` to `main`
 
-For the full current-state description, see [docs/product-guide.md](/home/deploy/deckterm_dev/docs/product-guide.md).
-For rollout and CI/CD details, see [deploy/README.md](/home/deploy/deckterm_dev/deploy/README.md) and [docs/operations-guide.md](/home/deploy/deckterm_dev/docs/operations-guide.md).
+For the full current-state description, see [docs/product-guide.md](docs/product-guide.md).
+For rollout and CI/CD details, see [deploy/README.md](deploy/README.md) and [docs/operations-guide.md](docs/operations-guide.md).
 
 ## Runtime Model
 
@@ -192,9 +192,9 @@ Common runtime variables:
 | `ALLOWED_FILE_ROOTS`                  | `$HOME`                      | Allowed browse/upload/git roots                                                                                                                                                                         |
 | `TMUX_BACKEND`                        | `1` in deployed environments | Persistent tmux sessions                                                                                                                                                                                |
 | `DECKTERM_STATE_DIR`                  | `$HOME/.deckterm`            | Task Runner metadata, control files, and worktree root                                                                                                                                                  |
-| `DECKTERM_TASK_MAX_ROUNDS`            | `5`                          | Reserved cap for supervised worker/judge rounds                                                                                                                                                         |
-| `DECKTERM_TASK_PROVIDERS`             | `codex,claude`               | Reserved provider allow-list for task workflows                                                                                                                                                         |
-| `DECKTERM_PUBLISH_MODE`               | `local`                      | Setup doctor profile: `local`, `cloudflare`, `nginx`, or `direct`                                                                                                                                       |
+| `DECKTERM_TASK_MAX_ROUNDS`            | `5`                          | Cap for supervised worker/judge rounds (enforced by the task runner)                                                                                                                                    |
+| `DECKTERM_TASK_PROVIDERS`             | `codex,claude`               | Provider allow-list for task workflows (enforced by the task runner)                                                                                                                                    |
+| `DECKTERM_PUBLISH_MODE`               | `local`                      | Publish profile: `local`, `cloudflare`, `cloudflare-tunnel` (edge-authenticated tunnel), `cloudflare-access` (server validates the Access JWT), `nginx`, or `direct`                                    |
 | `CF_ACCESS_REQUIRED`                  | `0`                          | Require Cloudflare Access JWTs                                                                                                                                                                          |
 | `CF_ACCESS_TEAM_NAME`                 | empty                        | Cloudflare Access team name                                                                                                                                                                             |
 | `CF_ACCESS_AUD`                       | empty                        | Cloudflare Access application audience tag                                                                                                                                                              |
@@ -255,9 +255,9 @@ Project rule: browser tests target the dev environment on `4174`.
 
 ## Docs
 
-- Product guide: [docs/product-guide.md](/home/deploy/deckterm_dev/docs/product-guide.md)
-- Operations and CI/CD: [docs/operations-guide.md](/home/deploy/deckterm_dev/docs/operations-guide.md)
-- Deploy layout and rollback: [deploy/README.md](/home/deploy/deckterm_dev/deploy/README.md)
+- Product guide: [docs/product-guide.md](docs/product-guide.md)
+- Operations and CI/CD: [docs/operations-guide.md](docs/operations-guide.md)
+- Deploy layout and rollback: [deploy/README.md](deploy/README.md)
 
 ## Tech Stack
 
