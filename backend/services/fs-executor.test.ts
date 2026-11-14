@@ -5,6 +5,8 @@ import {
   writeFileSync,
   rmSync,
   readFileSync,
+  statSync,
+  chmodSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -264,5 +266,47 @@ describe("brokered concurrency cap (Codex #13)", () => {
       acquireBrokerSlot(uid);
       releaseBrokerSlot(uid);
     }).not.toThrow();
+  });
+});
+
+describe("LegacyFsExecutor never damages an existing file", () => {
+  let base: string;
+  beforeAll(() => {
+    base = mkdtempSync(join(tmpdir(), "deckterm-fsx-safety-"));
+  });
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+
+  test("rename onto an existing name is refused and both files stay", async () => {
+    const ex = getFsExecutor({ kind: "legacy" });
+    writeFileSync(join(base, "a.txt"), "source");
+    writeFileSync(join(base, "b.txt"), "keep me");
+    await expect(ex.rename(base, "a.txt", "b.txt")).rejects.toMatchObject({
+      code: "exists",
+    });
+    expect(readFileSync(join(base, "a.txt"), "utf8")).toBe("source");
+    expect(readFileSync(join(base, "b.txt"), "utf8")).toBe("keep me");
+    await ex.rename(base, "a.txt", "c.txt");
+    expect(readFileSync(join(base, "c.txt"), "utf8")).toBe("source");
+  });
+
+  test("a save keeps the permission bits of the file it replaces", async () => {
+    const ex = getFsExecutor({ kind: "legacy" });
+    writeFileSync(join(base, "secret.env"), "A=1\n", { mode: 0o600 });
+    chmodSync(join(base, "secret.env"), 0o600);
+    writeFileSync(join(base, "run.sh"), "#!/bin/sh\n", { mode: 0o755 });
+    chmodSync(join(base, "run.sh"), 0o755);
+    await ex.write(base, "secret.env", Buffer.from("A=2\n"));
+    await ex.write(base, "run.sh", Buffer.from("#!/bin/sh\necho hi\n"));
+    expect(statSync(join(base, "secret.env")).mode & 0o777).toBe(0o600);
+    expect(statSync(join(base, "run.sh")).mode & 0o777).toBe(0o755);
+    expect(readFileSync(join(base, "secret.env"), "utf8")).toBe("A=2\n");
+  });
+
+  test("a new file gets the usual default mode", async () => {
+    const ex = getFsExecutor({ kind: "legacy" });
+    await ex.write(base, "fresh.txt", Buffer.from("new"));
+    expect(statSync(join(base, "fresh.txt")).mode & 0o777).toBe(
+      0o666 & ~process.umask(),
+    );
   });
 });

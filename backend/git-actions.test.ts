@@ -866,3 +866,178 @@ test("resolve-stage denies (audits deny, 400) an invalid resolution mode", async
   const row = rows[rows.length - 1] as any;
   expect(row.decision).toBe("deny");
 });
+
+// ── Files and git panel must not damage files (upkeep R2, 2026-11-14) ──
+
+function getJson(path: string) {
+  return app.fetch(new Request(`http://deckterm.test${path}`));
+}
+
+test("diff refuses an option-shaped commit (--output would overwrite a file)", async () => {
+  const victim = join(repo, "victim.txt");
+  await writeFile(victim, "precious\n");
+  for (const ref of [`--output=${victim}`, "--stat", "-p"]) {
+    const res = await getJson(
+      `/api/git/diff?cwd=${encodeURIComponent(repo)}&commit=${encodeURIComponent(ref)}`,
+    );
+    expect(res.status).toBe(400);
+  }
+  expect(await readFile(victim, "utf8")).toBe("precious\n");
+  // A real revision still works.
+  const ok = await getJson(
+    `/api/git/diff?cwd=${encodeURIComponent(repo)}&commit=HEAD`,
+  );
+  expect(ok.status).toBe(200);
+  await rm(victim, { force: true });
+});
+
+test("checkout refuses a dash-led branch (-f would discard uncommitted work)", async () => {
+  await writeFile(join(repo, "a.txt"), "uncommitted edit\n");
+  // "." and a file name are refused by git itself: the trailing `--` makes
+  // the value a revision, never a path to restore.
+  for (const branch of ["-f", "--force", "-B", ".", "a.txt"]) {
+    const res = await post("/api/git/checkout", { cwd: repo, branch });
+    expect(res.status).toBe(400);
+  }
+  expect(await readFile(join(repo, "a.txt"), "utf8")).toBe("uncommitted edit\n");
+  await git(repo, "checkout", "--", "a.txt");
+});
+
+test("rename onto an existing name answers 409 and keeps both files", async () => {
+  await writeFile(join(repo, "rename-src.txt"), "source\n");
+  await writeFile(join(repo, "rename-dst.txt"), "existing\n");
+  const res = await post("/api/files/rename", {
+    from: join(repo, "rename-src.txt"),
+    to: join(repo, "rename-dst.txt"),
+  });
+  expect(res.status).toBe(409);
+  const body = (await res.json()) as any;
+  expect(body.reason).toBe("exists");
+  expect(body.error).toContain("already exists");
+  expect(await readFile(join(repo, "rename-src.txt"), "utf8")).toBe("source\n");
+  expect(await readFile(join(repo, "rename-dst.txt"), "utf8")).toBe(
+    "existing\n",
+  );
+  await rm(join(repo, "rename-src.txt"), { force: true });
+  await rm(join(repo, "rename-dst.txt"), { force: true });
+});
+
+test("editor save keeps a private file private and a script executable", async () => {
+  const { chmod, stat } = await import("node:fs/promises");
+  const secret = join(repo, "private.env");
+  const script = join(repo, "tool.sh");
+  await writeFile(secret, "A=1\n");
+  await chmod(secret, 0o600);
+  await writeFile(script, "#!/bin/sh\n");
+  await chmod(script, 0o755);
+  for (const [path, content] of [
+    [secret, "A=2\n"],
+    [script, "#!/bin/sh\necho hi\n"],
+  ]) {
+    const res = await app.fetch(
+      new Request("http://deckterm.test/api/files/content", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path, content }),
+      }),
+    );
+    expect(res.status).toBe(200);
+  }
+  expect((await stat(secret)).mode & 0o777).toBe(0o600);
+  expect((await stat(script)).mode & 0o777).toBe(0o755);
+  await rm(secret, { force: true });
+  await rm(script, { force: true });
+});
+
+test("the editor refuses to open a file that is not valid UTF-8", async () => {
+  const latin1 = join(repo, "latin1.txt");
+  // "Příliš" in Windows-1250: no NUL byte, not UTF-8.
+  await writeFile(latin1, Buffer.from([0x50, 0xf8, 0xed, 0x6c, 0x69, 0x9a]));
+  const res = await getJson(
+    `/api/files/content?path=${encodeURIComponent(latin1)}`,
+  );
+  expect(res.status).toBe(415);
+  expect(((await res.json()) as any).reason).toBe("not_utf8");
+  // UTF-8 text (with a BOM) still opens.
+  const utf8 = join(repo, "utf8.txt");
+  await writeFile(utf8, "﻿Příliš žluťoučký\n");
+  expect(
+    (await getJson(`/api/files/content?path=${encodeURIComponent(utf8)}`))
+      .status,
+  ).toBe(200);
+  await rm(latin1, { force: true });
+  await rm(utf8, { force: true });
+});
+
+test("status returns raw names with non-ASCII characters and spaces, and stage works on them", async () => {
+  const names = ["é.txt", "with space.txt"];
+  for (const name of names) await writeFile(join(repo, name), "x\n");
+  const res = await getJson(`/api/git/status?cwd=${encodeURIComponent(repo)}`);
+  expect(res.status).toBe(200);
+  const paths = (((await res.json()) as any).files as any[]).map((f) => f.path);
+  for (const name of names) expect(paths).toContain(name);
+  const staged = await post("/api/git/stage", { cwd: repo, paths: names });
+  expect(staged.status).toBe(200);
+  const after = (await git(repo, "diff", "--cached", "--name-only", "-z"))
+    .split("\0")
+    .filter(Boolean);
+  for (const name of names) expect(after).toContain(name);
+  await git(repo, "reset", "-q", "--", ...names);
+  for (const name of names) await rm(join(repo, name), { force: true });
+});
+
+test("status keeps a rename's old and new path under -z", async () => {
+  await git(repo, "mv", "a.txt", "renamed a.txt");
+  const res = await getJson(`/api/git/status?cwd=${encodeURIComponent(repo)}`);
+  const entry = (((await res.json()) as any).files as any[]).find(
+    (f) => f.path === "renamed a.txt",
+  );
+  expect(entry).toBeTruthy();
+  expect(entry.oldPath).toBe("a.txt");
+  expect(entry.isRenamed).toBe(true);
+  await git(repo, "mv", "renamed a.txt", "a.txt");
+});
+
+test("the untracked-file diff runs no repository fsmonitor hook", async () => {
+  const marker = join(allowedRoot, "fsmonitor-ran");
+  const hook = join(allowedRoot, "fsmonitor-hook.sh");
+  await writeFile(hook, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+  const { chmod } = await import("node:fs/promises");
+  await chmod(hook, 0o755);
+  await git(repo, "config", "core.fsmonitor", hook);
+  try {
+    await writeFile(join(repo, "untracked-hook.txt"), "new line\n");
+    const res = await getJson(
+      `/api/git/diff?cwd=${encodeURIComponent(repo)}&path=untracked-hook.txt`,
+    );
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).diff).toContain("+new line");
+    expect(await Bun.file(marker).exists()).toBe(false);
+  } finally {
+    await git(repo, "config", "--unset", "core.fsmonitor");
+    await rm(join(repo, "untracked-hook.txt"), { force: true });
+    await rm(marker, { force: true });
+  }
+});
+
+test("status leaves out a name that is not valid UTF-8 instead of a lossy path", async () => {
+  const bad = Buffer.concat([
+    Buffer.from(join(repo, "x-")),
+    Buffer.from([0xff]),
+    Buffer.from(".txt"),
+  ]);
+  const { writeFileSync, rmSync } = await import("node:fs");
+  writeFileSync(bad, "x\n");
+  await writeFile(join(repo, "plain-next.txt"), "y\n");
+  try {
+    const res = await getJson(`/api/git/status?cwd=${encodeURIComponent(repo)}`);
+    const paths = (((await res.json()) as any).files as any[]).map(
+      (f) => f.path,
+    );
+    expect(paths).toContain("plain-next.txt");
+    expect(paths.some((p: string) => p.includes("\uFFFD"))).toBe(false);
+  } finally {
+    rmSync(bad, { force: true });
+    await rm(join(repo, "plain-next.txt"), { force: true });
+  }
+});

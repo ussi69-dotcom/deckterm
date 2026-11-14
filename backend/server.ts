@@ -3318,6 +3318,61 @@ export const GIT_PROBE_ENV: Readonly<Record<string, string>> = Object.freeze({
   LC_ALL: "C",
 });
 
+// The deepest directory both absolute paths live under ("/" at worst).
+function commonAncestorDir(a: string, b: string): string {
+  const as = a.split("/").filter(Boolean);
+  const bs = b.split("/").filter(Boolean);
+  const shared: string[] = [];
+  for (let i = 0; i < Math.min(as.length, bs.length) && as[i] === bs[i]; i++)
+    shared.push(as[i]);
+  return `/${shared.join("/")}`;
+}
+
+const RENAME_EXISTS_MESSAGE =
+  "A file or folder with that name already exists";
+
+// A revision the git routes pass as an argument: hex/HEAD/refname with an
+// optional ~N/^N, never a leading dash (argv-flag smuggling). Passed
+// argv-style, never through a shell.
+export function isSafeGitRevision(value: string): boolean {
+  return (
+    value.length > 0 &&
+    !value.startsWith("-") &&
+    /^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(value)
+  );
+}
+
+// Parses `git status --porcelain -z -b`: NUL-separated records, the first
+// one the `## branch...upstream [ahead N, behind M]` header. A rename or copy
+// record (X or Y is R/C) is followed by a second record holding the original
+// path. Names are raw bytes decoded as UTF-8, never C-quoted.
+export function parseGitStatusPorcelainZ(output: string): {
+  header: string;
+  entries: Array<{ rawStatus: string; path: string; oldPath?: string }>;
+} {
+  const records = output.split("\0");
+  let header = "";
+  const entries: Array<{ rawStatus: string; path: string; oldPath?: string }> =
+    [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.startsWith("## ")) {
+      if (!header) header = record.slice(3);
+      continue;
+    }
+    if (record.length < 4) continue;
+    const rawStatus = record.slice(0, 2);
+    const path = record.slice(3);
+    const oldPath = /[RC]/.test(rawStatus) ? records[++i] : undefined;
+    // A name that is not valid UTF-8 was decoded lossily (U+FFFD); two such
+    // names can collapse into one string, so a stage or discard could hit
+    // the wrong file. Leave those out rather than hand out a wrong path.
+    if (path.includes("\uFFFD") || oldPath?.includes("\uFFFD")) continue;
+    entries.push({ rawStatus, path, ...(oldPath ? { oldPath } : {}) });
+  }
+  return { header, entries };
+}
+
 export function classifyGitStatusFailure(exitCode: number, stderr: string) {
   const message = stderr.trim() || "git status failed";
   if (/not a git repository/i.test(message)) {
@@ -9833,6 +9888,19 @@ export function createWebApp() {
       if (data.includes(0)) {
         return c.json({ error: "Binary file cannot be edited" }, 415);
       }
+      // The editor works on a UTF-8 string and saves it back as UTF-8, so a
+      // file that does not survive that round trip (Latin-1, Windows-1250)
+      // would have every non-UTF-8 byte rewritten on save. Same gate as
+      // replace-in-files.
+      if (!utf8RoundTrips(data)) {
+        return c.json(
+          {
+            error: "File is not UTF-8 text and cannot be edited here",
+            reason: "not_utf8",
+          },
+          415,
+        );
+      }
       return c.json({
         path: scoped.relPath ? `${scoped.root}/${scoped.relPath}` : scoped.root,
         content: data.toString("utf8"),
@@ -10327,14 +10395,25 @@ export function createWebApp() {
         const toAbs = scopedTo.relPath
           ? join(scopedTo.root, scopedTo.relPath)
           : scopedTo.root;
-        const fsp = await import("node:fs/promises");
-        await fsp.rename(fromAbs, toAbs);
+        // Rename beneath the two roots' common ancestor through the same
+        // fd-contained RENAME_NOREPLACE helper, so an existing (or a
+        // concurrently created) destination is never replaced. No usable
+        // common ancestor: the helper refuses and so does the move.
+        const common = commonAncestorDir(scopedFrom.root, scopedTo.root);
+        const fx = getFsExecutor(execCtx.ctx);
+        await fx.rename(
+          common,
+          relative(common, fromAbs),
+          relative(common, toAbs),
+        );
         return c.json({ ok: true });
       }
       const fx = getFsExecutor(execCtx.ctx);
       await fx.rename(scopedFrom.root, scopedFrom.relPath, scopedTo.relPath);
       return c.json({ ok: true });
     } catch (err) {
+      if (err instanceof FsExecError && err.code === "exists")
+        return c.json({ error: RENAME_EXISTS_MESSAGE, reason: "exists" }, 409);
       if (err instanceof FsExecError)
         return fsErrorResponse(c, err, "Failed to rename");
       return c.json({ error: "Failed to rename" }, 500);
@@ -10753,7 +10832,7 @@ export function createWebApp() {
       // the broker's own fixed environment (LANG defaults to C.UTF-8).
       const statusRes = await runGit(
         g.git,
-        ["status", "--porcelain", "-uall", "-b"],
+        ["status", "--porcelain", "-z", "-uall", "-b"],
         undefined,
         GIT_PROBE_ENV,
       );
@@ -10768,8 +10847,10 @@ export function createWebApp() {
         return c.json(failure.body, failure.status);
       }
 
-      const lines = output.trim().split("\n");
-      const headerLine = lines[0]?.replace("## ", "") || "";
+      // -z: names arrive raw (no C quoting of non-ASCII or spaces), so the
+      // panel's stage/diff/discard calls get a name that matches the file.
+      const parsed = parseGitStatusPorcelainZ(output);
+      const headerLine = parsed.header;
       // "main...origin/main [ahead 1, behind 2]" | "main" | "No commits yet on main"
       const trackMatch = headerLine.match(
         /^(.+?)(?:\.\.\.(\S+))?(?:\s+\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\])?$/,
@@ -10778,25 +10859,14 @@ export function createWebApp() {
       const upstream = trackMatch?.[2] || null;
       const ahead = Number(trackMatch?.[3] || 0);
       const behind = Number(trackMatch?.[4] || 0);
-      const files = lines
-        .slice(1)
-        .filter((line) => line.length >= 3)
-        .map((line) => {
-          const rawStatus = line.substring(0, 2);
+      const files = parsed.entries.map(
+        ({ rawStatus, path, oldPath }) => {
           const stagedStatus = rawStatus[0] === " " ? "" : rawStatus[0];
           const unstagedStatus = rawStatus[1] === " " ? "" : rawStatus[1];
-          const rawPath = line.substring(3).trim();
-          const renameSep = " -> ";
-          const renameIdx = rawPath.indexOf(renameSep);
           const isRenamed =
-            stagedStatus === "R" || unstagedStatus === "R" || renameIdx !== -1;
-
-          let path = rawPath;
-          let oldPath: string | undefined;
-          if (renameIdx !== -1) {
-            oldPath = rawPath.substring(0, renameIdx).trim();
-            path = rawPath.substring(renameIdx + renameSep.length).trim();
-          }
+            stagedStatus === "R" ||
+            unstagedStatus === "R" ||
+            oldPath !== undefined;
 
           // Conflict classification uses the raw (unstripped) XY code — the
           // codes never contain a space, so this is safe before any trimming —
@@ -10858,6 +10928,13 @@ export function createWebApp() {
       );
     }
 
+    // Same ref validation as /api/git/show and /api/git/commit-files: a value
+    // that starts with a dash would reach `git show` as an option
+    // (`--output=<file>` overwrites that file).
+    if (commit && !isSafeGitRevision(commit)) {
+      return c.json({ error: "Invalid commit reference" }, 400);
+    }
+
     const stagedEnabled = staged === "1" || staged?.toLowerCase?.() === "true";
     if (stagedEnabled && commit) {
       return c.json(
@@ -10908,42 +10985,34 @@ export function createWebApp() {
         path &&
         output.trim() === ""
       ) {
+        // Both calls go through runGit like every other read-only git call:
+        // hardened (no fsmonitor, hooks or external diff) and with the
+        // sanitized terminal environment instead of the service's own.
         const cwd = g.git.reldir ? join(g.git.root, g.git.reldir) : g.git.root;
-        const statusProc = Bun.spawn(
-          ["git", "status", "--porcelain", "--", path],
-          { cwd, stdout: "pipe", stderr: "pipe" },
-        );
-        const statusTimeoutId = setTimeout(() => statusProc.kill(), 10000);
-        const [statusOut, , statusExit] = await Promise.all([
-          new Response(statusProc.stdout).text(),
-          new Response(statusProc.stderr).text(),
-          statusProc.exited,
+        const statusRes = await runGit(g.git, [
+          "status",
+          "--porcelain",
+          "--",
+          path,
         ]);
-        clearTimeout(statusTimeoutId);
+        const statusOut = statusRes.output;
+        const statusExit = statusRes.code;
 
         if (statusExit === 0 && statusOut.trimStart().startsWith("??")) {
           // Resolve the absolute path for --no-index (git diff --no-index
           // expects real filesystem paths, not relative-to-cwd)
           const absPath = path.startsWith("/") ? path : `${cwd}/${path}`;
-          const noIndexProc = Bun.spawn(
-            [
-              "git",
-              "diff",
-              "--no-index",
-              "--color=never",
-              "--",
-              "/dev/null",
-              absPath,
-            ],
-            { cwd, stdout: "pipe", stderr: "pipe" },
-          );
-          const noIndexTimeoutId = setTimeout(() => noIndexProc.kill(), 10000);
-          const [noIndexOut, noIndexErr, noIndexExit] = await Promise.all([
-            new Response(noIndexProc.stdout).text(),
-            new Response(noIndexProc.stderr).text(),
-            noIndexProc.exited,
+          const noIndexRes = await runGit(g.git, [
+            "diff",
+            "--no-index",
+            "--color=never",
+            "--",
+            "/dev/null",
+            absPath,
           ]);
-          clearTimeout(noIndexTimeoutId);
+          const noIndexOut = noIndexRes.output;
+          const noIndexErr = noIndexRes.stderr;
+          const noIndexExit = noIndexRes.code;
 
           // exit 1 + non-empty stdout = files differ (expected for untracked)
           if (
@@ -11317,9 +11386,12 @@ export function createWebApp() {
       return c.json(g.body, { status: g.status as any });
     }
 
+    // A leading dash would reach git as an option (`-f` discards every
+    // uncommitted change to tracked files).
     if (
       !branch ||
       typeof branch !== "string" ||
+      branch.startsWith("-") ||
       !/^[\w\-\/\.]+$/.test(branch)
     ) {
       return c.json({ error: "Invalid branch name" }, 400);

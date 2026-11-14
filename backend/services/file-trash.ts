@@ -857,7 +857,8 @@ export async function listTrashItems(
     .query(
       `${ITEM_SELECT}
        WHERE actor_id = ? AND root_id = ? AND root_path = ? AND exec_kind = ?
-         AND os_uid = ? AND os_gid = ? AND os_username IS ? AND status = 'ready'
+         AND os_uid = ? AND os_gid = ? AND os_username IS ?
+         AND status IN ('ready', 'error')
        ORDER BY deleted_at DESC, id DESC`,
     )
     .all(
@@ -924,6 +925,9 @@ export async function purgeTrashItem(
     let row = findBoundRow(db, id, current);
     await checkTrashDirectory(executor, current, false);
     row = await reconcileRow(db, row, executor, now);
+    if (row.status === "error") {
+      return publicItem(await purgeErrorRow(db, row, executor, now), now);
+    }
     if (row.status !== "ready") {
       throw new FileTrashError("invalid_state", `trash item is ${row.status}`);
     }
@@ -939,6 +943,49 @@ export async function purgeTrashItem(
     }
     return publicItem(row, now);
   });
+}
+
+/** The way out of `error`: an item whose recorded identity no longer matches
+ * what is on disk can never be restored, but the owner may still delete it
+ * for good. Only on an explicit purge (never on expiry), and only what lies
+ * at the item's own paths inside the private 0700 trash directory: each entry
+ * is removed against the identity it has now, through the same fd-contained,
+ * no-follow removeExact. When nothing is left, the record closes as purged. */
+async function purgeErrorRow(
+  db: Database,
+  row: TrashRow,
+  executor: FsExecutor,
+  now: Date,
+): Promise<TrashRow> {
+  // removeExact(path, identity, recursive, quarantine) moves `path` to
+  // `quarantine` and deletes it there; when the quarantine already exists it
+  // resumes by deleting the quarantine. So a quarantine left by a crashed
+  // purge goes first, then whatever is still at the trash path.
+  for (const relPath of [row.purge_rel_path, row.trash_rel_path]) {
+    const identity = await maybeIdentity(executor, row.root_path, relPath);
+    if (identity === null) continue;
+    if (identity.kind !== "file" && identity.kind !== "dir") {
+      throw new FileTrashError(
+        "unsupported_entry",
+        "trash item is not a regular file or directory",
+      );
+    }
+    await executor.removeExact(
+      row.root_path,
+      row.trash_rel_path,
+      identity,
+      identity.kind === "dir",
+      row.purge_rel_path,
+    );
+  }
+  const [trashAfter, purgeAfter] = await Promise.all([
+    maybeIdentity(executor, row.root_path, row.trash_rel_path),
+    maybeIdentity(executor, row.root_path, row.purge_rel_path),
+  ]);
+  if (trashAfter !== null || purgeAfter !== null) {
+    throw new FileTrashError("invalid_state", "trash item could not be removed");
+  }
+  return casStatus(db, row, "purged", now, { purgedAt: now.toISOString() });
 }
 
 export async function purgeExpiredTrashItems(
