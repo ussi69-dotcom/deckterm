@@ -13811,7 +13811,9 @@ class TerminalManager {
     let result = null;
     try {
       // The POST first, so its answer decides before any tile is built (and
-      // without createTerminal's failure alert).
+      // without createTerminal's failure alert). After the boot restore, so
+      // an already-open view is known here.
+      await this.waitForBootstrap?.();
       await this.waitForFontMetrics?.();
       const { cols, rows } = this.estimateInitialTerminalSize(false);
       let res;
@@ -13826,6 +13828,9 @@ class TerminalManager {
       } catch {
         res = null;
       }
+      // A 200 that is not a terminal (a login page from a proxy) counts as
+      // a failure.
+      if (res?.ok && typeof body?.id !== "string") res = null;
       if (res?.ok && body?.existing && this.terminals.has(body.id)) {
         // The server's open view is already a tile in this page.
         this.switchTo(body.id);

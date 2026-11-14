@@ -89,6 +89,8 @@ tmux sockets.
 | `/api/files/trash?path=`    | GET       | List the current root's Trash items      |
 | `/api/files/trash/restore`  | POST      | Restore one Trash item without overwrite |
 | `/api/files/trash/purge`    | POST      | Permanently purge one Trash item         |
+| `/api/operators`            | GET       | Running operator sessions (outside DeckTerm) the actor may open |
+| `/api/operators/:name/attach` | POST    | Open (or return) an attached view; closing it only detaches |
 
 Unsafe same-origin API calls need `X-DeckTerm-Request: 1`. The browser client
 adds it through `web/api-client.js`; keep new client mutations on that path.
@@ -109,6 +111,8 @@ adds it through `web/api-client.js`; keep new client mutations on that path.
 | `CF_ACCESS_TEAM_NAME` / `CF_ACCESS_AUD` | empty                | Required issuer team and audience when CF Access is required    |
 | `DECKTERM_OS_ISOLATION`                 | `0`                  | Enable mapped-user brokered operations; unmapped work is denied |
 | `DECKTERM_RELEASE`                      | inferred             | Release identity returned by health                             |
+| `DECKTERM_OPERATOR_TMUX_DIR`            | `/tmp/tmux-<uid>`    | Operator tmux socket folder (owned by the service user, 0700)   |
+| `DECKTERM_OPERATOR_TMUX_BIN`            | `/usr/bin/tmux`      | tmux binary the operator servers run                            |
 
 Public or proxy publishing, and Cloudflare Access, require explicit
 `TRUSTED_ORIGINS`; the server refuses to start without them. Values must be

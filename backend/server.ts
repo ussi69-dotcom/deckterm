@@ -333,6 +333,7 @@ import {
   isValidOperatorName,
   parseOperatorAttachClient,
   probeOperator,
+  operatorSocketPath,
   operatorSocketTrusted,
   readOperatorDir,
   resolveOperatorConfig,
@@ -9360,6 +9361,24 @@ export function createWebApp() {
   // the actor passes the same terminal.create + root.use decision the create
   // path makes on that root. `audit: false` for the list poll, which repeats
   // every few seconds and, like GET /api/terminals, writes no rows.
+  // Operators belong to the service user, i.e. to the owner. Only an actor
+  // whose ROLE grants terminal.create on everything (owner/admin), or the
+  // legacy/edge-trusted modes, may see or attach one: a member's scoped grants
+  // never reach a resource type "operator" (wildcard grants are refused).
+  // Decided quietly and BEFORE any socket is touched.
+  async function operatorActorAllowed(
+    actor: DeckTermActor,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const decision = await requireFoundationCapability({
+      actor,
+      capability: "terminal.create",
+      resourceType: "operator",
+      resourceId: "*",
+      audit: false,
+    });
+    return decision.ok ? { ok: true } : { ok: false, reason: decision.reason };
+  }
+
   async function operatorFolderAccess(
     state: FoundationState,
     actor: DeckTermActor,
@@ -9438,6 +9457,7 @@ export function createWebApp() {
         403,
       );
     }
+    if (!(await operatorActorAllowed(actor)).ok) return c.json([]);
     let operators: OperatorInfo[] = [];
     try {
       operators = await operatorDiscovery.get();
@@ -9539,6 +9559,11 @@ export function createWebApp() {
       run: (argv: string[]) => runOperatorArgv(argv),
       statEntry: statOperatorEntry,
     };
+    const actorAllowed = await operatorActorAllowed(actor);
+    if (!actorAllowed.ok) return unavailable(actorAllowed.reason);
+    if (!(await statOperatorEntry(operatorSocketPath(operatorConfig, name)))) {
+      return unavailable("operator_not_running");
+    }
     if (!(await operatorSocketTrusted(probeDeps, name))) {
       return unavailable("operator_socket_untrusted");
     }
@@ -9579,6 +9604,14 @@ export function createWebApp() {
         if (!(await probeOperator(probeDeps, name))) {
           return unavailable("operator_not_running");
         }
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.operator_attach",
+          resourceType: "operator",
+          resourceId: name,
+          decision: "deny",
+          reason: "attach_failed",
+        });
         throw err;
       }
       if (!created.ok) return created.response;
@@ -9588,8 +9621,12 @@ export function createWebApp() {
       // the new session with it. Answer like "not running", not with a
       // terminal that closes immediately.
       await Bun.sleep(OPERATOR_ATTACH_SETTLE_MS);
-      if (!terminals.has(terminal.id) && !(await probeOperator(probeDeps, name))) {
-        return unavailable("operator_not_running");
+      if (!terminals.has(terminal.id)) {
+        return unavailable(
+          (await probeOperator(probeDeps, name))
+            ? "attach_exited"
+            : "operator_not_running",
+        );
       }
       writeAuditEvent(state.db, {
         actorUserId: created.ownerId,

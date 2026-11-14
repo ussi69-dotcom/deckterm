@@ -71,8 +71,8 @@ and each socket are checked with `lstat` first: a socket, owned by the service u
 Returns `[{ name, cwd, agentName, agentStatus, agentStatusRule, agentRulesVersion, lastActivityAt, attachedTerminalId }]`.
 
 - Actor resolution as `GET /api/terminals` (canonical owner id; identity conflict 403).
-- An operator is listed only when its folder lies inside a registered allowed root **and** the actor could open a
-  terminal there: legacy bypass (dev/test only), the edge-trusted tunnel mode, or bootstrap complete and the user not
+- An operator is listed only for an owner/admin actor (section 7), and only when its folder lies inside a registered
+  allowed root **and** the actor could open a terminal there: legacy bypass (dev/test only), the edge-trusted tunnel mode, or bootstrap complete and the user not
   disabled and either an owner/admin role bundle or scoped `terminal.create` and `root.use` grants on that root. This
   is the same decision `requireFoundationCapability` makes, evaluated without writing a row: like `GET /api/terminals`,
   a list poll every 5 s writes no audit rows. A member without those grants sees no operators.
@@ -87,7 +87,7 @@ Route capability `terminal.create` (added to `getRouteCapability`).
 
 1. `:name` must match the name pattern, else 400. e2e actor: 404. Isolation on: 403. No tmux backend: 409.
 2. Actor validity (identity conflict, disabled user, untrusted source) is checked and audited first, then the
-   per-user cap and rate limit, before anything touches an operator.
+   per-user cap and rate limit, then the owner/admin rule of section 7, before anything touches an operator.
 3. The socket folder must be owned by the service uid and writable by nobody else, and `op-<name>` must be a socket
    of that uid (a tmux client obeys its server, so a server planted by another user is never connected to). The
    operator must be running (fresh probe, not the cache), and the actor must pass the create path's
@@ -150,22 +150,34 @@ Route capability `terminal.create` (added to `getRouteCapability`).
 
 ## 6. Tests and validation
 
-- Unit (bun): name pattern, socket listing with stale sockets, the `list-panes` parser, agent detection from the
-  process tree, attached-client parser (both `-S` and `-L` forms), the listing permission decision, the route
-  capability, and a real-tmux test that starts a throwaway server with the system tmux in a temporary folder, lists
-  it, creates an attached pane by argv and checks that killing the outer session leaves the inner one running.
+- Unit (bun): name pattern, socket listing with stale sockets and an untrusted folder, the `list-panes` parser, agent
+  detection from the process tree, the attached-view parser (only the pane's own client, only `-S` in the operator
+  folder), the route capability, and a real-tmux test: a throwaway server with the system tmux in a temporary folder,
+  listed, attached by argv, and still running after the outer session is killed.
+- API against a child DeckTerm server and a throwaway operator: with the bootstrap bypass (`backend/operator-api.test.ts`:
+  list, refusals, one view, close = detach, an ended operator drops out) and on the real authorization path
+  (`backend/foundation-operators.test.ts`: before bootstrap, owner with exact audit rows and no rows from list polls,
+  member refused without and with scoped root grants).
 - Unit (web): `mergeOperatorRows`, tiers, grouping, rendering with the badge, and "no operators = unchanged".
-- Playwright: a spec with `page.route` data for `/api/operators` (deterministic rows: needs you, working, idle) checks
-  the panel, the IDE view, the phone chip and the Sessions sheet, and that a click opens an attached view.
-- Dev instance (4174) by hand: the real operators are listed with the right folder and status, and an attach to a
-  throwaway operator opens, closes (operator still alive) and disappears when the throwaway ends.
+- Playwright: `page.route` data for `/api/operators` (needs you, working); the attach POST is answered with an ordinary
+  terminal the test creates, since an e2e actor never reaches real operators. Covers the panel, the IDE view, the phone
+  chip and Sessions sheet, focus on a second click, and an operator that ended before the click.
+- Dev instance (4174) by hand: the real operators listed with the right folders and states; an attached view opened on
+  the building session itself, a second attach returned it, closing it left the operator running with no client.
+- Not tested: an operator that ends in the instant between the probe and the attach (covered by the fail-closed mark
+  and the 250 ms settle check, not staged).
+- Known, accepted: if DeckTerm's own tmux fails to answer the pipe check of a view, the pipe arming falls back to its
+  normal behaviour (arm), as for every terminal; a server that cannot answer that would fail the arming too. Right
+  after a service restart, `attachedOperator` of a re-adopted view is empty until its first runtime sync, so an attach
+  in those few seconds could open a second view.
 
 ## 7. Who may attach
 
-A member with scoped `terminal.create` and `root.use` grants on a root may attach an operator whose folder is inside
-that root, exactly as they could type `operator-tmux attach` in a terminal there (no isolation: every terminal runs as
-the service user). If operators should be owner-only, the list and attach checks can additionally require the
-owner/admin role; dev and production today have one owner.
+Operators belong to the service user, that is, to the owner. Before any socket is touched, the list and the attach
+both require the actor's role to grant `terminal.create` on everything (owner or admin), or the legacy or edge-trusted
+mode; this check writes no row (the attach's deny row records its reason). A member's scoped grants are keyed to roots
+and never reach the resource type `operator`, so a member sees no operators and cannot attach one, even in a folder
+where they may open terminals. The folder check (section 2) still applies on top.
 
 ## 8. Left out on purpose
 

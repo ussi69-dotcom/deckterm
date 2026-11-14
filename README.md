@@ -120,6 +120,7 @@ DeckTerm never falls back to permanent deletion in that case.
 - Workspace tabs detect running processes
 - Codex and Claude sessions can surface `Codex` / `Codex Responding` style labels
 - Port and worktree hints are also surfaced in workspace metadata
+- Running operator sessions (long-lived Claude Code sessions started with `operator-tmux` outside DeckTerm) appear in the Agents panel with an "operator" badge; a click opens an attached view, and closing it only detaches ([design](docs/plans/2026-11-14-operator-sessions-panel-design.md))
 
 ### Agent tool telemetry (opt-in)
 
@@ -214,6 +215,8 @@ Common runtime variables:
 | `DECKTERM_BACKUP_KEEP`                | `7`                          | Backup sets kept by `scripts/backup-state.sh`                                                                                                                                                           |
 | `TERMINAL_RATE_LIMIT_PER_USER_MAX`    | rate-limit max (`40`)        | Per-user terminal-create budget per window (B7)                                                                                                                                                         |
 | `TERMINAL_RATE_LIMIT_GLOBAL_MAX`      | `4×` per-user                | Global backstop terminal-create budget per window (B7)                                                                                                                                                  |
+| `DECKTERM_OPERATOR_TMUX_DIR`          | `/tmp/tmux-<uid>`            | Folder of the operator tmux sockets (`op-<name>`) listed in the Agents panel                                                                                                                            |
+| `DECKTERM_OPERATOR_TMUX_BIN`          | `/usr/bin/tmux`              | tmux binary the operator servers run (system tmux)                                                                                                                                                      |
 
 Legacy compatibility note:
 

@@ -27,16 +27,23 @@ shell, no pipe-pane transcript). Closing it only detaches. DeckTerm never starts
 - Dev by hand: `GET /api/operators` listed the three real operators with the right folders and states; an attached
   view opened on the building session itself (one 200x50 client), a second attach returned the same view, closing it
   left the operator running with no client; an unknown name gave 404 `operator_not_available`.
+- Real authorization path: `backend/foundation-operators.test.ts` runs a child server WITHOUT the bootstrap bypass
+  (before bootstrap: refused; owner: list polls write no audit rows, one attach writes exactly the create path's rows
+  plus one `terminal.operator_attach`; member: refused, also with root grants).
+- A real WebSocket on an attached view of the building session streamed its screen; clients went 1 → 0 on close.
+- CI on `dev` green (unit, isolation-e2e, smoke-e2e) for the first merge; Slack milestone note sent to the owner.
 - Review: one independent Claude subagent (Opus, high) reviewed the diff; its three medium findings (socket trust on
   attach, auth order and folder leak, folding a hand-typed attach that keeps a transcript) and the minor ones were
-  fixed in "fix(operators): review fixes …". Codex was not used: its weekly limit was spent and every call would have
-  drawn paid credits.
+  fixed. A second, narrow re-check of that fix found a timing leak before the permission check; fixed by making
+  operators owner/admin-only, decided quietly before any socket is touched (design section 7). Codex was not used: its
+  weekly limit was spent and every call would have drawn paid credits.
 
 ## Open / possible next steps (none started)
 
 - "Done (unseen)" tier and push notifications for operators (needs a per-operator attention record and a pump).
-- Owner-only operators: today a member with scoped `terminal.create` + `root.use` on the operator's folder may see and
-  attach it (design section 7); add an owner/admin role check if the owner wants that.
+- Operators are owner/admin-only (design section 7). If a member should ever see one, that is the owner's decision.
+- Not tested: an operator ending in the instant between probe and attach (covered by construction). Known gaps are
+  listed at the end of design section 6.
 - After promotion, a quick look on production (4173 is never tested from here): the list should show the same
   operators, since the folder and tmux binary are the defaults (`DECKTERM_OPERATOR_TMUX_DIR`,
   `DECKTERM_OPERATOR_TMUX_BIN`).
