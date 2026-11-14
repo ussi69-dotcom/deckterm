@@ -13810,15 +13810,56 @@ class TerminalManager {
     const url = `/api/operators/${encodeURIComponent(name)}/attach`;
     let result = null;
     try {
-      result = await this.createTerminal(false, {
-        cwd: operator?.cwd,
-        createRequest: ({ cols, rows }) =>
-          fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cols, rows }),
-          }),
-      });
+      // The POST first, so its answer decides before any tile is built (and
+      // without createTerminal's failure alert).
+      await this.waitForFontMetrics?.();
+      const { cols, rows } = this.estimateInitialTerminalSize(false);
+      let res;
+      let body = {};
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cols, rows }),
+        });
+        body = await res.json().catch(() => ({}));
+      } catch {
+        res = null;
+      }
+      if (res?.ok && body?.existing && this.terminals.has(body.id)) {
+        // The server's open view is already a tile in this page.
+        this.switchTo(body.id);
+        result = true;
+      } else if (res?.ok) {
+        result = await this.createTerminal(false, {
+          cwd: body.cwd || operator?.cwd,
+          createRequest: async () =>
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+        });
+      } else {
+        if (res?.status === 404) {
+          // Ended meanwhile: drop the row now; the next poll agrees.
+          this._operatorCatalog = (this._operatorCatalog || []).filter(
+            (o) => o?.name !== name,
+          );
+          this.renderAgentsOverview();
+        }
+        this.notify?.({
+          key: "operator-attach",
+          kind: "info",
+          title:
+            res?.status === 404
+              ? `${name} is no longer running`
+              : `Could not open ${name}`,
+          body:
+            res?.status === 404
+              ? "The operator ended or is not available to you."
+              : body?.error || "Try again in a moment.",
+        });
+      }
     } finally {
       this.operatorAttachesInFlight.delete(name);
     }

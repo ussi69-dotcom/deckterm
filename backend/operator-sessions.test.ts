@@ -9,6 +9,7 @@ import {
   discoverOperators,
   isValidOperatorName,
   listOperatorCandidates,
+  operatorSocketTrusted,
   parseOperatorAttachClient,
   parseOperatorPanes,
   readOperatorDir,
@@ -124,27 +125,43 @@ describe("parsers", () => {
     expect(detectOperatorAgent(["sleep 300", "grep claude"])).toBeNull();
   });
 
-  test("attached clients: DeckTerm's view and operator-tmux attach", () => {
+  test("attached view: only the pane's own client, only a socket in the operator folder", () => {
+    const dir = "/tmp/tmux-1001";
     expect(
-      parseOperatorAttachClient([
-        "/usr/bin/env -u TMUX /usr/bin/tmux -u -S /tmp/tmux-1001/op-myclaude-operator attach-session -t =myclaude-operator",
-      ]),
+      parseOperatorAttachClient(
+        [
+          "/usr/bin/env -u TMUX /usr/bin/tmux -u -S /tmp/tmux-1001/op-myclaude-operator attach-session -t =myclaude-operator",
+        ],
+        dir,
+      ),
     ).toBe("myclaude-operator");
     expect(
-      parseOperatorAttachClient([
-        "/bin/bash --rcfile x -i",
-        "/usr/bin/tmux -L op-aispend-operator attach -t aispend-operator",
-      ]),
-    ).toBe("aispend-operator");
-    // Not an attach, not an operator socket, not a valid name.
+      parseOperatorAttachClient(
+        ["/usr/bin/tmux -S /tmp/tmux-1001/op-a attach -t a"],
+        dir,
+      ),
+    ).toBe("a");
+    // Typed into a shell (a child of the pane's shell, whose pane keeps a
+    // transcript): not a DeckTerm view.
     expect(
-      parseOperatorAttachClient([
-        "/usr/bin/tmux -L op-x list-sessions",
-        "tmux -S /home/u/.deckterm/tmux/deckterm_deckterm.sock attach-session -t s",
-        "/usr/bin/tmux -L op-Bad_Name attach -t x",
-        "vim op-x attach",
-      ]),
+      parseOperatorAttachClient(
+        [
+          "/bin/bash --rcfile x -i",
+          "/usr/bin/tmux -S /tmp/tmux-1001/op-a attach-session -t =a",
+        ],
+        dir,
+      ),
     ).toBeNull();
+    // `-L`, a socket in another folder, not an attach, a bad name.
+    for (const args of [
+      "/usr/bin/tmux -L op-aispend-operator attach -t aispend-operator",
+      "/usr/bin/tmux -S /home/evil/op-a attach-session -t =a",
+      "/usr/bin/tmux -S /tmp/tmux-1001/op-x list-sessions",
+      "/usr/bin/tmux -S /tmp/tmux-1001/op-Bad_Name attach -t x",
+      "vim op-x attach",
+    ]) {
+      expect(parseOperatorAttachClient([args], dir)).toBeNull();
+    }
   });
 });
 
@@ -210,6 +227,25 @@ describe("discovery", () => {
       },
     });
     expect(await listOperatorCandidates(deps)).toEqual(["alive"]);
+  });
+
+  test("a folder others may write to yields nothing", async () => {
+    const deps = fakeDeps({ entries: { "op-a": { isSocket: true, uid: 7 } } });
+    deps.statEntry = async (path) =>
+      path === "/s"
+        ? { isSocket: false, uid: 7, mode: 0o1777 }
+        : { isSocket: true, uid: 7 };
+    expect(await listOperatorCandidates(deps)).toEqual([]);
+    expect(await operatorSocketTrusted(deps, "a")).toBe(false);
+    deps.statEntry = async (path) =>
+      path === "/s"
+        ? { isSocket: false, uid: 7, mode: 0o700 }
+        : path === "/s/op-a"
+          ? { isSocket: true, uid: 7 }
+          : null;
+    expect(await operatorSocketTrusted(deps, "a")).toBe(true);
+    expect(await operatorSocketTrusted(deps, "b")).toBe(false);
+    expect(await operatorSocketTrusted(deps, "A;b")).toBe(false);
   });
 
   test("a folder owned by someone else yields nothing", async () => {
@@ -368,7 +404,10 @@ describeTmux("real tmux: list, attach by argv, close = detach", () => {
     const ps = Bun.spawnSync(["ps", "-eo", "pid=,ppid=,args="]).stdout.toString();
     const { collectProcessTreeArgs } = await import("./services/runtime-sync-cache");
     expect(
-      parseOperatorAttachClient(collectProcessTreeArgs(parseProcessTable(ps), panePid)),
+      parseOperatorAttachClient(
+        collectProcessTreeArgs(parseProcessTable(ps), panePid),
+        dir,
+      ),
     ).toBe("unit-op");
 
     // Closing the view: the operator stays, without a client.

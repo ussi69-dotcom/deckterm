@@ -333,6 +333,7 @@ import {
   isValidOperatorName,
   parseOperatorAttachClient,
   probeOperator,
+  operatorSocketTrusted,
   readOperatorDir,
   resolveOperatorConfig,
   runOperatorArgv,
@@ -645,6 +646,9 @@ const operatorConfig = resolveOperatorConfig(
   process.env,
   typeof process.getuid === "function" ? process.getuid() : -1,
 );
+
+/** How long an attach waits to see whether the new view exited at once. */
+const OPERATOR_ATTACH_SETTLE_MS = 250;
 
 function operatorsAvailable(): boolean {
   return TMUX_BACKEND && operatorConfig !== null && !isOsIsolationEnabled(process.env);
@@ -6280,9 +6284,13 @@ async function syncTmuxRuntimeState(
   }
   term.agentState = nextRuntimeState.agentState;
   term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
-  // null = the ps snapshot failed: keep what was known.
-  if (processTree) {
-    term.attachedOperator = parseOperatorAttachClient(processTree);
+  // null = the ps snapshot failed, no pane pid = the tmux read failed: both
+  // inconclusive, keep what was known.
+  if (processTree && panePid > 0 && operatorConfig) {
+    term.attachedOperator = parseOperatorAttachClient(
+      processTree,
+      operatorConfig.dir,
+    );
   }
   if (!nextRuntimeState.agentName) {
     term.agentHasUserPrompt = false;
@@ -9357,19 +9365,22 @@ export function createWebApp() {
     actor: DeckTermActor,
     cwd: string,
     { audit }: { audit: boolean },
-  ): Promise<{ ok: true; cwd: string } | { ok: false }> {
+  ): Promise<{ ok: true; cwd: string } | { ok: false; reason: string }> {
     const fs = await import("fs/promises");
     let real: string;
     try {
       real = await fs.realpath(cwd);
     } catch {
-      return { ok: false };
+      return { ok: false, reason: "forbidden_root" };
     }
     const resolved = await resolveTerminalStartDir(real);
-    if (!resolved || resolved !== real) return { ok: false };
+    if (!resolved || resolved !== real) {
+      return { ok: false, reason: "forbidden_root" };
+    }
     const rootId = resolveFoundationRootIdForPath(state, resolved);
-    if (!rootId) return { ok: false };
-    if (!preflightTerminalActor(state, actor).ok) return { ok: false };
+    if (!rootId) return { ok: false, reason: "no_matching_root" };
+    const pre = preflightTerminalActor(state, actor);
+    if (!pre.ok) return { ok: false, reason: pre.reason };
     for (const capability of ["terminal.create", "root.use"] as const) {
       const decision = await requireFoundationCapability({
         actor,
@@ -9379,7 +9390,7 @@ export function createWebApp() {
         data: { cwd: resolved },
         audit,
       });
-      if (!decision.ok) return { ok: false };
+      if (!decision.ok) return { ok: false, reason: decision.reason };
     }
     return { ok: true, cwd: resolved };
   }
@@ -9476,52 +9487,72 @@ export function createWebApp() {
       return c.json({ error: "Missing route capability" }, 500);
     }
     const state = await getFoundationState();
-    const ownerId = resolveListOwnerId(state, actor);
-    if (!ownerId) {
+    // Actor validity first, audited like the create path, before anything
+    // touches an operator: identity conflict, disabled user, untrusted source.
+    const pre = preflightTerminalActor(state, actor);
+    if (!pre.ok) {
+      writeAuditEvent(state.db, {
+        actorUserId: pre.auditOwnerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason: pre.reason,
+      });
       return c.json(
-        { error: "DeckTerm identity resolution conflict", reason: "identity_conflict" },
+        foundationGateJson({
+          message: pre.message,
+          reason: pre.reason,
+          capability: "terminal.create",
+          resourceType: "terminal",
+          resourceId: `operator:${name}`,
+        }),
         403,
       );
     }
-    const probeDeps = { config: operatorConfig, run: (argv: string[]) => runOperatorArgv(argv) };
+    const ownerId = pre.ownerId;
+    // The per-user cap and rate limit before the probe spawns anything.
+    const creationError = getTerminalCreationError(ownerId);
+    if (creationError) return c.json(creationError.body, creationError.status);
+
+    // Not running, a socket DeckTerm must not trust, and a folder this actor
+    // may not open a terminal in all get the SAME answer, so the endpoint
+    // reveals neither which operators run nor where. The audit row keeps the
+    // real reason.
+    const unavailable = (reason: string, data: Record<string, unknown> = {}) => {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason,
+        data,
+      });
+      return c.json(
+        { error: "Operator not available", reason: "operator_not_available" },
+        404,
+      );
+    };
+    const probeDeps = {
+      config: operatorConfig,
+      run: (argv: string[]) => runOperatorArgv(argv),
+      statEntry: statOperatorEntry,
+    };
+    if (!(await operatorSocketTrusted(probeDeps, name))) {
+      return unavailable("operator_socket_untrusted");
+    }
     const pane = await probeOperator(probeDeps, name);
-    if (!pane) {
-      writeAuditEvent(state.db, {
-        actorUserId: ownerId,
-        action: "terminal.operator_attach",
-        resourceType: "operator",
-        resourceId: name,
-        decision: "deny",
-        reason: "operator_not_running",
-      });
-      return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
-    }
-    const existing = findOperatorView(ownerId, name);
-    if (existing) {
-      return c.json({ ...serializeTerminal(existing), existing: true });
-    }
-    const access = await operatorFolderAccess(state, actor, pane.cwd, { audit: true });
-    if (!access.ok) {
-      writeAuditEvent(state.db, {
-        actorUserId: ownerId,
-        action: "terminal.operator_attach",
-        resourceType: "operator",
-        resourceId: name,
-        decision: "deny",
-        reason: "forbidden_root",
-        data: { cwd: pane.cwd },
-      });
-      return c.json(
-        {
-          error: "Forbidden terminal root",
-          reason: "forbidden_root",
-          ...forbiddenRootDetail({ path: pane.cwd, subject: "terminal" }),
-        },
-        403,
-      );
-    }
-    // One attach per actor and operator at a time: a double click must not
-    // open two views.
+    if (!pane) return unavailable("operator_not_running");
+    // The same decision the create path makes, without its audit rows: the
+    // create path below writes them once.
+    const access = await operatorFolderAccess(state, actor, pane.cwd, {
+      audit: false,
+    });
+    if (!access.ok) return unavailable(access.reason, { cwd: pane.cwd });
+
+    // One attach per actor and operator at a time, checked before looking
+    // for an open view: a double click must not open two views.
     const flightKey = `${ownerId}\u0000${name}`;
     if (operatorAttachesInProgress.has(flightKey)) {
       return c.json(
@@ -9531,6 +9562,10 @@ export function createWebApp() {
     }
     operatorAttachesInProgress.add(flightKey);
     try {
+      const existing = findOperatorView(ownerId, name);
+      if (existing) {
+        return c.json({ ...serializeTerminal(existing), existing: true });
+      }
       let created: TerminalCreateOutcome;
       try {
         created = await createTerminalThroughCreatePath(
@@ -9540,16 +9575,22 @@ export function createWebApp() {
           { command: buildOperatorAttachArgv(operatorConfig, name), noPipe: true },
         );
       } catch (err) {
-        // The operator ended between the probe and the attach: its client
-        // exited at once and took the new session with it.
+        // The operator ended between the probe and the attach.
         if (!(await probeOperator(probeDeps, name))) {
-          return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
+          return unavailable("operator_not_running");
         }
         throw err;
       }
       if (!created.ok) return created.response;
       const terminal = created.terminal;
       terminal.attachedOperator = name;
+      // An operator that ended meanwhile: its client exits at once and takes
+      // the new session with it. Answer like "not running", not with a
+      // terminal that closes immediately.
+      await Bun.sleep(OPERATOR_ATTACH_SETTLE_MS);
+      if (!terminals.has(terminal.id) && !(await probeOperator(probeDeps, name))) {
+        return unavailable("operator_not_running");
+      }
       writeAuditEvent(state.db, {
         actorUserId: created.ownerId,
         action: "terminal.operator_attach",

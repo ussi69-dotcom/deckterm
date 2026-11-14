@@ -213,12 +213,17 @@ describeIf("lists running operators, ignores stale sockets and folders outside t
 describeIf("attach refuses bad names, ended operators and folders outside the roots", async () => {
   expect((await attach("Bad_Name")).status).toBe(400);
   expect((await attach("x%3Bid")).status).toBe(400);
+  // Not running and a folder outside the roots answer the same: the
+  // endpoint reveals neither which operators run nor where.
   const missing = await attach("nobody");
   expect(missing.status).toBe(404);
-  expect((await missing.json()).reason).toBe("operator_not_running");
+  const missingBody = await missing.json();
+  expect(missingBody.reason).toBe("operator_not_available");
   const forbidden = await attach("outsider");
-  expect(forbidden.status).toBe(403);
-  expect((await forbidden.json()).reason).toBe("forbidden_root");
+  expect(forbidden.status).toBe(404);
+  const forbiddenBody = await forbidden.json();
+  expect(forbiddenBody).toEqual(missingBody);
+  expect(JSON.stringify(forbiddenBody)).not.toContain(outside);
   // Nothing was created by any of them.
   const terminals = (await (await api("/api/terminals")).json()) as any[];
   expect(terminals.filter((t) => t.sessionStatus !== "ended")).toEqual([]);

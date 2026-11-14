@@ -176,6 +176,38 @@ test.describe("Operator sessions (desktop)", () => {
     expect((await terminalIds(page)).length).toBe(before.length + 1);
   });
 
+  test("an operator that ended before the click: the row goes, no terminal, no alert", async ({
+    page,
+  }) => {
+    const { operators } = await routeOperators(page);
+    await page.route("**/api/operators/e2e-alpha/attach", (route) =>
+      route.fulfill({
+        status: 404,
+        json: { error: "Operator not available", reason: "operator_not_available" },
+      }),
+    );
+    let dialogs = 0;
+    page.on("dialog", (dialog) => {
+      dialogs += 1;
+      void dialog.dismiss();
+    });
+    await resetAppState(page, BASE_URL);
+    await waitForTerminal(page);
+    await refreshAgents(page);
+    const alpha = operatorRow(page, "#agents-panel", "e2e-alpha");
+    await expect(alpha).toBeVisible();
+    const before = await terminalIds(page);
+    // The server no longer lists it either from now on.
+    operators.splice(
+      operators.findIndex((o) => o.name === "e2e-alpha"),
+      1,
+    );
+    await alpha.click();
+    await expect(alpha).toHaveCount(0);
+    expect((await terminalIds(page)).length).toBe(before.length);
+    expect(dialogs).toBe(0);
+  });
+
   test("the IDE Agents view lists the same operator rows", async ({ page }) => {
     await routeOperators(page);
     await resetAppState(page, BASE_URL);

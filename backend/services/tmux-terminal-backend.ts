@@ -284,12 +284,30 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
     if (options.noPipe) {
       // Before the pipe is armed below: ensurePipeCapture reads this and
-      // never writes a transcript of this session.
+      // never writes a transcript of this session. Fail closed: a mark that
+      // cannot be set and read back ends the session instead of letting a
+      // transcript start.
       const markProc = await this.spawnTmux(
         ["set-option", "-t", sessionName, NO_PIPE_OPTION, "1"],
         { stdout: "pipe", stderr: "pipe" },
       );
-      await markProc.exited;
+      const markCode = await markProc.exited;
+      const readProc = await this.spawnTmux(
+        ["show-options", "-v", "-t", sessionName, NO_PIPE_OPTION],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const readBack = (
+        await new Response((readProc as any).stdout).text()
+      ).trim();
+      await readProc.exited;
+      if (markCode !== 0 || readBack !== "1") {
+        const killProc = await this.spawnTmux(
+          ["kill-session", "-t", sessionName],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        await killProc.exited;
+        throw new Error("Could not mark the session as transcript-free");
+      }
     }
 
     await this.hideStatusBar(sessionName);

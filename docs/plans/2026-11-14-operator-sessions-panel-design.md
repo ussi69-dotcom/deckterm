@@ -86,18 +86,27 @@ Returns `[{ name, cwd, agentName, agentStatus, agentStatusRule, agentRulesVersio
 Route capability `terminal.create` (added to `getRouteCapability`).
 
 1. `:name` must match the name pattern, else 400. e2e actor: 404. Isolation on: 403. No tmux backend: 409.
-2. The operator must be running (fresh probe, not the cache), else 404 `operator_not_running`.
-3. If a live terminal of this actor is already attached to it, the answer is that terminal with `existing: true`;
-   nothing is created.
-4. Otherwise the terminal is created through `createTerminalThroughCreatePath` in the operator's folder, so the root
+2. Actor validity (identity conflict, disabled user, untrusted source) is checked and audited first, then the
+   per-user cap and rate limit, before anything touches an operator.
+3. The socket folder must be owned by the service uid and writable by nobody else, and `op-<name>` must be a socket
+   of that uid (a tmux client obeys its server, so a server planted by another user is never connected to). The
+   operator must be running (fresh probe, not the cache), and the actor must pass the create path's
+   `terminal.create` and `root.use` decision on its folder. Each failure gives the same answer, 404
+   `operator_not_available`, so the endpoint reveals neither which operators run nor where; the audit row
+   (`terminal.operator_attach`, deny) keeps the real reason.
+4. Under a per-actor-and-operator in-flight guard: if a live attached view of this actor exists, the answer is that
+   terminal with `existing: true`; nothing is created.
+5. Otherwise the terminal is created through `createTerminalThroughCreatePath` in the operator's folder, so the root
    check, `terminal.create` and `root.use` (with their audit rows), the per-user cap and the rate limit all apply. A
    folder outside the allowed roots is refused there (403), and the create path's "fall back to a parent folder" is
    refused for an operator (403 `forbidden_root`).
-5. The new tmux session's pane command is the argv
+6. The new tmux session's pane command is the argv
    `/usr/bin/env -u TMUX <tmux bin> -S <dir>/op-<name> attach-session -t =<name>` instead of the shell. tmux runs a
    multi-argument command with `execvp`, so no shell parses it. `env -u TMUX` is needed because a tmux client refuses
    to attach while `TMUX` says it is inside another tmux.
-6. An audit row `terminal.operator_attach` (allow, `{ operator, cwd }`) is written.
+7. The session is marked `@deckterm_nopipe 1`; a mark that cannot be set and read back ends the session (fail
+   closed). If the view exits within 250 ms and the operator is gone, the answer is the 404 above.
+8. An audit row `terminal.operator_attach` (allow, `{ operator, cwd }`) is written.
 
 ## 3. Lifecycle of the attached view
 
@@ -107,10 +116,10 @@ Route capability `terminal.create` (added to `getRouteCapability`).
   ends and its row ends, as any terminal whose shell exits.
 - **DeckTerm restart.** DeckTerm's tmux server survives (KillMode=process), the attached pane with it, and startup
   reconciliation re-adopts it like any terminal.
-- **Recognising an attached view.** During the existing runtime sync, DeckTerm already reads the process tree under
-  each pane. A pure parser finds a tmux client whose arguments are `-S …/op-<name>` or `-L op-<name>` followed by
-  `attach`/`attach-session`/`a`, and sets `attachedOperator` on that terminal (also served in `/api/terminals`). This
-  also recognises a terminal where the owner typed `operator-tmux attach <name>` by hand.
+- **Recognising an attached view.** `attachedOperator` is set when DeckTerm creates the view. During the existing
+  runtime sync, DeckTerm re-reads it from the pane's OWN process (after a restart too): a tmux client with
+  `-S <operator folder>/op-<name>` and `attach`/`attach-session`. A client the owner typed into a shell is a child of
+  that shell, whose pane keeps a transcript, so it is deliberately not taken for a view and stays an ordinary row.
 - **No transcript.** DeckTerm's pipe-pane log is a full transcript of a pane. An attached-view session is created with
   the tmux user option `@deckterm-nopipe 1`, and the pipe arming skips (and closes) the pipe for such a session, on
   create and on every later attach. The runtime sync still reads the pane into memory, as for every terminal.
@@ -151,7 +160,14 @@ Route capability `terminal.create` (added to `getRouteCapability`).
 - Dev instance (4174) by hand: the real operators are listed with the right folder and status, and an attach to a
   throwaway operator opens, closes (operator still alive) and disappears when the throwaway ends.
 
-## 7. Left out on purpose
+## 7. Who may attach
+
+A member with scoped `terminal.create` and `root.use` grants on a root may attach an operator whose folder is inside
+that root, exactly as they could type `operator-tmux attach` in a terminal there (no isolation: every terminal runs as
+the service user). If operators should be owner-only, the list and attach checks can additionally require the
+owner/admin role; dev and production today have one owner.
+
+## 8. Left out on purpose
 
 - Starting, stopping, relaunching or sending keys to operators.
 - "Done (unseen)" and push notifications for operators (no attention record; they would need a per-operator record

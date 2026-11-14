@@ -14,7 +14,7 @@
 // explicit socket path (-S), never `tmux` from PATH, never a shell string.
 
 import { lstat, readdir } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { RuleAgent, ScreenRuleInput, ScreenRuleResult } from "../agent-screen-rules";
 import {
   collectProcessTreeArgs,
@@ -154,13 +154,17 @@ export function detectOperatorAgent(processArgs: string[]): RuleAgent | null {
 }
 
 /**
- * The operator a tmux client in this process tree is attached to, or null.
- * Recognises DeckTerm's own attached view (`-S <dir>/op-<name> attach-session
- * -t =<name>`) and the owner's `operator-tmux attach <name>` (`-L op-<name>
- * attach -t <name>`).
+ * The operator a DeckTerm attached view is attached to, or null. Only the
+ * pane's OWN process counts (DeckTerm's view execs the client as the pane
+ * command; a client typed into a shell is a child of that shell, and that
+ * shell's pane keeps a transcript), and only a `-S` socket in the operator
+ * folder `dir`. `processArgs[0]` is the pane process (collectProcessTreeArgs).
  */
-export function parseOperatorAttachClient(processArgs: string[]): string | null {
-  for (const args of processArgs) {
+export function parseOperatorAttachClient(
+  processArgs: string[],
+  dir: string,
+): string | null {
+  for (const args of processArgs.slice(0, 1)) {
     const tokens = String(args || "").trim().split(/\s+/);
     // The tmux client itself (also when started through `env -u TMUX`).
     let start = 0;
@@ -174,8 +178,13 @@ export function parseOperatorAttachClient(processArgs: string[]): string | null 
     for (let i = start + 1; i < tokens.length; i++) {
       const token = tokens[i]!;
       if ((token === "-L" || token === "-S") && i + 1 < tokens.length) {
-        const value = basename(tokens[i + 1]!);
-        if (value.startsWith(OPERATOR_SOCKET_PREFIX)) {
+        const path = tokens[i + 1]!;
+        const value = basename(path);
+        if (
+          token === "-S" &&
+          dirname(path) === dir &&
+          value.startsWith(OPERATOR_SOCKET_PREFIX)
+        ) {
           const candidate = value.slice(OPERATOR_SOCKET_PREFIX.length);
           if (isValidOperatorName(candidate)) name = candidate;
         }
@@ -205,14 +214,41 @@ export type OperatorInfo = {
 };
 
 export type OperatorRunResult = { ok: boolean; stdout: string };
+export type OperatorEntryStat = { isSocket: boolean; uid: number; mode?: number };
+
+/**
+ * The socket folder is trusted only when the service uid owns it and nobody
+ * else may write to it (tmux makes it 0700): a tmux client obeys its server,
+ * so a server planted by another user must never be connected to.
+ */
+export async function operatorDirTrusted(
+  deps: Pick<OperatorDiscoveryDeps, "config" | "statEntry">,
+): Promise<boolean> {
+  const info = await deps.statEntry(deps.config.dir).catch(() => null);
+  if (!info || info.uid !== deps.config.uid) return false;
+  return typeof info.mode !== "number" || (info.mode & 0o022) === 0;
+}
+
+/** The trusted folder holds `op-<name>` as a socket of the service uid. */
+export async function operatorSocketTrusted(
+  deps: Pick<OperatorDiscoveryDeps, "config" | "statEntry">,
+  name: string,
+): Promise<boolean> {
+  if (!isValidOperatorName(name)) return false;
+  if (!(await operatorDirTrusted(deps))) return false;
+  const info = await deps
+    .statEntry(operatorSocketPath(deps.config, name))
+    .catch(() => null);
+  return Boolean(info && info.isSocket && info.uid === deps.config.uid);
+}
 
 export type OperatorDiscoveryDeps = {
   config: OperatorConfig;
   /** Runs an argv with a timeout; never throws. */
   run(argv: string[]): Promise<OperatorRunResult>;
   readDir(dir: string): Promise<string[]>;
-  /** lstat: is it a socket, and who owns it. Null when missing. */
-  statEntry(path: string): Promise<{ isSocket: boolean; uid: number } | null>;
+  /** lstat: is it a socket, who owns it, its mode. Null when missing. */
+  statEntry(path: string): Promise<OperatorEntryStat | null>;
   processSnapshot(): Promise<ProcessSnapshot | null>;
   evaluate(agent: RuleAgent, input: ScreenRuleInput): ScreenRuleResult;
 };
@@ -222,8 +258,7 @@ export async function listOperatorCandidates(
   deps: Pick<OperatorDiscoveryDeps, "config" | "readDir" | "statEntry">,
 ): Promise<string[]> {
   const { config } = deps;
-  const dirStat = await deps.statEntry(config.dir).catch(() => null);
-  if (!dirStat || dirStat.uid !== config.uid) return [];
+  if (!(await operatorDirTrusted(deps))) return [];
   let entries: string[];
   try {
     entries = await deps.readDir(config.dir);
@@ -402,10 +437,10 @@ export async function readOperatorDir(dir: string): Promise<string[]> {
 
 export async function statOperatorEntry(
   path: string,
-): Promise<{ isSocket: boolean; uid: number } | null> {
+): Promise<OperatorEntryStat | null> {
   try {
     const info = await lstat(path);
-    return { isSocket: info.isSocket(), uid: info.uid };
+    return { isSocket: info.isSocket(), uid: info.uid, mode: info.mode & 0o7777 };
   } catch {
     return null;
   }
