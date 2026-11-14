@@ -57,6 +57,118 @@
   const UUID_RE =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+  // --- Operator sessions (design 2026-11-14) ----------------------------------
+  // Long-lived Claude Code sessions that run OUTSIDE DeckTerm (own unit, own
+  // tmux server). GET /api/operators lists them; each becomes one row here,
+  // and the DeckTerm terminal that is its attached view is left out (the
+  // operator row stands for it). With no operators nothing changes.
+  const OPERATOR_NAME_RE = /^[a-z0-9][a-z0-9-]{0,40}$/;
+  const OPERATOR_ID_PREFIX = "operator:";
+  const OPERATOR_TOOLTIP =
+    "Operator: runs outside DeckTerm in its own unit. Opens an attached view; closing it only detaches.";
+
+  function isOperatorRow(session) {
+    return session?.kind === "operator";
+  }
+
+  function operatorRowId(name) {
+    return `${OPERATOR_ID_PREFIX}${name}`;
+  }
+
+  // "operator:<name>" -> "<name>", else null.
+  function operatorNameFromRowId(id) {
+    const value = typeof id === "string" ? id : "";
+    if (!value.startsWith(OPERATOR_ID_PREFIX)) return null;
+    const name = value.slice(OPERATOR_ID_PREFIX.length);
+    return OPERATOR_NAME_RE.test(name) ? name : null;
+  }
+
+  function validOperators(operators) {
+    return (Array.isArray(operators) ? operators : []).filter(
+      (op) =>
+        op &&
+        typeof op.name === "string" &&
+        OPERATOR_NAME_RE.test(op.name) &&
+        typeof op.cwd === "string",
+    );
+  }
+
+  function operatorRow(op) {
+    const status = ["working", "blocked", "idle"].includes(op.agentStatus)
+      ? op.agentStatus
+      : null;
+    const agent =
+      op.agentName === "claude" || op.agentName === "codex"
+        ? op.agentName
+        : null;
+    return {
+      id: operatorRowId(op.name),
+      kind: "operator",
+      operatorName: op.name,
+      name: op.name,
+      cwd: op.cwd,
+      projectRoot: null,
+      // Every operator is an agent session: an unrecognised one is "idle".
+      agentName: agent || "operator",
+      operatorAgent: agent,
+      agentStatus: status,
+      agentStatusRule:
+        status && typeof op.agentStatusRule === "string"
+          ? op.agentStatusRule
+          : null,
+      agentRulesVersion:
+        status && typeof op.agentRulesVersion === "string"
+          ? op.agentRulesVersion
+          : null,
+      lastActivityAt: Number(op.lastActivityAt) || 0,
+      attachedTerminalId:
+        typeof op.attachedTerminalId === "string" ? op.attachedTerminalId : null,
+      sessionStatus: "active",
+      status: "active",
+    };
+  }
+
+  // The list every Agents surface renders: DeckTerm's sessions minus the
+  // attached views of listed operators, then one row per operator. No
+  // operators: the very same array, so DeckTerm's own rows and order stay.
+  function mergeOperatorRows(sessions, operators) {
+    const list = Array.isArray(sessions) ? sessions : [];
+    const ops = validOperators(operators);
+    if (!ops.length) return list;
+    const names = new Set(ops.map((op) => op.name));
+    const viewIds = new Set(
+      ops.map((op) => op.attachedTerminalId).filter(Boolean),
+    );
+    const kept = list.filter(
+      (s) =>
+        !s ||
+        !(
+          viewIds.has(s.id) ||
+          (typeof s.attachedOperator === "string" &&
+            names.has(s.attachedOperator) &&
+            isLiveSession(s))
+        ),
+    );
+    return [...kept, ...ops.map(operatorRow)];
+  }
+
+  // The operator a DeckTerm terminal is an attached view of (when that
+  // operator is listed), else null. Maps the active terminal to its row.
+  function operatorForTerminal(terminalId, sessions, operators) {
+    if (!terminalId) return null;
+    const ops = validOperators(operators);
+    if (!ops.length) return null;
+    const byView = ops.find((op) => op.attachedTerminalId === terminalId);
+    if (byView) return byView.name;
+    const session = (Array.isArray(sessions) ? sessions : []).find(
+      (s) => s?.id === terminalId,
+    );
+    const name = session?.attachedOperator;
+    return typeof name === "string" && ops.some((op) => op.name === name)
+      ? name
+      : null;
+  }
+
   function hasAgent(session) {
     return (
       typeof session?.agentName === "string" &&
@@ -369,6 +481,15 @@
   // (claude@2026.10.11.1)". Without a screen-rule status it names the tier and
   // where it came from. Never screen text.
   function tooltipFor(session, tier = null) {
+    if (isOperatorRow(session)) {
+      const resolved = Number.isInteger(tier) ? tier : statusTier(session);
+      const { kind: _kind, ...plain } = session;
+      const inner = tooltipFor(
+        { ...plain, agentName: session.operatorAgent || "operator" },
+        resolved,
+      );
+      return `${OPERATOR_TOOLTIP} · ${inner}`;
+    }
     if (tier === TIER_RESUMABLE) return resumeTooltip(session);
     const status = session?.agentStatus;
     if (hasAgent(session) && AGENT_STATUSES.has(status)) {
@@ -480,21 +601,30 @@
       .map((group) => {
         const rows = group.rows
           .map(({ session, tier }) => {
-            const title = getTitle(session);
+            const operator = isOperatorRow(session);
+            const title = operator ? session.operatorName : getTitle(session);
             const age = getAge(session);
             const resumable = tier === TIER_RESUMABLE;
-            const agentWord = resumable
-              ? resumeOf(session)?.agent || ""
-              : hasAgent(session)
-                ? session.agentName
-                : "";
+            const agentWord = operator
+              ? session.operatorAgent || ""
+              : resumable
+                ? resumeOf(session)?.agent || ""
+                : hasAgent(session)
+                  ? session.agentName
+                  : "";
             const meta = [agentWord, age].filter(Boolean).join(" · ");
             const active = session.id === activeVisibleId;
             const word = resumable ? resumeLabel(session) : TIER_LABELS[tier];
-            return `<button type="button" class="agents-row${active ? " active" : ""}" data-agent-session-id="${escapeHtml(session.id)}" data-tier="${tier}"${resumable ? ' data-agent-resume="1"' : ""} title="${escapeHtml(tooltipFor(session, tier))}">
+            const operatorAttrs = operator
+              ? ` data-operator-name="${escapeHtml(session.operatorName)}"`
+              : "";
+            const badge = operator
+              ? '<span class="agents-row-badge" aria-label="Operator, runs outside DeckTerm">operator</span>'
+              : "";
+            return `<button type="button" class="agents-row${operator ? " agents-row-operator" : ""}${active ? " active" : ""}" data-agent-session-id="${escapeHtml(session.id)}" data-tier="${tier}"${resumable ? ' data-agent-resume="1"' : ""}${operatorAttrs} title="${escapeHtml(tooltipFor(session, tier))}">
   <span class="agents-row-status" data-tier="${tier}"><span class="agents-row-icon" aria-hidden="true">${TIER_ICONS[tier]}</span><span class="agents-row-word">${escapeHtml(word)}</span></span>
   <span class="agents-row-title">${escapeHtml(title)}</span>
-  ${meta ? `<span class="agents-row-meta">${escapeHtml(meta)}</span>` : ""}
+  ${meta || badge ? `<span class="agents-row-meta">${badge}${badge && meta ? " " : ""}${escapeHtml(meta)}</span>` : ""}
 </button>`;
           })
           .join("");
@@ -542,6 +672,12 @@
     mergeSeenMaps,
     sessionIdFromDeepLink,
     renderAgentListHtml,
+    OPERATOR_TOOLTIP,
+    isOperatorRow,
+    operatorRowId,
+    operatorNameFromRowId,
+    mergeOperatorRows,
+    operatorForTerminal,
   };
 
   if (typeof window !== "undefined") {

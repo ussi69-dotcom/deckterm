@@ -536,3 +536,141 @@ describe("resumable rows", () => {
     expect(html).not.toMatch(/data-agent-session-id="live-1"[^>]*data-agent-resume/);
   });
 });
+
+// --- Operator sessions (design docs/plans/2026-11-14-operator-sessions-panel-design.md)
+
+describe("operator rows", () => {
+  const {
+    mergeOperatorRows,
+    operatorForTerminal,
+    operatorNameFromRowId,
+    operatorRowId,
+    isOperatorRow,
+  } = require("./agent-overview");
+
+  const own = [
+    {
+      id: "11111111-1111-4111-8111-111111111111",
+      cwd: "/w/proj",
+      agentName: "claude",
+      agentStatus: "working",
+      status: "active",
+      sessionStatus: "active",
+    },
+    {
+      id: "22222222-2222-4222-8222-222222222222",
+      cwd: "/w/other",
+      agentName: null,
+      status: "active",
+      sessionStatus: "active",
+    },
+  ];
+  const ops = [
+    {
+      name: "myclaude-operator",
+      cwd: "/w/myclaude",
+      agentName: "claude",
+      agentStatus: "idle",
+      agentStatusRule: "live_prompt_box",
+      agentRulesVersion: "claude@x",
+      lastActivityAt: 1000,
+      attachedTerminalId: null,
+    },
+    {
+      name: "aispend-operator",
+      cwd: "/w/proj",
+      agentName: "claude",
+      agentStatus: "blocked",
+      agentStatusRule: "live_blocked_form",
+      lastActivityAt: 2000,
+      attachedTerminalId: null,
+    },
+  ];
+
+  test("no operators: the very same array, so own rows and order stay", () => {
+    expect(mergeOperatorRows(own, [])).toBe(own);
+    expect(mergeOperatorRows(own, undefined)).toBe(own);
+    expect(mergeOperatorRows(own, [{ name: "Bad Name", cwd: "/x" }])).toBe(own);
+    const html = renderAgentListHtml(mergeOperatorRows(own, []), {});
+    expect(html).toBe(renderAgentListHtml(own, {}));
+  });
+
+  test("each operator is one row with its folder, agent and status tier", () => {
+    const merged = mergeOperatorRows(own, ops);
+    expect(merged.slice(0, 2)).toEqual(own);
+    const rows = merged.slice(2);
+    expect(rows.map((r) => r.id)).toEqual([
+      "operator:myclaude-operator",
+      "operator:aispend-operator",
+    ]);
+    expect(rows.every(isOperatorRow)).toBe(true);
+    expect(statusTier(rows[0])).toBe(TIER_IDLE);
+    expect(statusTier(rows[1])).toBe(TIER_NEEDS_YOU);
+    // An operator whose agent was not recognised is still an idle agent row.
+    const unknown = mergeOperatorRows([], [{ name: "x", cwd: "/w" }])[0];
+    expect(statusTier(unknown)).toBe(TIER_IDLE);
+  });
+
+  test("the attached view is left out: the operator row stands for it", () => {
+    const view = {
+      id: "33333333-3333-4333-8333-333333333333",
+      cwd: "/w/myclaude",
+      attachedOperator: "myclaude-operator",
+      status: "active",
+      sessionStatus: "active",
+    };
+    const handTyped = { ...view, id: "44444444-4444-4444-8444-444444444444" };
+    const withView = ops.map((op, i) =>
+      i === 0 ? { ...op, attachedTerminalId: view.id } : op,
+    );
+    const merged = mergeOperatorRows([...own, view, handTyped], withView);
+    expect(merged.map((s) => s.id)).not.toContain(view.id);
+    expect(merged.map((s) => s.id)).not.toContain(handTyped.id);
+    // A view of an operator that is not listed stays an ordinary row.
+    const orphan = { ...view, attachedOperator: "ended-one" };
+    expect(mergeOperatorRows([orphan], ops)[0]).toBe(orphan);
+    expect(operatorForTerminal(view.id, [view], withView)).toBe("myclaude-operator");
+    expect(operatorForTerminal(handTyped.id, [handTyped], ops)).toBe(
+      "myclaude-operator",
+    );
+    expect(operatorForTerminal(orphan.id, [orphan], ops)).toBeNull();
+    expect(operatorForTerminal(view.id, [view], [])).toBeNull();
+  });
+
+  test("counts, Next and grouping include operators", () => {
+    const merged = mergeOperatorRows(own, ops);
+    const counts = summaryCounts(merged, {});
+    expect(counts).toMatchObject({ needsYou: 1, working: 1, idle: 1, agents: 3 });
+    expect(nextTarget(merged, {})?.id).toBe("operator:aispend-operator");
+    // Viewing that operator (its row is the active one) skips it.
+    expect(
+      nextTarget(merged, {}, { activeVisibleId: "operator:aispend-operator" }),
+    ).toBeNull();
+    const groups = groupSessions(merged, {});
+    const proj = groups.find((g) => g.key === "/w/proj");
+    expect(proj.rows.map((r) => r.session.id)).toEqual([
+      "operator:aispend-operator",
+      own[0].id,
+    ]);
+  });
+
+  test("the row is marked as an operator that runs outside DeckTerm", () => {
+    const html = renderAgentListHtml(mergeOperatorRows([], ops), {});
+    expect(html).toContain('data-operator-name="aispend-operator"');
+    expect(html).toContain('data-agent-session-id="operator:aispend-operator"');
+    expect(html).toContain("agents-row-operator");
+    expect(html).toContain(">operator</span>");
+    expect(html).toContain("runs outside DeckTerm");
+    expect(html).toContain("rule live_blocked_form");
+    // The title is the operator's name, not its folder.
+    expect(html).toContain('<span class="agents-row-title">myclaude-operator</span>');
+  });
+
+  test("row ids round-trip and refuse anything else", () => {
+    expect(operatorRowId("a-b")).toBe("operator:a-b");
+    expect(operatorNameFromRowId("operator:a-b")).toBe("a-b");
+    expect(operatorNameFromRowId("operator:A;b")).toBeNull();
+    expect(operatorNameFromRowId(own[0].id)).toBeNull();
+    expect(operatorNameFromRowId(null)).toBeNull();
+  });
+});
