@@ -300,7 +300,10 @@ import {
   BrokeredTmuxBackendCache,
   type BrokeredTmuxBackend,
 } from "./services/brokered-tmux-backend";
-import type { BrokeredExecContext } from "./services/terminal-backend";
+import type {
+  BrokeredExecContext,
+  TerminalCreateSessionOptions,
+} from "./services/terminal-backend";
 import {
   applyE2ERunActorNamespace,
   crossesE2ERunNamespaceForRequest,
@@ -323,6 +326,19 @@ import {
   forbiddenRootDetail,
   rejectedPathMayBeMissing,
 } from "./forbidden-root";
+import {
+  buildOperatorAttachArgv,
+  createOperatorDiscoveryCache,
+  discoverOperators,
+  isValidOperatorName,
+  parseOperatorAttachClient,
+  probeOperator,
+  readOperatorDir,
+  resolveOperatorConfig,
+  runOperatorArgv,
+  statOperatorEntry,
+  type OperatorInfo,
+} from "./services/operator-sessions";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -388,6 +404,11 @@ type Terminal = {
   // Consecutive tmux samples without the process-detected agent (see
   // inferTmuxRuntimeState); the agent is cleared at two.
   agentMissedSamples: number;
+  // The operator (design 2026-11-14) a tmux client in this pane is attached
+  // to: set when DeckTerm creates the attached view, then re-read from the
+  // pane's process tree on every runtime sync (also after a restart, and for
+  // a hand-typed `operator-tmux attach`). Display only.
+  attachedOperator?: string | null;
   agentTurnCompletedAt: number | null;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
   // S11: display-only ring of recent tool-used marker events (untrusted,
@@ -617,6 +638,17 @@ const DECKTERM_TASK_PROVIDERS = (
 
 // tmux backend for session persistence (survives server restart)
 const TMUX_BACKEND = process.env.TMUX_BACKEND === "1";
+
+// Operator sessions (design 2026-11-14): read once at startup. Null = a
+// configured path is not a plain absolute path, and the feature stays off.
+const operatorConfig = resolveOperatorConfig(
+  process.env,
+  typeof process.getuid === "function" ? process.getuid() : -1,
+);
+
+function operatorsAvailable(): boolean {
+  return TMUX_BACKEND && operatorConfig !== null && !isOsIsolationEnabled(process.env);
+}
 const TMUX_SESSION_NAMESPACE = resolveTmuxSessionNamespace({
   namespace: process.env.TMUX_SESSION_NAMESPACE,
   port: process.env.PORT,
@@ -1899,12 +1931,19 @@ async function requireFoundationCapability({
   resourceType,
   resourceId = "*",
   data = {},
+  audit = true,
 }: {
   actor: DeckTermActor;
   capability: ScopedGrantCapability;
   resourceType: string;
   resourceId?: string | null;
   data?: Record<string, unknown>;
+  /**
+   * false: the same decision without writing an audit row, for a read that
+   * repeats every few seconds (the operator list poll). Every path that
+   * acts (create, attach) keeps the default.
+   */
+  audit?: boolean;
 }): Promise<
   | { ok: true; ownerId: string }
   | {
@@ -1937,7 +1976,7 @@ async function requireFoundationCapability({
     canonical = resolveCanonicalOwnerId(state, actor);
   } catch (err) {
     if (err instanceof IdentityConflictError) {
-      writeAuditEvent(state.db, {
+      if (audit) writeAuditEvent(state.db, {
         actorUserId: actor.id,
         action: capability,
         resourceType,
@@ -1966,7 +2005,7 @@ async function requireFoundationCapability({
   // edge-tunnel allow just below. An unknown actor (`user === null`) can't
   // be disabled, so this is a no-op for actors without a user row.
   if (user?.disabled) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -1992,7 +2031,7 @@ async function requireFoundationCapability({
   // the real identity for accountability. Root mapping still happens upstream,
   // so this does not widen filesystem scope.
   if (isEdgeProtectedTunnelMode(process.env)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -2005,7 +2044,7 @@ async function requireFoundationCapability({
   }
 
   if (!isBootstrapComplete(state)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -2034,7 +2073,7 @@ async function requireFoundationCapability({
   // §9.3): owner/admin imply the five capabilities on any resource; member
   // gets no wildcards, scoped grants only.
   if (user && roleImpliesCapability(user.role, capability)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -2054,7 +2093,7 @@ async function requireFoundationCapability({
       resourceId: resourceId || "*",
     })
   ) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -5029,6 +5068,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
     ...serializeAgentStatus(term.agentStatusRecord),
+    attachedOperator: term.attachedOperator ?? null,
     recentTools: term.recentTools,
     attention: term.attention.attention,
     progress: term.attention.progress,
@@ -6001,6 +6041,21 @@ async function completeTmuxReconnectReplay(
   }
 }
 
+// One operator discovery at a time, shared by every list poll for 3 s. The
+// operator screens it reads stay in memory for one rule evaluation each.
+const operatorDiscovery = createOperatorDiscoveryCache(() =>
+  operatorConfig
+    ? discoverOperators({
+        config: operatorConfig,
+        run: (argv) => runOperatorArgv(argv),
+        readDir: readOperatorDir,
+        statEntry: statOperatorEntry,
+        processSnapshot: () => readProcessSnapshot(),
+        evaluate: (agent, input) => evaluateAgentScreen(agent, input),
+      })
+    : Promise.resolve([]),
+);
+
 async function readProcessSnapshot(): Promise<ProcessSnapshot> {
   const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], {
     stdout: "pipe",
@@ -6225,6 +6280,10 @@ async function syncTmuxRuntimeState(
   }
   term.agentState = nextRuntimeState.agentState;
   term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
+  // null = the ps snapshot failed: keep what was known.
+  if (processTree) {
+    term.attachedOperator = parseOperatorAttachClient(processTree);
+  }
   if (!nextRuntimeState.agentName) {
     term.agentHasUserPrompt = false;
     term.agentMarkerActive = false;
@@ -6252,9 +6311,12 @@ async function createManagedTerminal({
   initialScrollback = "",
   exec,
   attachCwd,
+  paneOptions,
 }: {
   id?: string;
   cwd: string;
+  /** Server-decided pane command / no-transcript (operator attached view). */
+  paneOptions?: TerminalCreateSessionOptions;
   /** Where to spawn the attach client, when it differs from `cwd`. */
   attachCwd?: string;
   cols: number;
@@ -6410,6 +6472,7 @@ async function createManagedTerminal({
         rows,
         ownerId,
         ownerEmail,
+        paneOptions,
       );
     } catch (err) {
       // Nothing was registered yet: release the PTY handle so a refused
@@ -6552,6 +6615,7 @@ async function createOwnedTerminal({
   ownerId,
   ownerEmail,
   exec,
+  paneOptions,
 }: {
   cwd: string;
   cols?: number;
@@ -6560,6 +6624,7 @@ async function createOwnedTerminal({
   ownerEmail: string;
   /** B2: brokered execution context (mapped uid) when isolation is active. */
   exec?: BrokeredExecContext;
+  paneOptions?: TerminalCreateSessionOptions;
 }): Promise<Terminal> {
   const fs = await import("fs/promises");
   let resolvedCwd = cwd || process.env.HOME || "/";
@@ -6590,6 +6655,7 @@ async function createOwnedTerminal({
     sessionName,
     createTmuxSession: Boolean(sessionName),
     exec,
+    paneOptions,
   });
 }
 
@@ -8511,6 +8577,8 @@ export function createWebApp() {
     // Same shape the route always read: { cwd?, cols?, rows? }.
     body: Record<string, any>,
     routeCapability: { capability: ScopedGrantCapability },
+    // Server-decided only (the operator attach route), never from `body`.
+    paneOptions?: TerminalCreateSessionOptions,
   ): Promise<TerminalCreateOutcome> {
     const fail = (response: Response): TerminalCreateOutcome => ({
       ok: false,
@@ -8703,12 +8771,21 @@ export function createWebApp() {
     const exec = execResolution.exec;
 
     rateLimitState.record(ownerId);
+    if (paneOptions?.command && exec) {
+      // An operator belongs to the service user; a brokered (mapped-user)
+      // terminal never runs a server-chosen command.
+      return fail(c.json(
+        { error: "OS isolation denied", reason: "os_isolation_operator" },
+        403,
+      ));
+    }
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
       ...resolveTerminalSize(body.cols, body.rows),
       ownerId,
       ownerEmail,
       exec,
+      paneOptions,
     });
 
     recordTerminalSession(state.db, {
@@ -9262,6 +9339,228 @@ export function createWebApp() {
       }
     } finally {
       agentResumesInProgress.delete(id);
+    }
+  });
+
+  // --- Operator sessions (design 2026-11-14) ---------------------------------
+  // Long-lived Claude Code sessions the owner runs OUTSIDE DeckTerm (own unit,
+  // own system-tmux server `op-<name>`). DeckTerm lists the running ones and
+  // gives an attached view; it never starts, stops or types into one.
+
+  // Whether this actor may see / attach the operator whose folder is `cwd`:
+  // the folder itself (no parent fallback) is inside the allowed roots, and
+  // the actor passes the same terminal.create + root.use decision the create
+  // path makes on that root. `audit: false` for the list poll, which repeats
+  // every few seconds and, like GET /api/terminals, writes no rows.
+  async function operatorFolderAccess(
+    state: FoundationState,
+    actor: DeckTermActor,
+    cwd: string,
+    { audit }: { audit: boolean },
+  ): Promise<{ ok: true; cwd: string } | { ok: false }> {
+    const fs = await import("fs/promises");
+    let real: string;
+    try {
+      real = await fs.realpath(cwd);
+    } catch {
+      return { ok: false };
+    }
+    const resolved = await resolveTerminalStartDir(real);
+    if (!resolved || resolved !== real) return { ok: false };
+    const rootId = resolveFoundationRootIdForPath(state, resolved);
+    if (!rootId) return { ok: false };
+    if (!preflightTerminalActor(state, actor).ok) return { ok: false };
+    for (const capability of ["terminal.create", "root.use"] as const) {
+      const decision = await requireFoundationCapability({
+        actor,
+        capability,
+        resourceType: "root",
+        resourceId: rootId,
+        data: { cwd: resolved },
+        audit,
+      });
+      if (!decision.ok) return { ok: false };
+    }
+    return { ok: true, cwd: resolved };
+  }
+
+  function findOperatorView(ownerId: string, name: string): Terminal | null {
+    for (const term of terminals.values()) {
+      if (term.ownerId === ownerId && term.attachedOperator === name) {
+        return term;
+      }
+    }
+    return null;
+  }
+
+  function resolveListOwnerId(
+    state: FoundationState,
+    actor: DeckTermActor,
+  ): string | null {
+    try {
+      return isFoundationLegacyBypassEnabled()
+        ? actor.id
+        : resolveCanonicalOwnerId(state, actor).ownerId;
+    } catch (err) {
+      if (err instanceof IdentityConflictError) return null;
+      throw err;
+    }
+  }
+
+  // [{ name, cwd, agentName, agentStatus, agentStatusRule, agentRulesVersion,
+  //    lastActivityAt, attachedTerminalId }]. Empty when the feature is off,
+  // for an e2e run actor (a test never sees the host's real operators), and
+  // for operators whose folder this actor may not open a terminal in.
+  app.get("/api/operators", async (c) => {
+    const actor = getCurrentActor(c);
+    if (!operatorsAvailable() || getE2ERunIdFromActorId(actor.id)) {
+      return c.json([]);
+    }
+    const state = await getFoundationState();
+    const ownerId = resolveListOwnerId(state, actor);
+    if (!ownerId) {
+      return c.json(
+        {
+          error: "DeckTerm identity resolution conflict",
+          reason: "identity_conflict",
+        },
+        403,
+      );
+    }
+    let operators: OperatorInfo[] = [];
+    try {
+      operators = await operatorDiscovery.get();
+    } catch (err) {
+      debug("[operators] discovery failed:", err);
+    }
+    const visible = [];
+    for (const operator of operators) {
+      const access = await operatorFolderAccess(state, actor, operator.cwd, {
+        audit: false,
+      });
+      if (!access.ok) continue;
+      visible.push({
+        ...operator,
+        attachedTerminalId: findOperatorView(ownerId, operator.name)?.id ?? null,
+      });
+    }
+    return c.json(visible);
+  });
+
+  // Opens (or returns the open) attached view of one operator: a NEW terminal
+  // through the normal create path in the operator's folder whose pane runs a
+  // system-tmux client attached to it (argv, no shell, no transcript).
+  // Closing that terminal only detaches the client.
+  const operatorAttachesInProgress = new Set<string>();
+  app.post("/api/operators/:name/attach", async (c) => {
+    const name = c.req.param("name");
+    if (!isValidOperatorName(name)) {
+      return c.json({ error: "Not an operator name", reason: "invalid_operator_name" }, 400);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const actor = getCurrentActor(c);
+    if (getE2ERunIdFromActorId(actor.id)) {
+      return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
+    }
+    if (isOsIsolationEnabled(process.env)) {
+      return c.json({ error: "OS isolation denied", reason: "os_isolation_operator" }, 403);
+    }
+    if (!operatorsAvailable() || !operatorConfig) {
+      return c.json(
+        { error: "Operator views need the tmux backend", reason: "operators_unavailable" },
+        409,
+      );
+    }
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    const state = await getFoundationState();
+    const ownerId = resolveListOwnerId(state, actor);
+    if (!ownerId) {
+      return c.json(
+        { error: "DeckTerm identity resolution conflict", reason: "identity_conflict" },
+        403,
+      );
+    }
+    const probeDeps = { config: operatorConfig, run: (argv: string[]) => runOperatorArgv(argv) };
+    const pane = await probeOperator(probeDeps, name);
+    if (!pane) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason: "operator_not_running",
+      });
+      return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
+    }
+    const existing = findOperatorView(ownerId, name);
+    if (existing) {
+      return c.json({ ...serializeTerminal(existing), existing: true });
+    }
+    const access = await operatorFolderAccess(state, actor, pane.cwd, { audit: true });
+    if (!access.ok) {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason: "forbidden_root",
+        data: { cwd: pane.cwd },
+      });
+      return c.json(
+        {
+          error: "Forbidden terminal root",
+          reason: "forbidden_root",
+          ...forbiddenRootDetail({ path: pane.cwd, subject: "terminal" }),
+        },
+        403,
+      );
+    }
+    // One attach per actor and operator at a time: a double click must not
+    // open two views.
+    const flightKey = `${ownerId}\u0000${name}`;
+    if (operatorAttachesInProgress.has(flightKey)) {
+      return c.json(
+        { error: "This operator is already being opened", reason: "attach_in_progress" },
+        409,
+      );
+    }
+    operatorAttachesInProgress.add(flightKey);
+    try {
+      let created: TerminalCreateOutcome;
+      try {
+        created = await createTerminalThroughCreatePath(
+          c,
+          { cwd: access.cwd, cols: body?.cols, rows: body?.rows },
+          routeCapability,
+          { command: buildOperatorAttachArgv(operatorConfig, name), noPipe: true },
+        );
+      } catch (err) {
+        // The operator ended between the probe and the attach: its client
+        // exited at once and took the new session with it.
+        if (!(await probeOperator(probeDeps, name))) {
+          return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
+        }
+        throw err;
+      }
+      if (!created.ok) return created.response;
+      const terminal = created.terminal;
+      terminal.attachedOperator = name;
+      writeAuditEvent(state.db, {
+        actorUserId: created.ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "terminal",
+        resourceId: terminal.id,
+        decision: "allow",
+        data: { operator: name, cwd: access.cwd },
+      });
+      return c.json(serializeTerminal(terminal));
+    } finally {
+      operatorAttachesInProgress.delete(flightKey);
     }
   });
 

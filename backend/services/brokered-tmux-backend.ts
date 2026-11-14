@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { buildTmuxSessionName } from "../tmux-session-names";
 import { brokerExec, brokerKill, brokerSpawn } from "./broker-client";
 import type {
+  TerminalCreateSessionOptions,
   BrokeredExecContext,
   TerminalBackend,
   TerminalBackendAttachOptions,
@@ -106,7 +107,11 @@ export class BrokeredTmuxBackend implements TerminalBackend {
     rows: number,
     ownerId: string,
     ownerEmail: string,
+    options?: TerminalCreateSessionOptions,
   ): Promise<TerminalBackendSession> {
+    if (options?.command) {
+      throw new Error("A pane command needs the legacy tmux backend");
+    }
     const sessionName = buildTmuxSessionName({
       namespace: this.namespace,
       terminalId: id,
