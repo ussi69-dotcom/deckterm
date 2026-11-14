@@ -35,6 +35,12 @@ objevovat v panelu agents?". Implementation plan: [2026-11-14-operator-sessions-
   audit rows of DeckTerm's existing terminal access. An operator's name reaches a command line only after a strict
   pattern check and only as an argv element, never inside a shell string. No operator screen text goes into a log.
 
+**Why this needs no owner decision.** With OS isolation off (dev and production), a DeckTerm terminal already runs
+as the service user, the same user that owns the operators, so anyone who may open a terminal in a folder can already
+type `operator-tmux attach <name>` there (the owner does exactly that today). The attached view adds no capability and
+no new reach: it is that same action done by DeckTerm, gated by the same `terminal.create` and `root.use` grants on the
+operator's folder. With OS isolation on, terminals run as mapped Unix users, so the feature is off there.
+
 ## 1. Finding operators (`backend/services/operator-sessions.ts`)
 
 - **Where.** The socket folder is `DECKTERM_OPERATOR_TMUX_DIR`, default `/tmp/tmux-<service uid>` (tmux's default
@@ -43,7 +49,8 @@ objevovat v panelu agents?". Implementation plan: [2026-11-14-operator-sessions-
 - **Names.** Every entry `op-<name>` whose `<name>` matches `^[a-z0-9][a-z0-9-]{0,40}$` (the same pattern
   `operator-tmux` enforces) is a candidate. Anything else in the folder is ignored.
 - **Alive or stale.** Sockets of ended operators stay in the folder. For each candidate DeckTerm runs, as argv,
-  `/usr/bin/tmux -S <dir>/op-<name> list-panes -t =<name> -F <format>`. A failure (no server, no such session) means
+  `/usr/bin/tmux -S <dir>/op-<name> list-panes -t =<name>: -F <format>` (every call has a 2 s timeout; the folder
+and each socket are checked with `lstat` first: a socket, owned by the service uid). A failure (no server, no such session) means
   "not running": the row is simply absent, never an error. The format reads the pane's current path, pid, title and
   the window's last activity time.
 - **Agent and status.** One `ps` snapshot (the existing `readProcessSnapshot`) tells whether a `claude` or `codex`
