@@ -318,6 +318,22 @@ export function getRouteCapability(
     }
   }
 
+  // An operator's attached view (design 2026-11-14) is a NEW terminal made
+  // through the normal create path in the operator's folder, so it needs
+  // terminal.create; the create path keys that check on the resolved root.
+  const operatorAttachMatch = normalizedPath.match(
+    /^\/api\/operators\/([^/]+)\/attach$/,
+  );
+  if (normalizedMethod === "POST" && operatorAttachMatch) {
+    const resourceId = operatorAttachMatch[1]?.trim();
+    if (!resourceId) return null;
+    return {
+      capability: "terminal.create",
+      resourceType: "terminal",
+      resourceId: `operator:${resourceId}`,
+    };
+  }
+
   if (
     normalizedMethod === "GET" &&
     normalizedPath.startsWith("/ws/terminals/")

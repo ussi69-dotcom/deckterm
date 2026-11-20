@@ -1680,3 +1680,40 @@ test("rows clone one cached lucide SVG per icon name instead of placeholders", (
     else delete globalThis.window;
   }
 });
+
+test("a Trash item in the error state shows its reason and offers only permanent deletion", () => {
+  withFakeDocument(() => {
+    document.body = makeNodeStub("body");
+    const controller = trashController(async () => trashResponse({}));
+    const broken = {
+      ...trashFixtureItem,
+      id: "trash_broken",
+      status: "error",
+      lastError: "trash_identity_changed",
+    };
+    const state = {
+      context: controller.fileContext(),
+      root: "/allowed",
+      items: [broken],
+      dialog: makeNodeStub(),
+      location: makeNodeStub(),
+      statusEl: makeNodeStub(),
+      errorEl: makeNodeStub(),
+      listEl: makeNodeStub(),
+      closeButton: makeNodeStub("button"),
+      loading: false,
+      message: "",
+      error: "",
+      busy: false,
+    };
+    controller.trashDialog = state;
+    controller.renderTrashDialog(state);
+    const detail = state.listEl.querySelectorAll(".file-trash-detail")[0];
+    expect(detail.textContent).toContain("Cannot be restored");
+    expect(detail.textContent).toContain("trash_identity_changed");
+    const actions = state.listEl
+      .querySelectorAll("button")
+      .map((button) => button.dataset.trashAction);
+    expect(actions).toEqual(["purge"]);
+  });
+});

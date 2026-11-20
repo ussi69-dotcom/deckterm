@@ -2,6 +2,10 @@
 
 > **Datum:** 2026-05-29 · **Delta 2026-10-22 viz sekce 0x** (mezitím: QoL 2026-10-12 a tmux 3.8 2026-10-13 jsou v `docs/handoffs/` a v OpenKnowledge)
 
+## 0w. Delta 2026-11-14 — operátorské session v panelu Agents (na `dev`, ne v produkci)
+
+Na přání vlastníka (14. 11. 2026) panel Agents, pohled Agents v IDE, štítek na telefonu a Sessions sheet ukazují i běžící **operátory**: dlouhé session Claude Code spuštěné přes `operator-tmux` mimo DeckTerm (vlastní unit, vlastní tmux server se systémovým tmux 3.4). Řádek má jméno, složku, stav (čeká na tebe / pracuje / nečinný z pravidel obrazovky) a štítek „operator“. Klik otevře terminál, který je k operátorovi jen připojený (klient systémového tmux spuštěný jako argv, bez přepisu do pipe logu); zavření ho jen odpojí. DeckTerm operátory nikdy nespouští, nezastavuje ani do nich nepíše. Návrh a plán: `docs/plans/2026-11-14-operator-sessions-panel{-design,}.md`.
+
 ## 0x. Delta 2026-10-22 — oprava mobilu + funkce z herdru (na `dev`, ne v produkci)
 
 Běh podle `docs/handoffs/2026-10-22-herdr-adoption-operator.md`; kontrakty v `docs/plans/2026-10-22-mobile-touch-repair-design.md` a `docs/plans/2026-10-22-agent-attention{-design,}.md`, revize mobilu v `docs/audits/2026-10-22-mobile-usability-review.md`.

@@ -31,6 +31,7 @@ import type {
   TerminalBackendSession,
   TerminalScrollCallOptions,
   TerminalScrollDirection,
+  TerminalCreateSessionOptions,
 } from "./terminal-backend";
 
 export type TmuxSessionInfo = {
@@ -233,12 +234,20 @@ export class TmuxTerminalBackend implements TerminalBackend {
     rows: number,
     ownerId: string,
     ownerEmail: string,
+    options: TerminalCreateSessionOptions = {},
   ): Promise<TerminalBackendSession> {
     const sessionName = buildTmuxSessionName({
       namespace: this.namespace,
       terminalId: id,
     });
-    const shellCommand = await this.shellCommandResolver();
+    // An operator's attached view (design 2026-11-14) runs a server-built
+    // argv instead of the shell: more than one argument, so tmux execs it
+    // directly and no shell parses it.
+    const command = options.command;
+    if (command && (command.length < 2 || command.some((arg) => typeof arg !== "string"))) {
+      throw new Error("A pane command must be an argv of two or more strings");
+    }
+    const shellCommand = command ?? (await this.shellCommandResolver());
     await this.assertExternalServerRunning();
     // Throws TmuxEnvironmentUnverifiedError (HTTP 503) when the server may
     // still hold service secrets; the next create tries again. Re-scrubs
@@ -272,6 +281,34 @@ export class TmuxTerminalBackend implements TerminalBackend {
       },
     );
     await createProc.exited;
+
+    if (options.noPipe) {
+      // Before the pipe is armed below: ensurePipeCapture reads this and
+      // never writes a transcript of this session. Fail closed: a mark that
+      // cannot be set and read back ends the session instead of letting a
+      // transcript start.
+      const markProc = await this.spawnTmux(
+        ["set-option", "-t", sessionName, NO_PIPE_OPTION, "1"],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const markCode = await markProc.exited;
+      const readProc = await this.spawnTmux(
+        ["show-options", "-v", "-t", sessionName, NO_PIPE_OPTION],
+        { stdout: "pipe", stderr: "pipe" },
+      );
+      const readBack = (
+        await new Response((readProc as any).stdout).text()
+      ).trim();
+      await readProc.exited;
+      if (markCode !== 0 || readBack !== "1") {
+        const killProc = await this.spawnTmux(
+          ["kill-session", "-t", sessionName],
+          { stdout: "pipe", stderr: "pipe" },
+        );
+        await killProc.exited;
+        throw new Error("Could not mark the session as transcript-free");
+      }
+    }
 
     await this.hideStatusBar(sessionName);
     await this.ensureServerOptions();
@@ -907,7 +944,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   private async ensurePipeCapture(
     sessionName: string,
-  ): Promise<{ pipePath: string; pipeOffset: number }> {
+  ): Promise<{ pipePath: string | null; pipeOffset: number }> {
     const prev = this.pipeArmLocks.get(sessionName) ?? Promise.resolve();
     const run = prev.then(
       () => this.ensurePipeCaptureLocked(sessionName),
@@ -929,7 +966,7 @@ export class TmuxTerminalBackend implements TerminalBackend {
 
   private async ensurePipeCaptureLocked(
     sessionName: string,
-  ): Promise<{ pipePath: string; pipeOffset: number }> {
+  ): Promise<{ pipePath: string | null; pipeOffset: number }> {
     // Pipe logs are full terminal transcripts: keep them private.
     await mkdir(this.pipeDir, { recursive: true, mode: 0o700 });
     await chmod(this.pipeDir, 0o700);
@@ -940,13 +977,33 @@ export class TmuxTerminalBackend implements TerminalBackend {
     // shell-integration marker in tmux mode (S9 spike finding). Only arm the
     // pipe when the pane reports none is open.
     const checkProc = await this.spawnTmux(
-      ["display-message", "-p", "-t", sessionName, "#{pane_pipe}"],
+      [
+        "display-message",
+        "-p",
+        "-t",
+        sessionName,
+        `#{pane_pipe} #{${NO_PIPE_OPTION}}`,
+      ],
       { stdout: "pipe", stderr: "pipe" },
     );
-    const pipeState = (
+    const [pipeState = "", noPipe = ""] = (
       await new Response((checkProc as any).stdout).text()
-    ).trim();
+    )
+      .trim()
+      .split(" ");
     await checkProc.exited;
+    // An operator's attached view: no transcript, ever. Close a pipe that is
+    // open anyway (an older release armed it) and report none.
+    if (noPipe === "1") {
+      if (pipeState === "1") {
+        const closeProc = await this.spawnTmux(["pipe-pane", "-t", sessionName], {
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+        await closeProc.exited;
+      }
+      return { pipePath: null, pipeOffset: 0 };
+    }
     // The log file is created below before the pipe is armed, so an open pipe
     // with no file here means the pane still writes somewhere else — an older
     // release's /tmp location. Close that pipe and re-arm it here.
@@ -989,6 +1046,9 @@ async function fileExists(path: string): Promise<boolean> {
     return false;
   }
 }
+
+/** tmux user option of a session that must never get a pipe-pane transcript. */
+const NO_PIPE_OPTION = "@deckterm_nopipe";
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;

@@ -7892,8 +7892,39 @@ class TerminalManager {
     ).filter((element) => !element.hidden && element.offsetParent !== null);
   }
 
+  // A Sessions-sheet row for an operator (design 2026-11-14): name, folder,
+  // status, the "operator" chip, and "Open" (an attached view).
+  renderOperatorSessionRow(s, tierOptions, now) {
+    const esc = (v) => (this.escapeHtml ? this.escapeHtml(v) : v);
+    const overview = window.AgentOverview;
+    const signals = window.TaskSignals;
+    const tier = overview.statusTier(s, {}, tierOptions);
+    const word = overview.TIER_LABELS[tier] || "";
+    const activityAt = signals?.sessionActivityAt?.(s) || 0;
+    const activity =
+      activityAt && signals?.formatActivityAge
+        ? signals.formatActivityAge(now - activityAt)
+        : "";
+    const agent = s.operatorAgent ? `${esc(s.operatorAgent)} · ` : "";
+    return `<div class="session-row session-row-operator" role="button" tabindex="0" data-session-id="${esc(s.id)}" data-row-action="operator" data-tier="${tier}" title="${esc(overview.tooltipFor(s, tier))}">
+          <div class="session-row-main">
+            <strong class="session-row-title"><span class="session-badge active">●</span> <span class="agent-tier-icon" data-tier="${tier}" role="img" aria-label="${esc(word)}">${overview.TIER_ICONS[tier]}</span><span class="session-row-name">${esc(s.operatorName)}</span><span class="session-chip session-chip-operator">operator</span><span class="session-chip session-chip-agent">${agent}${esc(word.toLowerCase())}</span></strong>
+            <div class="session-row-cwd">${esc(s.cwd || "")}</div>
+            <small>runs outside DeckTerm${activity ? ` · last activity ${esc(activity)}` : ""}</small>
+          </div>
+          <span class="session-row-action" aria-hidden="true">Open</span>
+        </div>`;
+  }
+
   async handleSessionRowActivate(sessionId) {
     if (!sessionId) return;
+    const operatorName =
+      window.AgentOverview?.operatorNameFromRowId?.(sessionId) ?? null;
+    if (operatorName) {
+      await this.openOperatorView(operatorName);
+      this.closeSessionsPanel({ restoreFocus: false });
+      return;
+    }
     const session = (this._sessionCatalog || []).find(
       (s) => s.id === sessionId,
     );
@@ -8134,15 +8165,19 @@ class TerminalManager {
     if (!list) return;
     list.innerHTML = "<div class='task-item'>Loading sessions…</div>";
     try {
+      const operatorsPromise = this.fetchOperatorCatalog();
       const res = await fetch("/api/terminals", {
         headers: { "x-deckterm-client-id": this.clientInstanceId },
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const sessions = await res.json();
+      const terminalRows = await res.json();
       // Keep the catalog so the click handler can resolve cwd/flags per row.
-      this._sessionCatalog = sessions;
-      this.updateSessionsAvailableBadge(sessions);
+      this._sessionCatalog = terminalRows;
+      this._operatorCatalog = await operatorsPromise;
+      this.updateSessionsAvailableBadge(terminalRows);
       this.renderAgentsOverview();
+      // Running operators (sessions outside DeckTerm) are rows here too.
+      const sessions = this.agentsOverviewSessions();
       if (!sessions.length) {
         list.innerHTML = "<div class='task-item'>No sessions yet.</div>";
         return "empty";
@@ -8153,12 +8188,15 @@ class TerminalManager {
       const now = Date.now();
       // Agents overview order (needs you > done > working > idle > shell).
       const overview = window.AgentOverview;
-      const tierOptions = { activeVisibleId: this.getActiveVisibleTerminalId() };
+      const tierOptions = this.agentsOverviewOptions();
       const ordered = signals?.orderSessionsForPanel
         ? signals.orderSessionsForPanel(sessions, seen, tierOptions)
         : sessions;
       list.innerHTML = ordered
         .map((s) => {
+          if (overview?.isOperatorRow?.(s)) {
+            return this.renderOperatorSessionRow(s, tierOptions, now);
+          }
           const isLocallyOpen = this.terminals.has(s.id);
           const action = window.SessionActions.planSessionRowAction(s, {
             isLocallyOpen,
@@ -12090,6 +12128,8 @@ class TerminalManager {
         // the older server snapshot.
         const requestStartedAt = Date.now();
         this.telemetryLastStartedAt = requestStartedAt;
+        // Operators (sessions outside DeckTerm) load next to the terminals.
+        const operatorsPromise = this.fetchOperatorCatalog();
         const response = await fetch("/api/terminals");
         if (!response.ok) return;
         const serverTerminals = await response.json();
@@ -12098,6 +12138,7 @@ class TerminalManager {
         this._sessionCatalog = Array.isArray(serverTerminals)
           ? serverTerminals
           : [];
+        this._operatorCatalog = await operatorsPromise;
         this.updateSessionsAvailableBadge(this._sessionCatalog);
         const telemetryById = new Map(
           serverTerminals
@@ -13703,8 +13744,132 @@ class TerminalManager {
     this.setAgentsPanelVisible(!this.readAgentsPanelSetting());
   }
 
+  // The active row: an operator's attached view counts as that operator's
+  // row (design 2026-11-14), so Next never "goes" to the one on screen.
   agentsOverviewOptions() {
-    return { activeVisibleId: this.getActiveVisibleTerminalId() };
+    const activeId = this.getActiveVisibleTerminalId();
+    const overview = window.AgentOverview;
+    const operator = overview?.operatorForTerminal?.(
+      activeId,
+      this._sessionCatalog,
+      this._operatorCatalog,
+    );
+    return {
+      activeVisibleId: operator ? overview.operatorRowId(operator) : activeId,
+    };
+  }
+
+  // DeckTerm's sessions plus one row per running operator (the operator's
+  // attached view folded into its row). Every Agents surface uses this.
+  agentsOverviewSessions() {
+    const sessions = Array.isArray(this._sessionCatalog)
+      ? this._sessionCatalog
+      : [];
+    return (
+      window.AgentOverview?.mergeOperatorRows?.(
+        sessions,
+        this._operatorCatalog,
+      ) ?? sessions
+    );
+  }
+
+  // GET /api/operators. A refused or unknown answer (older server, feature
+  // off) is no operators; a network failure keeps the last list.
+  async fetchOperatorCatalog() {
+    try {
+      const res = await fetch("/api/operators");
+      if (!res.ok) return [];
+      const list = await res.json();
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return Array.isArray(this._operatorCatalog) ? this._operatorCatalog : [];
+    }
+  }
+
+  // Choosing an operator row: focus its attached view when this page has it,
+  // attach the live one the server knows, else open a new attached view
+  // (POST /api/operators/:name/attach, the normal create path). Closing
+  // that terminal only detaches; DeckTerm never stops an operator.
+  async openOperatorView(name) {
+    const overview = window.AgentOverview;
+    if (!overview || !name) return false;
+    const operator = (this._operatorCatalog || []).find((o) => o?.name === name);
+    for (const id of this.terminals.keys()) {
+      if (overview.operatorForTerminal(id, this._sessionCatalog, this._operatorCatalog) === name) {
+        this.switchTo(id);
+        return true;
+      }
+    }
+    const viewId = operator?.attachedTerminalId;
+    if (viewId && (this._sessionCatalog || []).some((s) => s?.id === viewId)) {
+      return this.activateAgentSession(viewId);
+    }
+    this.operatorAttachesInFlight ||= new Set();
+    if (this.operatorAttachesInFlight.has(name)) return false;
+    this.operatorAttachesInFlight.add(name);
+    const url = `/api/operators/${encodeURIComponent(name)}/attach`;
+    let result = null;
+    try {
+      // The POST first, so its answer decides before any tile is built (and
+      // without createTerminal's failure alert). After the boot restore, so
+      // an already-open view is known here.
+      await this.waitForBootstrap?.();
+      await this.waitForFontMetrics?.();
+      const { cols, rows } = this.estimateInitialTerminalSize(false);
+      let res;
+      let body = {};
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cols, rows }),
+        });
+        body = await res.json().catch(() => ({}));
+      } catch {
+        res = null;
+      }
+      // A 200 that is not a terminal (a login page from a proxy) counts as
+      // a failure.
+      if (res?.ok && typeof body?.id !== "string") res = null;
+      if (res?.ok && body?.existing && this.terminals.has(body.id)) {
+        // The server's open view is already a tile in this page.
+        this.switchTo(body.id);
+        result = true;
+      } else if (res?.ok) {
+        result = await this.createTerminal(false, {
+          cwd: body.cwd || operator?.cwd,
+          createRequest: async () =>
+            new Response(JSON.stringify(body), {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            }),
+        });
+      } else {
+        if (res?.status === 404) {
+          // Ended meanwhile: drop the row now; the next poll agrees.
+          this._operatorCatalog = (this._operatorCatalog || []).filter(
+            (o) => o?.name !== name,
+          );
+          this.renderAgentsOverview();
+        }
+        this.notify?.({
+          key: "operator-attach",
+          kind: "info",
+          title:
+            res?.status === 404
+              ? `${name} is no longer running`
+              : `Could not open ${name}`,
+          body:
+            res?.status === 404
+              ? "The operator ended or is not available to you."
+              : body?.error || "Try again in a moment.",
+        });
+      }
+    } finally {
+      this.operatorAttachesInFlight.delete(name);
+    }
+    this.queueTelemetryRefresh(0);
+    return Boolean(result);
   }
 
   // Render the panel, the IDE view, the phone chip and the Sessions bar from
@@ -13712,9 +13877,7 @@ class TerminalManager {
   renderAgentsOverview() {
     const overview = window.AgentOverview;
     if (!overview || !this.agentsRenderedHtml) return;
-    const sessions = Array.isArray(this._sessionCatalog)
-      ? this._sessionCatalog
-      : [];
+    const sessions = this.agentsOverviewSessions();
     const seen = this.getAttentionSeenMap();
     const opts = this.agentsOverviewOptions();
     const signals = window.TaskSignals;
@@ -13820,6 +13983,9 @@ class TerminalManager {
   // never re-created from here.
   async activateAgentSession(sessionId) {
     if (!sessionId) return false;
+    const operatorName =
+      window.AgentOverview?.operatorNameFromRowId?.(sessionId) ?? null;
+    if (operatorName) return this.openOperatorView(operatorName);
     if (this.terminals.has(sessionId)) {
       this.switchTo(sessionId);
       this.markAttentionSeen(sessionId);
@@ -13857,7 +14023,7 @@ class TerminalManager {
     const overview = window.AgentOverview;
     if (!overview) return false;
     const target = overview.nextTarget(
-      this._sessionCatalog || [],
+      this.agentsOverviewSessions(),
       this.getAttentionSeenMap(),
       this.agentsOverviewOptions(),
     );

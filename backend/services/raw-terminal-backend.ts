@@ -2,6 +2,7 @@ import type { Subprocess } from "bun";
 import { brokerKill, brokerSpawn } from "./broker-client";
 import { sanitizeTerminalEnv } from "./terminal-env";
 import type {
+  TerminalCreateSessionOptions,
   BrokeredExecContext,
   TerminalBackend,
   TerminalBackendAttachOptions,
@@ -37,7 +38,11 @@ export class RawTerminalBackend implements TerminalBackend {
     rows: number,
     ownerId: string,
     ownerEmail: string,
+    options?: TerminalCreateSessionOptions,
   ): Promise<TerminalBackendSession> {
+    if (options?.command) {
+      throw new Error("A pane command needs the legacy tmux backend");
+    }
     return {
       id,
       mode: this.mode,

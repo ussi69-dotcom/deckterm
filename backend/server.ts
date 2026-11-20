@@ -123,6 +123,8 @@ import {
   applyOnboardingRemediation,
 } from "./onboarding-doctor";
 import { supportsLinkedView as supportsTerminalLinkedView } from "./terminal-capabilities";
+import { isPrimarySessionHandle } from "./services/session-handles";
+import { runWithDeadline } from "./services/startup-deadline";
 import { RawTerminalBackend } from "./services/raw-terminal-backend";
 import {
   sanitizeTerminalEnv,
@@ -298,7 +300,10 @@ import {
   BrokeredTmuxBackendCache,
   type BrokeredTmuxBackend,
 } from "./services/brokered-tmux-backend";
-import type { BrokeredExecContext } from "./services/terminal-backend";
+import type {
+  BrokeredExecContext,
+  TerminalCreateSessionOptions,
+} from "./services/terminal-backend";
 import {
   applyE2ERunActorNamespace,
   crossesE2ERunNamespaceForRequest,
@@ -321,6 +326,21 @@ import {
   forbiddenRootDetail,
   rejectedPathMayBeMissing,
 } from "./forbidden-root";
+import {
+  buildOperatorAttachArgv,
+  createOperatorDiscoveryCache,
+  discoverOperators,
+  isValidOperatorName,
+  parseOperatorAttachClient,
+  probeOperator,
+  operatorSocketPath,
+  operatorSocketTrusted,
+  readOperatorDir,
+  resolveOperatorConfig,
+  runOperatorArgv,
+  statOperatorEntry,
+  type OperatorInfo,
+} from "./services/operator-sessions";
 
 // =============================================================================
 // GLOBAL ERROR HANDLERS - Prevent 502 from uncaught exceptions
@@ -386,6 +406,11 @@ type Terminal = {
   // Consecutive tmux samples without the process-detected agent (see
   // inferTmuxRuntimeState); the agent is cleared at two.
   agentMissedSamples: number;
+  // The operator (design 2026-11-14) a tmux client in this pane is attached
+  // to: set when DeckTerm creates the attached view, then re-read from the
+  // pane's process tree on every runtime sync (also after a restart, and for
+  // a hand-typed `operator-tmux attach`). Display only.
+  attachedOperator?: string | null;
   agentTurnCompletedAt: number | null;
   agentRespondingTimer: ReturnType<typeof setTimeout> | null;
   // S11: display-only ring of recent tool-used marker events (untrusted,
@@ -615,6 +640,20 @@ const DECKTERM_TASK_PROVIDERS = (
 
 // tmux backend for session persistence (survives server restart)
 const TMUX_BACKEND = process.env.TMUX_BACKEND === "1";
+
+// Operator sessions (design 2026-11-14): read once at startup. Null = a
+// configured path is not a plain absolute path, and the feature stays off.
+const operatorConfig = resolveOperatorConfig(
+  process.env,
+  typeof process.getuid === "function" ? process.getuid() : -1,
+);
+
+/** How long an attach waits to see whether the new view exited at once. */
+const OPERATOR_ATTACH_SETTLE_MS = 250;
+
+function operatorsAvailable(): boolean {
+  return TMUX_BACKEND && operatorConfig !== null && !isOsIsolationEnabled(process.env);
+}
 const TMUX_SESSION_NAMESPACE = resolveTmuxSessionNamespace({
   namespace: process.env.TMUX_SESSION_NAMESPACE,
   port: process.env.PORT,
@@ -971,6 +1010,8 @@ function recordAgentResumeEvents(
   term: Terminal,
   events: ReturnType<typeof parseShellIntegrationChunk>["events"],
 ) {
+  // The resume record belongs to the session, not to each view of it.
+  if (!isPrimaryHandle(term)) return;
   for (const event of events) {
     if (event.type === "agent-start") {
       const agentName = event.agentName;
@@ -1399,6 +1440,15 @@ export async function reconcileSessionsOnStartup(
   return fixed;
 }
 
+// A stopped or wedged tmux server whose socket still exists never answers;
+// startup waits this long for the environment scrub and for session recovery
+// each, then opens the port anyway.
+const STARTUP_TMUX_TIMEOUT_MS =
+  Number(process.env.DECKTERM_STARTUP_TMUX_TIMEOUT_MS) > 0
+    ? Number(process.env.DECKTERM_STARTUP_TMUX_TIMEOUT_MS)
+    : 15_000;
+let startupTmuxRecoveryAbandoned = false;
+
 // Recover existing tmux sessions on startup (for TMUX_BACKEND)
 async function recoverTmuxSessions(): Promise<number> {
   if (!TMUX_BACKEND) return 0;
@@ -1420,6 +1470,9 @@ async function recoverTmuxSessions(): Promise<number> {
     const state = await getFoundationState();
 
     for (const sessionName of sessions) {
+      // Startup gave up waiting on tmux: the port is open and lazy restore
+      // owns these sessions now.
+      if (startupTmuxRecoveryAbandoned) break;
       // One session that fails to attach must not strand every session
       // listed after it.
       try {
@@ -1453,9 +1506,20 @@ async function recoverTmuxSession(
     return false;
   }
   if (recordedSession.status !== "active") {
-    console.warn(
-      `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
-    );
+    // Its row is ended, so no surface can ever reach this session again. It
+    // outlived its row only because another handle (a linked view) still
+    // used it when the row ended; once no handle in this process uses it,
+    // nothing would ever stop the shell or the agent in it.
+    if (!hasOtherTerminalForSession(sessionName)) {
+      console.warn(
+        `[tmux] Session ${sessionName} outlived its ${recordedSession.status} row and no view uses it; ending it`,
+      );
+      await killTmuxSessionIfLast(sessionName);
+    } else {
+      console.warn(
+        `[tmux] Inactive database session found for ${sessionName} (${recordedSession.status}), skipping recovery`,
+      );
+    }
     return false;
   }
   if (terminals.has(id)) return false;
@@ -1819,10 +1883,20 @@ async function getFoundationState(): Promise<FoundationState> {
 // needs-input push is never swallowed by an earlier completion push.
 const COMPLETION_PUSH_DEDUPE_MS = 5_000;
 
+// A linked view is a second handle on the same tmux session and reads the
+// same output: session-level effects go through one handle only.
+function isPrimaryHandle(term: Terminal): boolean {
+  const own = term.sessionName
+    ? parseTmuxSessionName(term.sessionName, TMUX_SESSION_PREFIX)?.terminalId
+    : null;
+  return isPrimarySessionHandle(term, terminals.values(), own);
+}
+
 function notifyCompletionPush(
   term: Terminal,
   kind: "agent" | "command" | "input",
 ) {
+  if (!isPrimaryHandle(term)) return;
   const now = Date.now();
   if (
     kind !== "input" &&
@@ -1862,12 +1936,19 @@ async function requireFoundationCapability({
   resourceType,
   resourceId = "*",
   data = {},
+  audit = true,
 }: {
   actor: DeckTermActor;
   capability: ScopedGrantCapability;
   resourceType: string;
   resourceId?: string | null;
   data?: Record<string, unknown>;
+  /**
+   * false: the same decision without writing an audit row, for a read that
+   * repeats every few seconds (the operator list poll). Every path that
+   * acts (create, attach) keeps the default.
+   */
+  audit?: boolean;
 }): Promise<
   | { ok: true; ownerId: string }
   | {
@@ -1900,7 +1981,7 @@ async function requireFoundationCapability({
     canonical = resolveCanonicalOwnerId(state, actor);
   } catch (err) {
     if (err instanceof IdentityConflictError) {
-      writeAuditEvent(state.db, {
+      if (audit) writeAuditEvent(state.db, {
         actorUserId: actor.id,
         action: capability,
         resourceType,
@@ -1929,7 +2010,7 @@ async function requireFoundationCapability({
   // edge-tunnel allow just below. An unknown actor (`user === null`) can't
   // be disabled, so this is a no-op for actors without a user row.
   if (user?.disabled) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -1955,7 +2036,7 @@ async function requireFoundationCapability({
   // the real identity for accountability. Root mapping still happens upstream,
   // so this does not widen filesystem scope.
   if (isEdgeProtectedTunnelMode(process.env)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -1968,7 +2049,7 @@ async function requireFoundationCapability({
   }
 
   if (!isBootstrapComplete(state)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -1997,7 +2078,7 @@ async function requireFoundationCapability({
   // §9.3): owner/admin imply the five capabilities on any resource; member
   // gets no wildcards, scoped grants only.
   if (user && roleImpliesCapability(user.role, capability)) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -2017,7 +2098,7 @@ async function requireFoundationCapability({
       resourceId: resourceId || "*",
     })
   ) {
-    writeAuditEvent(state.db, {
+    if (audit) writeAuditEvent(state.db, {
       actorUserId,
       action: capability,
       resourceType,
@@ -3317,6 +3398,61 @@ export function computeLiteralEdits(
 export const GIT_PROBE_ENV: Readonly<Record<string, string>> = Object.freeze({
   LC_ALL: "C",
 });
+
+// The deepest directory both absolute paths live under ("/" at worst).
+function commonAncestorDir(a: string, b: string): string {
+  const as = a.split("/").filter(Boolean);
+  const bs = b.split("/").filter(Boolean);
+  const shared: string[] = [];
+  for (let i = 0; i < Math.min(as.length, bs.length) && as[i] === bs[i]; i++)
+    shared.push(as[i]);
+  return `/${shared.join("/")}`;
+}
+
+const RENAME_EXISTS_MESSAGE =
+  "A file or folder with that name already exists";
+
+// A revision the git routes pass as an argument: hex/HEAD/refname with an
+// optional ~N/^N, never a leading dash (argv-flag smuggling). Passed
+// argv-style, never through a shell.
+export function isSafeGitRevision(value: string): boolean {
+  return (
+    value.length > 0 &&
+    !value.startsWith("-") &&
+    /^([a-f0-9]{4,40}|HEAD|[\w\-\/.]+)(~\d+|\^\d+)?$/i.test(value)
+  );
+}
+
+// Parses `git status --porcelain -z -b`: NUL-separated records, the first
+// one the `## branch...upstream [ahead N, behind M]` header. A rename or copy
+// record (X or Y is R/C) is followed by a second record holding the original
+// path. Names are raw bytes decoded as UTF-8, never C-quoted.
+export function parseGitStatusPorcelainZ(output: string): {
+  header: string;
+  entries: Array<{ rawStatus: string; path: string; oldPath?: string }>;
+} {
+  const records = output.split("\0");
+  let header = "";
+  const entries: Array<{ rawStatus: string; path: string; oldPath?: string }> =
+    [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.startsWith("## ")) {
+      if (!header) header = record.slice(3);
+      continue;
+    }
+    if (record.length < 4) continue;
+    const rawStatus = record.slice(0, 2);
+    const path = record.slice(3);
+    const oldPath = /[RC]/.test(rawStatus) ? records[++i] : undefined;
+    // A name that is not valid UTF-8 was decoded lossily (U+FFFD); two such
+    // names can collapse into one string, so a stage or discard could hit
+    // the wrong file. Leave those out rather than hand out a wrong path.
+    if (path.includes("\uFFFD") || oldPath?.includes("\uFFFD")) continue;
+    entries.push({ rawStatus, path, ...(oldPath ? { oldPath } : {}) });
+  }
+  return { header, entries };
+}
 
 export function classifyGitStatusFailure(exitCode: number, stderr: string) {
   const message = stderr.trim() || "git status failed";
@@ -4937,6 +5073,7 @@ function serializeTerminal(term: Terminal, requestingClientId?: string | null) {
     agentState: term.agentState,
     agentTurnCompletedAt: term.agentTurnCompletedAt,
     ...serializeAgentStatus(term.agentStatusRecord),
+    attachedOperator: term.attachedOperator ?? null,
     recentTools: term.recentTools,
     attention: term.attention.attention,
     progress: term.attention.progress,
@@ -5909,6 +6046,21 @@ async function completeTmuxReconnectReplay(
   }
 }
 
+// One operator discovery at a time, shared by every list poll for 3 s. The
+// operator screens it reads stay in memory for one rule evaluation each.
+const operatorDiscovery = createOperatorDiscoveryCache(() =>
+  operatorConfig
+    ? discoverOperators({
+        config: operatorConfig,
+        run: (argv) => runOperatorArgv(argv),
+        readDir: readOperatorDir,
+        statEntry: statOperatorEntry,
+        processSnapshot: () => readProcessSnapshot(),
+        evaluate: (agent, input) => evaluateAgentScreen(agent, input),
+      })
+    : Promise.resolve([]),
+);
+
 async function readProcessSnapshot(): Promise<ProcessSnapshot> {
   const proc = Bun.spawn(["ps", "-eo", "pid=,ppid=,args="], {
     stdout: "pipe",
@@ -6133,6 +6285,14 @@ async function syncTmuxRuntimeState(
   }
   term.agentState = nextRuntimeState.agentState;
   term.agentMissedSamples = nextRuntimeState.agentMissedSamples || 0;
+  // null = the ps snapshot failed, no pane pid = the tmux read failed: both
+  // inconclusive, keep what was known.
+  if (processTree && panePid > 0 && operatorConfig) {
+    term.attachedOperator = parseOperatorAttachClient(
+      processTree,
+      operatorConfig.dir,
+    );
+  }
   if (!nextRuntimeState.agentName) {
     term.agentHasUserPrompt = false;
     term.agentMarkerActive = false;
@@ -6160,9 +6320,12 @@ async function createManagedTerminal({
   initialScrollback = "",
   exec,
   attachCwd,
+  paneOptions,
 }: {
   id?: string;
   cwd: string;
+  /** Server-decided pane command / no-transcript (operator attached view). */
+  paneOptions?: TerminalCreateSessionOptions;
   /** Where to spawn the attach client, when it differs from `cwd`. */
   attachCwd?: string;
   cols: number;
@@ -6318,6 +6481,7 @@ async function createManagedTerminal({
         rows,
         ownerId,
         ownerEmail,
+        paneOptions,
       );
     } catch (err) {
       // Nothing was registered yet: release the PTY handle so a refused
@@ -6460,6 +6624,7 @@ async function createOwnedTerminal({
   ownerId,
   ownerEmail,
   exec,
+  paneOptions,
 }: {
   cwd: string;
   cols?: number;
@@ -6468,6 +6633,7 @@ async function createOwnedTerminal({
   ownerEmail: string;
   /** B2: brokered execution context (mapped uid) when isolation is active. */
   exec?: BrokeredExecContext;
+  paneOptions?: TerminalCreateSessionOptions;
 }): Promise<Terminal> {
   const fs = await import("fs/promises");
   let resolvedCwd = cwd || process.env.HOME || "/";
@@ -6498,6 +6664,7 @@ async function createOwnedTerminal({
     sessionName,
     createTmuxSession: Boolean(sessionName),
     exec,
+    paneOptions,
   });
 }
 
@@ -8419,6 +8586,8 @@ export function createWebApp() {
     // Same shape the route always read: { cwd?, cols?, rows? }.
     body: Record<string, any>,
     routeCapability: { capability: ScopedGrantCapability },
+    // Server-decided only (the operator attach route), never from `body`.
+    paneOptions?: TerminalCreateSessionOptions,
   ): Promise<TerminalCreateOutcome> {
     const fail = (response: Response): TerminalCreateOutcome => ({
       ok: false,
@@ -8611,12 +8780,21 @@ export function createWebApp() {
     const exec = execResolution.exec;
 
     rateLimitState.record(ownerId);
+    if (paneOptions?.command && exec) {
+      // An operator belongs to the service user; a brokered (mapped-user)
+      // terminal never runs a server-chosen command.
+      return fail(c.json(
+        { error: "OS isolation denied", reason: "os_isolation_operator" },
+        403,
+      ));
+    }
     const terminal = await createOwnedTerminal({
       cwd: resolvedCwd,
       ...resolveTerminalSize(body.cols, body.rows),
       ownerId,
       ownerEmail,
       exec,
+      paneOptions,
     });
 
     recordTerminalSession(state.db, {
@@ -9170,6 +9348,297 @@ export function createWebApp() {
       }
     } finally {
       agentResumesInProgress.delete(id);
+    }
+  });
+
+  // --- Operator sessions (design 2026-11-14) ---------------------------------
+  // Long-lived Claude Code sessions the owner runs OUTSIDE DeckTerm (own unit,
+  // own system-tmux server `op-<name>`). DeckTerm lists the running ones and
+  // gives an attached view; it never starts, stops or types into one.
+
+  // Whether this actor may see / attach the operator whose folder is `cwd`:
+  // the folder itself (no parent fallback) is inside the allowed roots, and
+  // the actor passes the same terminal.create + root.use decision the create
+  // path makes on that root. `audit: false` for the list poll, which repeats
+  // every few seconds and, like GET /api/terminals, writes no rows.
+  // Operators belong to the service user, i.e. to the owner. Only an actor
+  // whose ROLE grants terminal.create on everything (owner/admin), or the
+  // legacy/edge-trusted modes, may see or attach one: a member's scoped grants
+  // never reach a resource type "operator" (wildcard grants are refused).
+  // Decided quietly and BEFORE any socket is touched.
+  async function operatorActorAllowed(
+    actor: DeckTermActor,
+  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+    const decision = await requireFoundationCapability({
+      actor,
+      capability: "terminal.create",
+      resourceType: "operator",
+      resourceId: "*",
+      audit: false,
+    });
+    return decision.ok ? { ok: true } : { ok: false, reason: decision.reason };
+  }
+
+  async function operatorFolderAccess(
+    state: FoundationState,
+    actor: DeckTermActor,
+    cwd: string,
+    { audit }: { audit: boolean },
+  ): Promise<{ ok: true; cwd: string } | { ok: false; reason: string }> {
+    const fs = await import("fs/promises");
+    let real: string;
+    try {
+      real = await fs.realpath(cwd);
+    } catch {
+      return { ok: false, reason: "forbidden_root" };
+    }
+    const resolved = await resolveTerminalStartDir(real);
+    if (!resolved || resolved !== real) {
+      return { ok: false, reason: "forbidden_root" };
+    }
+    const rootId = resolveFoundationRootIdForPath(state, resolved);
+    if (!rootId) return { ok: false, reason: "no_matching_root" };
+    const pre = preflightTerminalActor(state, actor);
+    if (!pre.ok) return { ok: false, reason: pre.reason };
+    for (const capability of ["terminal.create", "root.use"] as const) {
+      const decision = await requireFoundationCapability({
+        actor,
+        capability,
+        resourceType: "root",
+        resourceId: rootId,
+        data: { cwd: resolved },
+        audit,
+      });
+      if (!decision.ok) return { ok: false, reason: decision.reason };
+    }
+    return { ok: true, cwd: resolved };
+  }
+
+  function findOperatorView(ownerId: string, name: string): Terminal | null {
+    for (const term of terminals.values()) {
+      if (term.ownerId === ownerId && term.attachedOperator === name) {
+        return term;
+      }
+    }
+    return null;
+  }
+
+  function resolveListOwnerId(
+    state: FoundationState,
+    actor: DeckTermActor,
+  ): string | null {
+    try {
+      return isFoundationLegacyBypassEnabled()
+        ? actor.id
+        : resolveCanonicalOwnerId(state, actor).ownerId;
+    } catch (err) {
+      if (err instanceof IdentityConflictError) return null;
+      throw err;
+    }
+  }
+
+  // [{ name, cwd, agentName, agentStatus, agentStatusRule, agentRulesVersion,
+  //    lastActivityAt, attachedTerminalId }]. Empty when the feature is off,
+  // for an e2e run actor (a test never sees the host's real operators), and
+  // for operators whose folder this actor may not open a terminal in.
+  app.get("/api/operators", async (c) => {
+    const actor = getCurrentActor(c);
+    if (!operatorsAvailable() || getE2ERunIdFromActorId(actor.id)) {
+      return c.json([]);
+    }
+    const state = await getFoundationState();
+    const ownerId = resolveListOwnerId(state, actor);
+    if (!ownerId) {
+      return c.json(
+        {
+          error: "DeckTerm identity resolution conflict",
+          reason: "identity_conflict",
+        },
+        403,
+      );
+    }
+    if (!(await operatorActorAllowed(actor)).ok) return c.json([]);
+    let operators: OperatorInfo[] = [];
+    try {
+      operators = await operatorDiscovery.get();
+    } catch (err) {
+      debug("[operators] discovery failed:", err);
+    }
+    const visible = [];
+    for (const operator of operators) {
+      const access = await operatorFolderAccess(state, actor, operator.cwd, {
+        audit: false,
+      });
+      if (!access.ok) continue;
+      visible.push({
+        ...operator,
+        attachedTerminalId: findOperatorView(ownerId, operator.name)?.id ?? null,
+      });
+    }
+    return c.json(visible);
+  });
+
+  // Opens (or returns the open) attached view of one operator: a NEW terminal
+  // through the normal create path in the operator's folder whose pane runs a
+  // system-tmux client attached to it (argv, no shell, no transcript).
+  // Closing that terminal only detaches the client.
+  const operatorAttachesInProgress = new Set<string>();
+  app.post("/api/operators/:name/attach", async (c) => {
+    const name = c.req.param("name");
+    if (!isValidOperatorName(name)) {
+      return c.json({ error: "Not an operator name", reason: "invalid_operator_name" }, 400);
+    }
+    const body = await c.req.json().catch(() => ({}));
+    const actor = getCurrentActor(c);
+    if (getE2ERunIdFromActorId(actor.id)) {
+      return c.json({ error: "Operator not running", reason: "operator_not_running" }, 404);
+    }
+    if (isOsIsolationEnabled(process.env)) {
+      return c.json({ error: "OS isolation denied", reason: "os_isolation_operator" }, 403);
+    }
+    if (!operatorsAvailable() || !operatorConfig) {
+      return c.json(
+        { error: "Operator views need the tmux backend", reason: "operators_unavailable" },
+        409,
+      );
+    }
+    const routeCapability = getRouteCapability(c.req.method, c.req.url);
+    if (!routeCapability) {
+      return c.json({ error: "Missing route capability" }, 500);
+    }
+    const state = await getFoundationState();
+    // Actor validity first, audited like the create path, before anything
+    // touches an operator: identity conflict, disabled user, untrusted source.
+    const pre = preflightTerminalActor(state, actor);
+    if (!pre.ok) {
+      writeAuditEvent(state.db, {
+        actorUserId: pre.auditOwnerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason: pre.reason,
+      });
+      return c.json(
+        foundationGateJson({
+          message: pre.message,
+          reason: pre.reason,
+          capability: "terminal.create",
+          resourceType: "terminal",
+          resourceId: `operator:${name}`,
+        }),
+        403,
+      );
+    }
+    const ownerId = pre.ownerId;
+    // The per-user cap and rate limit before the probe spawns anything.
+    const creationError = getTerminalCreationError(ownerId);
+    if (creationError) return c.json(creationError.body, creationError.status);
+
+    // Not running, a socket DeckTerm must not trust, and a folder this actor
+    // may not open a terminal in all get the SAME answer, so the endpoint
+    // reveals neither which operators run nor where. The audit row keeps the
+    // real reason.
+    const unavailable = (reason: string, data: Record<string, unknown> = {}) => {
+      writeAuditEvent(state.db, {
+        actorUserId: ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "operator",
+        resourceId: name,
+        decision: "deny",
+        reason,
+        data,
+      });
+      return c.json(
+        { error: "Operator not available", reason: "operator_not_available" },
+        404,
+      );
+    };
+    const probeDeps = {
+      config: operatorConfig,
+      run: (argv: string[]) => runOperatorArgv(argv),
+      statEntry: statOperatorEntry,
+    };
+    const actorAllowed = await operatorActorAllowed(actor);
+    if (!actorAllowed.ok) return unavailable(actorAllowed.reason);
+    if (!(await statOperatorEntry(operatorSocketPath(operatorConfig, name)))) {
+      return unavailable("operator_not_running");
+    }
+    if (!(await operatorSocketTrusted(probeDeps, name))) {
+      return unavailable("operator_socket_untrusted");
+    }
+    const pane = await probeOperator(probeDeps, name);
+    if (!pane) return unavailable("operator_not_running");
+    // The same decision the create path makes, without its audit rows: the
+    // create path below writes them once.
+    const access = await operatorFolderAccess(state, actor, pane.cwd, {
+      audit: false,
+    });
+    if (!access.ok) return unavailable(access.reason, { cwd: pane.cwd });
+
+    // One attach per actor and operator at a time, checked before looking
+    // for an open view: a double click must not open two views.
+    const flightKey = `${ownerId}\u0000${name}`;
+    if (operatorAttachesInProgress.has(flightKey)) {
+      return c.json(
+        { error: "This operator is already being opened", reason: "attach_in_progress" },
+        409,
+      );
+    }
+    operatorAttachesInProgress.add(flightKey);
+    try {
+      const existing = findOperatorView(ownerId, name);
+      if (existing) {
+        return c.json({ ...serializeTerminal(existing), existing: true });
+      }
+      let created: TerminalCreateOutcome;
+      try {
+        created = await createTerminalThroughCreatePath(
+          c,
+          { cwd: access.cwd, cols: body?.cols, rows: body?.rows },
+          routeCapability,
+          { command: buildOperatorAttachArgv(operatorConfig, name), noPipe: true },
+        );
+      } catch (err) {
+        // The operator ended between the probe and the attach.
+        if (!(await probeOperator(probeDeps, name))) {
+          return unavailable("operator_not_running");
+        }
+        writeAuditEvent(state.db, {
+          actorUserId: ownerId,
+          action: "terminal.operator_attach",
+          resourceType: "operator",
+          resourceId: name,
+          decision: "deny",
+          reason: "attach_failed",
+        });
+        throw err;
+      }
+      if (!created.ok) return created.response;
+      const terminal = created.terminal;
+      terminal.attachedOperator = name;
+      // An operator that ended meanwhile: its client exits at once and takes
+      // the new session with it. Answer like "not running", not with a
+      // terminal that closes immediately.
+      await Bun.sleep(OPERATOR_ATTACH_SETTLE_MS);
+      if (!terminals.has(terminal.id)) {
+        return unavailable(
+          (await probeOperator(probeDeps, name))
+            ? "attach_exited"
+            : "operator_not_running",
+        );
+      }
+      writeAuditEvent(state.db, {
+        actorUserId: created.ownerId,
+        action: "terminal.operator_attach",
+        resourceType: "terminal",
+        resourceId: terminal.id,
+        decision: "allow",
+        data: { operator: name, cwd: access.cwd },
+      });
+      return c.json(serializeTerminal(terminal));
+    } finally {
+      operatorAttachesInProgress.delete(flightKey);
     }
   });
 
@@ -9833,6 +10302,19 @@ export function createWebApp() {
       if (data.includes(0)) {
         return c.json({ error: "Binary file cannot be edited" }, 415);
       }
+      // The editor works on a UTF-8 string and saves it back as UTF-8, so a
+      // file that does not survive that round trip (Latin-1, Windows-1250)
+      // would have every non-UTF-8 byte rewritten on save. Same gate as
+      // replace-in-files.
+      if (!utf8RoundTrips(data)) {
+        return c.json(
+          {
+            error: "File is not UTF-8 text and cannot be edited here",
+            reason: "not_utf8",
+          },
+          415,
+        );
+      }
       return c.json({
         path: scoped.relPath ? `${scoped.root}/${scoped.relPath}` : scoped.root,
         content: data.toString("utf8"),
@@ -10327,14 +10809,25 @@ export function createWebApp() {
         const toAbs = scopedTo.relPath
           ? join(scopedTo.root, scopedTo.relPath)
           : scopedTo.root;
-        const fsp = await import("node:fs/promises");
-        await fsp.rename(fromAbs, toAbs);
+        // Rename beneath the two roots' common ancestor through the same
+        // fd-contained RENAME_NOREPLACE helper, so an existing (or a
+        // concurrently created) destination is never replaced. No usable
+        // common ancestor: the helper refuses and so does the move.
+        const common = commonAncestorDir(scopedFrom.root, scopedTo.root);
+        const fx = getFsExecutor(execCtx.ctx);
+        await fx.rename(
+          common,
+          relative(common, fromAbs),
+          relative(common, toAbs),
+        );
         return c.json({ ok: true });
       }
       const fx = getFsExecutor(execCtx.ctx);
       await fx.rename(scopedFrom.root, scopedFrom.relPath, scopedTo.relPath);
       return c.json({ ok: true });
     } catch (err) {
+      if (err instanceof FsExecError && err.code === "exists")
+        return c.json({ error: RENAME_EXISTS_MESSAGE, reason: "exists" }, 409);
       if (err instanceof FsExecError)
         return fsErrorResponse(c, err, "Failed to rename");
       return c.json({ error: "Failed to rename" }, 500);
@@ -10753,7 +11246,7 @@ export function createWebApp() {
       // the broker's own fixed environment (LANG defaults to C.UTF-8).
       const statusRes = await runGit(
         g.git,
-        ["status", "--porcelain", "-uall", "-b"],
+        ["status", "--porcelain", "-z", "-uall", "-b"],
         undefined,
         GIT_PROBE_ENV,
       );
@@ -10768,8 +11261,10 @@ export function createWebApp() {
         return c.json(failure.body, failure.status);
       }
 
-      const lines = output.trim().split("\n");
-      const headerLine = lines[0]?.replace("## ", "") || "";
+      // -z: names arrive raw (no C quoting of non-ASCII or spaces), so the
+      // panel's stage/diff/discard calls get a name that matches the file.
+      const parsed = parseGitStatusPorcelainZ(output);
+      const headerLine = parsed.header;
       // "main...origin/main [ahead 1, behind 2]" | "main" | "No commits yet on main"
       const trackMatch = headerLine.match(
         /^(.+?)(?:\.\.\.(\S+))?(?:\s+\[(?:ahead (\d+))?(?:, )?(?:behind (\d+))?\])?$/,
@@ -10778,25 +11273,14 @@ export function createWebApp() {
       const upstream = trackMatch?.[2] || null;
       const ahead = Number(trackMatch?.[3] || 0);
       const behind = Number(trackMatch?.[4] || 0);
-      const files = lines
-        .slice(1)
-        .filter((line) => line.length >= 3)
-        .map((line) => {
-          const rawStatus = line.substring(0, 2);
+      const files = parsed.entries.map(
+        ({ rawStatus, path, oldPath }) => {
           const stagedStatus = rawStatus[0] === " " ? "" : rawStatus[0];
           const unstagedStatus = rawStatus[1] === " " ? "" : rawStatus[1];
-          const rawPath = line.substring(3).trim();
-          const renameSep = " -> ";
-          const renameIdx = rawPath.indexOf(renameSep);
           const isRenamed =
-            stagedStatus === "R" || unstagedStatus === "R" || renameIdx !== -1;
-
-          let path = rawPath;
-          let oldPath: string | undefined;
-          if (renameIdx !== -1) {
-            oldPath = rawPath.substring(0, renameIdx).trim();
-            path = rawPath.substring(renameIdx + renameSep.length).trim();
-          }
+            stagedStatus === "R" ||
+            unstagedStatus === "R" ||
+            oldPath !== undefined;
 
           // Conflict classification uses the raw (unstripped) XY code — the
           // codes never contain a space, so this is safe before any trimming —
@@ -10858,6 +11342,13 @@ export function createWebApp() {
       );
     }
 
+    // Same ref validation as /api/git/show and /api/git/commit-files: a value
+    // that starts with a dash would reach `git show` as an option
+    // (`--output=<file>` overwrites that file).
+    if (commit && !isSafeGitRevision(commit)) {
+      return c.json({ error: "Invalid commit reference" }, 400);
+    }
+
     const stagedEnabled = staged === "1" || staged?.toLowerCase?.() === "true";
     if (stagedEnabled && commit) {
       return c.json(
@@ -10908,42 +11399,34 @@ export function createWebApp() {
         path &&
         output.trim() === ""
       ) {
+        // Both calls go through runGit like every other read-only git call:
+        // hardened (no fsmonitor, hooks or external diff) and with the
+        // sanitized terminal environment instead of the service's own.
         const cwd = g.git.reldir ? join(g.git.root, g.git.reldir) : g.git.root;
-        const statusProc = Bun.spawn(
-          ["git", "status", "--porcelain", "--", path],
-          { cwd, stdout: "pipe", stderr: "pipe" },
-        );
-        const statusTimeoutId = setTimeout(() => statusProc.kill(), 10000);
-        const [statusOut, , statusExit] = await Promise.all([
-          new Response(statusProc.stdout).text(),
-          new Response(statusProc.stderr).text(),
-          statusProc.exited,
+        const statusRes = await runGit(g.git, [
+          "status",
+          "--porcelain",
+          "--",
+          path,
         ]);
-        clearTimeout(statusTimeoutId);
+        const statusOut = statusRes.output;
+        const statusExit = statusRes.code;
 
         if (statusExit === 0 && statusOut.trimStart().startsWith("??")) {
           // Resolve the absolute path for --no-index (git diff --no-index
           // expects real filesystem paths, not relative-to-cwd)
           const absPath = path.startsWith("/") ? path : `${cwd}/${path}`;
-          const noIndexProc = Bun.spawn(
-            [
-              "git",
-              "diff",
-              "--no-index",
-              "--color=never",
-              "--",
-              "/dev/null",
-              absPath,
-            ],
-            { cwd, stdout: "pipe", stderr: "pipe" },
-          );
-          const noIndexTimeoutId = setTimeout(() => noIndexProc.kill(), 10000);
-          const [noIndexOut, noIndexErr, noIndexExit] = await Promise.all([
-            new Response(noIndexProc.stdout).text(),
-            new Response(noIndexProc.stderr).text(),
-            noIndexProc.exited,
+          const noIndexRes = await runGit(g.git, [
+            "diff",
+            "--no-index",
+            "--color=never",
+            "--",
+            "/dev/null",
+            absPath,
           ]);
-          clearTimeout(noIndexTimeoutId);
+          const noIndexOut = noIndexRes.output;
+          const noIndexErr = noIndexRes.stderr;
+          const noIndexExit = noIndexRes.code;
 
           // exit 1 + non-empty stdout = files differ (expected for untracked)
           if (
@@ -11317,9 +11800,12 @@ export function createWebApp() {
       return c.json(g.body, { status: g.status as any });
     }
 
+    // A leading dash would reach git as an option (`-f` discards every
+    // uncommitted change to tracked files).
     if (
       !branch ||
       typeof branch !== "string" ||
+      branch.startsWith("-") ||
       !/^[\w\-\/\.]+$/.test(branch)
     ) {
       return c.json({ error: "Invalid branch name" }, 400);
@@ -12076,12 +12562,26 @@ async function startOwnedWebServer(
     // A failure is retried a few times; if it still cannot be verified the
     // service keeps running, and every terminal creation re-runs the scrub
     // and is refused (HTTP 503) until one succeeds.
-    if (tmuxTerminalBackend) {
-      const backend = tmuxTerminalBackend;
-      const { result, attempts } = await scrubTmuxEnvironmentWithRetry(
-        () => backend.scrubServerEnvironment(),
-        { attempts: 3, delayMs: 500 },
+    const scrub = tmuxTerminalBackend
+      ? await runWithDeadline(() => {
+          const backend = tmuxTerminalBackend!;
+          return scrubTmuxEnvironmentWithRetry(
+            () => backend.scrubServerEnvironment(),
+            { attempts: 3, delayMs: 500 },
+          );
+        }, STARTUP_TMUX_TIMEOUT_MS)
+      : null;
+    if (scrub && !scrub.ok) {
+      // Unverified, so every terminal creation re-runs the scrub and is
+      // refused until one succeeds.
+      console.error(
+        scrub.timedOut
+          ? `[tmux] environment: no answer from tmux within ${STARTUP_TMUX_TIMEOUT_MS} ms (stopped or wedged server?); starting without the scrub. New terminals are refused until a scrub succeeds.`
+          : `[tmux] environment: scrub failed at startup: ${String(scrub.error)}`,
       );
+    }
+    if (scrub?.ok) {
+      const { result, attempts } = scrub.value;
       if (result.removed.length > 0) {
         console.log(
           `[tmux] environment: removed ${result.removed.length} service variable(s) from the global environment: ${result.removed.join(", ")}`,
@@ -12098,9 +12598,17 @@ async function startOwnedWebServer(
         );
       }
     }
-    const recovered = await recoverTmuxSessions();
-    if (recovered > 0) {
-      console.log(`[tmux] Recovered ${recovered} session(s)`);
+    const recovery = await runWithDeadline(
+      () => recoverTmuxSessions(),
+      STARTUP_TMUX_TIMEOUT_MS,
+    );
+    if (!recovery.ok && recovery.timedOut) {
+      startupTmuxRecoveryAbandoned = true;
+      console.error(
+        `[tmux] session recovery got no answer from tmux within ${STARTUP_TMUX_TIMEOUT_MS} ms (stopped or wedged server?); starting without it. Recorded sessions are restored when they are next opened.`,
+      );
+    } else if (recovery.ok && recovery.value > 0) {
+      console.log(`[tmux] Recovered ${recovery.value} session(s)`);
     }
   }
 

@@ -21,6 +21,7 @@ import {
   isReservedTrashPath,
   listTrashItems,
   purgeExpiredTrashItems,
+  purgeTrashItem,
   restoreTrashItem,
   trashPath,
   type FileTrashBinding,
@@ -449,6 +450,44 @@ describe("crash reconciliation and expiry", () => {
       results.filter((result) => result.status === "rejected"),
     ).toHaveLength(1);
     expect(readFileSync(join(root, "once.txt"), "utf8")).toBe("once");
+    db.close();
+  });
+});
+
+describe("the error state has a way out", () => {
+  test("an item whose identity changed is listed with its reason and can be purged", async () => {
+    const { db, binding, root } = setup();
+    writeFileSync(join(root, "tampered.txt"), "original");
+    const item = await trashPath(db, binding, "tampered.txt");
+    writeFileSync(join(root, FILE_TRASH_DIR, item.id), "changed in trash");
+    await expect(restoreTrashItem(db, binding, item.id)).rejects.toMatchObject({
+      code: "identity_changed",
+    });
+
+    const listed = await listTrashItems(db, binding);
+    expect(listed.map((entry) => [entry.id, entry.status])).toEqual([
+      [item.id, "error"],
+    ]);
+    expect(listed[0].lastError).toContain("identity");
+
+    const purged = await purgeTrashItem(db, binding, item.id);
+    expect(purged.status).toBe("purged");
+    expect(existsSync(join(root, FILE_TRASH_DIR, item.id))).toBe(false);
+    expect(await listTrashItems(db, binding)).toEqual([]);
+    db.close();
+  });
+
+  test("an error item with nothing left on disk closes as purged", async () => {
+    const { db, binding, root } = setup();
+    writeFileSync(join(root, "gone.txt"), "x");
+    const item = await trashPath(db, binding, "gone.txt");
+    rmSync(join(root, FILE_TRASH_DIR, item.id));
+    db.query(
+      "UPDATE file_trash_items SET status = 'error', last_error = 'trash_missing' WHERE id = ?",
+    ).run(item.id);
+    const purged = await purgeTrashItem(db, binding, item.id);
+    expect(purged.status).toBe("purged");
+    expect(await listTrashItems(db, binding)).toEqual([]);
     db.close();
   });
 });

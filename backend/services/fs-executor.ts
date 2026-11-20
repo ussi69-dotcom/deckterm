@@ -399,13 +399,28 @@ class LegacyFsExecutor implements FsExecutor {
     // `legacyOwnerNote` response field) rather than imply ownership is
     // actively preserved here.
     const p = this.abs(root, relPath);
+    // Without an explicit mode the save keeps the permission bits of the file
+    // it replaces (a 0600 file stays private, a script stays executable), as
+    // the brokered helper does. A new file gets the process default.
+    let mode = expectedMode;
+    if (mode == null) {
+      try {
+        const current = await lstat(p);
+        if (current.isFile()) mode = current.mode & 0o777;
+      } catch {
+        // missing target: a new file
+      }
+    }
     const tmp = join(
       dirname(p),
       `.deckterm-save-${process.pid}-${Math.random().toString(36).slice(2)}`,
     );
-    await writeFile(tmp, content);
-    if (expectedMode != null) await chmod(tmp, expectedMode);
+    // Created private and exclusive, so the content is never readable by
+    // others before the final mode is set; the mode is applied before the
+    // rename makes the file visible under its name.
+    await writeFile(tmp, content, { mode: 0o600, flag: "wx" });
     try {
+      await chmod(tmp, mode ?? 0o666 & ~process.umask());
       await fsRename(tmp, p);
     } catch (err) {
       await rm(tmp, { force: true }).catch(() => {});
@@ -452,7 +467,15 @@ class LegacyFsExecutor implements FsExecutor {
     });
   }
   async rename(root: string, relFrom: string, relTo: string): Promise<void> {
-    await fsRename(this.abs(root, relFrom), this.abs(root, relTo));
+    // Never replaces an existing destination: the fd-contained helper renames
+    // with RENAME_NOREPLACE and answers `exists` (409 at the route), as the
+    // brokered executor does. A plain fs.rename would silently overwrite it.
+    await callLocalHelper({
+      op: "rename",
+      root,
+      path: relFrom,
+      toPath: relTo,
+    });
   }
   async atomicMove(
     root: string,

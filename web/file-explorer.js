@@ -1933,13 +1933,21 @@ class FileExplorerController {
       const cleanupDate = Number.isNaN(expiresAt.getTime())
         ? "Cleanup date unavailable"
         : `Eligible for cleanup from ${expiresAt.toLocaleString()}`;
-      detail.textContent = `Deleted ${Number.isNaN(deletedAt.getTime()) ? "recently" : deletedAt.toLocaleString()} · ${cleanupDate}`;
+      const broken = item.status === "error";
+      detail.textContent = broken
+        ? `Cannot be restored (${item.lastError || "unknown reason"}). You can still delete it permanently.`
+        : `Deleted ${Number.isNaN(deletedAt.getTime()) ? "recently" : deletedAt.toLocaleString()} · ${cleanupDate}`;
       const actions = document.createElement("div");
       actions.className = "file-trash-actions";
-      for (const [operation, label] of [
-        ["restore", "Restore"],
-        ["purge", "Delete permanently"],
-      ]) {
+      // An item in the error state can no longer be restored; deleting it for
+      // good is its only way out of the Trash.
+      const operations = broken
+        ? [["purge", "Delete permanently"]]
+        : [
+            ["restore", "Restore"],
+            ["purge", "Delete permanently"],
+          ];
+      for (const [operation, label] of operations) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = operation === "purge" ? "btn danger" : "btn";

@@ -36,6 +36,18 @@ export type BrokeredExecContext = {
   osUsername: string;
 };
 
+/**
+ * Server-decided options of one created session; never from a request body.
+ * Only the legacy tmux backend supports them (an operator's attached view,
+ * design 2026-11-14); the others refuse a `command`.
+ */
+export type TerminalCreateSessionOptions = {
+  /** The pane runs this argv (execvp, no shell) instead of the login shell. */
+  command?: string[];
+  /** No pipe-pane transcript for this session, on create and every attach. */
+  noPipe?: boolean;
+};
+
 export type TerminalBackendAttachOptions = {
   cwd: string;
   cols: number;
@@ -81,6 +93,7 @@ export interface TerminalBackend {
     rows: number,
     ownerId: string,
     ownerEmail: string,
+    options?: TerminalCreateSessionOptions,
   ): Promise<TerminalBackendSession>;
 
   attach(sessionName: string, options: any): Promise<any>;

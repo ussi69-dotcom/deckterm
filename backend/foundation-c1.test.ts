@@ -346,6 +346,16 @@ test("foundation C1 exposes a minimal route capability registry", () => {
     resourceType: "terminal",
     resourceId: "term_123",
   });
+  // The operator attached view is a new terminal (design 2026-11-14).
+  expect(
+    getRouteCapability("POST", "/api/operators/aispend-operator/attach"),
+  ).toEqual({
+    capability: "terminal.create",
+    resourceType: "terminal",
+    resourceId: "operator:aispend-operator",
+  });
+  expect(getRouteCapability("GET", "/api/operators")).toBeNull();
+  expect(getRouteCapability("POST", "/api/operators/x/detach")).toBeNull();
   expect(getRouteCapability("GET", "/api/health")).toBe(null);
 });
 

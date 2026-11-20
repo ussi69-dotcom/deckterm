@@ -152,6 +152,9 @@ function spawnServer(h: Omit<Harness, "child">): Bun.Subprocess {
     DECKTERM_PUBLISH_MODE: "local",
     DECKTERM_OS_ISOLATION: "0",
     DECKTERM_RETENTION_DISABLED: "1",
+    // Short, so a frozen-tmux restart still opens the port well inside
+    // waitForHealth's window.
+    DECKTERM_STARTUP_TMUX_TIMEOUT_MS: "3000",
     CF_ACCESS_REQUIRED: "0",
     CF_ACCESS_TEAM_NAME: "",
     CF_ACCESS_AUD: "",
@@ -777,6 +780,65 @@ test.skipIf(!TMUX_AVAILABLE)(
       8_000,
     );
     expect(await attachClientPids(h, id)).toHaveLength(1);
+  },
+  60_000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "a session kept for a linked view is not left running unseen after its source closes and the service restarts",
+  async () => {
+    let h = await startHarness();
+    const source = await createTerminal(h);
+    const res = await fetch(
+      `http://127.0.0.1:${h.port}/api/terminals/${source}/linked-view`,
+      { method: "POST" },
+    );
+    expect(res.status).toBe(200);
+    const view = ((await res.json()) as { id: string }).id;
+    expect(view).not.toBe(source);
+
+    // Closing the source keeps its tmux session: the linked view still uses it.
+    const closed = await fetch(
+      `http://127.0.0.1:${h.port}/api/terminals/${source}`,
+      { method: "DELETE" },
+    );
+    expect(closed.ok).toBe(true);
+    expect(dbStatus(h, source)).toBe("ended");
+    expect(await tmuxHasSession(h, source)).toBe(true);
+
+    // After a restart nothing can reach that session any more (the view's
+    // row ends, the source's row is ended), so it must not keep running.
+    await stopServer(h);
+    h = await restartServer(h);
+    expect(dbStatus(h, view)).toBe("ended");
+    expect(dbStatus(h, source)).toBe("ended");
+    expect(await tmuxHasSession(h, source)).toBe(false);
+  },
+  60_000,
+);
+
+test.skipIf(!TMUX_AVAILABLE)(
+  "a frozen tmux server does not keep the service from starting",
+  async () => {
+    let h = await startHarness();
+    const id = await createTerminal(h);
+    const { code, out } = await tmux(h, ["display-message", "-p", "#{pid}"]);
+    expect(code).toBe(0);
+    const tmuxPid = Number(out);
+    expect(tmuxPid).toBeGreaterThan(0);
+    await stopServer(h);
+
+    // The socket file stays, the server never answers.
+    process.kill(tmuxPid, "SIGSTOP");
+    try {
+      h = await restartServer(h);
+      const health = await fetch(`http://127.0.0.1:${h.port}/api/health`);
+      expect(health.status).toBe(200);
+      // Nothing proved the session gone: its row stays active.
+      expect(dbStatus(h, id)).toBe("active");
+    } finally {
+      process.kill(tmuxPid, "SIGCONT");
+    }
   },
   60_000,
 );

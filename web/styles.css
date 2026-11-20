@@ -8167,6 +8167,21 @@ body.chrome-mobile .agents-panel-toggle {
   cursor: pointer;
 }
 
+/* Operator rows (design 2026-11-14): sessions that run outside DeckTerm. */
+.agents-row-badge,
+.session-chip-operator {
+  display: inline-block;
+  padding: 0 5px;
+  border: 1px dashed var(--accent-blue);
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 14px;
+  color: var(--accent-blue);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  vertical-align: 1px;
+}
+
 .agents-row:hover {
   background: var(--bg-tertiary);
 }

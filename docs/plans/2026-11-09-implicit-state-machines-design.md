@@ -1,6 +1,6 @@
 # Implicit state machines in DeckTerm
 
-Date: 2026-11-09. Status: first target built on `feature/task-state-machine`, not yet merged to `dev`.
+Date: 2026-11-09. Status: first target built on `feature/task-state-machine`, merged to `dev` and promoted to production (PR #49, `c6dbcf7`).
 
 An _implicit state machine_ is code where something clearly has states (connecting, running, finished), but the states live in scattered flags or strings and nothing says which moves between them are allowed. The usual symptoms are objects stuck in a state, impossible combinations, and rules copied into several places.
 
