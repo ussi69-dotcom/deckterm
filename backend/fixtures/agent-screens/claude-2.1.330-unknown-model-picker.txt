@@ -1,0 +1,48 @@
+---
+agent: claude
+version: 2.1.330
+state: unknown
+rule: model_picker_menu
+title: ✳ Folder listing with Bash
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: /model picker. 2.1.330 says "Enter to save" where 2.1.308 said "Enter to set as default"; the rule keeps the previous status (skip_state_update). Before the fix this screen fell through to osc_title_idle.
+---
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Haiku 5.5 · Claude Enterprise
+ ▝▝   ▝▝   /tmp/scratch
+
+⚠ Code Mode (experimental) is on · this session can be resumed only with Code Mode on
+
+❯ Run ls in this folder with the Bash tool.
+
+  Listed 1 directory
+
+● Předchozí ls jsem spustil přes shell v REPLu, ne přes Bash tool, o který jsi žádal. Spouštím ho znovu přes Bash tool.
+
+  Listed 1 directory
+
+● Složka /tmp/scratch je prázdná. ls přes Bash tool nevypsal žádný soubor ani složku a
+  nevrátil žádnou chybu.
+
+  Příkaz jsem spustil dvakrát: poprvé přes shell v REPLu, podruhé přes Bash tool, jak jsi žádal. Výsledek byl stejný.
+
+✻ Worked for 4s · done 8:49 AM
+▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+  Select model
+  Your pick is the default for new sessions. For other models, use --model.
+
+    1. Default (recommended)  Opus 5.5 · Best for everyday, complex tasks
+    2. Opus 5.5               For complex work and everyday tasks
+    3. Opus 5                 For complex tasks
+    4. Fable 5.2              For your toughest challenges
+  ❯ 5. Haiku 5.5 ✔            Fastest for quick answers
+    6. Haiku 4.5              Fastest for quick answers
+    7. Opus 4.8               Best for everyday, complex tasks
+
+  ◐ Medium effort (default) ←/→ to adjust
+
+  s to use this session only · Enter to save · Esc to cancel

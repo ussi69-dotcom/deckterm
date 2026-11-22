@@ -1,0 +1,48 @@
+---
+agent: claude
+version: 2.1.330
+state: blocked
+rule: bash_permission_prompt
+title: ✳ Folder listing with Bash
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: Started with --permission-mode default; mkdir demo asked through the REPL shell (Code Mode), cancelled with Esc before it ran.
+---
+  ⎿  Kept model as Haiku 5.5
+
+❯ Run the shell command mkdir demo with the Bash tool (not via any REPL).
+
+● Příkaz mkdir demo nespustím. V mém seznamu nástrojů není přímo dostupný Bash tool, takže jediná cesta, jak ho zavolat,
+  vede přes REPL, a to jsi výslovně nechtěl.
+
+  Můžeš to ověřit a spustit jedním z těchto způsobů:
+  - Napiš do promptu ! mkdir demo. Příkaz poběží v této session a výstup se objeví v konverzaci.
+  - Spusť mkdir demo v terminálu ve složce /tmp/scratch.
+
+  Pokud chceš, abych to zkusil znovu, napiš, jestli mám hledat Bash tool přes searchTools. To bych ale udělal přes REPL,
+  takže to jen potvrď.
+
+✻ Cogitated for 4s · done 8:50 AM
+
+❯ Ok, run mkdir demo through the REPL shell then.
+
+  Creating demo folder via REPL shell
+  ⎿  $ mkdir demo
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+ Tip: auto mode handles these prompts for you — choose "switch to auto mode" below
+ Run shell command
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ mkdir demo
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and always allow access to /tmp/scratch from this project
+   3. Yes, and switch to auto mode · auto mode handles these prompts for you
+   4. No
+
+ Esc to cancel · Tab to amend

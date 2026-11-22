@@ -82,7 +82,9 @@ describe("agent screen fixtures", () => {
         expect(header).toHaveProperty(key);
       }
       expect(["claude", "codex"]).toContain(header.agent);
-      expect(["working", "blocked", "idle"]).toContain(header.state);
+      // "unknown" is a screen whose rule keeps the previous status
+      // (skip_state_update), such as Claude's model picker.
+      expect(["working", "blocked", "idle", "unknown"]).toContain(header.state);
       // The file name and the synthetic flag must agree.
       expect(fixture.file.endsWith("-synthetic.txt")).toBe(
         header.synthetic === "yes",
@@ -95,6 +97,12 @@ describe("agent screen fixtures", () => {
         file: fixture.file,
         state: header.state as never,
       });
+      if (header.state === "unknown") {
+        expect({ file: fixture.file, skip: result.skip }).toEqual({
+          file: fixture.file,
+          skip: true,
+        });
+      }
       if (header.rule) {
         expect({ file: fixture.file, rule: result.ruleId }).toEqual({
           file: fixture.file,

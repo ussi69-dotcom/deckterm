@@ -1,0 +1,48 @@
+---
+agent: claude
+version: 2.1.330
+state: working
+rule: live_turn_working
+title: ✳ Folder listing with Bash
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: Frame ~2s into "Run ls in this folder with the Bash tool." Code Mode on (the owner's settings). The pane title keeps the ✳ prefix while working, as on 2.1.308.
+---
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Haiku 5.5 · Claude Enterprise
+ ▝▝   ▝▝   /tmp/scratch
+
+⚠ Code Mode (experimental) is on · this session can be resumed only with Code Mode on
+
+❯ Run ls in this folder with the Bash tool.
+
+● Listing files in the working folder
+  ⎿  $ ls
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+✻ Flummoxing… (1s · ↓ 83 tokens)
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    scratch  ✻ Haiku 5.5 ·medium  ········ 0%  $0.00  user@host
+  ⏸ manual mode on · esc to interrupt · ← 2 agents

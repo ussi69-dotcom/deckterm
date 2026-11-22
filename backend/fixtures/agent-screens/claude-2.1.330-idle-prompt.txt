@@ -1,0 +1,48 @@
+---
+agent: claude
+version: 2.1.330
+state: idle
+rule: live_prompt_box
+title: ✳ Folder listing with Bash
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: Empty prompt after the ls reply.
+---
+ ▐▛███▛█   Claude Code v2.1.330
+▝▜██████▀  Haiku 5.5 · Claude Enterprise
+ ▝▝   ▝▝   /tmp/scratch
+
+⚠ Code Mode (experimental) is on · this session can be resumed only with Code Mode on
+
+❯ Run ls in this folder with the Bash tool.
+
+  Listed 1 directory
+
+● Předchozí ls jsem spustil přes shell v REPLu, ne přes Bash tool, o který jsi žádal. Spouštím ho znovu přes Bash tool.
+
+  Listed 1 directory
+
+● Složka /tmp/scratch je prázdná. ls přes Bash tool nevypsal žádný soubor ani složku a
+  nevrátil žádnou chybu.
+
+  Příkaz jsem spustil dvakrát: poprvé přes shell v REPLu, podruhé přes Bash tool, jak jsi žádal. Výsledek byl stejný.
+
+✻ Worked for 4s · done 8:49 AM
+
+
+
+
+
+
+
+
+
+  No Chrome or computer use: exit and run CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0 claude for a new session without Code …
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    scratch  ✻ Haiku 5.5 ·medium  █······· 3% 35k/1M  $0.01  user@host
+  ⏸ manual mode on · ← 2 agents

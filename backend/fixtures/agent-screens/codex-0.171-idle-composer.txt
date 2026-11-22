@@ -1,0 +1,40 @@
+---
+agent: codex
+version: 0.171.0
+state: idle
+rule: osc_title_idle
+title: Create hello.txt with hi | scratch
+size: 120×36
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: Empty composer after the approval was cancelled with Esc.
+---
+  >_ OpenAI Codex (v0.171.0)
+     /tmp/scratch
+
+  To get started, describe a task or try one of these commands:
+
+  /init - create an AGENTS.md file with instructions for Codex
+  /status - show current session configuration
+  /permissions - choose what Codex is allowed to do
+  /model - choose what model and reasoning effort to use
+  /review - review any changes and find issues
+
+
+› Create a file named hello.txt containing the word hi.
+
+
+• Vytvořím hello.txt v aktuálním pracovním adresáři s obsahem hi.
+
+• Added hello.txt (+1 -0)
+    1 +hi
+
+■ Conversation interrupted - use /feedback if something went wrong
+
+
+› Ask Codex to do anything
+
+  GPT-5.6-Luna low · Context 96% left · /tmp/scratch · weekly 16% left
+  ← for agents · ? for shortcuts                                                              ⚠ 2 warnings · f2 to view

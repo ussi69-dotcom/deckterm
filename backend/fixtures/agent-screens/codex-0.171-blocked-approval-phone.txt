@@ -1,0 +1,42 @@
+---
+agent: codex
+version: 0.171.0
+state: blocked
+rule: osc_title_blocked
+title: [ . ] Action Required | Create hello.txt with hi | scratch
+size: 44×30
+capture: /home/user/opt/tmux-3.8/bin/tmux -S <private-instance-socket> capture-pane -p -t <session>
+date: 2026-11-22
+synthetic: no
+redactions: host name -> host; home directory path -> /home/user; scratch folder path -> /tmp/scratch (also its short forms in status lines and titles); user name -> user
+notes: The same prompt after resize-window -x 44 -y 30. The wrapped destination path was joined into one line by the redaction.
+---
+  issues
+
+
+› Create a file named hello.txt containing
+  the word hi.
+
+
+• Vytvořím hello.txt v aktuálním pracovním
+  adresáři s obsahem hi.
+
+• Added hello.txt (+1 -0)
+    1 +hi
+
+
+  Would you like to make the following
+  edits?
+
+  Description: Apply proposed file edits
+  Destination:
+  /tmp/scratch/hello.txt
+
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for these
+     files (a)
+  3. No, and tell Codex what to do
+     differently (esc)
+
+  Press enter to confirm or esc to cancel

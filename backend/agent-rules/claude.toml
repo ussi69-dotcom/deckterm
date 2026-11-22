@@ -37,6 +37,11 @@
 #      - legacy_no_prompt_blocker: `(?m)^\s*❯\s*$` became
 #        `(?m)^[^\S\n]*❯[^\S\n]*$` (`\s` crossed line breaks, so every line
 #        start re-scanned all following blank lines).
+#   4. model_picker_menu accepts "enter to save" beside "enter to set as
+#      default". Claude 2.1.329 changed the /model picker footer to
+#      "s to use this session only · Enter to save · Esc to cancel", so the
+#      rule missed and the open picker read as idle (osc_title_idle).
+#      Fixture: backend/fixtures/agent-screens/claude-2.1.330-unknown-model-picker.txt
 
 id = "claude"
 version = "2026.10.11.1"
@@ -209,7 +214,12 @@ state = "unknown"
 priority = 900
 region = "whole_recent"
 skip_state_update = true
-contains = ["select model", "enter to set as default", "esc to cancel"]
+# DeckTerm edit 4 (see the header): 2.1.330 says "enter to save".
+contains = ["select model", "esc to cancel"]
+any = [
+  { contains = ["enter to set as default"] },
+  { contains = ["enter to save"] },
+]
 not = [
   { contains = ["do you want to proceed?"] },
   { contains = ["enter to select"] },
