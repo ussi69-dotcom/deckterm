@@ -38,6 +38,8 @@ candidate_root=""
 candidate_log=""
 current_target=""
 current_release=""
+had_previous_link=0
+original_previous_link=""
 release_dir=""
 release_created=0
 promoted=0
@@ -126,8 +128,11 @@ read_release_marker() {
 }
 
 stop_candidate() {
+  # Explicit status: a bare return inside the EXIT trap returns the status of
+  # the command before the trap (the failing exit), which set -e then turns
+  # into an early exit that skips the rest of cleanup.
   if [[ -z "$candidate_pid" ]]; then
-    return
+    return 0
   fi
   if kill -0 "$candidate_pid" 2>/dev/null; then
     kill -TERM "$candidate_pid" 2>/dev/null || true
@@ -155,7 +160,7 @@ candidate_is_running() {
 
 remove_candidate_root() {
   if [[ -z "$candidate_root" ]]; then
-    return
+    return 0
   fi
   if [[ -d "$candidate_root" ]] && \
      [[ "$(dirname "$candidate_root")" == "$shared_dir" ]] && \
@@ -201,6 +206,13 @@ if [[ -L "$current_link" ]]; then
       exit 1
     fi
   fi
+fi
+
+# Remember the rollback pointer as it was, so a failed promotion can put it
+# back instead of leaving it on the release that is still running.
+if [[ -L "$previous_link" ]]; then
+  had_previous_link=1
+  original_previous_link=$(readlink "$previous_link")
 fi
 
 if [[ -e "$release_dir" || -L "$release_dir" ]]; then
@@ -337,12 +349,22 @@ fi
   "$contracts_dir/${release_id}.json" >/dev/null
 remove_candidate_root
 
+restore_previous_link() {
+  if (( had_previous_link == 1 )); then
+    ln -sfnT "$original_previous_link" "$previous_link"
+  elif [[ -L "$previous_link" ]]; then
+    rm -f -- "$previous_link"
+  fi
+}
+
 rollback_live() {
   if [[ -z "$current_target" || -z "$current_release" ]]; then
     echo "No prior release is available for automatic rollback." >&2
     return 1
   fi
-  ln -sfnT "$current_target" "$current_link"
+  # rollback_live runs as an if condition, where set -e is off: check each step.
+  ln -sfnT "$current_target" "$current_link" || return 1
+  restore_previous_link || return 1
   if [[ -n "$systemd_service" ]]; then
     if ! XDG_RUNTIME_DIR="$xdg_runtime_dir" "$systemctl_bin" --user restart "$systemd_service" 9>&-; then
       return 1
@@ -363,7 +385,11 @@ promoted=1
 if [[ -n "$systemd_service" ]]; then
   if ! XDG_RUNTIME_DIR="$xdg_runtime_dir" "$systemctl_bin" --user restart "$systemd_service" 9>&-; then
     echo "Production restart failed for release ${release_id}; restoring the prior release." >&2
-    if ! rollback_live; then
+    if rollback_live; then
+      # Verified back on the prior release: drop the failed release (cleanup)
+      # so the same release ID can be deployed again.
+      promoted=0
+    else
       echo "Automatic rollback also failed health or identity verification." >&2
     fi
     exit 1
@@ -375,7 +401,9 @@ if ! "$trusted_health_waiter" "$live_url" 45 || \
    ! "$bun_bin" "$trusted_release_tool" health \
       "$live_url" "$release_id" live >/dev/null; then
   echo "Live verification failed for release ${release_id}; restoring the prior release." >&2
-  if ! rollback_live; then
+  if rollback_live; then
+    promoted=0
+  else
     echo "Automatic rollback also failed health or identity verification." >&2
   fi
   exit 1

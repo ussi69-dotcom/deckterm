@@ -108,6 +108,10 @@ if [[ $# -eq 1 && "$rollback_release" != "$requested_release" ]]; then
   echo "Rollback target marker does not match the requested release." >&2
   exit 1
 fi
+if [[ "$rollback_target" == "$original_target" ]]; then
+  echo "Rollback target ${rollback_release} is already the running release; nothing was changed. Name an older release ID." >&2
+  exit 1
+fi
 
 # Fail closed before changing the symlink. Both contracts are inert JSON; no
 # old server module and no live SQLite database is opened for this probe.

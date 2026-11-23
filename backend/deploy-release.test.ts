@@ -585,3 +585,98 @@ test("successful deploy isolates preflight, persists contracts, and rollback ver
   expect(refused.stderr).toContain("contract is missing");
   expect(readlinkSync(setup.currentLink)).toBe(setup.oldRelease);
 }, 45_000);
+
+
+test("a failed promotion keeps the prior previous link and lets the same release be retried", async () => {
+  const setup = createDeployFixture(false);
+  const [targetPort, candidatePort] = await twoFreePorts();
+  const env = deployEnv(setup, targetPort, candidatePort);
+  env.FAKE_SYSTEMCTL_FAIL_ONCE = "1";
+  const releasesDir = join(setup.deployRoot, "releases");
+  const previousLink = join(setup.deployRoot, "previous");
+  const olderRelease = join(releasesDir, "older-release");
+  mkdirSync(join(olderRelease, "backend"), { recursive: true, mode: 0o700 });
+  writeFileSync(join(olderRelease, "RELEASE_ID"), "older-release\n", {
+    mode: 0o600,
+  });
+  symlinkSync(olderRelease, previousLink);
+
+  const failed = await runShell(
+    join(repoRoot, "scripts", "deploy_release.sh"),
+    ["retry-release"],
+    env,
+  );
+  expect(failed.exitCode).not.toBe(0);
+  expect(failed.stderr).toContain("Production restart failed");
+  expect(readlinkSync(setup.currentLink)).toBe(setup.oldRelease);
+  // The rollback pointer still names the release before the running one.
+  expect(readlinkSync(previousLink)).toBe(olderRelease);
+  // The failed release is gone, so the same release can be deployed again.
+  expect(existsSync(join(releasesDir, "retry-release"))).toBe(false);
+
+  const retried = await runShell(
+    join(repoRoot, "scripts", "deploy_release.sh"),
+    ["retry-release"],
+    env,
+  );
+  expect(retried.exitCode).toBe(0);
+  expect(retried.stdout).toContain(
+    "production is serving release retry-release",
+  );
+  expect(readlinkSync(setup.currentLink)).toBe(
+    join(releasesDir, "retry-release"),
+  );
+  expect(readlinkSync(previousLink)).toBe(setup.oldRelease);
+  await expectPortClosed(candidatePort);
+}, 45_000);
+
+test("a failed first promotion leaves no previous link pointing at the running release", async () => {
+  const setup = createDeployFixture(false);
+  const [targetPort, candidatePort] = await twoFreePorts();
+  const env = deployEnv(setup, targetPort, candidatePort);
+  env.FAKE_SYSTEMCTL_FAIL_ONCE = "1";
+  const previousLink = join(setup.deployRoot, "previous");
+
+  const failed = await runShell(
+    join(repoRoot, "scripts", "deploy_release.sh"),
+    ["first-fails"],
+    env,
+  );
+  expect(failed.exitCode).not.toBe(0);
+  expect(readlinkSync(setup.currentLink)).toBe(setup.oldRelease);
+  expect(existsSync(previousLink)).toBe(false);
+  expect(
+    existsSync(join(setup.deployRoot, "releases", "first-fails")),
+  ).toBe(false);
+}, 30_000);
+
+test("rollback refuses a target that is already the running release", async () => {
+  const setup = createDeployFixture(false);
+  const [targetPort, candidatePort] = await twoFreePorts();
+  const env = deployEnv(setup, targetPort, candidatePort);
+  symlinkSync(setup.oldRelease, join(setup.deployRoot, "previous"));
+  const contractsDir = join(setup.deployRoot, "shared", "schema-contracts");
+  mkdirSync(contractsDir, { recursive: true, mode: 0o700 });
+  const captured = Bun.spawnSync([
+    process.execPath,
+    join(repoRoot, "scripts", "release-state.ts"),
+    "capture",
+    join(setup.liveState, "deckterm.db"),
+    "old-release",
+    join(contractsDir, "old-release.json"),
+  ]);
+  expect(captured.exitCode).toBe(0);
+
+  for (const args of [[], ["old-release"]]) {
+    const result = await runShell(
+      join(repoRoot, "scripts", "rollback_release.sh"),
+      args,
+      env,
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain("already the running release");
+    expect(readlinkSync(setup.currentLink)).toBe(setup.oldRelease);
+    // No service restart was attempted.
+    expect(existsSync(setup.servicePidFile)).toBe(false);
+  }
+}, 30_000);

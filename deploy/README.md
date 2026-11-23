@@ -209,6 +209,11 @@ The deploy chain currently includes these important fixes:
   release symlink or service changes
 - release retention uses deployment-directory modification time while always preserving
   `current` and `previous`
+- a failed promotion (restart or live verification) restores both `current` and
+  `previous` as they were; once the prior release is verified live again, the failed
+  release directory is removed so the same release ID can be deployed again
+- `rollback_release.sh` refuses a target that is already the running release instead of
+  restarting it and reporting a rollback
 
 ## Promotion flow
 
